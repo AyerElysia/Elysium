@@ -7,11 +7,13 @@ remain open strings in the domain records consumed by these interfaces.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Generic, Protocol, TypeVar, runtime_checkable
 
 from ...memory.edges import MemoryEdge
 from ...memory.epistemic import (
@@ -32,6 +34,8 @@ from ...memory.epistemic import (
 )
 from ...memory.experience import (
     ExperienceAppendReport,
+    ExperienceOccurrenceCursor,
+    ExperienceOccurrencePage,
     ExperienceOccurrenceRef,
     ExperienceRecord,
     WitnessMemory,
@@ -83,6 +87,150 @@ class MemoryStoreCharacterization:
     uses_compare_and_swap: bool
     rebuild_source: str
     migration_order: int
+
+
+_PageItemT = TypeVar("_PageItemT")
+
+
+@dataclass(frozen=True, slots=True, order=True)
+class StableLedgerCursor:
+    """Stable string ordering value plus immutable identity tie-breaker."""
+
+    order_value: str
+    identity: str
+
+    def __post_init__(self) -> None:
+        if not str(self.order_value):
+            raise ValueError("StableLedgerCursorOrderRequired")
+        if not str(self.identity):
+            raise ValueError("StableLedgerCursorIdentityRequired")
+
+
+@dataclass(frozen=True, slots=True)
+class StableLedgerPage(Generic[_PageItemT]):
+    """Bounded page tied to a stable frontier for restartable scans."""
+
+    items: tuple[_PageItemT, ...]
+    next_cursor: StableLedgerCursor | None
+    frontier: StableLedgerCursor | None
+    has_more: bool
+
+
+@dataclass(frozen=True, slots=True)
+class WitnessReconciliationState:
+    """Durable technical cursor for one idempotent Witness reconciliation scan."""
+
+    scan_name: str
+    cursor: StableLedgerCursor | None = None
+    frontier: StableLedgerCursor | None = None
+    revision: int = 0
+    cycle_started_at: str = ""
+    last_completed_at: str = ""
+    updated_at: str = ""
+    state_sha256: str = ""
+
+
+class WitnessReconciliationStateCorrupt(RuntimeError):
+    """A durable technical cursor row violates its composite-key invariants."""
+
+
+def witness_reconciliation_state_sha256(
+    *,
+    scan_name: str,
+    cursor: StableLedgerCursor | None,
+    frontier: StableLedgerCursor | None,
+    revision: int,
+    cycle_started_at: str,
+    last_completed_at: str,
+    updated_at: str,
+) -> str:
+    """Fingerprint one persisted technical scan state without ledger content."""
+
+    body = {
+        "scan_name": str(scan_name),
+        "cursor": (
+            None
+            if cursor is None
+            else [str(cursor.order_value), str(cursor.identity)]
+        ),
+        "frontier": (
+            None
+            if frontier is None
+            else [str(frontier.order_value), str(frontier.identity)]
+        ),
+        "revision": int(revision),
+        "cycle_started_at": str(cycle_started_at),
+        "last_completed_at": str(last_completed_at),
+        "updated_at": str(updated_at),
+    }
+    encoded = json.dumps(
+        body,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def validate_witness_reconciliation_state(
+    state: WitnessReconciliationState,
+) -> WitnessReconciliationState:
+    """Fail closed on partial, regressed, or out-of-frontier durable cursors."""
+
+    if not str(state.scan_name):
+        raise WitnessReconciliationStateCorrupt(
+            "WitnessReconciliationScanNameMissing"
+        )
+    if int(state.revision) < 0:
+        raise WitnessReconciliationStateCorrupt(
+            "WitnessReconciliationRevisionInvalid"
+        )
+    if state.cursor is not None and state.frontier is None:
+        raise WitnessReconciliationStateCorrupt(
+            "WitnessReconciliationCursorWithoutFrontier"
+        )
+    if (
+        state.cursor is not None
+        and state.frontier is not None
+        and state.cursor > state.frontier
+    ):
+        raise WitnessReconciliationStateCorrupt(
+            "WitnessReconciliationCursorBeyondFrontier"
+        )
+    if state.frontier is not None and not str(state.cycle_started_at):
+        raise WitnessReconciliationStateCorrupt(
+            "WitnessReconciliationCycleTimestampMissing"
+        )
+    persisted = bool(
+        int(state.revision)
+        or state.cursor is not None
+        or state.frontier is not None
+        or str(state.cycle_started_at)
+        or str(state.last_completed_at)
+        or str(state.updated_at)
+    )
+    if persisted:
+        observed = str(state.state_sha256 or "").strip().lower()
+        if len(observed) != 64 or any(
+            character not in "0123456789abcdef" for character in observed
+        ):
+            raise WitnessReconciliationStateCorrupt(
+                "WitnessReconciliationChecksumMissing"
+            )
+        expected = witness_reconciliation_state_sha256(
+            scan_name=state.scan_name,
+            cursor=state.cursor,
+            frontier=state.frontier,
+            revision=state.revision,
+            cycle_started_at=state.cycle_started_at,
+            last_completed_at=state.last_completed_at,
+            updated_at=state.updated_at,
+        )
+        if observed != expected:
+            raise WitnessReconciliationStateCorrupt(
+                "WitnessReconciliationChecksumMismatch"
+            )
+    return state
 
 
 def memory_store_characterizations() -> tuple[MemoryStoreCharacterization, ...]:
@@ -146,9 +294,28 @@ class MemoryStorePort(Protocol):
     async def availability(self) -> StorageAvailability: ...
 
 
+@dataclass(frozen=True, slots=True)
+class CanonicalDocumentMetadata:
+    """Content-free canonical metadata for one indexed document path."""
+
+    node_id: str
+    file_path: str
+    content_hash: str | None
+    title: str
+    source_mtime: float | None
+    index_revision: int
+    is_deleted: bool
+    updated_at: float
+
+
 @runtime_checkable
 class DocumentIndexProjection(MemoryStorePort, Protocol):
     """Rebuildable lexical/chunk/vector-work projection."""
+
+    async def get_document_metadata(
+        self,
+        path: str,
+    ) -> CanonicalDocumentMetadata | None: ...
 
     async def upsert_document(
         self,
@@ -282,6 +449,15 @@ class ExperienceLedgerStore(MemoryStorePort, Protocol):
         limit: int = 100,
     ) -> list[ExperienceOccurrenceRef]: ...
 
+    async def list_occurrence_page(
+        self,
+        *,
+        position_after: int = 0,
+        after: ExperienceOccurrenceCursor | None = None,
+        through: ExperienceOccurrenceCursor | None = None,
+        limit: int = 100,
+    ) -> ExperienceOccurrencePage: ...
+
     async def health_snapshot(self) -> dict[str, Any]: ...
 
 
@@ -301,6 +477,14 @@ class WitnessLedgerStore(MemoryStorePort, Protocol):
     ) -> bool: ...
 
     async def list_pending(self, *, limit: int = 100) -> list[WitnessMemory]: ...
+
+    async def list_pending_page(
+        self,
+        *,
+        after: StableLedgerCursor | None = None,
+        through: StableLedgerCursor | None = None,
+        limit: int = 100,
+    ) -> StableLedgerPage[WitnessMemory]: ...
 
     async def get_by_projection_path(
         self,
@@ -363,6 +547,16 @@ class WitnessLedgerStore(MemoryStorePort, Protocol):
         limit: int = 100,
     ) -> list[WitnessDeliveryJob]: ...
 
+    async def list_delivery_jobs_page(
+        self,
+        *,
+        delivery_kind: str | None = None,
+        statuses: Sequence[str] = ("pending", "failed"),
+        after: StableLedgerCursor | None = None,
+        through: StableLedgerCursor | None = None,
+        limit: int = 100,
+    ) -> StableLedgerPage[WitnessDeliveryJob]: ...
+
     async def mark_delivery_job(
         self,
         job_id: str,
@@ -382,6 +576,32 @@ class WitnessLedgerStore(MemoryStorePort, Protocol):
         statuses: Sequence[str] = (),
         limit: int = 100,
     ) -> list[WitnessDeliveryJob]: ...
+
+    async def list_projection_records_page(
+        self,
+        *,
+        statuses: Sequence[str] = (),
+        after: StableLedgerCursor | None = None,
+        through: StableLedgerCursor | None = None,
+        limit: int = 100,
+    ) -> StableLedgerPage[WitnessDeliveryJob]: ...
+
+    async def get_reconciliation_state(
+        self,
+        scan_name: str,
+    ) -> WitnessReconciliationState: ...
+
+    async def compare_and_advance_reconciliation_state(
+        self,
+        scan_name: str,
+        *,
+        expected_revision: int,
+        next_cursor: StableLedgerCursor | None,
+        frontier: StableLedgerCursor | None,
+        completed: bool,
+    ) -> WitnessReconciliationState: ...
+
+    async def delivery_health(self) -> dict[str, Any]: ...
 
     async def projection_health(self) -> dict[str, Any]: ...
 

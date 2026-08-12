@@ -11,7 +11,7 @@ import hashlib
 import json
 import re
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum
@@ -80,6 +80,30 @@ class ExperienceOccurrenceRef:
     is_alias: bool = False
 
 
+@dataclass(frozen=True, slots=True, order=True)
+class ExperienceOccurrenceCursor:
+    """Stable immutable ordering key for occurrence-ledger pagination."""
+
+    ingest_position: int
+    occurrence_id: str
+
+    def __post_init__(self) -> None:
+        if int(self.ingest_position) < 0:
+            raise ValueError("ExperienceOccurrenceCursorPositionInvalid")
+        if not str(self.occurrence_id):
+            raise ValueError("ExperienceOccurrenceCursorIdentityRequired")
+
+
+@dataclass(frozen=True, slots=True)
+class ExperienceOccurrencePage:
+    """One bounded page tied to an immutable composite frontier."""
+
+    items: tuple[ExperienceOccurrenceRef, ...]
+    next_cursor: ExperienceOccurrenceCursor | None
+    frontier: ExperienceOccurrenceCursor | None
+    has_more: bool
+
+
 @dataclass(frozen=True, slots=True)
 class ExperienceAppendReport:
     """Canonical records affected by an idempotent ledger append."""
@@ -115,6 +139,11 @@ class WitnessMemory:
     projection_status: str = "pending"
     projection_error: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    payload_sha256: str = ""
+
+
+class WitnessIdentityConflict(RuntimeError):
+    """One witness identity was replayed with different persisted bytes."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +204,20 @@ def create_life_memory_schema(db: sqlite3.Connection) -> None:
                 db.execute(
                     """ALTER TABLE memory_experiences
                     ADD COLUMN source_event_id TEXT NOT NULL DEFAULT ''"""
+                )
+        existing_witness_table = db.execute(
+            """SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'memory_witnesses'"""
+        ).fetchone()
+        if existing_witness_table is not None:
+            witness_columns = {
+                str(row["name"])
+                for row in db.execute("PRAGMA table_info(memory_witnesses)")
+            }
+            if "payload_sha256" not in witness_columns:
+                db.execute(
+                    "ALTER TABLE memory_witnesses "
+                    "ADD COLUMN payload_sha256 TEXT NOT NULL DEFAULT ''"
                 )
         db.executescript(
             """
@@ -252,7 +295,8 @@ def create_life_memory_schema(db: sqlite3.Connection) -> None:
                 projection_path TEXT NOT NULL DEFAULT '',
                 projection_status TEXT NOT NULL DEFAULT 'pending',
                 projection_error TEXT NOT NULL DEFAULT '',
-                metadata_json TEXT NOT NULL DEFAULT '{}'
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                payload_sha256 TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_witnesses_scope_time
                 ON memory_witnesses(stream_scope, recorded_at DESC);
@@ -260,6 +304,32 @@ def create_life_memory_schema(db: sqlite3.Connection) -> None:
                 ON memory_witnesses(status, epistemic_kind);
             CREATE UNIQUE INDEX IF NOT EXISTS idx_witnesses_projection_path
                 ON memory_witnesses(projection_path) WHERE projection_path <> '';
+            CREATE TRIGGER IF NOT EXISTS memory_witnesses_authority_immutable_update
+            BEFORE UPDATE ON memory_witnesses
+            WHEN OLD.witness_id IS NOT NEW.witness_id
+              OR OLD.content IS NOT NEW.content
+              OR OLD.consciousness_instance_id IS NOT NEW.consciousness_instance_id
+              OR OLD.perspective_subject_id IS NOT NEW.perspective_subject_id
+              OR OLD.epistemic_kind IS NOT NEW.epistemic_kind
+              OR OLD.source_kind IS NOT NEW.source_kind
+              OR OLD.status IS NOT NEW.status
+              OR OLD.stream_scope IS NOT NEW.stream_scope
+              OR OLD.visibility IS NOT NEW.visibility
+              OR OLD.valid_from IS NOT NEW.valid_from
+              OR OLD.valid_to IS NOT NEW.valid_to
+              OR OLD.recorded_at IS NOT NEW.recorded_at
+              OR OLD.source_sequence_start IS NOT NEW.source_sequence_start
+              OR OLD.source_sequence_end IS NOT NEW.source_sequence_end
+              OR OLD.model_task_name IS NOT NEW.model_task_name
+              OR OLD.metadata_json IS NOT NEW.metadata_json
+              OR OLD.payload_sha256 IS NOT NEW.payload_sha256
+            BEGIN
+                SELECT RAISE(ABORT, 'MemoryWitnessAuthorityImmutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS memory_witnesses_authority_immutable_delete
+            BEFORE DELETE ON memory_witnesses BEGIN
+                SELECT RAISE(ABORT, 'MemoryWitnessAuthorityImmutable');
+            END;
 
             CREATE TABLE IF NOT EXISTS memory_witness_sources (
                 witness_id TEXT NOT NULL,
@@ -273,6 +343,14 @@ def create_life_memory_schema(db: sqlite3.Connection) -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_witness_sources_event
                 ON memory_witness_sources(event_id, witness_id);
+            CREATE TRIGGER IF NOT EXISTS memory_witness_sources_immutable_update
+            BEFORE UPDATE ON memory_witness_sources BEGIN
+                SELECT RAISE(ABORT, 'MemoryWitnessSourceImmutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS memory_witness_sources_immutable_delete
+            BEFORE DELETE ON memory_witness_sources BEGIN
+                SELECT RAISE(ABORT, 'MemoryWitnessSourceImmutable');
+            END;
 
             CREATE TABLE IF NOT EXISTS memory_witness_state (
                 consciousness_instance_id TEXT PRIMARY KEY,
@@ -282,6 +360,18 @@ def create_life_memory_schema(db: sqlite3.Connection) -> None:
                 last_success_at TEXT NOT NULL DEFAULT '',
                 last_error TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS memory_witness_reconciliation_state (
+                scan_name TEXT PRIMARY KEY,
+                cursor_order_value TEXT NOT NULL DEFAULT '',
+                cursor_identity TEXT NOT NULL DEFAULT '',
+                frontier_order_value TEXT NOT NULL DEFAULT '',
+                frontier_identity TEXT NOT NULL DEFAULT '',
+                revision INTEGER NOT NULL DEFAULT 0,
+                cycle_started_at TEXT NOT NULL DEFAULT '',
+                last_completed_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL,
+                state_sha256 TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS memory_witness_migrations (
                 migration_key TEXT PRIMARY KEY,
@@ -305,6 +395,17 @@ def create_life_memory_schema(db: sqlite3.Connection) -> None:
             db.execute(
                 "ALTER TABLE memory_witness_state "
                 "ADD COLUMN revision INTEGER NOT NULL DEFAULT 0"
+            )
+        reconciliation_columns = {
+            str(row[1])
+            for row in db.execute(
+                "PRAGMA table_info(memory_witness_reconciliation_state)"
+            )
+        }
+        if "state_sha256" not in reconciliation_columns:
+            db.execute(
+                "ALTER TABLE memory_witness_reconciliation_state "
+                "ADD COLUMN state_sha256 TEXT NOT NULL DEFAULT ''"
             )
 
     # Kept additive so historical local ledgers gain the staged pipeline
@@ -339,6 +440,54 @@ def experience_payload_sha256(record: ExperienceRecord) -> str:
     ).hexdigest()
 
 
+def witness_append_payload_sha256(
+    *,
+    witness_id: str,
+    content: str,
+    consciousness_instance_id: str,
+    perspective_subject_id: str,
+    epistemic_kind: str,
+    source_kind: str,
+    status: str,
+    stream_scope: str,
+    visibility: str,
+    valid_from: str,
+    valid_to: str,
+    recorded_at: str,
+    source_sequence_start: int,
+    source_sequence_end: int,
+    model_task_name: str,
+    projection_path: str,
+    metadata: Mapping[str, Any],
+    source_event_ids: Sequence[str],
+) -> str:
+    """Hash the exact bytes and initial fields accepted by witness append."""
+
+    body = {
+        "witness_id": str(witness_id),
+        "content": str(content),
+        "consciousness_instance_id": str(consciousness_instance_id),
+        "perspective_subject_id": str(perspective_subject_id),
+        "epistemic_kind": str(epistemic_kind),
+        "source_kind": str(source_kind),
+        "status": str(status),
+        "stream_scope": str(stream_scope),
+        "visibility": str(visibility),
+        "valid_from": str(valid_from),
+        "valid_to": str(valid_to),
+        "recorded_at": str(recorded_at),
+        "source_sequence_start": max(0, int(source_sequence_start)),
+        "source_sequence_end": max(0, int(source_sequence_end)),
+        "model_task_name": str(model_task_name),
+        "projection_path": str(projection_path),
+        "projection_status": "pending",
+        "projection_error": "",
+        "metadata_json": canonical_json(dict(metadata)),
+        "source_event_ids": tuple(str(item) for item in source_event_ids),
+    }
+    return hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
+
+
 def make_experience_occurrence_ref(
     experience: ExperienceRecord,
     *,
@@ -361,6 +510,17 @@ def make_experience_occurrence_ref(
         recorded_at=str(recorded_at or experience.recorded_at),
         experience=experience,
         is_alias=bool(is_alias),
+    )
+
+
+def experience_occurrence_cursor(
+    occurrence: ExperienceOccurrenceRef,
+) -> ExperienceOccurrenceCursor:
+    """Return the stable composite key for one occurrence."""
+
+    return ExperienceOccurrenceCursor(
+        ingest_position=int(occurrence.ingest_position),
+        occurrence_id=str(occurrence.occurrence_id),
     )
 
 
@@ -631,6 +791,73 @@ def list_experience_occurrences_after(
     return [_experience_occurrence_from_row(row) for row in rows]
 
 
+def list_experience_occurrence_page(
+    db: sqlite3.Connection,
+    *,
+    position_after: int = 0,
+    after: ExperienceOccurrenceCursor | None = None,
+    through: ExperienceOccurrenceCursor | None = None,
+    limit: int = 100,
+) -> ExperienceOccurrencePage:
+    """Read one stable composite-key page without guessing a numeric offset."""
+
+    lower_position = max(0, int(position_after))
+    page_limit = max(1, min(int(limit), 1000))
+    if after is not None and int(after.ingest_position) <= lower_position:
+        raise ValueError("ExperienceOccurrenceCursorOutsideScan")
+    frontier = through
+    if frontier is not None and int(frontier.ingest_position) <= lower_position:
+        raise ValueError("ExperienceOccurrenceFrontierOutsideScan")
+    if frontier is None:
+        frontier_row = db.execute(
+            _EXPERIENCE_OCCURRENCE_VIEW_SQL
+            + """ WHERE occurrence.ingest_position > ?
+            ORDER BY occurrence.ingest_position DESC,
+                     occurrence.occurrence_id DESC LIMIT 1""",
+            (lower_position,),
+        ).fetchone()
+        if frontier_row is None:
+            return ExperienceOccurrencePage((), None, None, False)
+        frontier = ExperienceOccurrenceCursor(
+            ingest_position=int(frontier_row["ingest_position"]),
+            occurrence_id=str(frontier_row["occurrence_id"]),
+        )
+    if after is not None and after > frontier:
+        raise ValueError("ExperienceOccurrenceCursorBeyondFrontier")
+
+    clauses = ["occurrence.ingest_position > ?"]
+    params: list[Any] = [lower_position]
+    if after is not None:
+        clauses.append(
+            "(occurrence.ingest_position > ? OR "
+            "(occurrence.ingest_position = ? AND occurrence.occurrence_id > ?))"
+        )
+        params.extend(
+            [after.ingest_position, after.ingest_position, after.occurrence_id]
+        )
+    clauses.append(
+        "(occurrence.ingest_position < ? OR "
+        "(occurrence.ingest_position = ? AND occurrence.occurrence_id <= ?))"
+    )
+    params.extend(
+        [frontier.ingest_position, frontier.ingest_position, frontier.occurrence_id]
+    )
+    params.append(page_limit + 1)
+    rows = db.execute(
+        _EXPERIENCE_OCCURRENCE_VIEW_SQL
+        + " WHERE "
+        + " AND ".join(clauses)
+        + " ORDER BY occurrence.ingest_position, occurrence.occurrence_id LIMIT ?",
+        params,
+    ).fetchall()
+    has_more = len(rows) > page_limit
+    items = tuple(
+        _experience_occurrence_from_row(row) for row in rows[:page_limit]
+    )
+    next_cursor = experience_occurrence_cursor(items[-1]) if items else after
+    return ExperienceOccurrencePage(items, next_cursor, frontier, has_more)
+
+
 def experience_health_snapshot(db: sqlite3.Connection) -> dict[str, Any]:
     row = db.execute(
         """SELECT
@@ -644,6 +871,11 @@ def experience_health_snapshot(db: sqlite3.Connection) -> dict[str, Any]:
     ).fetchone()
     canonical_count = int(row["canonical_count"] or 0)
     alias_count = int(row["alias_count"] or 0)
+    frontier_row = db.execute(
+        _EXPERIENCE_OCCURRENCE_VIEW_SQL
+        + " ORDER BY occurrence.ingest_position DESC, "
+        "occurrence.occurrence_id DESC LIMIT 1"
+    ).fetchone()
     return {
         "status": "healthy",
         "canonical_count": canonical_count,
@@ -652,6 +884,16 @@ def experience_health_snapshot(db: sqlite3.Connection) -> dict[str, Any]:
         "frontier": max(
             int(row["canonical_frontier"] or 0),
             int(row["alias_frontier"] or 0),
+        ),
+        "frontier_cursor": (
+            {
+                "ingest_position": int(frontier_row["ingest_position"]),
+                "occurrence_id_sha256": hashlib.sha256(
+                    str(frontier_row["occurrence_id"]).encode("utf-8")
+                ).hexdigest(),
+            }
+            if frontier_row is not None
+            else None
         ),
         "latest_recorded_at": str(row["latest_recorded_at"] or ""),
     }
@@ -686,7 +928,41 @@ def insert_witness_memory(
         raise ValueError("WitnessSourceRequired")
     new_id = witness_id or f"wit_{uuid4().hex}"
     recorded = recorded_at or _now_iso()
+    metadata_body = dict(metadata or {})
+    normalized_sequence_start = max(0, int(source_sequence_start))
+    normalized_sequence_end = max(0, int(source_sequence_end))
+    payload_sha256 = witness_append_payload_sha256(
+        witness_id=new_id,
+        content=content,
+        consciousness_instance_id=consciousness_instance_id,
+        perspective_subject_id=perspective_subject_id,
+        epistemic_kind=epistemic_kind,
+        source_kind=source_kind,
+        status=status,
+        stream_scope=stream_scope,
+        visibility=visibility,
+        valid_from=valid_from,
+        valid_to=valid_to,
+        recorded_at=recorded,
+        source_sequence_start=normalized_sequence_start,
+        source_sequence_end=normalized_sequence_end,
+        model_task_name=model_task_name,
+        projection_path=projection_path,
+        metadata=metadata_body,
+        source_event_ids=source_ids,
+    )
     with transaction(db):
+        existing = db.execute(
+            "SELECT * FROM memory_witnesses WHERE witness_id = ?",
+            (new_id,),
+        ).fetchone()
+        if existing is not None:
+            persisted = _witness_from_row(db, existing)
+            if persisted.payload_sha256 != payload_sha256:
+                raise WitnessIdentityConflict(
+                    f"WitnessIdentityConflict:{new_id}"
+                )
+            return persisted
         db.execute(
             """
             INSERT INTO memory_witnesses (
@@ -694,12 +970,14 @@ def insert_witness_memory(
                 perspective_subject_id, epistemic_kind, source_kind, status,
                 stream_scope, visibility, valid_from, valid_to, recorded_at,
                 source_sequence_start, source_sequence_end, model_task_name,
-                projection_path, projection_status, metadata_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                projection_path, projection_status, metadata_json,
+                payload_sha256
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                      'pending', ?, ?)
             """,
             (
                 new_id,
-                content.strip(),
+                content,
                 consciousness_instance_id,
                 perspective_subject_id,
                 epistemic_kind,
@@ -710,11 +988,12 @@ def insert_witness_memory(
                 valid_from,
                 valid_to,
                 recorded,
-                int(source_sequence_start),
-                int(source_sequence_end),
+                normalized_sequence_start,
+                normalized_sequence_end,
                 model_task_name,
                 projection_path,
-                json.dumps(metadata or {}, ensure_ascii=False),
+                canonical_json(metadata_body),
+                payload_sha256,
             ),
         )
         for ordinal, event_id in enumerate(source_ids):
@@ -724,7 +1003,7 @@ def insert_witness_memory(
             )
         db.execute(
             "INSERT INTO memory_witness_fts (witness_id, content) VALUES (?, ?)",
-            (new_id, content.strip()),
+            (new_id, content),
         )
     row = db.execute(
         "SELECT * FROM memory_witnesses WHERE witness_id = ?", (new_id,)
@@ -1048,6 +1327,30 @@ def _witness_from_row(db: sqlite3.Connection, row: sqlite3.Row) -> WitnessMemory
         WHERE witness_id = ? ORDER BY ordinal""",
         (row["witness_id"],),
     ).fetchall()
+    source_event_ids = tuple(str(item["event_id"]) for item in source_rows)
+    metadata = _json_dict(row["metadata_json"])
+    payload_sha256 = str(row["payload_sha256"] or "")
+    if not payload_sha256:
+        payload_sha256 = witness_append_payload_sha256(
+            witness_id=str(row["witness_id"]),
+            content=str(row["content"]),
+            consciousness_instance_id=str(row["consciousness_instance_id"]),
+            perspective_subject_id=str(row["perspective_subject_id"]),
+            epistemic_kind=str(row["epistemic_kind"]),
+            source_kind=str(row["source_kind"]),
+            status=str(row["status"]),
+            stream_scope=str(row["stream_scope"]),
+            visibility=str(row["visibility"]),
+            valid_from=str(row["valid_from"]),
+            valid_to=str(row["valid_to"]),
+            recorded_at=str(row["recorded_at"]),
+            source_sequence_start=int(row["source_sequence_start"]),
+            source_sequence_end=int(row["source_sequence_end"]),
+            model_task_name=str(row["model_task_name"]),
+            projection_path=str(row["projection_path"] or ""),
+            metadata=metadata,
+            source_event_ids=source_event_ids,
+        )
     return WitnessMemory(
         witness_id=str(row["witness_id"]),
         content=str(row["content"]),
@@ -1063,28 +1366,42 @@ def _witness_from_row(db: sqlite3.Connection, row: sqlite3.Row) -> WitnessMemory
         recorded_at=str(row["recorded_at"]),
         source_sequence_start=int(row["source_sequence_start"]),
         source_sequence_end=int(row["source_sequence_end"]),
-        source_event_ids=tuple(str(item["event_id"]) for item in source_rows),
+        source_event_ids=source_event_ids,
         model_task_name=str(row["model_task_name"]),
         projection_path=str(row["projection_path"]),
         projection_status=str(row["projection_status"]),
         projection_error=str(row["projection_error"]),
-        metadata=_json_dict(row["metadata_json"]),
+        metadata=metadata,
+        payload_sha256=payload_sha256,
     )
+
+
+def witness_memory_from_row(
+    db: sqlite3.Connection,
+    row: sqlite3.Row,
+) -> WitnessMemory:
+    """Deserialize one authoritative local witness row without rewriting it."""
+
+    return _witness_from_row(db, row)
 
 
 __all__ = [
     "EpistemicKind",
     "EvidenceAwareMemoryResult",
     "ExperienceAppendReport",
+    "ExperienceOccurrenceCursor",
+    "ExperienceOccurrencePage",
     "ExperienceOccurrenceRef",
     "ExperienceRecord",
     "MemorySearchMode",
     "WitnessMemory",
+    "WitnessIdentityConflict",
     "WitnessSearchResult",
     "append_experiences_detailed",
     "create_life_memory_schema",
     "experience_evidence_body",
     "experience_health_snapshot",
+    "experience_occurrence_cursor",
     "experience_payload_sha256",
     "get_experience_occurrence",
     "get_witness_by_projection_path",
@@ -1092,6 +1409,7 @@ __all__ = [
     "insert_experiences",
     "insert_witness_memory",
     "list_experience_occurrences_after",
+    "list_experience_occurrence_page",
     "list_experiences_after",
     "list_pending_witness_projections",
     "make_experience_occurrence_ref",
@@ -1101,4 +1419,6 @@ __all__ = [
     "record_witness_migration",
     "search_witness_memories",
     "update_witness_state",
+    "witness_append_payload_sha256",
+    "witness_memory_from_row",
 ]

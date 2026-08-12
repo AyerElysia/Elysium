@@ -10,10 +10,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from plugins.life_engine.memory import tools as memory_tools
 from plugins.life_engine.memory.experience import (
     EpistemicKind,
     EvidenceAwareMemoryResult,
-    ExperienceAppendReport,
+    ExperienceOccurrenceRef,
     ExperienceRecord,
     MemorySearchMode,
     WitnessMemory,
@@ -26,6 +27,9 @@ from plugins.life_engine.memory.experience import (
     update_witness_state,
 )
 from plugins.life_engine.memory.lineage import MemoryBundle, MemoryEvidence
+from plugins.life_engine.memory.recall_delivery import (
+    get_memory_search_recall_delivery_coordinator,
+)
 from plugins.life_engine.memory.tools import (
     MEMORY_SEARCH_CORE_MAX_BYTES,
     MEMORY_SEARCH_EXPRESSION_MAX_BYTES,
@@ -36,14 +40,15 @@ from plugins.life_engine.service.consciousness import (
     ConsciousnessInstance,
     ConsciousnessRegistry,
 )
-from plugins.life_engine.service.event_bus import LifeEvent, RawEventGapError
 from plugins.life_engine.service.legacy_diary import parse_legacy_diary_file
 from plugins.life_engine.service.memory_witness import (
     MEMORY_WITNESS_INSTANCE_ID,
     MemoryWitnessCoordinator,
 )
 from plugins.life_engine.service.tool_manifests import get_tool_manifest
+from src.kernel.llm.context_delivery import EffectiveContextReceipt
 from src.kernel.llm.exceptions import LLMAPIError, LLMModelsCoolingDownError
+from src.kernel.llm.payload import ToolResult
 from src.kernel.storage import CursorConflict
 
 
@@ -66,6 +71,20 @@ def _experience(event_id: str = "event-1", sequence: int = 1) -> ExperienceRecor
         event_type="message",
         content="我记得这段真实经历。",
         stream_id="stream-1",
+    )
+
+
+def _occurrence(record: ExperienceRecord | None = None) -> ExperienceOccurrenceRef:
+    experience = record or _experience()
+    payload_sha256 = hashlib.sha256(experience.content.encode("utf-8")).hexdigest()
+    return ExperienceOccurrenceRef(
+        occurrence_id=experience.event_id,
+        source_event_id=experience.source_event_id or experience.event_id,
+        ingest_position=experience.sequence,
+        canonical_event_id=experience.event_id,
+        canonical_payload_sha256=payload_sha256,
+        recorded_at=experience.recorded_at,
+        experience=experience,
     )
 
 
@@ -250,6 +269,31 @@ def test_legacy_parser_handles_adjacent_and_multiline_entries(tmp_path: Path) ->
     assert entries[0].migration_key != entries[1].migration_key
 
 
+def test_legacy_diary_entry_identity_survives_unrelated_file_edits(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "diaries"
+    root.mkdir()
+    path = root / "2026-07-29.md"
+    path.write_text(
+        "**[08:00]** first memory\n\n**[09:00]** second memory\n",
+        encoding="utf-8",
+    )
+    before = parse_legacy_diary_file(path, root=root)
+
+    path.write_text(
+        "header added later\n\n**[08:00]** first memory\n\n"
+        "**[09:00]** second memory\n",
+        encoding="utf-8",
+    )
+    after = parse_legacy_diary_file(path, root=root)
+
+    assert [item.migration_key for item in before] == [
+        item.migration_key for item in after
+    ]
+    assert before[0].source_hash != after[0].source_hash
+
+
 @pytest.mark.asyncio
 async def test_memory_witness_is_registered_as_consciousness_without_tools(
     tmp_path: Path,
@@ -276,40 +320,94 @@ async def test_memory_witness_is_registered_as_consciousness_without_tools(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("exact", [True, False])
+@pytest.mark.parametrize(
+    ("receipt_state", "expected_request_id"),
+    (
+        ("exact", "42"),
+        ("failover_exact", "84"),
+        ("trimmed", None),
+        ("mismatched", None),
+    ),
+)
 async def test_memory_witness_commits_only_with_final_exact_context_receipt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    exact: bool,
+    receipt_state: str,
+    expected_request_id: str | None,
 ) -> None:
+    world_content = "world-perception:witness-world\ncurrent world"
+    world_sha256 = hashlib.sha256(world_content.encode("utf-8")).hexdigest()
     perception = SimpleNamespace(
+        instance_id=MEMORY_WITNESS_INSTANCE_ID,
+        from_position=2,
+        through_position=5,
+        cursor_revision=7,
         delivery_id="witness-world",
         delivery_marker="world-perception:witness-world",
-        content="world-perception:witness-world\ncurrent world",
-        projection_sha256="projection-sha",
-        delivered_bytes=48,
+        content=world_content,
+        projection_sha256=world_sha256,
+        delivered_bytes=len(world_content.encode("utf-8")),
     )
-    commits: list[tuple[object, object]] = []
     requests: list[object] = []
+    send_streams: list[bool] = []
+    attempt_outcomes: list[str] = []
+    source_digest = "a" * 64
+    subject_text = f"""# Subject Context Projection
+
+- source_digest: `{source_digest}`
+- projection_version: `3`
+
+<subject-source path="SOUL.md">
+SOUL authority projection
+</subject-source>
+
+<subject-source path="USER.md">
+USER authority projection
+</subject-source>
+
+<subject-source path="MEMORY.md">
+MEMORY authority projection
+</subject-source>"""
+    subject_snapshot = {
+        "text": subject_text,
+        "source_digest": source_digest,
+        "projection_version": 3,
+        "projection_sha256": hashlib.sha256(
+            subject_text.encode("utf-8")
+        ).hexdigest(),
+    }
 
     class _Response:
         message = "我愿意记住这一刻。"
-        request_record_id = 42
 
         def __init__(self, request: object) -> None:
             self._request = request
+            self.request_record_id = 84 if receipt_state == "failover_exact" else 42
+
+        def __await__(self):
+            async def _done() -> str:
+                return self.message
+
+            return _done().__await__()
 
         def effective_context_receipt(self, delivery_id: str) -> object:
             assert delivery_id == perception.delivery_id
             expected_text = self._request.expected_text
             encoded = expected_text.encode("utf-8")
             digest = hashlib.sha256(encoded).hexdigest()
+            exact = receipt_state in {"exact", "failover_exact", "mismatched"}
             return SimpleNamespace(
+                delivery_id=(
+                    "another-delivery"
+                    if receipt_state == "mismatched"
+                    else perception.delivery_id
+                ),
                 exact_present=exact,
                 expected_utf8_bytes=len(encoded),
                 expected_sha256=digest,
                 effective_utf8_bytes=(len(encoded) if exact else None),
                 effective_sha256=(digest if exact else None),
+                part_kind="text",
             )
 
     class _Request:
@@ -329,24 +427,25 @@ async def test_memory_witness_commits_only_with_final_exact_context_receipt(
             marker: str,
         ) -> None:
             assert delivery_id == perception.delivery_id
-            assert marker in expected_text
+            assert marker == perception.delivery_marker
+            assert expected_text == perception.content
             self.expected_text = expected_text
 
-        async def send(self) -> _Response:
+        async def send(self, *, stream: bool = True) -> _Response:
+            send_streams.append(stream)
+            if receipt_state == "failover_exact":
+                attempt_outcomes.extend(("primary_stream_failed", "fallback_succeeded"))
             return _Response(self)
 
     async def _prepare(_instance_id: str) -> object:
         return perception
 
-    async def _commit(prepared: object, receipt: object) -> None:
-        commits.append((prepared, receipt))
-
-    async def _read_subject_authority_texts() -> dict[str, str]:
-        return {
-            "SOUL.md": "SOUL.md content",
-            "USER.md": "USER.md content",
-            "MEMORY.md": "",
+    async def _subject_projection(**kwargs: object) -> dict[str, object]:
+        assert kwargs == {
+            "projection_kind": "memory_witness",
+            "max_bytes": 24 * 1024,
         }
+        return subject_snapshot
 
     service = SimpleNamespace(
         _cfg=lambda: SimpleNamespace(
@@ -356,10 +455,8 @@ async def test_memory_witness_commits_only_with_final_exact_context_receipt(
             )
         ),
         prepare_perception=_prepare,
-        commit_perception=_commit,
-        read_subject_authority_texts=_read_subject_authority_texts,
+        get_subject_context_projection_snapshot=_subject_projection,
         _workspace_dir=lambda: tmp_path,
-        _read_workspace_text=lambda _workspace, name: f"{name} content",
     )
     monkeypatch.setattr(
         "plugins.life_engine.service.memory_witness.get_model_set_by_task",
@@ -375,20 +472,49 @@ async def test_memory_witness_commits_only_with_final_exact_context_receipt(
         kind="memory_witness",
     )
 
-    if exact:
-        authored = await coordinator._author_witness(instance, [_experience()])
-        assert authored == "我愿意记住这一刻。"
-        assert commits[0][0] is perception
-        assert commits[0][1].delivery_id == perception.delivery_id
-        assert commits[0][1].transport_request_id == "42"
+    if receipt_state in {"exact", "failover_exact"}:
+        authored = await coordinator._author_witness(instance, [_occurrence()])
+        assert authored.text == "我愿意记住这一刻。"
+        assert authored.world_payload["proof_state"] == "exact_final_attempt"
+        assert authored.world_payload["receipt"]["delivery_id"] == (
+            perception.delivery_id
+        )
+        assert (
+            authored.world_payload["receipt"]["transport_request_id"]
+            == expected_request_id
+        )
+        assert coordinator._last_subject_projection == {
+            "source_digest": source_digest,
+            "projection_version": 3,
+            "projection_sha256": subject_snapshot["projection_sha256"],
+            "max_bytes": 24 * 1024,
+        }
     else:
         with pytest.raises(
             RuntimeError,
             match="MemoryWitnessPerceptionDeliveryUnverified",
         ):
-            await coordinator._author_witness(instance, [_experience()])
-        assert commits == []
+            await coordinator._author_witness(instance, [_occurrence()])
     assert len(requests) == 1
+    assert send_streams == [False]
+    if receipt_state == "failover_exact":
+        assert attempt_outcomes == ["primary_stream_failed", "fallback_succeeded"]
+    else:
+        assert attempt_outcomes == []
+    assert requests[0].expected_text == perception.content
+    user_texts = [
+        content.text
+        for payload in requests[0].payloads
+        for content in payload.content
+        if hasattr(content, "text")
+    ]
+    assert user_texts[-1] == perception.content
+    assert sum(perception.delivery_marker in text for text in user_texts) == 1
+    assert perception.content in user_texts
+    assert all(
+        text == perception.content or perception.content not in text
+        for text in user_texts
+    )
 
 
 def test_projection_path_is_deterministic_and_stream_scoped() -> None:
@@ -511,226 +637,6 @@ async def test_witness_projection_keeps_local_atomic_write_when_disabled(
 
     assert (tmp_path / witness.projection_path).read_text(encoding="utf-8")
     assert memory.projections[0][1]["status"] == "complete"
-
-
-class _WitnessMemoryStub:
-    def __init__(self, *, existing: object | None = None) -> None:
-        self.existing = existing
-        self.states: list[dict[str, object]] = []
-        self.appended: list[ExperienceRecord] = []
-        self.recorded = 0
-        self.recorded_kwargs: list[dict[str, object]] = []
-
-    async def get_witness_state(self, _instance_id: str) -> dict[str, object]:
-        return {"last_sequence": 0}
-
-    async def append_experiences(self, records: list[ExperienceRecord]) -> int:
-        self.appended.extend(records)
-        return len(records)
-
-    async def list_pending_witness_projections(self, *, limit: int) -> list[object]:
-        assert limit == 20
-        return []
-
-    async def get_witness_by_projection_path(self, _path: str) -> object | None:
-        return self.existing
-
-    async def record_witness_memory(self, **kwargs: object) -> object:
-        self.recorded += 1
-        self.recorded_kwargs.append(kwargs)
-        return SimpleNamespace(
-            witness_id="witness-1",
-            projection_path=kwargs["projection_path"],
-        )
-
-    async def update_witness_state(self, _instance_id: str, **kwargs: object) -> None:
-        self.states.append(kwargs)
-
-
-class _RawStoreStub:
-    def __init__(self, event: LifeEvent | list[LifeEvent]) -> None:
-        self.events = list(event) if isinstance(event, list) else [event]
-        self.event = self.events[0]
-
-    async def read_since(self, sequence: int, *, limit: int) -> list[LifeEvent]:
-        assert sequence == 0
-        assert limit == 80
-        return list(self.events)
-
-
-def _witness_service_stub(tmp_path: Path, memory: object) -> SimpleNamespace:
-    registry = ConsciousnessRegistry()
-    event = LifeEvent(
-        event_id="event-1",
-        sequence=1,
-        timestamp="2026-07-29T08:00:00+08:00",
-        source="chat",
-        channel="chat",
-        event_type="text",
-        content="真实经历",
-        stream_id="stream-1",
-    )
-    config = SimpleNamespace(
-        enabled=True,
-        max_events_per_run=80,
-        model_task_name="diary",
-        migrate_legacy_diaries=False,
-    )
-
-    async def _register(instance: ConsciousnessInstance) -> ConsciousnessInstance:
-        return registry.register(instance)
-
-    async def _resume(instance_id: str, **kwargs: object) -> bool:
-        return registry.resume(instance_id, **kwargs)
-
-    async def _touch(instance_id: str, **kwargs: object) -> None:
-        registry.touch(instance_id, **kwargs)
-
-    store = _RawStoreStub(event)
-    return SimpleNamespace(
-        consciousness_registry=registry,
-        save_consciousness_registry=lambda: None,
-        register_consciousness_instance=_register,
-        resume_consciousness_instance=_resume,
-        touch_consciousness_instance=_touch,
-        memory_service=memory,
-        _cfg=lambda: SimpleNamespace(memory_witness=config),
-        _get_life_event_store=lambda: store,
-        _workspace_dir=lambda: tmp_path,
-    )
-
-
-async def test_witness_self_presence_side_effect_is_persisted_without_authoring(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    memory = _WitnessMemoryStub()
-    service = _witness_service_stub(tmp_path, memory)
-    self_presence = LifeEvent(
-        event_id="presence-1",
-        sequence=1,
-        timestamp="2026-08-04T12:00:00+08:00",
-        source="life_engine.presence",
-        channel="system",
-        event_type="consciousness.instance_seen",
-        content="memory witness lease maintained",
-        stream_id="presence:memory_witness",
-        source_instance_id=MEMORY_WITNESS_INSTANCE_ID,
-    )
-    store = service._get_life_event_store()
-    store.event = self_presence
-    store.events = [self_presence]
-    coordinator = MemoryWitnessCoordinator(service)
-
-    async def _must_not_author(*_args: object) -> str:
-        raise AssertionError("self Presence side effect must not invoke the model")
-
-    monkeypatch.setattr(coordinator, "_author_witness", _must_not_author)
-
-    report = await coordinator.run_once()
-
-    assert [item.sequence for item in memory.appended] == [1]
-    assert memory.appended[0].event_type == "consciousness.instance_seen"
-    assert memory.appended[0].consciousness_instance_id == (MEMORY_WITNESS_INSTANCE_ID)
-    assert memory.recorded == 0
-    assert report.synced_experiences == 1
-    assert report.considered_events == 1
-    assert report.suppressed_self_echo_events == 1
-    assert report.written_witnesses == ()
-    assert report.skipped_scopes == ()
-    assert report.last_sequence == 1
-    assert memory.states[-1]["last_sequence"] == 1
-
-
-async def test_witness_mixed_window_fences_only_own_presence_side_effect(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    memory = _WitnessMemoryStub()
-    service = _witness_service_stub(tmp_path, memory)
-    events = [
-        LifeEvent(
-            event_id="presence-self",
-            sequence=1,
-            timestamp="2026-08-04T12:00:00+08:00",
-            source="life_engine.presence",
-            channel="system",
-            event_type="consciousness.instance_seen",
-            content="memory witness lease maintained",
-            stream_id="stream-1",
-            source_instance_id=MEMORY_WITNESS_INSTANCE_ID,
-        ),
-        LifeEvent(
-            event_id="presence-other",
-            sequence=2,
-            timestamp="2026-08-04T12:00:01+08:00",
-            source="life_engine.presence",
-            channel="system",
-            event_type="consciousness.instance_seen",
-            content="another consciousness remains present",
-            stream_id="stream-1",
-            source_instance_id="chat_global",
-        ),
-        LifeEvent(
-            event_id="chat-1",
-            sequence=3,
-            timestamp="2026-08-04T12:00:02+08:00",
-            source="chat",
-            channel="chat",
-            event_type="text",
-            content="a retained experience",
-            stream_id="stream-1",
-            source_instance_id="chat_global",
-        ),
-        LifeEvent(
-            event_id="witness-thought-1",
-            sequence=4,
-            timestamp="2026-08-04T12:00:03+08:00",
-            source="life_engine.memory_witness",
-            channel="internal",
-            event_type="reflection",
-            content="the witness's own retained inner experience",
-            stream_id="stream-1",
-            source_instance_id=MEMORY_WITNESS_INSTANCE_ID,
-        ),
-    ]
-    store = service._get_life_event_store()
-    store.event = events[0]
-    store.events = events
-    coordinator = MemoryWitnessCoordinator(service)
-    authored: list[ExperienceRecord] = []
-
-    async def _author(
-        _instance: ConsciousnessInstance,
-        records: list[ExperienceRecord],
-    ) -> str:
-        authored.extend(records)
-        return "a first-person witness"
-
-    async def _project(_witness: object) -> None:
-        return None
-
-    monkeypatch.setattr(coordinator, "_author_witness", _author)
-    monkeypatch.setattr(coordinator, "_project_witness", _project)
-
-    report = await coordinator.run_once()
-
-    assert [item.sequence for item in memory.appended] == [1, 2, 3, 4]
-    assert [item.sequence for item in authored] == [2, 3, 4]
-    assert authored[0].consciousness_instance_id == "chat_global"
-    assert authored[-1].consciousness_instance_id == MEMORY_WITNESS_INSTANCE_ID
-    assert memory.recorded == 1
-    assert memory.recorded_kwargs[0]["source_sequence_start"] == 2
-    assert memory.recorded_kwargs[0]["source_sequence_end"] == 4
-    assert memory.recorded_kwargs[0]["source_event_ids"] == [
-        item.event_id for item in authored
-    ]
-    assert report.synced_experiences == 4
-    assert report.considered_events == 4
-    assert report.suppressed_self_echo_events == 1
-    assert report.written_witnesses == ("witness-1",)
-    assert report.last_sequence == 4
-    assert memory.states[-1]["last_sequence"] == 4
 
 
 @pytest.mark.parametrize(
@@ -857,6 +763,52 @@ async def test_search_tool_accepts_open_retrieval_intent(
     assert observed["mode"] == "objective_truth"
 
 
+async def test_search_tool_uses_only_canonical_living_association_expansion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool = LifeEngineSearchMemoryTool(plugin=SimpleNamespace())
+    observed: dict[str, object] = {}
+
+    class _CanonicalAssociationService:
+        async def search_memory(
+            self,
+            *_args: object,
+            **kwargs: object,
+        ) -> list[object]:
+            observed["legacy_enable_association"] = kwargs["enable_association"]
+            return []
+
+        async def expand_living_document_associations(
+            self,
+            results: list[object],
+            **kwargs: object,
+        ) -> list[object]:
+            observed["canonical_called"] = True
+            observed["canonical_limit"] = kwargs["limit"]
+            return results
+
+        async def search_evidence_aware(
+            self,
+            _query: str,
+            **_kwargs: object,
+        ) -> list[object]:
+            return []
+
+    async def _service() -> object:
+        return _CanonicalAssociationService()
+
+    monkeypatch.setattr(tool, "_get_service", _service)
+
+    ok, _payload = await tool.execute("关联", enable_association=True, top_k=4)
+
+    assert ok is True
+    assert observed == {
+        "legacy_enable_association": False,
+        "canonical_called": True,
+        "canonical_limit": 4,
+    }
+
+
 async def test_search_tool_returns_evidence_payload_without_fake_confidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -961,8 +913,13 @@ async def test_search_tool_bounds_large_unicode_results_and_exposes_only_page(
     ]
     exposed_pages: list[tuple[object, ...]] = []
     corecalls: list[object] = []
+    episodes: list[dict[str, object]] = []
 
     class _BoundedService:
+        async def begin_memory_recall(self, **kwargs: object) -> SimpleNamespace:
+            episodes.append(dict(kwargs))
+            return SimpleNamespace(episode_id=kwargs["episode_id"])
+
         async def search_memory(self, *_args: object, **_kwargs: object) -> list[object]:
             return []
 
@@ -983,6 +940,41 @@ async def test_search_tool_bounds_large_unicode_results_and_exposes_only_page(
         return _BoundedService()
 
     monkeypatch.setattr(tool, "_get_service", _service)
+    monkeypatch.setattr(
+        memory_tools,
+        "_resolve_search_recall_identity",
+        lambda _tool, *, binding: SimpleNamespace(
+            actor_consciousness_instance_id="consciousness-1",
+            stream_scope="chat-stream",
+            source_occurrence_id="life-turn-1",
+            recall_chain_id="memory-search-chain-1",
+            recorded_at="2026-08-13T00:00:00+00:00",
+        ),
+    )
+
+    def _delivery_id(payload: dict[str, object]) -> str:
+        binding = payload.get("recall_delivery_binding")
+        assert isinstance(binding, dict)
+        return str(binding["delivery_id"])
+
+    def _receipt(payload: dict[str, object]) -> EffectiveContextReceipt:
+        delivery_id = _delivery_id(payload)
+        expected = ToolResult(
+            value=payload,
+            call_id="tool-call",
+            name="nucleus_search_memory",
+        ).to_text()
+        encoded = expected.encode("utf-8")
+        digest = hashlib.sha256(encoded).hexdigest()
+        return EffectiveContextReceipt(
+            delivery_id=delivery_id,
+            exact_present=True,
+            expected_utf8_bytes=len(encoded),
+            expected_sha256=digest,
+            effective_utf8_bytes=len(encoded),
+            effective_sha256=digest,
+            part_kind="tool_result",
+        )
 
     ok, first = await tool.execute("珍贵经历")
 
@@ -996,12 +988,32 @@ async def test_search_tool_bounds_large_unicode_results_and_exposes_only_page(
     assert first["delivered_bytes"] <= MEMORY_SEARCH_CORE_MAX_BYTES
     assert any(item["delivery"] == "excerpt" for item in first["canonical_items"])
     first_refs = {item["entity_ref"] for item in first["evidence_results"]}
+    assert _delivery_id(first)
+    assert first["recall_episode"]["persisted"] is False
+    assert first["recall_episode"]["trace_state"] == (
+        "pending_exact_tool_result_delivery"
+    )
+    assert exposed_pages == []
+    assert corecalls == []
+    coordinator = get_memory_search_recall_delivery_coordinator()
+    coordinator.register_pending_tool_result(
+        first,
+        ToolResult(
+            value=first,
+            call_id="tool-call",
+            name="nucleus_search_memory",
+        ).to_text(),
+    )
+    assert await coordinator.commit_exact(
+        _delivery_id(first),
+        _receipt(first),
+    )
     assert {event.entity_ref for event in exposed_pages[0]} == first_refs
     assert all(
-        event.metadata["content_delivery"] in {"full", "excerpt", "ref"}
+        event.action == "delivered_to_model_context"
         for event in exposed_pages[0]
     )
-    assert set(corecalls[0].entity_refs) == first_refs
+    assert {event.actor for event in corecalls} == {"consciousness-1"}
 
     ok, second = await tool.execute(
         "珍贵经历",
@@ -1014,7 +1026,21 @@ async def test_search_tool_bounds_large_unicode_results_and_exposes_only_page(
     assert second["delivered_bytes"] <= MEMORY_SEARCH_CORE_MAX_BYTES
     second_refs = {item["entity_ref"] for item in second["evidence_results"]}
     assert first_refs.isdisjoint(second_refs)
+    assert len(exposed_pages) == 1
+    coordinator.register_pending_tool_result(
+        second,
+        ToolResult(
+            value=second,
+            call_id="tool-call",
+            name="nucleus_search_memory",
+        ).to_text(),
+    )
+    assert await coordinator.commit_exact(
+        _delivery_id(second),
+        _receipt(second),
+    )
     assert {event.entity_ref for event in exposed_pages[1]} == second_refs
+    assert len({item["episode_id"] for item in episodes}) == 1
 
 
 async def test_search_tool_uses_task_budget_and_deduplicates_content(
@@ -1118,174 +1144,3 @@ async def test_search_tool_rejects_tampered_continuation_without_exposure(
     assert ok is False
     assert "continuation" in payload["error"]
     assert exposures == []
-
-
-async def test_projection_failure_does_not_advance_witness_cursor(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    memory = _WitnessMemoryStub()
-    coordinator = MemoryWitnessCoordinator(_witness_service_stub(tmp_path, memory))
-
-    async def _author(*_args: object) -> str:
-        return "我的第一人称见证。"
-
-    async def _fail_projection(_witness: object) -> None:
-        raise OSError("projection failed")
-
-    monkeypatch.setattr(coordinator, "_author_witness", _author)
-    monkeypatch.setattr(coordinator, "_project_witness", _fail_projection)
-
-    with pytest.raises(OSError, match="projection failed"):
-        await coordinator.run_once()
-
-    assert memory.recorded == 1
-    assert not any("last_sequence" in state for state in memory.states)
-
-
-async def test_witness_retry_authors_existing_experiences_before_advancing(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A model failure after append must not turn the retry into a silent skip."""
-
-    class _RetryMemory(_WitnessMemoryStub):
-        def __init__(self) -> None:
-            super().__init__()
-            self.append_calls = 0
-
-        async def append_experiences_detailed(
-            self,
-            records: list[ExperienceRecord],
-        ) -> ExperienceAppendReport:
-            self.append_calls += 1
-            canonical = tuple(records)
-            if self.append_calls == 1:
-                return ExperienceAppendReport(inserted=canonical)
-            return ExperienceAppendReport(existing=canonical)
-
-    memory = _RetryMemory()
-    coordinator = MemoryWitnessCoordinator(_witness_service_stub(tmp_path, memory))
-    author_calls = 0
-
-    async def _author(*_args: object) -> str:
-        nonlocal author_calls
-        author_calls += 1
-        if author_calls == 1:
-            raise LLMAPIError("temporary", status_code=500)
-        return "retry witness"
-
-    async def _project(_witness: object) -> None:
-        return None
-
-    monkeypatch.setattr(coordinator, "_author_witness", _author)
-    monkeypatch.setattr(coordinator, "_project_witness", _project)
-
-    with pytest.raises(LLMAPIError):
-        await coordinator.run_once()
-
-    assert memory.recorded == 0
-    assert not any("last_sequence" in state for state in memory.states)
-
-    report = await coordinator.run_once()
-
-    assert author_calls == 2
-    assert memory.append_calls == 2
-    assert memory.recorded == 1
-    assert report.synced_experiences == 0
-    assert report.last_sequence == 1
-    assert memory.states[-1]["last_sequence"] == 1
-
-
-async def test_existing_window_is_reused_without_calling_model(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    existing = SimpleNamespace(witness_id="existing", projection_path="path.md")
-    memory = _WitnessMemoryStub(existing=existing)
-    coordinator = MemoryWitnessCoordinator(_witness_service_stub(tmp_path, memory))
-    projected: list[object] = []
-
-    async def _must_not_author(*_args: object) -> str:
-        raise AssertionError("model must not be called for an existing window")
-
-    async def _project(witness: object) -> None:
-        projected.append(witness)
-
-    monkeypatch.setattr(coordinator, "_author_witness", _must_not_author)
-    monkeypatch.setattr(coordinator, "_project_witness", _project)
-
-    report = await coordinator.run_once()
-
-    assert projected == [existing]
-    assert memory.recorded == 0
-    assert report.last_sequence == 1
-    assert memory.states[-1]["last_sequence"] == 1
-
-
-async def test_witness_refuses_to_skip_retained_event_gap(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A retention gap is fatal to the consumer cursor and is never skipped."""
-
-    memory = _WitnessMemoryStub(
-        existing=SimpleNamespace(
-            witness_id="existing",
-            projection_path="path.md",
-        )
-    )
-
-    async def _get_state(_instance_id: str) -> dict[str, object]:
-        return {"last_sequence": 1}
-
-    memory.get_witness_state = _get_state  # type: ignore[method-assign]
-    service = _witness_service_stub(tmp_path, memory)
-    event = service._get_life_event_store().event
-    event = LifeEvent(
-        event_id=event.event_id,
-        sequence=4,
-        timestamp=event.timestamp,
-        source=event.source,
-        channel=event.channel,
-        event_type=event.event_type,
-        content=event.content,
-        stream_id=event.stream_id,
-    )
-
-    class _GapStore:
-        def __init__(self) -> None:
-            self.calls: list[int] = []
-
-        async def read_since(
-            self,
-            sequence: int,
-            *,
-            limit: int,
-        ) -> list[LifeEvent]:
-            assert limit == 80
-            self.calls.append(sequence)
-            if len(self.calls) == 1:
-                raise RawEventGapError(sequence, 4)
-            return [event]
-
-    store = _GapStore()
-    service._get_life_event_store = lambda: store
-    coordinator = MemoryWitnessCoordinator(service)
-
-    async def _project(_witness: object) -> None:
-        return None
-
-    monkeypatch.setattr(coordinator, "_project_witness", _project)
-    warnings: list[str] = []
-    monkeypatch.setattr(
-        "plugins.life_engine.service.memory_witness.logger.warning",
-        warnings.append,
-    )
-
-    with pytest.raises(RuntimeError, match="MemoryWitnessRawLedgerGap"):
-        await coordinator.run_once()
-
-    assert store.calls == [1]
-    assert memory.states == []
-    assert warnings == []

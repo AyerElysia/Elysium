@@ -19,7 +19,7 @@ from src.kernel.storage.migration_runner import MySQLMigrationRunner, SchemaMigr
 from ..contracts import StorageBackendRuntime, StorageWriterRole
 from ..models import BackendKind
 
-MEMORY_SCHEMA_VERSION = 12
+MEMORY_SCHEMA_VERSION = 14
 MEMORY_IMMUTABILITY_SCHEMA_VERSION = 3
 
 # Database immutability follows the Memory Port contract, not a blanket
@@ -119,6 +119,7 @@ MEMORY_MUTABLE_TABLES = (
     "memory_index_state",
     "memory_vector_tombstones",
     "memory_witness_state",
+    "memory_witness_reconciliation_state",
     "memory_artifact_heads",
     "memory_association_projection",
     "memory_edges",
@@ -933,6 +934,41 @@ _WITNESS_PIPELINE = SchemaMigration(
     ),
 )
 
+_WITNESS_RECONCILIATION_CURSOR = SchemaMigration(
+    version=13,
+    name="life_memory_witness_reconciliation_cursor_v1",
+    statements=(
+        """CREATE TABLE IF NOT EXISTS memory_witness_reconciliation_state (
+            scan_name VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+            cursor_order_value VARCHAR(64)
+                CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            cursor_identity VARCHAR(255)
+                CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+            frontier_order_value VARCHAR(64)
+                CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            frontier_identity VARCHAR(255)
+                CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+            revision BIGINT UNSIGNED NOT NULL,
+            cycle_started_at VARCHAR(64)
+                CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            last_completed_at VARCHAR(64)
+                CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            updated_at VARCHAR(64)
+                CHARACTER SET ascii COLLATE ascii_bin NOT NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci""",
+    ),
+)
+
+_WITNESS_RECONCILIATION_CHECKSUM = SchemaMigration(
+    version=14,
+    name="life_memory_witness_reconciliation_checksum_v1",
+    statements=(
+        """ALTER TABLE memory_witness_reconciliation_state
+        ADD COLUMN state_sha256 CHAR(64)
+            CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT ''""",
+    ),
+)
+
 MEMORY_MIGRATIONS = (
     _DOCUMENT_INDEX,
     _EXPERIENCE,
@@ -946,6 +982,8 @@ MEMORY_MIGRATIONS = (
     _INDEX_JOB_LEASE,
     _VECTOR_TOMBSTONE_FORCE_DELETE,
     _WITNESS_PIPELINE,
+    _WITNESS_RECONCILIATION_CURSOR,
+    _WITNESS_RECONCILIATION_CHECKSUM,
 )
 
 

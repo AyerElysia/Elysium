@@ -509,7 +509,9 @@ class TestConsciousnessManifestContracts:
         assert {
             "tool-nucleus_grep_events",
             "tool-nucleus_search_memory",
-            "tool-nucleus_view_relations",
+            "tool-nucleus_read_memory_boundary",
+            "tool-nucleus_memory_continuity_review",
+            "tool-nucleus_relations",
             "tool-nucleus_memory_stats",
             "action-life_send_image",
             "action-life_send_voice",
@@ -518,6 +520,11 @@ class TestConsciousnessManifestContracts:
             "tool-platform_action",
             "tool-nucleus_minecraft",
         } <= manifest
+        assert {
+            "tool-nucleus_relate_file",
+            "tool-nucleus_view_relations",
+            "tool-nucleus_forget_relation",
+        }.isdisjoint(manifest)
 
     def test_chat_manifest_sends_directly_without_legacy_think_action(self) -> None:
         manifest = set(get_tool_manifest("chat"))

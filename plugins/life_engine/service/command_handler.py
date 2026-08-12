@@ -197,36 +197,12 @@ class LifeEngineCommandHandler(BaseEventHandler):
         # 1.5) 做梦命令（支持 @机器人 + 命令）
         dream_command = self._extract_dream_command(content)
         if dream_command is not None:
-            try:
-                logger.info(f"收到手动触发做梦命令: {dream_command}")
-                result = await service.trigger_dream_manually()
-
-                if result.get("success"):
-                    dream_text = str(result.get("dream_text") or "").strip()
-                    if len(dream_text) > 280:
-                        dream_text = dream_text[:279] + "…"
-                    residue = result.get("dream_residue") or {}
-                    residue_summary = str(residue.get("summary") or "").strip()
-                    archive_path = str(result.get("archive_path") or "").strip()
-                    seed_titles = result.get("seed_titles") or []
-                    reply_text = (
-                        f"✓ 做梦已手动触发\n"
-                        f"Dream ID: {result.get('dream_id')}\n"
-                        f"耗时: {result.get('duration_seconds')}s\n"
-                        f"NREM: {result.get('nrem_episodes')} 集 / {result.get('nrem_steps')} 步\n"
-                        f"REM: 激活 {result.get('rem_nodes')} 节点，新增 {result.get('rem_new_edges')} 边，修剪 {result.get('rem_pruned_edges')} 边\n"
-                        f"梦核: {', '.join(seed_titles) if seed_titles else '（无）'}\n"
-                        f"余韵: {residue_summary or '（无）'}\n"
-                        f"梦札: {archive_path or '（未写入）'}\n"
-                        f"梦境:\n{dream_text or '（无正文）'}"
-                    )
-                else:
-                    reply_text = f"✗ 做梦触发失败: {result.get('error', '未知错误')}"
-
-                await self._send_reply(message, reply_text)
-                logger.info(f"已回复做梦命令结果: success={result.get('success')}")
-            except Exception as exc:  # noqa: BLE001
-                logger.error(f"处理做梦命令失败: {exc}")
+            logger.info("收到已退役的 /dream 命令；未执行任何记忆写入")
+            await self._send_reply(
+                message,
+                "旧 Dream 写关系系统已退役。记忆整理现在只通过可追溯的回忆、"
+                "解释、主体复盘与明确决定发生；这条命令不会修改或删减任何记忆。",
+            )
 
             return EventDecision.STOP, params
 

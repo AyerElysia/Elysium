@@ -177,11 +177,25 @@ async def test_memory_upgrade_orders_schema_immutability_and_trigger_verificatio
         ),
     ]
     assert calls[4][0] == "verify"
-    assert len(calls[4][1]) == 44
+    assert len(calls[4][1]) == len(baseline.MEMORY_IMMUTABILITY_TRIGGER_CONTRACT)
     assert {
         "memory_workspace_projection_events_immutable_update",
         "memory_workspace_projection_events_immutable_delete",
     }.issubset(set(calls[4][1]))
+
+
+def test_memory_trigger_contract_uses_delivery_specific_error_marker() -> None:
+    contracts = {
+        item.table: item.action_fragment
+        for item in baseline._memory_trigger_contracts()
+    }
+
+    assert contracts["memory_witnesses"] == "MemoryWitnessAuthorityImmutable"
+    assert (
+        contracts["memory_witness_delivery_jobs"]
+        == "MemoryWitnessDeliveryAuthorityImmutable"
+    )
+    assert contracts["memory_experiences"] == "MemoryAuthorityRecordImmutable"
 
 
 def _memory_upgrade_snapshot(*, new_tables_present: bool) -> dict[str, object]:
@@ -257,6 +271,17 @@ hashlib_empty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85
 def test_memory_upgrade_invariants_accept_additive_empty_tables() -> None:
     before = _memory_upgrade_snapshot(new_tables_present=False)
     after = _memory_upgrade_snapshot(new_tables_present=True)
+
+    baseline._assert_memory_upgrade_invariants(before, after)
+
+
+def test_memory_upgrade_invariants_allow_schema_metadata_evolution() -> None:
+    before = _memory_upgrade_snapshot(new_tables_present=False)
+    after = _memory_upgrade_snapshot(new_tables_present=True)
+    after["existing_memory"]["tables"][0].update(  # type: ignore[index]
+        primary_key=["event_id", "revision"],
+        table_collation="utf8mb4_0900_bin",
+    )
 
     baseline._assert_memory_upgrade_invariants(before, after)
 

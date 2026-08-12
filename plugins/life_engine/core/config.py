@@ -381,7 +381,37 @@ class LifeEngineConfig(BaseConfig):
             default=500,
             ge=1,
             le=2000,
-            description="每次苏醒最多读取的原始事件数（含操作噪音，游标推进用）。",
+            description="Experience 摄取单批最多读取的原始事件数。摄取不等待 LLM 或文件投影。",
+        )
+        max_ingest_batches_per_run: int = Field(
+            default=8,
+            ge=1,
+            le=64,
+            description="每次苏醒最多连续摄取的原始事件批数；用于有界追赶积压。",
+        )
+        max_witness_events_per_run: int = Field(
+            default=40,
+            ge=1,
+            le=500,
+            description="一次主体见证窗口最多包含的真实 occurrence 数。",
+        )
+        max_witness_context_bytes: int = Field(
+            default=64 * 1024,
+            ge=4 * 1024,
+            le=256 * 1024,
+            description="一次 Witness 经历窗口的 UTF-8 硬预算；只选完整 occurrence，不截断权威证据。",
+        )
+        delivery_batch_size: int = Field(
+            default=50,
+            ge=1,
+            le=500,
+            description="每轮最多重放的 World/Projection 耐久投递任务数。",
+        )
+        projection_reconcile_batch_size: int = Field(
+            default=100,
+            ge=1,
+            le=1000,
+            description="每轮最多核对并重建的 Witness Markdown 派生投影数。",
         )
         timeout_seconds: float = Field(
             default=600.0,
@@ -403,7 +433,7 @@ class LifeEngineConfig(BaseConfig):
         )
         migrate_legacy_diaries: bool = Field(
             default=True,
-            description="是否将旧 Diary Plugin 日记幂等登记为 legacy witness。",
+            description="是否在进程启动后的首次 Witness 运行中显式核对旧 Diary；不会每轮递归重扫。",
         )
         legacy_diary_path: str = Field(
             default="data/diaries",
@@ -1030,7 +1060,7 @@ class LifeEngineConfig(BaseConfig):
 
     @config_section("memory_algorithm")
     class MemoryAlgorithmSection(SectionBase):
-        """记忆算法参数配置。"""
+        """当前检索参数与历史配置兼容字段。"""
 
         rrf_k: int = Field(
             default=RRF_K,
@@ -1056,21 +1086,30 @@ class LifeEngineConfig(BaseConfig):
             default=DECAY_LAMBDA,
             ge=0.0,
             le=1.0,
-            description="遗忘衰减系数",
+            description=(
+                "历史兼容字段，仅用于旧图读取诊断；"
+                "当前系统不按时间或分数自动削弱记忆。"
+            ),
         )
 
         prune_threshold: float = Field(
             default=PRUNE_THRESHOLD,
             ge=0.0,
             le=1.0,
-            description="边剪枝阈值",
+            description=(
+                "历史兼容字段；旧 memory_edges 自动剪枝已退役，"
+                "不再作为正式记忆写路径。"
+            ),
         )
 
         dream_learning_rate: float = Field(
             default=DREAM_LEARNING_RATE,
             ge=0.0,
             le=1.0,
-            description="梦境学习率",
+            description=(
+                "历史兼容字段；Dream relation learning 已退役，"
+                "新关系只能来自显式 SemanticRelation 或可重放 co-recall。"
+            ),
         )
 
     @config_section("chatter")

@@ -23,6 +23,7 @@ from .indexing import transaction
 
 DELIVERY_KINDS = frozenset({"world", "projection"})
 DELIVERY_STATUSES = frozenset({"pending", "processing", "succeeded", "failed"})
+WITNESS_DECISION_KINDS = frozenset({"witness", "no_witness"})
 
 
 class WitnessPipelineConflict(RuntimeError):
@@ -228,6 +229,12 @@ def normalize_witness_decision(
     decided_at = str(decision.decided_at or "").strip()
     if not decision_id or not window_id or not instance_id or not decision_kind:
         raise ValueError("WitnessDecisionIdentityRequired")
+    if decision_kind not in WITNESS_DECISION_KINDS:
+        raise ValueError(f"WitnessDecisionKindUnsupported:{decision_kind}")
+    if decision_kind == "witness" and not str(decision.witness_id or "").strip():
+        raise ValueError("WitnessDecisionWitnessIdentityRequired")
+    if decision_kind == "no_witness" and str(decision.witness_id or "").strip():
+        raise ValueError("NoWitnessDecisionMustNotReferenceWitness")
     if not decided_at:
         raise ValueError("WitnessDecisionDecidedAtRequired")
     payloads, manifest_sha256 = _delivery_manifest(delivery_payloads)
@@ -430,16 +437,16 @@ def _window_from_row(db: sqlite3.Connection, row: sqlite3.Row) -> WitnessWindow:
         occurrences.append(ref)
     return normalize_witness_window(
         WitnessWindow(
-        window_id=str(row["window_id"]),
-        consciousness_instance_id=str(row["consciousness_instance_id"]),
-        stream_scope=str(row["stream_scope"]),
-        start_position=int(row["start_position"]),
-        end_position=int(row["end_position"]),
-        occurrences=tuple(occurrences),
-        source_digest=str(row["source_digest"]),
-        planner_version=str(row["planner_version"]),
-        created_at=str(row["created_at"]),
-        metadata=_json_dict(row["metadata_json"]),
+            window_id=str(row["window_id"]),
+            consciousness_instance_id=str(row["consciousness_instance_id"]),
+            stream_scope=str(row["stream_scope"]),
+            start_position=int(row["start_position"]),
+            end_position=int(row["end_position"]),
+            occurrences=tuple(occurrences),
+            source_digest=str(row["source_digest"]),
+            planner_version=str(row["planner_version"]),
+            created_at=str(row["created_at"]),
+            metadata=_json_dict(row["metadata_json"]),
             payload_sha256=str(row["payload_sha256"]),
         )
     )
@@ -873,6 +880,7 @@ def witness_projection_health(db: sqlite3.Connection) -> dict[str, Any]:
 __all__ = [
     "DELIVERY_KINDS",
     "DELIVERY_STATUSES",
+    "WITNESS_DECISION_KINDS",
     "WitnessDecision",
     "WitnessDeliveryJob",
     "WitnessPipelineConflict",

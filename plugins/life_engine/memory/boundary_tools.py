@@ -1,30 +1,19 @@
-"""Life Engine tools for subject-owned long-memory boundaries and indexes."""
+"""Exact read-only tools for subject-owned long-memory boundaries."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Annotated, Any, ClassVar
-from urllib.parse import quote
 
 from src.app.plugin_system.api import log_api
 from src.app.plugin_system.base import BaseTool
 
 from ..tools.bounded_projection import project_bounded_items
-from .boundary import (
-    MemoryBoundaryManifest,
-    MemoryBoundaryRepository,
-    MemoryBoundarySegment,
-    memory_boundary_uri,
-)
+from .boundary import MemoryBoundaryRepository
 from .boundary_resolver import MemoryBoundaryResolver
-from .continuity_index import (
-    build_continuity_memory_index_health,
-    diagnose_continuity_memory_index,
-)
-from .continuity_stewardship import ContinuityMemoryStewardship
 
 logger = log_api.get_logger("life_engine.memory_boundary_tools")
 
@@ -176,11 +165,7 @@ def _stable_recall_time(tool: BaseTool) -> str:
     text = str(value or "").strip()
     if text:
         try:
-            return (
-                datetime.fromisoformat(text)
-                .astimezone(UTC)
-                .isoformat()
-            )
+            return datetime.fromisoformat(text).astimezone(UTC).isoformat()
         except ValueError:
             pass
     # The tool-call identity still prevents replay ambiguity.  This fallback is
@@ -194,7 +179,7 @@ async def _resolve_runtime(tool: BaseTool) -> _BoundaryToolRuntime:
     service = get_life_engine_service()
     if service is None:
         raise RuntimeError("LifeEngineServiceUnavailable")
-    memory_service = getattr(service, "_memory_service", None)
+    memory_service = getattr(service, "memory_service", None)
     if memory_service is None:
         raise RuntimeError("LifeMemoryServiceUnavailable")
     scheduler = getattr(service, "_learning_scheduler", None)
@@ -204,20 +189,23 @@ async def _resolve_runtime(tool: BaseTool) -> _BoundaryToolRuntime:
     if not stream_scope:
         # 可操作化：心跳等无聊天流上下文时，模型看到这条就知道为什么被拒、该怎么办
         raise PermissionError(
+            "MemoryBoundaryStreamOwnerRequired: "
             "当前不在聊天流上下文中（如心跳），无流归属，不可读写记忆边界；"
             "请在聊天流对话中再调用"
         )
     instance = service.consciousness_registry.get_for_stream(stream_scope)
     if instance is None or not instance.is_active:
         raise PermissionError(
+            "MemoryBoundaryActorIsNotActive: "
             "当前意识实例不活跃（无有效聊天流），不可读写记忆边界；请在聊天流对话中再调用"
         )
     actor = str(instance.instance_id or "").strip()
     if not actor:
         raise PermissionError(
+            "MemoryBoundaryActorIdentityRequired: "
             "无法解析当前意识实例身份，不可读写记忆边界；请在聊天流对话中再调用"
         )
-    living = memory_service._require_memory_storage().living
+    living = memory_service.living_memory_store
     return _BoundaryToolRuntime(
         service=service,
         memory_service=memory_service,
@@ -622,7 +610,6 @@ class LifeCreateMemoryBoundaryFromSubjectRangeTool(BaseTool):
             )
             return False, {"error": type(exc).__name__, "detail": str(exc)}
 
-
 class LifeReadMemoryBoundaryTool(BaseTool):
     """Read exact boundary context, provenance, segments, or history."""
 
@@ -1006,20 +993,14 @@ class LifeProposeMemoryContinuityRevisionTool(BaseTool):
             )
 
 
-MEMORY_BOUNDARY_TOOLS = [
-    LifeCreateMemoryBoundaryTool,
-    LifeCreateMemoryBoundaryFromSubjectRangeTool,
-    LifeReadMemoryBoundaryTool,
-    LifeInspectMemoryContinuityTool,
-    LifeProposeMemoryContinuityRevisionTool,
-]
+# Exact immutable recall remains a small standalone capability. Boundary
+# authoring, current-index inspection, candidate preparation, and decisions are
+# exposed only through nucleus_memory_continuity_review, which keeps one pinned
+# subject revision and one recoverable decision chain.
+MEMORY_BOUNDARY_TOOLS = [LifeReadMemoryBoundaryTool]
 
 
 __all__ = [
     "MEMORY_BOUNDARY_TOOLS",
-    "LifeCreateMemoryBoundaryFromSubjectRangeTool",
-    "LifeCreateMemoryBoundaryTool",
-    "LifeInspectMemoryContinuityTool",
-    "LifeProposeMemoryContinuityRevisionTool",
     "LifeReadMemoryBoundaryTool",
 ]

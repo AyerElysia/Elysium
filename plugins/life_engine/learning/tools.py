@@ -420,13 +420,15 @@ class LifeViewKnowledgeTool(BaseTool):
 
 
 class LifeReviewSubjectDocumentTool(BaseTool):
-    """Expose review choices without granting a generic document write path."""
+    """Review SOUL/USER without granting a generic MEMORY write path."""
 
     tool_name = "nucleus_review_subject_document"
     tool_description = (
-        "读取并复盘当前权威 SOUL.md、USER.md 或 MEMORY.md。status 返回统一 revision、"
+        "读取并复盘当前权威 SOUL.md 或 USER.md。status 返回统一 revision、"
         "精确内容哈希，并可按 UTF-8 字节窗口返回目标文档原文；unchanged 明确记录当前版本"
         "保持不变；snooze 表示稍后再看；propose 只提交完整新版本候选，绝不会自动接受。"
+        "MEMORY.md 的读取、短文字整理、长记忆索引、候选核对和决定统一使用 "
+        "nucleus_memory_continuity_review。"
     )
     chatter_allow = ["life_engine_internal", "life_chatter"]
 
@@ -435,7 +437,7 @@ class LifeReviewSubjectDocumentTool(BaseTool):
         action: Annotated[str, "status|unchanged|snooze|propose"] = "status",
         target_path: Annotated[
             str,
-            "SOUL.md|USER.md|MEMORY.md；status 留空时返回全部",
+            "SOUL.md|USER.md；status 留空时返回全部文档的内容无关健康摘要",
         ] = "",
         expected_subject_revision: Annotated[
             str,
@@ -478,6 +480,11 @@ class LifeReviewSubjectDocumentTool(BaseTool):
             except Exception as exc:  # noqa: BLE001 - explicit tool refusal
                 return False, f"主体复盘状态不可用: {type(exc).__name__}"
             selected_path = str(target_path or "").strip()
+            if selected_path == "MEMORY.md":
+                return False, (
+                    "MemoryContinuityReviewRequired: MEMORY.md 只通过 "
+                    "nucleus_memory_continuity_review 读取和治理。"
+                )
             if selected_path:
                 documents = [
                     item
@@ -485,7 +492,7 @@ class LifeReviewSubjectDocumentTool(BaseTool):
                     if item.get("target_path") == selected_path
                 ]
                 if not documents:
-                    return False, "target_path 必须是 SOUL.md/USER.md/MEMORY.md。"
+                    return False, "target_path 必须是 SOUL.md/USER.md。"
                 raw = await scheduler.read_subject_document(
                     cast(SubjectDocumentPath, selected_path)
                 )
@@ -522,8 +529,13 @@ class LifeReviewSubjectDocumentTool(BaseTool):
             return True, {"action": "subject_review_status", **snapshot}
 
         target = str(target_path or "").strip()
-        if target not in {"SOUL.md", "USER.md", "MEMORY.md"}:
-            return False, "target_path 必须是 SOUL.md/USER.md/MEMORY.md。"
+        if target == "MEMORY.md":
+            return False, (
+                "MemoryContinuityReviewRequired: MEMORY.md 只通过 "
+                "nucleus_memory_continuity_review 读取和治理。"
+            )
+        if target not in {"SOUL.md", "USER.md"}:
+            return False, "target_path 必须是 SOUL.md/USER.md。"
         if not str(reason or "").strip():
             return False, "复盘选择必须填写 reason。"
 
@@ -721,6 +733,8 @@ class LifeListSubjectCandidatesTool(BaseTool):
     tool_description = (
         "查看学习系统整理出的 SOUL/USER/MEMORY 修改候选。候选不是主体结论，"
         "只有当前活跃意识实例在读完原文和候选后明确决定，才可能进入主体权威。"
+        "任何 target_path=MEMORY.md 的历史通用候选都只可审计、不可在这里决定；"
+        "MEMORY.md 只能回到 nucleus_memory_continuity_review 读取和决定。"
     )
     chatter_allow = ["life_engine_internal", "life_chatter"]
 
@@ -749,7 +763,8 @@ class LifeListSubjectCandidatesTool(BaseTool):
             "candidates": candidates,
             "note": (
                 "所有状态都是可审计流程状态；只有 committed 且带 authority_occurrence_id "
-                "才证明主体权威事务已提交。"
+                "才证明主体权威事务已提交；任何 target_path=MEMORY.md 的候选都不能"
+                "通过通用决定入口处理。历史通用候选仅供迁移审计。"
             ),
         }
 
@@ -780,6 +795,16 @@ class LifeReadSubjectCandidateTool(BaseTool):
             return False, f"主体候选读取失败: {type(exc).__name__}"
         if candidate is None:
             return False, f"未找到主体候选 {candidate_id}。"
+        is_memory_target = str(candidate.target_path or "").strip() == "MEMORY.md"
+        if (
+            is_memory_target
+            and candidate.candidate_kind == "memory_continuity_document_revision"
+        ):
+            return False, (
+                "MemoryContinuityReviewRequired: 长期记忆连续性候选只能在 "
+                "nucleus_memory_continuity_review 中分页读取；通用读取不形成"
+                "可供接受使用的精确投递证明。"
+            )
         raw = candidate.candidate_content_bytes
         try:
             raw.decode("utf-8")
@@ -816,6 +841,20 @@ class LifeReadSubjectCandidateTool(BaseTool):
             "next_offset": end,
             "has_more": end < len(raw),
             "content": content,
+            **(
+                {
+                    "audit_only": True,
+                    "migration_required": True,
+                    "decision_blocker": "LegacyMemoryCandidateMigrationRequired",
+                    "note": (
+                        "这是统一连续记忆审查上线前遗留的 MEMORY.md 通用候选；"
+                        "本次读取仅用于审计，不构成 exact delivery proof，不能接受、"
+                        "拒绝或保持开放，也不会自动转换。"
+                    ),
+                }
+                if is_memory_target
+                else {}
+            ),
         }
 
 
@@ -826,8 +865,9 @@ class LifeDecideSubjectCandidateTool(BaseTool):
     tool_description = (
         "对精确主体候选作出 accepted/rejected/kept_open 决定。accepted_content 必须是"
         "你最终选择的完整目标文档，不会自动合并；系统会验证活跃意识、候选证据和"
-        "当前 SOUL+USER+MEMORY revision，冲突时明确拒绝并要求重读。长期记忆连续性候选"
-        "只能逐字接受；若要再改，必须提交一个新候选。"
+        "当前 SOUL+USER+MEMORY revision，冲突时明确拒绝并要求重读。这个通用入口"
+        "只处理 SOUL.md/USER.md；任何 MEMORY.md 候选都必须回到"
+        " nucleus_memory_continuity_review。"
     )
     chatter_allow = ["life_engine_internal", "life_chatter"]
 
@@ -860,6 +900,13 @@ class LifeDecideSubjectCandidateTool(BaseTool):
             candidate = await ledger.read_candidate(str(candidate_id))
             if candidate is None:
                 return False, f"未找到主体候选 {candidate_id}。"
+            if str(candidate.target_path or "").strip() == "MEMORY.md":
+                return False, (
+                    "LegacyMemoryCandidateMigrationRequired: 任何 MEMORY.md 目标候选"
+                    "都不能通过通用决定入口处理。历史候选保持可读审计但不会自动转换；"
+                    "新的长期记忆候选只能在 nucleus_memory_continuity_review 中完整"
+                    "读取并决定，以保留 exact full-candidate delivery proof。"
+                )
             if candidate.target_path is None:
                 return False, "该候选没有主体文档目标，不能走主体接受入口。"
             content_bytes = str(accepted_content).encode("utf-8")
@@ -868,13 +915,6 @@ class LifeDecideSubjectCandidateTool(BaseTool):
                     return False, "accepted 必须提供完整 accepted_content。"
                 if len(content_bytes) > 240 * 1024:
                     return False, "accepted_content 超过单次 240 KiB 安全上限。"
-                if (
-                    candidate.candidate_kind == "memory_continuity_document_revision"
-                    and content_bytes != candidate.candidate_content_bytes
-                ):
-                    return False, (
-                        "长期记忆连续性候选只能逐字接受；任何改写都必须先提交为新候选。"
-                    )
             elif content_bytes:
                 return False, "rejected/kept_open 不能携带 accepted_content。"
             _, actor = _decision_actor(self)

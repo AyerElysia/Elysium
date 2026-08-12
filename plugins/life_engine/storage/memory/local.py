@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import sqlite3
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from src.kernel.storage import CursorConflict, canonical_json
 
 from ...memory.decay import (
     apply_decay,
@@ -61,6 +66,8 @@ from ...memory.epistemic import (
 )
 from ...memory.experience import (
     ExperienceAppendReport,
+    ExperienceOccurrenceCursor,
+    ExperienceOccurrencePage,
     ExperienceOccurrenceRef,
     ExperienceRecord,
     WitnessMemory,
@@ -69,6 +76,7 @@ from ...memory.experience import (
     get_witness_by_projection_path,
     get_witness_state,
     insert_witness_memory,
+    list_experience_occurrence_page,
     list_experience_occurrences_after,
     list_experiences_after,
     list_pending_witness_projections,
@@ -78,10 +86,12 @@ from ...memory.experience import (
     record_witness_migration,
     search_witness_memories,
     update_witness_state,
+    witness_memory_from_row,
 )
 from ...memory.indexing import (
     ACTIVE_CHUNK_STATE_KEY,
     ChunkIndexState,
+    DocumentIdentityConflict,
     DocumentIndexResult,
     IndexJob,
     claim_index_jobs,
@@ -134,6 +144,7 @@ from ...memory.living import (
 )
 from ...memory.nodes import (
     MemoryNode,
+    canonical_file_node_id,
     generate_file_node_id,
     get_node_by_file_path,
     get_or_create_file_node,
@@ -154,8 +165,11 @@ from ...memory.search import (
 )
 from ...memory.sqlite_runtime import run_db
 from ...memory.witness_pipeline import (
+    DELIVERY_KINDS,
+    DELIVERY_STATUSES,
     WitnessDecision,
     WitnessDeliveryJob,
+    WitnessPipelineConflict,
     WitnessWindow,
     append_witness_decision,
     append_witness_window,
@@ -177,9 +191,274 @@ from ...memory.worker import (
 from ..authority import FileAuthorityRegistry
 from ..contracts import StorageBackendRuntime
 from ..models import BackendKind, StorageAvailability
-from .contracts import MemoryStorageBundle
+from .contracts import (
+    CanonicalDocumentMetadata,
+    MemoryStorageBundle,
+    StableLedgerCursor,
+    StableLedgerPage,
+    WitnessReconciliationState,
+    WitnessReconciliationStateCorrupt,
+    validate_witness_reconciliation_state,
+    witness_reconciliation_state_sha256,
+)
 
 ConnectionProvider = Callable[[], sqlite3.Connection]
+
+
+def _now_iso() -> str:
+    return datetime.now(UTC).astimezone().isoformat()
+
+
+def _stable_ledger_page(
+    db: sqlite3.Connection,
+    *,
+    source_sql: str,
+    clauses: Sequence[str],
+    params: Sequence[Any],
+    order_column: str,
+    identity_column: str,
+    after: StableLedgerCursor | None,
+    through: StableLedgerCursor | None,
+    limit: int,
+    convert: Callable[[sqlite3.Row], Any],
+) -> StableLedgerPage[Any]:
+    """Read one bounded composite-key page from an internal fixed SQL source."""
+
+    page_limit = max(1, min(int(limit), 1000))
+    base_clauses = list(clauses)
+    base_params = list(params)
+    frontier = through
+    base_where = "" if not base_clauses else " WHERE " + " AND ".join(base_clauses)
+    if frontier is None:
+        row = db.execute(
+            f"SELECT * FROM {source_sql}{base_where} "
+            f"ORDER BY {order_column} DESC, {identity_column} DESC LIMIT 1",
+            base_params,
+        ).fetchone()
+        if row is None:
+            return StableLedgerPage((), None, None, False)
+        frontier = StableLedgerCursor(
+            order_value=str(row[order_column]),
+            identity=str(row[identity_column]),
+        )
+    if after is not None and after > frontier:
+        raise ValueError("StableLedgerCursorBeyondFrontier")
+
+    bounded_clauses = list(base_clauses)
+    bounded_params = list(base_params)
+    if after is not None:
+        bounded_clauses.append(
+            f"({order_column} > ? OR "
+            f"({order_column} = ? AND {identity_column} > ?))"
+        )
+        bounded_params.extend((after.order_value, after.order_value, after.identity))
+    bounded_clauses.append(
+        f"({order_column} < ? OR "
+        f"({order_column} = ? AND {identity_column} <= ?))"
+    )
+    bounded_params.extend(
+        (frontier.order_value, frontier.order_value, frontier.identity)
+    )
+    bounded_params.append(page_limit + 1)
+    where = " WHERE " + " AND ".join(bounded_clauses)
+    rows = db.execute(
+        f"SELECT * FROM {source_sql}{where} "
+        f"ORDER BY {order_column}, {identity_column} LIMIT ?",
+        bounded_params,
+    ).fetchall()
+    has_more = len(rows) > page_limit
+    delivered_rows = rows[:page_limit]
+    items = tuple(convert(row) for row in delivered_rows)
+    next_cursor = (
+        StableLedgerCursor(
+            order_value=str(delivered_rows[-1][order_column]),
+            identity=str(delivered_rows[-1][identity_column]),
+        )
+        if delivered_rows
+        else after
+    )
+    return StableLedgerPage(items, next_cursor, frontier, has_more)
+
+
+def _witness_delivery_job_from_row(row: sqlite3.Row) -> WitnessDeliveryJob:
+    job = WitnessDeliveryJob(
+        job_id=str(row["job_id"]),
+        decision_id=str(row["decision_id"]),
+        window_id=str(row["window_id"]),
+        delivery_kind=str(row["delivery_kind"]),
+        payload=dict(json.loads(str(row["payload_json"] or "{}"))),
+        payload_sha256=str(row["payload_sha256"]),
+        created_at=str(row["created_at"]),
+        status=str(row["status"]),
+        revision=int(row["revision"]),
+        attempt_count=int(row["attempt_count"]),
+        available_at=str(row["available_at"] or ""),
+        lease_owner=str(row["lease_owner"] or ""),
+        lease_expires_at=str(row["lease_expires_at"] or ""),
+        last_error_type=str(row["last_error_type"] or ""),
+        updated_at=str(row["updated_at"]),
+        completed_at=str(row["completed_at"] or ""),
+    )
+    if job.delivery_kind not in DELIVERY_KINDS or job.status not in DELIVERY_STATUSES:
+        raise WitnessPipelineConflict(f"WitnessDeliveryStateDrift:{job.job_id}")
+    payload_sha256 = hashlib.sha256(
+        canonical_json(job.payload).encode("utf-8")
+    ).hexdigest()
+    if payload_sha256 != job.payload_sha256:
+        raise WitnessPipelineConflict(f"WitnessDeliveryPayloadDrift:{job.job_id}")
+    return job
+
+
+def _reconciliation_state_from_row(
+    scan_name: str,
+    row: sqlite3.Row | None,
+) -> WitnessReconciliationState:
+    if row is None:
+        return WitnessReconciliationState(scan_name=scan_name)
+    cursor_order = str(row["cursor_order_value"] or "")
+    cursor_identity = str(row["cursor_identity"] or "")
+    frontier_order = str(row["frontier_order_value"] or "")
+    frontier_identity = str(row["frontier_identity"] or "")
+    if bool(cursor_order) != bool(cursor_identity):
+        raise WitnessReconciliationStateCorrupt(
+            "WitnessReconciliationCursorPartial"
+        )
+    if bool(frontier_order) != bool(frontier_identity):
+        raise WitnessReconciliationStateCorrupt(
+            "WitnessReconciliationFrontierPartial"
+        )
+    cursor = (
+        StableLedgerCursor(
+            cursor_order,
+            cursor_identity,
+        )
+        if cursor_order
+        else None
+    )
+    frontier = (
+        StableLedgerCursor(
+            frontier_order,
+            frontier_identity,
+        )
+        if frontier_order
+        else None
+    )
+    return validate_witness_reconciliation_state(
+        WitnessReconciliationState(
+            scan_name=str(row["scan_name"]),
+            cursor=cursor,
+            frontier=frontier,
+            revision=int(row["revision"]),
+            cycle_started_at=str(row["cycle_started_at"] or ""),
+            last_completed_at=str(row["last_completed_at"] or ""),
+            updated_at=str(row["updated_at"] or ""),
+            state_sha256=str(row["state_sha256"] or ""),
+        )
+    )
+
+
+def _get_reconciliation_state(
+    db: sqlite3.Connection,
+    scan_name: str,
+) -> WitnessReconciliationState:
+    normalized_name = str(scan_name or "").strip()
+    if not normalized_name:
+        raise ValueError("WitnessReconciliationScanNameRequired")
+    row = db.execute(
+        "SELECT * FROM memory_witness_reconciliation_state WHERE scan_name = ?",
+        (normalized_name,),
+    ).fetchone()
+    return _reconciliation_state_from_row(normalized_name, row)
+
+
+def _advance_reconciliation_state(
+    db: sqlite3.Connection,
+    scan_name: str,
+    *,
+    expected_revision: int,
+    next_cursor: StableLedgerCursor | None,
+    frontier: StableLedgerCursor | None,
+    completed: bool,
+) -> WitnessReconciliationState:
+    """Persist progress only after an idempotent reconciliation page completes."""
+
+    normalized_name = str(scan_name or "").strip()
+    if not normalized_name:
+        raise ValueError("WitnessReconciliationScanNameRequired")
+    if next_cursor is not None and frontier is None:
+        raise ValueError("WitnessReconciliationFrontierRequired")
+    if next_cursor is not None and frontier is not None and next_cursor > frontier:
+        raise ValueError("WitnessReconciliationCursorBeyondFrontier")
+    if completed and (next_cursor is not None or frontier is not None):
+        raise ValueError("WitnessReconciliationCompletedStateMustResetCursor")
+    with transaction(db):
+        current = _get_reconciliation_state(db, normalized_name)
+        if current.revision != max(0, int(expected_revision)):
+            raise CursorConflict(
+                "witness reconciliation revision changed: "
+                f"expected {expected_revision}, actual {current.revision}"
+            )
+        if current.frontier is not None and not completed:
+            if frontier != current.frontier:
+                raise CursorConflict("witness reconciliation frontier changed mid-cycle")
+            if (
+                current.cursor is not None
+                and next_cursor is not None
+                and next_cursor <= current.cursor
+            ):
+                raise CursorConflict("witness reconciliation cursor did not advance")
+        now = _now_iso()
+        revision = current.revision + 1
+        cycle_started_at = (
+            ""
+            if completed
+            else current.cycle_started_at or now
+        )
+        last_completed_at = now if completed else current.last_completed_at
+        state_sha256 = witness_reconciliation_state_sha256(
+            scan_name=normalized_name,
+            cursor=next_cursor,
+            frontier=frontier,
+            revision=revision,
+            cycle_started_at=cycle_started_at,
+            last_completed_at=last_completed_at,
+            updated_at=now,
+        )
+        values = (
+            next_cursor.order_value if next_cursor is not None else "",
+            next_cursor.identity if next_cursor is not None else "",
+            frontier.order_value if frontier is not None else "",
+            frontier.identity if frontier is not None else "",
+            revision,
+            cycle_started_at,
+            last_completed_at,
+            now,
+            state_sha256,
+            normalized_name,
+        )
+        if current.revision == 0 and not current.updated_at:
+            db.execute(
+                """INSERT INTO memory_witness_reconciliation_state (
+                    cursor_order_value, cursor_identity,
+                    frontier_order_value, frontier_identity, revision,
+                    cycle_started_at, last_completed_at, updated_at,
+                    state_sha256, scan_name
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                values,
+            )
+        else:
+            updated = db.execute(
+                """UPDATE memory_witness_reconciliation_state SET
+                    cursor_order_value = ?, cursor_identity = ?,
+                    frontier_order_value = ?, frontier_identity = ?,
+                    revision = ?, cycle_started_at = ?, last_completed_at = ?,
+                    updated_at = ?, state_sha256 = ?
+                WHERE scan_name = ? AND revision = ?""",
+                (*values, current.revision),
+            )
+            if updated.rowcount != 1:
+                raise CursorConflict("witness reconciliation state changed during CAS")
+    return _get_reconciliation_state(db, normalized_name)
 
 
 def _list_active_file_nodes(db: sqlite3.Connection) -> list[MemoryNode]:
@@ -295,6 +574,46 @@ class _LocalPort:
 
 
 class LocalDocumentIndexProjection(_LocalPort):
+    async def get_document_metadata(
+        self,
+        path: str,
+    ) -> CanonicalDocumentMetadata | None:
+        canonical_path, node_id = canonical_file_node_id(path)
+
+        def _read(db: sqlite3.Connection) -> CanonicalDocumentMetadata | None:
+            row = db.execute(
+                """SELECT node_id, file_path, content_hash, title,
+                source_mtime, index_revision, is_deleted, updated_at
+                FROM memory_nodes WHERE node_id = ? AND node_type = 'file'""",
+                (node_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            if str(row["file_path"] or "") != canonical_path:
+                raise DocumentIdentityConflict(
+                    "document node ID belongs to another canonical path"
+                )
+            return CanonicalDocumentMetadata(
+                node_id=str(row["node_id"]),
+                file_path=canonical_path,
+                content_hash=(
+                    str(row["content_hash"])
+                    if row["content_hash"] is not None
+                    else None
+                ),
+                title=str(row["title"] or ""),
+                source_mtime=(
+                    float(row["source_mtime"])
+                    if row["source_mtime"] is not None
+                    else None
+                ),
+                index_revision=int(row["index_revision"] or 0),
+                is_deleted=bool(row["is_deleted"]),
+                updated_at=float(row["updated_at"] or 0.0),
+            )
+
+        return await run_db(_read, self._db())
+
     async def upsert_document(
         self,
         path: str,
@@ -480,9 +799,9 @@ class LocalDocumentIndexProjection(_LocalPort):
         min_weight: float,
         focus_id: str | None,
     ) -> dict[str, Any]:
-        from ...memory.router import _read_graph_payload
+        from ...memory.legacy_graph_projection import read_legacy_graph_payload
 
-        return await _read_graph_payload(
+        return await read_legacy_graph_payload(
             self._db(),
             limit_nodes=limit_nodes,
             min_weight=min_weight,
@@ -525,6 +844,23 @@ class LocalExperienceLedgerStore(_LocalPort):
             limit,
         )
 
+    async def list_occurrence_page(
+        self,
+        *,
+        position_after: int = 0,
+        after: ExperienceOccurrenceCursor | None = None,
+        through: ExperienceOccurrenceCursor | None = None,
+        limit: int = 100,
+    ) -> ExperienceOccurrencePage:
+        return await run_db(
+            list_experience_occurrence_page,
+            self._db(),
+            position_after=position_after,
+            after=after,
+            through=through,
+            limit=limit,
+        )
+
     async def health_snapshot(self) -> dict[str, Any]:
         return await run_db(experience_health_snapshot, self._db())
 
@@ -557,6 +893,31 @@ class LocalWitnessLedgerStore(_LocalPort):
             list_pending_witness_projections,
             self._db(),
             limit=limit,
+        )
+
+    async def list_pending_page(
+        self,
+        *,
+        after: StableLedgerCursor | None = None,
+        through: StableLedgerCursor | None = None,
+        limit: int = 100,
+    ) -> StableLedgerPage[WitnessMemory]:
+        db = self._db()
+        return await run_db(
+            _stable_ledger_page,
+            db,
+            source_sql="memory_witnesses",
+            clauses=(
+                "projection_status IN ('pending', 'failed')",
+                "projection_path <> ''",
+            ),
+            params=(),
+            order_column="recorded_at",
+            identity_column="witness_id",
+            after=after,
+            through=through,
+            limit=limit,
+            convert=lambda row: witness_memory_from_row(db, row),
         )
 
     async def get_by_projection_path(
@@ -675,6 +1036,44 @@ class LocalWitnessLedgerStore(_LocalPort):
             limit=limit,
         )
 
+    async def list_delivery_jobs_page(
+        self,
+        *,
+        delivery_kind: str | None = None,
+        statuses: Sequence[str] = ("pending", "failed"),
+        after: StableLedgerCursor | None = None,
+        through: StableLedgerCursor | None = None,
+        limit: int = 100,
+    ) -> StableLedgerPage[WitnessDeliveryJob]:
+        normalized_statuses = tuple(dict.fromkeys(str(item) for item in statuses))
+        if any(status not in DELIVERY_STATUSES for status in normalized_statuses):
+            raise ValueError("WitnessDeliveryStatusUnsupported")
+        clauses: list[str] = []
+        params: list[Any] = []
+        if delivery_kind is not None:
+            if delivery_kind not in DELIVERY_KINDS:
+                raise ValueError(f"WitnessDeliveryKindUnsupported:{delivery_kind}")
+            clauses.append("delivery_kind = ?")
+            params.append(delivery_kind)
+        if normalized_statuses:
+            clauses.append(
+                "status IN (" + ",".join("?" for _ in normalized_statuses) + ")"
+            )
+            params.extend(normalized_statuses)
+        return await run_db(
+            _stable_ledger_page,
+            self._db(),
+            source_sql="memory_witness_delivery_jobs",
+            clauses=tuple(clauses),
+            params=tuple(params),
+            order_column="created_at",
+            identity_column="job_id",
+            after=after,
+            through=through,
+            limit=limit,
+            convert=_witness_delivery_job_from_row,
+        )
+
     async def mark_delivery_job(
         self,
         job_id: str,
@@ -713,6 +1112,91 @@ class LocalWitnessLedgerStore(_LocalPort):
             statuses=statuses,
             limit=limit,
         )
+
+    async def list_projection_records_page(
+        self,
+        *,
+        statuses: Sequence[str] = (),
+        after: StableLedgerCursor | None = None,
+        through: StableLedgerCursor | None = None,
+        limit: int = 100,
+    ) -> StableLedgerPage[WitnessDeliveryJob]:
+        return await self.list_delivery_jobs_page(
+            delivery_kind="projection",
+            statuses=statuses,
+            after=after,
+            through=through,
+            limit=limit,
+        )
+
+    async def get_reconciliation_state(
+        self,
+        scan_name: str,
+    ) -> WitnessReconciliationState:
+        return await run_db(_get_reconciliation_state, self._db(), scan_name)
+
+    async def compare_and_advance_reconciliation_state(
+        self,
+        scan_name: str,
+        *,
+        expected_revision: int,
+        next_cursor: StableLedgerCursor | None,
+        frontier: StableLedgerCursor | None,
+        completed: bool,
+    ) -> WitnessReconciliationState:
+        async with self._write_scope():
+            return await run_db(
+                _advance_reconciliation_state,
+                self._db(),
+                scan_name,
+                expected_revision=expected_revision,
+                next_cursor=next_cursor,
+                frontier=frontier,
+                completed=completed,
+            )
+
+    async def delivery_health(self) -> dict[str, Any]:
+        def _read(db: sqlite3.Connection) -> dict[str, Any]:
+            rows = db.execute(
+                """SELECT delivery_kind, status, COUNT(*) AS count,
+                SUM(CASE
+                    WHEN status IN ('pending', 'failed') THEN 1
+                    WHEN status = 'processing'
+                     AND (lease_expires_at = '' OR lease_expires_at <= ?) THEN 1
+                    ELSE 0 END) AS actionable
+                FROM memory_witness_delivery_jobs
+                GROUP BY delivery_kind, status""",
+                (_now_iso(),),
+            ).fetchall()
+            counts: dict[str, dict[str, int]] = {
+                kind: {status: 0 for status in sorted(DELIVERY_STATUSES)}
+                for kind in sorted(DELIVERY_KINDS)
+            }
+            for row in rows:
+                kind = str(row["delivery_kind"])
+                status = str(row["status"])
+                counts.setdefault(kind, {})[status] = int(row["count"])
+            actionable = {
+                kind: sum(
+                    int(row["actionable"] or 0)
+                    for row in rows
+                    if str(row["delivery_kind"]) == kind
+                )
+                for kind in counts
+            }
+            return {
+                "status": (
+                    "degraded"
+                    if any(item.get("failed", 0) for item in counts.values())
+                    else "healthy"
+                ),
+                "counts": counts,
+                "actionable": actionable,
+                "total": sum(sum(item.values()) for item in counts.values()),
+                "exact": True,
+            }
+
+        return await run_db(_read, self._db())
 
     async def projection_health(self) -> dict[str, Any]:
         return await run_db(witness_projection_health, self._db())

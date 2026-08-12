@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from dataclasses import replace
 
@@ -88,6 +89,12 @@ async def test_occurrence_report_and_view_preserve_input_order_and_aliases() -> 
             "alias_count": 1,
             "occurrence_count": 3,
             "frontier": 3,
+            "frontier_cursor": {
+                "ingest_position": 3,
+                "occurrence_id_sha256": hashlib.sha256(
+                    b"occurrence-3"
+                ).hexdigest(),
+            },
             "latest_recorded_at": "2026-08-12T10:01:03+08:00",
         }
 
@@ -130,7 +137,7 @@ async def test_window_and_decision_are_idempotent_but_conflicts_fail_closed() ->
             decision_id="decision-1",
             window_id="window-1",
             consciousness_instance_id="core",
-            decision_kind="authored",
+            decision_kind="witness",
             witness_id="witness-1",
             model_task_name="life_memory_witness",
             model_request_id="request-1",
@@ -159,6 +166,12 @@ async def test_window_and_decision_are_idempotent_but_conflicts_fail_closed() ->
                 decision,
                 delivery_payloads={**payloads, "world": {"delivery_id": "changed"}},
             )
+
+        with pytest.raises(ValueError, match="WitnessDecisionKindUnsupported"):
+            await bundle.witnesses.append_decision(
+                replace(decision, decision_id="decision-invalid", decision_kind="skip"),
+                delivery_payloads={},
+            )
     finally:
         db.close()
 
@@ -184,7 +197,8 @@ async def test_delivery_jobs_use_revision_cas_and_keep_authority_immutable() -> 
                 decision_id="decision-1",
                 window_id="window-1",
                 consciousness_instance_id="core",
-                decision_kind="authored",
+                decision_kind="witness",
+                witness_id="witness-1",
                 decided_at="2026-08-12T10:11:00+08:00",
             ),
             delivery_payloads={

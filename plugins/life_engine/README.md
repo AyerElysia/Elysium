@@ -98,34 +98,39 @@ Life Engine 维护一个主体下的多个场景意识：
 
 ## 4. 生命记忆
 
-记忆由权威层与派生层组成：
+记忆收敛为“不可变历史 + 主体当前解释 + 可重建投影”，而不是一套按分数筛选经历的图：
 
 ```text
 Life Event
-  → 心理显著性编码
-  → immutable Experience
-  → Witness / Evidence
-  → Claim / Belief / Conflict
-  → 双时间当前理解
-
-权威层：原始事件、Experience、Epistemic SQLite
-派生层：FTS、Chroma、关系图、检索亲和度与投影
+  ├─ 独立 raw cursor → immutable Experience
+  │                       └─ durable window → Witness decision
+  │                                            ├─ exact World outbox
+  │                                            └─ Markdown projection outbox
+  └─ Epistemic / artifact / SemanticRelation / Recall history
+                           ↓
+       FTS、vector、association 与 workspace projection
 ```
 
 关键边界：
 
-- 原始事件和经历只追加，不静默覆盖；
+- Raw→Experience 不等待 LLM；Witness 失败只阻塞自己的 durable window，不跳两个游标；
+- Experience、Witness decision、World 与 Markdown projection 分阶段恢复，失败不伪造成空见证；
+- Witness 使用统一、可追溯的 `SOUL+USER+MEMORY` 投影；World 只有 final attempt 的 exact receipt 才推进；
 - 第一人称见证是主观证词，不是客观真相；
-- `valid_time` 与 `recorded_time` 分离；
-- claim、evidence、belief、conflict 分层；
-- 遗忘调整可达性、认可度、抑制、叙事显著性和可见性，不删除原始证据；
-- 经常被检索只影响 retrieval affinity，不会让一件事变得更真。
+- claim、evidence、belief、conflict、interpretation 与 artifact version 保持可追溯；
+- 新的显式关系只写 `SemanticRelation`，一次真实回忆只写一套 Recall trace；co-recall 只改变可达性；
+- `memory_edges`、daily decay、Dream relation learning 与第二套 retrieval-plasticity 只读兼容，不再产生新权威写入；
+- 时间、分数、容量、检索频率和共同出现都不能自动判断重要性、真值或删除。
 
-旧的关联边、激活和衰减仍可服务于文档检索与联想，但不再决定认识论真值。
+主意识可以使用有界语义检索、显式关系历史、Memory Boundary 和记忆健康；所有工具结果保留来源、hash 与 continuation，只有最终成功 attempt 的 exact delivery 才留下 Recall/co-recall。
 
-主意识当前可以使用语义检索、关系遍历和记忆统计；更深层写入仍通过明确的经历、见证、反思和学习链完成。
+`MEMORY.md` 只承载当前连续性文字与显式长记忆索引。唯一 authoring 入口是 `nucleus_memory_continuity_review` 加 selected Subject Authority：会话固定 active actor、统一 revision 和 MEMORY version/hash；可精确读取当前 MEMORY，也可只读固定 `diaries/...` / `life_engine_workspace/diaries/...` Subject 版本（优先 Witness）。模型只选择 logical path、version/hash、UTF-8 ranges、Boundary 语义与 `SubjectTextEdit`；正文、source refs、occurrence 和完整 candidate 均由服务端构造。辅助长记忆可用 zero-length MEMORY anchor 插入 URI。
 
-`MEMORY.md` 只承载当前连续性所需的主体文字和显式长记忆索引。长正文可由活动意识保存成不可变 Memory Boundary，再通过 `nucleus_propose_memory_continuity_revision` 提交完整 `MEMORY.md` 候选；候选不会自动接受，索引移除也不会删除正文和历史。读取使用 `nucleus_read_memory_boundary` 的 overview/context/provenance/segment/history 有界模式；只有最终成功模型 attempt 精确接收未经裁剪的完整 ToolResult 后才幂等记录 recall/co-recall，来源标签默认保持 `external_unverified`。工程压力只邀请复盘，不判断重要性；邀请也只有精确送达后才进入冷却。
+`prepare_candidate` 只机械生成 open candidate，不修改主体文件；全部 candidate 页经内核证明 exact delivery 后，活动意识才另行接受、拒绝或保持开放。commit 通过 Subject Authority 原子 CAS；索引移除不删除正文和历史，commit 后 projection 可从不可变事件恢复。selected authority 不可用时，Boundary、candidate、`unchanged`、`snooze` 全部 fail closed，不先存一半。完整长记忆通过 `nucleus_read_memory_boundary` 的 overview/context/provenance/segment/history 有界读取。
+
+统一 health 只返回 content-free 事实：raw/Experience/Witness 复合游标与 backlog、window/decision/outbox/projection、耐久 reconcile cursor/checksum、最近成功、MEMORY revision/hash、Boundary exact refs，以及 Boundary/search 两条进程内 delivery proof。local Witness author 只具备进程内锁；任何 frontier、hash 或 authority 无法精确证明时都会 fail closed，不夸大为健康。
+
+旧 Memory Router、SSE 广播和三个 graph/dream/SNN dashboard 已完全退役；旧 `memory_nodes/memory_edges` 仅可由无网络依赖的只读迁移投影检查，不再形成第二套运行时表面。
 
 详见 [`docs/architecture/生命记忆系统.md`](../../docs/architecture/生命记忆系统.md) 与 [`docs/architecture/主体长期记忆治理与索引.md`](../../docs/architecture/主体长期记忆治理与索引.md)。
 

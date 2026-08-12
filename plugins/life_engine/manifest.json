@@ -88,25 +88,25 @@
     },
     {
       "component_type": "tool",
-      "component_name": "nucleus_relate_file",
-      "dependencies": [],
-      "enabled": true
-    },
-    {
-      "component_type": "tool",
-      "component_name": "nucleus_view_relations",
-      "dependencies": [],
-      "enabled": true
-    },
-    {
-      "component_type": "tool",
-      "component_name": "nucleus_forget_relation",
+      "component_name": "nucleus_relations",
       "dependencies": [],
       "enabled": true
     },
     {
       "component_type": "tool",
       "component_name": "nucleus_memory_stats",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
+      "component_type": "tool",
+      "component_name": "nucleus_read_memory_boundary",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
+      "component_type": "tool",
+      "component_name": "nucleus_memory_continuity_review",
       "dependencies": [],
       "enabled": true
     },

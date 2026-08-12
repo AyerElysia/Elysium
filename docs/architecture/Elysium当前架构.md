@@ -149,31 +149,31 @@ Presence 与 World Projection 使用不同权威：前者描述技术存在，�
 
 ## 5. 生命记忆
 
-记忆不是单一向量库，而是分层系统：
+记忆不是单一向量库，也不是按显著性分数筛选事件的网络。当前链路是：
 
 ```text
-原始 Life Event（追加式源事件）
-  ↓ 心理显著性编码，可追溯且源事件不丢失
-Experience Ledger（不可变经历）
-  ↓ 见证 / 证据连接
-Claim / Evidence / Belief / Conflict
-  ↓ 双时间投影
-当前理解
-
-SQLite / immutable event：权威层
-FTS / Chroma / 关系图 / 可达性：可重建派生层
+Life Event（追加式发生历史）
+  ├─ 独立 raw cursor → Experience（不等待 LLM）
+  │                      └─ durable Witness window
+  │                           └─ decision + World/projection outboxes
+  └─ Epistemic / artifact / SemanticRelation / Recall history
+                              ↓
+              FTS / vector / association / workspace projection
 ```
 
 核心原则：
 
-- 原始证据和经历不静默覆盖；
-- `valid_time` 与 `recorded_time` 分离；
-- 主张、证据、信念、冲突分层；
-- 遗忘不是删除，而是可达性、认可度、抑制、显著性和可见性的可逆变化；
-- 检索亲和度不等于真实性；
+- Raw→Experience 与 Experience→Witness 有独立耐久游标；见证失败不阻塞经历摄取，也不跳 author cursor；
+- Witness 使用统一 `SOUL+USER+MEMORY` 投影；decision、exact World commit 和 Markdown projection 可独立恢复；
+- 原始证据、经历、主张、解释、文档版本、关系和 Recall 轨迹只追加；
+- `valid_time` 与 `recorded_time` 分离，旧理解不会被新理解静默覆盖；
+- 新的显式关系只写 `SemanticRelation`，co-recall 只改变可达性；
+- 时间、分数、容量、检索频率和共同出现不等于重要性或真实性，也不触发自动删除；
 - 第一人称见证是主观证词，不冒充客观事实。
 
-旧关联网络仍可服务于文档检索和联想，但不再拥有认识论裁决权。
+`MEMORY.md` 是主体活着的当前连续性解释，不是第七套数据库。完整长记忆保存为不可变 Memory Boundary，当前文件只保留可精确取回的 URI 索引。唯一写链是 `nucleus_memory_continuity_review` → Learning decision → Subject Authority；候选由固定范围上的 edits 机械生成，全部分页 exact delivery 后才可独立接受。selected authority 不可用时，Boundary、candidate、unchanged 和 snooze 全部 fail closed。
+
+旧 `memory_edges`、daily decay、Dream relation learning 和第二套 retrieval-plasticity 只保留只读兼容、迁移或诊断，不再产生新权威写入。旧 Memory Router、SSE 广播与 graph/dream/SNN 页面已经删除，旧图只能通过无网络依赖的只读迁移投影检查。
 
 ---
 
@@ -195,7 +195,7 @@ FTS / Chroma / 关系图 / 可达性：可重建派生层
 - 技能蒸馏把稳定、可复用的方法沉淀为技能；
 - 子系统可以提供证据和候选认识，但最终意义与主体背书不能被规则替代。
 
-完整旧 SNN、neuromod 和 Dream 子系统已经删除；当前保留的 `dream_walk()` 是记忆图联想漫游的历史命名，不代表仍有完整梦境系统。
+完整旧 SNN、neuromod 和 Dream 子系统已经删除。当前保留的 `dream_walk(persist_learning=false)` 只是 legacy graph 的只读联想漫游；写关系模式、日衰减和弱边删除都已 fail closed，新的主体关系只进入 `SemanticRelation`。
 
 ---
 
@@ -282,7 +282,7 @@ NapCat 适配器已按 `client / events / outgoing / utils` 模块化：
 
 当前主要持久状态包括：
 
-- Life Event / Experience / Epistemic SQLite；
+- Life Event / Experience / Witness / Epistemic / artifact / Recall 的 coherent authority bundle；
 - `runtime/consciousness_presence.sqlite3`：意识实例运行权威、stream owner 与生命周期 outbox；
 - `runtime/consciousness_registry.json`：Presence 迁移期兼容导出，不再是权威；
 - `runtime/world_projection.sqlite3`：从不可变 Life Event 重建的 assertion、change 和逐实例 cursor；
@@ -304,7 +304,7 @@ NapCat 适配器已按 `client / events / outgoing / utils` 模块化：
 | Life Engine 心跳/潜意识 | 稳定使用 | 串行心跳、prepare/commit 语义已建立 |
 | 意识 Presence 核心 | 已落地 | SQLite 事务、stream 唯一归属、revision、lease、生命周期 outbox |
 | 跨实例世界感知 | 已落地 | 可重建 World Projection、逐实例 CAS cursor、主要实例 prepare/commit 闭环 |
-| 生命记忆 v2 | 稳定使用并继续演进 | 学习桥和主意识深层检索已接入 |
+| 生命记忆 | 收敛实现，待人工启动验收 | 两阶段 Experience/Witness、复合 frontier、耐久 reconciliation、连续性单写链、Recall/SemanticRelation、exact delivery 与 content-free health 已接入；隔离 MySQL v8→v14 和六域合同已通过 |
 | 使命编排 | 已实现并建立核心契约测试 | DAG、依赖、失败/取消/超时传播与结果账本已覆盖；仍需真实模型端到端验收 |
 | NapCat v3 / QQ | 已实现并持续运行加固 | 模块化与协议健康恢复已接入 |
 | 飞书 platform_action | 已实现，依赖外部环境 | 需要 lark-cli 与认证 |
@@ -337,7 +337,7 @@ NapCat 适配器已按 `client / events / outgoing / utils` 模块化：
 
 - DI/Registry 与旧 Manager 的职责仍需逐步统一；
 - 兼容工具、旧配置别名、legacy 索引回退需要退出条件；
-- 事件显著性编码仍需从固定技术筛选演进为可追溯、可重新解释的主体性机制；
+- Witness 已补齐 `(ingest_position, occurrence_id)` 复合分页、固定 frontier 和耐久 reconciliation；下一运行边界是由用户手工启动后确认生产配置、健康日志与真实流量闭环，而不是继续增加平行记忆本体；
 - 使命编排仍需真实模型端到端验收；livestream 已具备契约与模拟闭环，但 voice_live、livestream 与 Minecraft 仍需要各自真实环境验收；
 - CI 需要恢复自动化的核心逻辑测试，并把本地/GPU/平台集成测试分层。
 

@@ -1,4 +1,8 @@
-"""life_engine 仿生记忆系统。"""
+"""Life Engine 可追溯记忆领域的稳定公开表面。
+
+历史 epistemic retrieval-plasticity DTO 仍可从其定义模块用于迁移读取，
+但不再从包根导出；新的回忆留痕只使用 Living Recall/Corecall 历史。
+"""
 
 from __future__ import annotations
 
@@ -38,10 +42,6 @@ _LAZY_EXPORTS = {
     "MemoryClaim": ("epistemic", "MemoryClaim"),
     "MemoryDisposition": ("epistemic", "MemoryDisposition"),
     "MemoryStateEvent": ("epistemic", "MemoryStateEvent"),
-    "RetrievalEpisode": ("epistemic", "RetrievalEpisode"),
-    "RetrievalExposure": ("epistemic", "RetrievalExposure"),
-    "RetrievalFeedback": ("epistemic", "RetrievalFeedback"),
-    "RetrievalPlasticity": ("epistemic", "RetrievalPlasticity"),
     "MemorySearchMode": ("experience", "MemorySearchMode"),
     "EvidenceAwareMemoryResult": ("experience", "EvidenceAwareMemoryResult"),
     "MemoryArtifactVersion": ("living", "MemoryArtifactVersion"),
@@ -118,10 +118,6 @@ __all__ = [
     "MemoryClaim",
     "MemoryDisposition",
     "MemoryStateEvent",
-    "RetrievalEpisode",
-    "RetrievalExposure",
-    "RetrievalFeedback",
-    "RetrievalPlasticity",
     "MemorySearchMode",
     "EvidenceAwareMemoryResult",
     "MemoryArtifactVersion",

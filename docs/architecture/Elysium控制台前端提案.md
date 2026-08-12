@@ -34,7 +34,7 @@ Elysium 需要的不是一个写死功能列表的“后台管理页”，而是
 | Voice Live | `/voice-live/` | 已有完整深色视觉、通话状态和指标，但缺少启动前检查与统一入口 | 第一批迁移为原生旗舰页 |
 | Voice Live OBS | `/voice-live/overlay` | 已是透明只读输出 | 保持独立 URL，控制台负责预览与复制 |
 | Livestream | `/livestream/` | 功能存在，但页面接近浏览器默认控件 | 第一批视觉重做 |
-| 记忆图 | `/memory_vis/` | 信息密度和可视化较成熟，但品牌仍为 Neo-MoFox | 先嵌入，后统一设计令牌与品牌 |
+| 记忆健康 | `/api/v1/admin/memory` | 正式、只读、content-free 运维入口 | Console 原生健康与连续性索引诊断；不恢复旧 graph dashboard |
 | Life 时间线 | `/message_timeline/` | 可观测性丰富、视觉较完整，但没有权限分层和统一导航 | 先嵌入，后拆成控制台原生模块 |
 | LLM Inspector | 内核挂载页 | 有调试价值，但不适合普通模式首页 | 归入“诊断”并限制权限 |
 

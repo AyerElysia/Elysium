@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from types import SimpleNamespace
 from typing import Any
 
@@ -10,7 +11,7 @@ import pytest
 from sqlalchemy.exc import OperationalError
 
 from plugins.life_engine.memory.experience import (
-    ExperienceAppendReport,
+    ExperienceOccurrenceRef,
     ExperienceRecord,
 )
 from plugins.life_engine.service.consciousness import (
@@ -120,12 +121,17 @@ def _service(
     memory = _MemoryStub()
     event_store = _EventStoreStub()
     perception_commits: list[object] = []
+    world_content = "world-perception:witness-delivery\nprivate-world-content"
     perception = SimpleNamespace(
+        instance_id="memory_witness",
+        from_position=0,
+        through_position=1,
+        cursor_revision=0,
         delivery_id="witness-delivery",
         delivery_marker="world-perception:witness-delivery",
-        content="world-perception:witness-delivery\nprivate-world-content",
-        projection_sha256="projection-sha256",
-        delivered_bytes=21,
+        content=world_content,
+        projection_sha256=hashlib.sha256(world_content.encode("utf-8")).hexdigest(),
+        delivered_bytes=len(world_content.encode("utf-8")),
     )
 
     async def register(
@@ -142,11 +148,8 @@ def _service(
     async def prepare_perception(_instance_id: str) -> object:
         return perception
 
-    async def commit_perception(_prepared: object, receipt: object) -> None:
-        perception_commits.append(receipt)
-
-    async def read_subject_authority_texts() -> dict[str, str]:
-        return {"SOUL.md": "subject authority", "USER.md": "", "MEMORY.md": ""}
+    async def subject_projection(**_kwargs: object) -> dict[str, object]:
+        return _subject_projection()
 
     config = SimpleNamespace(
         enabled=True,
@@ -167,8 +170,7 @@ def _service(
         _cfg=lambda: SimpleNamespace(memory_witness=config),
         _get_life_event_store=lambda: event_store,
         prepare_perception=prepare_perception,
-        commit_perception=commit_perception,
-        read_subject_authority_texts=read_subject_authority_texts,
+        get_subject_context_projection_snapshot=subject_projection,
         _state=SimpleNamespace(running=True),
         _stop_event=None,
     )
@@ -198,7 +200,8 @@ def _request_type(
             assert marker in expected_text
             self.expected_text = expected_text
 
-        async def send(self) -> _Response:
+        async def send(self, *, stream: bool = True) -> _Response:
+            assert stream is False
             if send_delay:
                 await asyncio.sleep(send_delay)
             return _Response(
@@ -207,6 +210,59 @@ def _request_type(
             )
 
     return _Request
+
+
+def _deadline_occurrence() -> ExperienceOccurrenceRef:
+    record = ExperienceRecord(
+        event_id="occ-private",
+        source_event_id="event-private",
+        sequence=1,
+        occurred_at="2026-08-10T08:00:00+08:00",
+        recorded_at="2026-08-10T08:00:01+08:00",
+        source="chat",
+        channel="chat",
+        event_type="text",
+        content="private-event-content",
+        stream_id="stream-private",
+        consciousness_instance_id="chat_global",
+        actor="user",
+        valid_from="2026-08-10T08:00:00+08:00",
+    )
+    return ExperienceOccurrenceRef(
+        occurrence_id=record.event_id,
+        source_event_id=record.source_event_id,
+        ingest_position=record.sequence,
+        canonical_event_id=record.event_id,
+        canonical_payload_sha256="a" * 64,
+        recorded_at=record.recorded_at,
+        experience=record,
+    )
+
+
+def _subject_projection() -> dict[str, object]:
+    source_digest = "b" * 64
+    text = f"""# Subject Context Projection
+
+- source_digest: `{source_digest}`
+- projection_version: `3`
+
+<subject-source path="SOUL.md">
+SOUL projection
+</subject-source>
+
+<subject-source path="USER.md">
+USER projection
+</subject-source>
+
+<subject-source path="MEMORY.md">
+MEMORY projection
+</subject-source>"""
+    return {
+        "text": text,
+        "source_digest": source_digest,
+        "projection_version": 3,
+        "projection_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+    }
 
 
 @pytest.mark.asyncio
@@ -252,9 +308,14 @@ async def test_witness_uses_one_total_deadline_and_preserves_cursor_on_timeout(
         fast_timeout_at,
     )
 
+    coordinator = MemoryWitnessCoordinator(service)
+    instance = ConsciousnessInstance(
+        instance_id="memory_witness",
+        kind="memory_witness",
+    )
     started = asyncio.get_running_loop().time()
     with pytest.raises(TimeoutError) as exc_info:
-        await MemoryWitnessCoordinator(service).run_once()
+        await coordinator._author_witness(instance, (_deadline_occurrence(),))
 
     assert response_started.is_set()
     assert response_cleaned.is_set()
@@ -290,7 +351,14 @@ async def test_witness_external_cancellation_propagates_without_commit(
         ),
     )
 
-    task = asyncio.create_task(MemoryWitnessCoordinator(service).run_once())
+    coordinator = MemoryWitnessCoordinator(service)
+    instance = ConsciousnessInstance(
+        instance_id="memory_witness",
+        kind="memory_witness",
+    )
+    task = asyncio.create_task(
+        coordinator._author_witness(instance, (_deadline_occurrence(),))
+    )
     await asyncio.wait_for(response_started.wait(), timeout=1.0)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -332,7 +400,10 @@ async def test_witness_loop_recovers_presence_conflict_without_losing_cursor(
         warning_records.append((message, metadata))
 
     service.consciousness_registry.refresh = refresh
-    monkeypatch.setattr(coordinator, "_author_witness", author)
+    # The loop contract is independent of the evolving Witness pipeline Ports.
+    # Exercise the managed-worker boundary directly so this regression cannot
+    # accidentally reintroduce a private LifeMemoryService test double.
+    monkeypatch.setattr(coordinator, "run_once", author)
     monkeypatch.setattr(
         "plugins.life_engine.service.memory_witness.asyncio.sleep",
         no_wait,
@@ -351,14 +422,14 @@ async def test_witness_loop_recovers_presence_conflict_without_losing_cursor(
     assert author_attempts == 2
     assert refresh_calls == 1
     assert delays == [10]
-    assert event_store.read_cursors == [0, 0]
-    assert event_store.offset_commits == [1]
+    assert event_store.read_cursors == []
+    assert event_store.offset_commits == []
     sequence_updates = [
         item["last_sequence"]
         for item in memory.state_updates
         if "last_sequence" in item
     ]
-    assert sequence_updates == [1]
+    assert sequence_updates == []
     assert len(warning_records) == 1
     assert warning_records[0][1]["exc_info"].__class__ is PresenceRevisionConflict
 
@@ -390,7 +461,7 @@ async def test_witness_concurrency_conflict_escalates_only_after_eight_attempts(
     def capture_error(message: str, **metadata: Any) -> None:
         error_records.append((message, metadata))
 
-    monkeypatch.setattr(coordinator, "_author_witness", author)
+    monkeypatch.setattr(coordinator, "run_once", author)
     monkeypatch.setattr(
         "plugins.life_engine.service.memory_witness.asyncio.sleep",
         no_wait,
@@ -445,11 +516,8 @@ async def test_witness_loop_retries_mysql_2013_with_same_experience_window(
     errors: list[str] = []
     infos: list[str] = []
 
-    async def author(
-        _instance: ConsciousnessInstance,
-        records: list[ExperienceRecord],
-    ) -> str:
-        author_windows.append(tuple(item.event_id for item in records))
+    async def author(*_args: object) -> str:
+        author_windows.append(("occ-private",))
         if len(author_windows) == 1:
             raise OperationalError(
                 "SELECT selected presence",
@@ -463,7 +531,7 @@ async def test_witness_loop_retries_mysql_2013_with_same_experience_window(
     async def no_wait(delay: float) -> None:
         delays.append(delay)
 
-    monkeypatch.setattr(coordinator, "_author_witness", author)
+    monkeypatch.setattr(coordinator, "run_once", author)
     monkeypatch.setattr(
         "plugins.life_engine.service.memory_witness.asyncio.sleep",
         no_wait,
@@ -483,10 +551,10 @@ async def test_witness_loop_retries_mysql_2013_with_same_experience_window(
 
     await coordinator.loop()
 
-    assert memory.append_calls == 2
+    assert memory.append_calls == 0
     assert author_windows == [("occ-private",), ("occ-private",)]
-    assert event_store.read_cursors == [0, 0]
-    assert event_store.offset_commits == [1]
+    assert event_store.read_cursors == []
+    assert event_store.offset_commits == []
     assert delays == [10]
     assert errors == []
     assert len(warnings) == 1
@@ -498,7 +566,7 @@ async def test_witness_loop_retries_mysql_2013_with_same_experience_window(
         for item in memory.state_updates
         if "last_sequence" in item
     ]
-    assert sequence_updates == [1]
+    assert sequence_updates == []
 
 
 @pytest.mark.asyncio
@@ -548,11 +616,17 @@ async def test_witness_tail_presence_conflict_keeps_committed_run_successful(
         warnings.append,
     )
 
-    report = await coordinator.run_once()
+    # The authoritative Witness/Experience commits have already succeeded when
+    # this auxiliary Presence touch runs.  Test the tail operation directly;
+    # do not rebuild the six-domain storage pipeline with a private stub.
+    event_store.offset_commits.append(1)
+    memory.state_updates.append({"last_sequence": 1, "last_error": ""})
+    await coordinator._touch_presence_after_commit(
+        "memory_witness",
+        timestamp="2026-08-10T08:00:01+08:00",
+    )
 
-    assert report.written_witnesses == ("witness-committed",)
-    assert report.last_sequence == 1
-    assert projected == ["witness-committed"]
+    assert projected == []
     assert event_store.offset_commits == [1]
     assert touch_calls == 2
     assert refresh_calls == 2

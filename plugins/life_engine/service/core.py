@@ -670,7 +670,6 @@ class LifeEngineService(BaseService):
         self._sleep_state_active: bool = False
         self._self_pause_skip_logged: bool = False
         self._memory_service: LifeMemoryService | None = None
-        self._last_decay_date: str | None = None
         from ..storage.factory import settings_from_life_engine_config
 
         if hasattr(plugin, "global_storage_config"):
@@ -814,6 +813,376 @@ class LifeEngineService(BaseService):
     def memory_service(self) -> LifeMemoryService | None:
         """兼容旧调用方的公开记忆服务访问入口。"""
         return self._memory_service
+
+    async def _memory_behavior_health_snapshot(self) -> dict[str, Any]:
+        """Aggregate Witness, recall delivery, and continuity health."""
+
+        witness: dict[str, Any]
+        coordinator = self._memory_witness_coordinator
+        if coordinator is None:
+            witness = {
+                "status": "disabled",
+                "component": "memory_witness_pipeline",
+                "reason": "memory_witness_disabled",
+            }
+        else:
+            try:
+                witness = dict(await coordinator.health_snapshot())
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - health stays content-free
+                witness = {
+                    "status": "failed",
+                    "component": "memory_witness_pipeline",
+                    "error_type": type(exc).__name__,
+                }
+
+        continuity: dict[str, Any]
+        memory = self._memory_service
+        subject_store = self._subject_document_store
+        if not self._selectable_storage_enabled:
+            continuity = {
+                "status": "disabled",
+                "component": "memory_continuity",
+                "reason": "selected_subject_authority_disabled",
+            }
+        elif memory is None or subject_store is None:
+            continuity = {
+                "status": "failed",
+                "component": "memory_continuity",
+                "error_type": "ContinuityHealthCoherentRuntimeUnavailable",
+            }
+        else:
+            from ..memory.continuity_health import collect_continuity_memory_health
+
+            try:
+                continuity = await collect_continuity_memory_health(
+                    subject_store=subject_store,
+                    living_store=memory.living_memory_store,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - health stays content-free
+                continuity = {
+                    "status": "failed",
+                    "component": "memory_continuity",
+                    "error_type": type(exc).__name__,
+                }
+
+        from ..memory.boundary_resolver import (
+            get_memory_boundary_recall_coordinator,
+        )
+        from ..memory.recall_delivery import (
+            get_memory_search_recall_delivery_coordinator,
+        )
+
+        boundary_recall = (
+            get_memory_boundary_recall_coordinator().health_snapshot()
+        )
+        search_recall = (
+            get_memory_search_recall_delivery_coordinator().health_snapshot()
+        )
+        recall_statuses = {
+            str(boundary_recall.get("status") or "failed"),
+            str(search_recall.get("status") or "failed"),
+        }
+        if "failed" in recall_statuses:
+            recall_status = "failed"
+        elif recall_statuses - {"healthy", "ok", "disabled"}:
+            recall_status = "degraded"
+        elif recall_statuses == {"disabled"}:
+            recall_status = "disabled"
+        else:
+            recall_status = "healthy"
+        recall_delivery = {
+            "status": recall_status,
+            "component": "memory_recall_exact_delivery",
+            "pending_count": sum(
+                max(0, int(item.get("pending_count") or 0))
+                for item in (boundary_recall, search_recall)
+            ),
+            "boundary": boundary_recall,
+            "search": search_recall,
+            "authority": "process_local_delivery_proof_only",
+        }
+
+        generic_memory_candidates: dict[str, Any]
+        learning = self._learning_scheduler
+        decision_ledger = getattr(learning, "decision_ledger", None)
+        if decision_ledger is None:
+            generic_memory_candidates = {
+                "status": "disabled",
+                "component": "legacy_memory_candidates",
+                "reason": "learning_decision_ledger_disabled",
+                "backlog_lower_bound": 0,
+            }
+        else:
+            try:
+                candidate_page = await decision_ledger.list_candidates(
+                    status="all",
+                    limit=100,
+                )
+                blocked = [
+                    item
+                    for item in candidate_page
+                    if str(item.get("target_path") or "") == "MEMORY.md"
+                    and str(item.get("candidate_kind") or "")
+                    != "memory_continuity_document_revision"
+                    and str(item.get("status") or "") != "committed"
+                ]
+                generic_memory_candidates = {
+                    "status": "degraded" if blocked else "healthy",
+                    "component": "legacy_memory_candidates",
+                    "backlog_lower_bound": len(blocked),
+                    "page_limit": 100,
+                    "migration_required": bool(blocked),
+                    "decision_path": "blocked_fail_closed",
+                }
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - health stays content-free
+                generic_memory_candidates = {
+                    "status": "failed",
+                    "component": "legacy_memory_candidates",
+                    "error_type": type(exc).__name__,
+                    "backlog_lower_bound": 0,
+                }
+
+        statuses = {
+            str(witness.get("status") or "failed"),
+            str(continuity.get("status") or "failed"),
+            str(recall_delivery.get("status") or "failed"),
+            str(generic_memory_candidates.get("status") or "failed"),
+        }
+        if "failed" in statuses:
+            status = "failed"
+        elif statuses - {"healthy", "ok", "disabled"}:
+            status = "degraded"
+        elif statuses == {"disabled"}:
+            status = "disabled"
+        else:
+            status = "healthy"
+
+        raw = witness.get("raw_ingest")
+        author = witness.get("author")
+        runtime = witness.get("runtime")
+        backlogs = []
+        for section in (raw, author):
+            if isinstance(section, Mapping):
+                value = section.get("backlog")
+                if isinstance(value, int) and not isinstance(value, bool):
+                    backlogs.append(max(0, value))
+        for section, field in (
+            (recall_delivery, "pending_count"),
+            (generic_memory_candidates, "backlog_lower_bound"),
+        ):
+            value = section.get(field)
+            if isinstance(value, int) and not isinstance(value, bool):
+                backlogs.append(max(0, value))
+
+        snapshot: dict[str, Any] = {
+            "status": status,
+            "component": "memory_behavior",
+            "owner": "life_engine",
+            "witness": witness,
+            "continuity": continuity,
+            "recall_delivery": recall_delivery,
+            "legacy_memory_candidates": generic_memory_candidates,
+            "backlog": sum(backlogs),
+        }
+        if isinstance(runtime, Mapping):
+            snapshot["last_success_at"] = str(
+                runtime.get("last_success_at") or ""
+            )
+        if status not in {"healthy", "ok", "disabled"}:
+            failures = [
+                str(item.get("error_type") or item.get("reason") or "")
+                for item in (
+                    witness,
+                    continuity,
+                    recall_delivery,
+                    generic_memory_candidates,
+                )
+                if str(item.get("status") or "")
+                not in {"healthy", "ok", "disabled"}
+            ]
+            snapshot["reason"] = ",".join(filter(None, failures)) or (
+                "memory_behavior_degraded"
+            )
+        return snapshot
+
+    async def get_memory_continuity_review_runtime(self, tool: Any) -> Any:
+        """Build the one public, fail-closed continuity-review dependency bundle.
+
+        A review may inspect and prepare immutable evidence only when the same
+        selected runtime owns Subject Authority, Learning decisions, Memory
+        Boundaries, and the active Presence actor.  Local Markdown is never
+        promoted into a second acceptance authority here.
+        """
+
+        from ..memory.boundary import MemoryBoundaryRepository
+        from ..memory.continuity_delivery import (
+            get_memory_continuity_delivery_coordinator,
+        )
+        from ..memory.continuity_session import (
+            ContinuityReviewActorContext,
+            ContinuityReviewRuntimeUnavailable,
+            ContinuityReviewSession,
+        )
+        from ..memory.continuity_tools import ContinuityReviewToolRuntime
+
+        if not self._selectable_storage_enabled:
+            raise ContinuityReviewRuntimeUnavailable(
+                "ContinuityReviewSelectedSubjectAuthorityRequired"
+            )
+        memory = self._memory_service
+        scheduler = self._learning_scheduler
+        subject_authority = self._subject_document_store
+        ledger = getattr(scheduler, "decision_ledger", None)
+        if memory is None or scheduler is None or subject_authority is None:
+            raise ContinuityReviewRuntimeUnavailable(
+                "ContinuityReviewCoherentRuntimeUnavailable"
+            )
+        if ledger is None:
+            raise ContinuityReviewRuntimeUnavailable(
+                "ContinuityReviewLearningDecisionLedgerUnavailable"
+            )
+        selected_runtime = self._storage_runtime
+        if selected_runtime is None:
+            raise ContinuityReviewRuntimeUnavailable(
+                "ContinuityReviewCoherentRuntimeUnavailable"
+            )
+
+        def dependency_runtime(value: Any) -> Any | None:
+            runtime = getattr(value, "storage_runtime", None)
+            if runtime is None:
+                runtime = getattr(value, "runtime", None)
+            return runtime
+
+        bindings = {
+            "memory": dependency_runtime(memory),
+            "subject": dependency_runtime(subject_authority),
+            "learning": dependency_runtime(scheduler),
+            "decision_ledger": dependency_runtime(ledger),
+        }
+        if any(runtime is not selected_runtime for runtime in bindings.values()):
+            raise ContinuityReviewRuntimeUnavailable(
+                "ContinuityReviewCoherentRuntimeMismatch"
+            )
+
+        stream_scope = str(tool.get_current_stream_id() or "").strip()
+        instance = (
+            self.consciousness_registry.get_for_stream(stream_scope)
+            if stream_scope
+            else None
+        )
+        if instance is None and str(
+            getattr(tool, "_runtime_task_name", "") or ""
+        ) == "core":
+            instance = self.consciousness_registry.get("chat_global")
+            stream_scope = stream_scope or "chat_global"
+        if instance is None or not instance.is_active:
+            raise ContinuityReviewRuntimeUnavailable(
+                "ContinuityReviewActiveStreamOwnerRequired"
+            )
+
+        tool_call_id = str(getattr(tool, "_tool_call_id", "") or "").strip()
+        if not tool_call_id:
+            raise ContinuityReviewRuntimeUnavailable(
+                "ContinuityReviewToolCallIdentityRequired"
+            )
+        message = getattr(tool, "trigger_message", None)
+        extra = getattr(message, "extra", {}) or {}
+        turn_scope = extra.get("life_turn_scope") if isinstance(extra, dict) else None
+        source_occurrence_id = str(
+            getattr(tool, "_life_source_occurrence_id", "") or ""
+        ).strip()
+        if not source_occurrence_id and isinstance(turn_scope, dict):
+            source_occurrence_id = str(turn_scope.get("turn_key") or "").strip()
+        if not source_occurrence_id:
+            source_occurrence_id = str(
+                getattr(message, "message_id", "") or ""
+            ).strip()
+        if not source_occurrence_id:
+            raise ContinuityReviewRuntimeUnavailable(
+                "ContinuityReviewSourceOccurrenceRequired"
+            )
+
+        occurred_at = _now_iso()
+        raw_time = getattr(message, "time", None)
+        if isinstance(raw_time, datetime):
+            parsed_time = (
+                raw_time
+                if raw_time.tzinfo is not None
+                else raw_time.replace(tzinfo=timezone.utc)
+            )
+            occurred_at = parsed_time.astimezone(timezone.utc).isoformat()
+        elif isinstance(raw_time, (int, float)) and not isinstance(raw_time, bool):
+            occurred_at = datetime.fromtimestamp(
+                float(raw_time), tz=timezone.utc
+            ).isoformat()
+        elif str(raw_time or "").strip():
+            try:
+                parsed_time = datetime.fromisoformat(str(raw_time))
+                if parsed_time.tzinfo is None:
+                    parsed_time = parsed_time.replace(tzinfo=timezone.utc)
+                occurred_at = parsed_time.astimezone(timezone.utc).isoformat()
+            except ValueError:
+                pass
+
+        repository = MemoryBoundaryRepository(memory.living_memory_store)
+
+        async def record_review_outcome(outcome: Any) -> None:
+            """Project one already-durable continuity outcome idempotently."""
+
+            outcome_kind = str(outcome.outcome_kind)
+            scheduler_outcome = (
+                "snoozed" if outcome_kind == "snooze" else outcome_kind
+            )
+            if outcome_kind == "candidate_proposed":
+                occurrence_id = str(outcome.candidate_occurrence_id)
+            elif outcome_kind in {"rejected", "kept_open", "committed"}:
+                occurrence_id = str(outcome.decision_occurrence_id)
+            else:
+                occurrence_id = str(outcome.outcome_occurrence_id)
+            subject_revision = (
+                str(outcome.subject_revision_after)
+                if outcome_kind == "committed"
+                else str(outcome.subject_revision_before)
+            )
+            await scheduler.record_subject_review_outcome(
+                target_path="MEMORY.md",
+                outcome=scheduler_outcome,
+                actor_consciousness_instance_id=(
+                    str(outcome.actor_consciousness_instance_id)
+                ),
+                subject_revision=subject_revision,
+                occurrence_id=occurrence_id,
+                reason=str(outcome.reason),
+                candidate_id=str(outcome.candidate_id),
+                candidate_sha256=str(outcome.candidate_sha256),
+                authority_occurrence_id=str(outcome.authority_occurrence_id),
+                snooze_hours=float(outcome.snooze_hours),
+            )
+
+        session = ContinuityReviewSession(
+            subject_authority=subject_authority,
+            boundary_repository=repository,
+            candidate_ledger=ledger,
+            validate_active_actor=self._validate_learning_decision_actor,
+            delivery_verifier=get_memory_continuity_delivery_coordinator(),
+            outcome_recorder=record_review_outcome,
+        )
+        return ContinuityReviewToolRuntime(
+            session=session,
+            actor=ContinuityReviewActorContext(
+                consciousness_instance_id=str(instance.instance_id),
+                stream_scope=stream_scope,
+                source_occurrence_id=source_occurrence_id,
+                action_occurrence_id=tool_call_id,
+                occurred_at=occurred_at,
+            ),
+        )
 
     @property
     def selected_subject_storage_enabled(self) -> bool:
@@ -4046,8 +4415,27 @@ class LifeEngineService(BaseService):
         results = await memory_service.search_memory(
             query_text,
             top_k=max(1, int(top_k)),
+            # New association expansion is owned by the append-only living
+            # ledger. Legacy weighted edges remain historical evidence only.
+            enable_association=False,
             return_bundles=False,
         )
+        expand_associations = getattr(
+            memory_service,
+            "expand_living_document_associations",
+            None,
+        )
+        if callable(expand_associations):
+            association_seed = int.from_bytes(
+                hashlib.sha256(query_text.encode("utf-8")).digest()[:8],
+                "big",
+            ) & ((1 << 63) - 1)
+            results = await expand_associations(
+                results,
+                context_key="life_engine/dfc",
+                random_seed=association_seed,
+                limit=max(1, int(top_k)),
+            )
         if not results:
             logger.info(
                 f"[search_actor_memory] 记忆检索无结果:\n"
@@ -7473,7 +7861,7 @@ class LifeEngineService(BaseService):
             "- `nucleus_search_memory` 是历史检索，不要反复重搜同一主题",
             "- 本地 file 工具只用于私有工作区中的日记、笔记和普通文件，不用于替用户查项目或改项目",
             "- `SOUL.md`、`USER.md`、`MEMORY.md` 共同属于主体权威：通用 file/bash 不能直接修改",
-            "- 复盘三份主体文件时使用 `nucleus_review_subject_document`；后台只提供机会，保持原样、稍后再看和安静结束都有效",
+            "- 复盘 SOUL.md/USER.md 时使用 `nucleus_review_subject_document`；MEMORY.md 的长期索引整理只使用 `nucleus_memory_continuity_review` 单一会话链；后台只提供机会，保持原样、稍后再看和安静结束都有效",
             "- 只有活跃意识基于精确内容哈希与统一 revision 提出完整候选，并另行明确接受，才可能改变主体权威；迁移未就绪时必须 fail closed",
             "- `nucleus_bash` 只用于诊断 life_engine 自己的工作区或工具链问题；不要拿它查项目配置、跑用户任务或处理外部操作",
             "- `nucleus_browser_fetch` / `nucleus_web_search` 只用于私有好奇心、记忆核验或长期主题整理，不用于替用户做即时检索任务",
@@ -7702,6 +8090,8 @@ class LifeEngineService(BaseService):
 
         from ..attention_threads.tools import ATTENTION_THREAD_TOOLS
         from ..learning.tools import LEARNING_TOOLS
+        from ..memory.boundary_tools import MEMORY_BOUNDARY_TOOLS
+        from ..memory.continuity_tools import CONTINUITY_REVIEW_TOOLS
         from ..memory.tools import MEMORY_TOOLS
         from ..streams.tools import STREAM_TOOLS
         from ..tools import ALL_TOOLS, TODO_TOOLS, WEB_TOOLS
@@ -7719,6 +8109,8 @@ class LifeEngineService(BaseService):
             ALL_TOOLS
             + TODO_TOOLS
             + MEMORY_TOOLS
+            + MEMORY_BOUNDARY_TOOLS
+            + CONTINUITY_REVIEW_TOOLS
             + GREP_TOOLS
             + WEB_TOOLS
             + STREAM_TOOLS
@@ -7743,8 +8135,18 @@ class LifeEngineService(BaseService):
         tool_name: str,
         args: dict[str, Any],
         registry: ToolRegistry,
-    ) -> tuple[str, bool]:
-        """只执行心跳工具，不写事件/上下文 payload。"""
+        *,
+        tool_call_id: str = "",
+        source_occurrence_id: str = "",
+        source_occurred_at: str = "",
+    ) -> tuple[Any, bool]:
+        """只执行心跳工具，不写事件/上下文 payload。
+
+        Successful structured results stay structured until ``ToolResult``
+        serialization.  Flattening them to ``str(dict)`` would make exact
+        context-delivery receipts impossible to verify and would also diverge
+        from the normal chatter tool path.
+        """
         usable_cls = registry.get(tool_name) if tool_name else None
         if not usable_cls:
             return f"未知工具: {tool_name}", False
@@ -7755,11 +8157,19 @@ class LifeEngineService(BaseService):
             # no trigger Message to infer this from, so bind its identity
             # explicitly before executing any shared retrieval capability.
             tool_instance._runtime_task_name = "core"
+            bind_runtime = getattr(tool_instance, "_bind_runtime_context", None)
+            if callable(bind_runtime):
+                bind_runtime(
+                    stream_id="chat_global",
+                    tool_call_id=tool_call_id,
+                )
+            tool_instance._life_source_occurrence_id = source_occurrence_id
+            tool_instance._life_source_occurred_at = source_occurred_at
             call_args = dict(args)
             if should_strip_auto_reason_argument(tool_instance.execute, call_args):
                 call_args.pop("reason", None)
             success, result = await tool_instance.execute(**call_args)
-            return str(result) if success else f"执行失败: {result}", bool(success)
+            return result if success else f"执行失败: {result}", bool(success)
         except Exception as exc:  # noqa: BLE001
             return f"执行异常: {exc}", False
 
@@ -7768,15 +8178,209 @@ class LifeEngineService(BaseService):
         response: Any,
         call: Any,
         tool_name: str,
-        result_text: str,
+        result_value: Any,
     ) -> None:
         call_id = getattr(call, "id", None)
         response.add_payload(
             LLMPayload(
                 ROLE.TOOL_RESULT,
-                ToolResult(value=result_text, call_id=call_id, name=tool_name),
+                ToolResult(value=result_value, call_id=call_id, name=tool_name),
             )
         )
+
+    @staticmethod
+    def _register_pending_heartbeat_memory_deliveries(
+        response: Any,
+    ) -> tuple[tuple[str, str], ...]:
+        """Register exact ToolResult bytes for boundary and candidate reads."""
+
+        from ..memory.boundary_resolver import (
+            get_memory_boundary_recall_coordinator,
+        )
+        from ..memory.continuity_delivery import (
+            ContinuityCandidateDeliveryError,
+            get_memory_continuity_delivery_coordinator,
+        )
+        from ..memory.recall_delivery import (
+            MemorySearchRecallDeliveryError,
+            get_memory_search_recall_delivery_coordinator,
+        )
+
+        register = getattr(response, "register_context_delivery", None)
+        payloads = getattr(response, "payloads", None)
+        if not callable(register) or not isinstance(payloads, list):
+            return ()
+
+        boundary = get_memory_boundary_recall_coordinator()
+        continuity = get_memory_continuity_delivery_coordinator()
+        search = get_memory_search_recall_delivery_coordinator()
+        deliveries: dict[tuple[str, str], str] = {}
+        for payload in payloads:
+            if getattr(payload, "role", None) != ROLE.TOOL_RESULT:
+                continue
+            for part in getattr(payload, "content", ()):
+                if not isinstance(part, ToolResult) or not isinstance(part.value, dict):
+                    continue
+                expected = part.to_text()
+                boundary_id = str(
+                    part.value.get("memory_recall_delivery_id") or ""
+                ).strip()
+                if boundary_id and boundary.has_pending(boundary_id):
+                    key = ("boundary", boundary_id)
+                    previous = deliveries.get(key)
+                    if previous is not None and previous != expected:
+                        raise RuntimeError(
+                            f"MemoryBoundaryRecallToolResultConflict:{boundary_id}"
+                        )
+                    deliveries[key] = expected
+
+                search_binding = part.value.get("recall_delivery_binding")
+                search_delivery_id = (
+                    str(search_binding.get("delivery_id") or "").strip()
+                    if isinstance(search_binding, Mapping)
+                    else ""
+                )
+                if search.has_pending(search_delivery_id):
+                    try:
+                        expectation = search.register_pending_tool_result(
+                            part.value,
+                            expected,
+                        )
+                    except MemorySearchRecallDeliveryError as error:
+                        logger.warning(
+                            "memory search ToolResult could not be bound for "
+                            "exact heartbeat delivery: "
+                            f"error_type={type(error).__name__}"
+                        )
+                    else:
+                        key = ("search", expectation.delivery_id)
+                        previous = deliveries.get(key)
+                        if (
+                            previous is not None
+                            and previous != expectation.expected_text
+                        ):
+                            raise RuntimeError(
+                                "MemorySearchRecallToolResultConflict:"
+                                f"{expectation.delivery_id}"
+                            )
+                        deliveries[key] = expectation.expected_text
+
+                binding = part.value.get("delivery_binding")
+                if (
+                    part.value.get("action") != "candidate_read"
+                    or not isinstance(binding, Mapping)
+                ):
+                    continue
+                try:
+                    expectation = continuity.register_pending_tool_result(
+                        part.value,
+                        expected,
+                    )
+                except ContinuityCandidateDeliveryError as error:
+                    logger.warning(
+                        "continuity candidate ToolResult could not be bound for "
+                        "exact delivery; acceptance remains unavailable: "
+                        f"error_type={type(error).__name__}"
+                    )
+                    continue
+                key = ("continuity", expectation.delivery_id)
+                previous = deliveries.get(key)
+                if previous is not None and previous != expectation.expected_text:
+                    raise RuntimeError(
+                        "ContinuityCandidateToolResultConflict:"
+                        f"{expectation.delivery_id}"
+                    )
+                deliveries[key] = expectation.expected_text
+
+        for (kind, delivery_id), expected in deliveries.items():
+            register(
+                delivery_id,
+                expected,
+                marker=delivery_id,
+                part_kind="tool_result",
+            )
+        return tuple(deliveries)
+
+    @staticmethod
+    async def _commit_heartbeat_memory_deliveries(
+        response: Any,
+        deliveries: tuple[tuple[str, str], ...],
+    ) -> None:
+        """Commit only final-attempt receipts; missing proof stays pending."""
+
+        if not deliveries:
+            return
+        from ..memory.boundary_resolver import (
+            get_memory_boundary_recall_coordinator,
+        )
+        from ..memory.continuity_delivery import (
+            get_memory_continuity_delivery_coordinator,
+        )
+        from ..memory.recall_delivery import (
+            get_memory_search_recall_delivery_coordinator,
+        )
+
+        boundary = get_memory_boundary_recall_coordinator()
+        continuity = get_memory_continuity_delivery_coordinator()
+        search = get_memory_search_recall_delivery_coordinator()
+        lookup = getattr(response, "effective_context_receipt", None)
+        for kind, delivery_id in deliveries:
+            receipt = lookup(delivery_id) if callable(lookup) else None
+            if receipt is None:
+                if kind == "boundary":
+                    boundary.discard(delivery_id)
+                elif kind == "continuity":
+                    continuity.discard_pending(delivery_id)
+                else:
+                    search.discard(delivery_id)
+                continue
+            try:
+                if kind == "boundary":
+                    await boundary.commit_exact(delivery_id, receipt)
+                elif kind == "search":
+                    await search.commit_exact(delivery_id, receipt)
+                elif not continuity.commit_effective_context_receipt(receipt):
+                    logger.warning(
+                        "continuity candidate exact-delivery receipt was rejected: "
+                        f"delivery_id={delivery_id}"
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001 - derived trace retries safely
+                logger.warning(
+                    "heartbeat memory exact-delivery commit failed: "
+                    f"kind={kind}, delivery_id={delivery_id}, "
+                    f"error_type={type(error).__name__}"
+                )
+
+    @staticmethod
+    def _discard_pending_heartbeat_memory_deliveries(
+        deliveries: tuple[tuple[str, str], ...],
+    ) -> None:
+        """Drop only unverified in-process proofs after a failed model attempt."""
+
+        if not deliveries:
+            return
+        from ..memory.boundary_resolver import (
+            get_memory_boundary_recall_coordinator,
+        )
+        from ..memory.continuity_delivery import (
+            get_memory_continuity_delivery_coordinator,
+        )
+        from ..memory.recall_delivery import (
+            get_memory_search_recall_delivery_coordinator,
+        )
+
+        boundary = get_memory_boundary_recall_coordinator()
+        continuity = get_memory_continuity_delivery_coordinator()
+        search = get_memory_search_recall_delivery_coordinator()
+        for kind, delivery_id in deliveries:
+            if kind == "boundary":
+                boundary.discard(delivery_id)
+            elif kind == "continuity":
+                continuity.discard_pending(delivery_id)
+            else:
+                search.discard(delivery_id)
 
     async def _execute_heartbeat_tool_call(
         self,
@@ -7802,14 +8406,27 @@ class LifeEngineService(BaseService):
         else:
             call_event = await self.record_tool_call(tool_name or "<unknown>", log_args)
 
-        result_text, success = await self._run_heartbeat_tool_call_execution(
+        call_id = call_id or str(getattr(call_event, "event_id", "") or "")
+        source_occurrence_id = str(
+            heartbeat_run_id
+            or getattr(call_event, "event_id", "")
+            or f"heartbeat:{self._state.heartbeat_count}"
+        )
+
+        result_value, success = await self._run_heartbeat_tool_call_execution(
             tool_name,
             args,
             registry,
+            tool_call_id=call_id,
+            source_occurrence_id=source_occurrence_id,
+            source_occurred_at=str(
+                getattr(call_event, "occurred_at", "") or ""
+            ),
         )
         self._append_heartbeat_tool_result_payload(
-            response, call, tool_name, result_text
+            response, call, tool_name, result_value
         )
+        result_text = str(result_value)
         if heartbeat_run_id:
             await self.record_tool_result(
                 tool_name or "<unknown>",
@@ -7855,6 +8472,7 @@ class LifeEngineService(BaseService):
                 call_event = await self.record_tool_call(
                     tool_name or "<unknown>", log_args
                 )
+            call_id = call_id or str(getattr(call_event, "event_id", "") or "")
             prepared.append((call, tool_name, args, call_event, call_id))
 
         if len(prepared) > 1:
@@ -7865,8 +8483,21 @@ class LifeEngineService(BaseService):
 
         outcomes = await asyncio.gather(
             *(
-                self._run_heartbeat_tool_call_execution(tool_name, args, registry)
-                for _, tool_name, args, _, _ in prepared
+                self._run_heartbeat_tool_call_execution(
+                    tool_name,
+                    args,
+                    registry,
+                    tool_call_id=call_id,
+                    source_occurrence_id=str(
+                        heartbeat_run_id
+                        or getattr(call_event, "event_id", "")
+                        or f"heartbeat:{self._state.heartbeat_count}"
+                    ),
+                    source_occurred_at=str(
+                        getattr(call_event, "occurred_at", "") or ""
+                    ),
+                )
+                for _, tool_name, args, call_event, call_id in prepared
             ),
             return_exceptions=True,
         )
@@ -7876,13 +8507,14 @@ class LifeEngineService(BaseService):
             strict=False,
         ):
             if isinstance(outcome, Exception):
-                result_text = f"执行异常: {outcome}"
+                result_value = f"执行异常: {outcome}"
                 success = False
             else:
-                result_text, success = outcome
+                result_value, success = outcome
             self._append_heartbeat_tool_result_payload(
-                response, call, tool_name, result_text
+                response, call, tool_name, result_value
             )
+            result_text = str(result_value)
             if heartbeat_run_id:
                 await self.record_tool_result(
                     tool_name or "<unknown>",
@@ -7930,7 +8562,7 @@ class LifeEngineService(BaseService):
             [
                 "- 这只是结构压力信号，不表示任何记忆应被删除、改写或重新解释。",
                 "- 你可以保持原样、稍后再看或安静结束；不要用 file/bash 直接修改 MEMORY.md。",
-                "- 若你主动复盘，请通过 `nucleus_review_subject_document` 绑定精确内容哈希与统一 revision。",
+                "- 若你主动复盘 MEMORY.md，请只通过 `nucleus_memory_continuity_review` 的 open/read_source/prepare_candidate/read_candidate/decide 阶段绑定精确字节、统一 revision 与显式决定。",
             ]
         )
         return "\n".join(lines)
@@ -8304,6 +8936,9 @@ class LifeEngineService(BaseService):
             # 之后上下文最长、最慢），少了重试等于把最脆弱的一环裸奔。
             # 重发是幂等的：response.send() 每次都带同一份累积 payload 重投。
             current_response = response
+            pending_memory_deliveries = (
+                self._register_pending_heartbeat_memory_deliveries(current_response)
+            )
             if world_perception is not None:
                 current_response.register_context_delivery(
                     world_perception.delivery_id,
@@ -8354,6 +8989,10 @@ class LifeEngineService(BaseService):
                         stage="followup_backoff",
                     )
                     response = await _send_followup_request()
+                await self._commit_heartbeat_memory_deliveries(
+                    response,
+                    pending_memory_deliveries,
+                )
                 if world_perception is not None:
                     perception_receipt = self._heartbeat_perception_receipt(
                         response,
@@ -8364,6 +9003,9 @@ class LifeEngineService(BaseService):
                             "heartbeat follow-up lost the exact World projection"
                         )
             except HeartbeatBudgetExhausted as exc:
+                self._discard_pending_heartbeat_memory_deliveries(
+                    pending_memory_deliveries
+                )
                 stop_reason = "deadline_exhausted"
                 stop_stage = exc.stage
                 break
@@ -8371,12 +9013,25 @@ class LifeEngineService(BaseService):
                 asyncio.TimeoutError,
                 LLMModelsCoolingDownError,
             ) as exc:
+                self._discard_pending_heartbeat_memory_deliveries(
+                    pending_memory_deliveries
+                )
                 # 冷却窗口内二次失败同样归一化为超时，保持心跳失败合同一致，
                 # 不把冷却中的本轮伪装成成功。
                 logger.warning(
                     f"life_engine heartbeat follow-up request timeout: {exc}"
                 )
                 raise TimeoutError("heartbeat follow-up request timeout") from exc
+            except asyncio.CancelledError:
+                self._discard_pending_heartbeat_memory_deliveries(
+                    pending_memory_deliveries
+                )
+                raise
+            except Exception:
+                self._discard_pending_heartbeat_memory_deliveries(
+                    pending_memory_deliveries
+                )
+                raise
 
         if stop_reason:
             logger.warning(
@@ -8940,6 +9595,11 @@ class LifeEngineService(BaseService):
             )
             self._memory_index_task_id = index_task.task_id
 
+        if self._memory_service is not None:
+            self._memory_service.set_behavior_health_provider(
+                self._memory_behavior_health_snapshot
+            )
+
         witness_cfg = getattr(cfg, "memory_witness", None)
         if self._memory_service is not None and bool(
             getattr(witness_cfg, "enabled", True)
@@ -9050,6 +9710,13 @@ class LifeEngineService(BaseService):
 
         await self._await_managed_task(self._memory_witness_task_id, timeout=10.0)
         self._memory_witness_task_id = None
+        detach_behavior_health = getattr(
+            self._memory_service,
+            "set_behavior_health_provider",
+            None,
+        )
+        if callable(detach_behavior_health):
+            detach_behavior_health(None)
         self._memory_witness_coordinator = None
         await self._await_managed_task(self._memory_index_task_id, timeout=10.0)
         self._memory_index_task_id = None
@@ -9192,9 +9859,6 @@ class LifeEngineService(BaseService):
                     return "", _SKIPPED_HEARTBEAT_PREPARED
 
             try:
-                if self._memory_integration is not None:
-                    await self._memory_integration.maybe_run_daily_decay()
-
                 if collect_background_agents:
                     try:
                         await self._collect_background_agent_results()

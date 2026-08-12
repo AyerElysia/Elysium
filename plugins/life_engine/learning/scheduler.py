@@ -43,7 +43,7 @@ from ..storage.subject_contracts import (
     SubjectDocumentPath,
 )
 from .auditor import InsightAuditor
-from .decisions import LearningCandidate, LearningDecisionLedger, SubjectAuthorityPort
+from .decisions import LearningDecisionLedger, SubjectAuthorityPort
 from .knowledge import SelfKnowledgeCompressor
 from .maintenance import (
     LearningMaintenanceEvent,
@@ -100,6 +100,8 @@ _DEFAULT_SUBJECT_REVIEW_INTERVAL_HOURS: dict[SubjectDocumentPath, float] = {
 _DEFAULT_SUBJECT_REVIEW_OFFER_COOLDOWN_HOURS = 24.0
 _SUBJECT_REVIEW_STATE_KEY = "subject_review_v1"
 _SUBJECT_REVIEW_SNOOZED_EVENT_KIND = "subject_review.snoozed"
+_SUBJECT_REVIEW_UNCHANGED_EVENT_KIND = "subject_review.unchanged"
+_SUBJECT_REVIEW_RECONCILE_PAGE_SIZE = 64
 _DEFAULT_MAINTENANCE_POLL_SECONDS = 15.0
 _MAINTENANCE_START_EVIDENCE_BACKOFF_BASE_SECONDS = 1.0
 _MAINTENANCE_START_EVIDENCE_BACKOFF_MAX_SECONDS = 60.0
@@ -233,7 +235,9 @@ class LearningScheduler:
 
         # 初始化核心组件
         self._selected_persistence: SelectedLearningPersistence | None = None
+        self._selected_persistence: SelectedLearningPersistence | None = None
         self._learning_event_store = learning_event_store
+        self._storage_runtime = getattr(learning_store, "runtime", None)
         self.decision_ledger: LearningDecisionLedger | None = None
         self._writer_instance_id = (
             str(writer_instance_id).strip() or f"learning_writer_{uuid4().hex}"
@@ -361,6 +365,12 @@ class LearningScheduler:
         self._projector_quiesce_reason = ""
         self._projector_quiesce_error_type = ""
 
+    @property
+    def storage_runtime(self) -> object | None:
+        """Return the selected Learning runtime for coherence checks."""
+
+        return self._storage_runtime
+
     async def initialize(self) -> None:
         """Restore bounded maintenance health without blocking the event loop."""
 
@@ -369,6 +379,7 @@ class LearningScheduler:
             self.store.reconcile_knowledge_versions()
             await self._selected_persistence.flush()
         await self.maintenance_journal.initialize()
+        await self.reconcile_subject_review_outcomes()
 
     async def flush(self) -> None:
         """Durably flush selected learning mutations at an async boundary."""
@@ -1739,10 +1750,17 @@ class LearningScheduler:
         for item in due:
             reasons = item.get("due_reasons", [])
             if "candidate_decision_pending" in reasons:
-                lines.append(
-                    f"- `{item['target_path']}`：候选 `{item['last_candidate_id']}` "
-                    "仍在等待你的独立决定；保持开放、拒绝或接受都有效，后台不会替你选择。"
-                )
+                if item["target_path"] == "MEMORY.md":
+                    lines.append(
+                        f"- `{item['target_path']}`：历史通用候选 "
+                        f"`{item['last_candidate_id']}` 只保留为迁移审计证据；"
+                        "它不能再被决定、接受或自动转换，也不会写入主体。"
+                    )
+                else:
+                    lines.append(
+                        f"- `{item['target_path']}`：候选 `{item['last_candidate_id']}` "
+                        "仍在等待你的独立决定；保持开放、拒绝或接受都有效，后台不会替你选择。"
+                    )
             elif "engineering_pressure" in reasons:
                 lines.append(
                     f"- `{item['target_path']}`：当前 {item['size_bytes']} bytes，"
@@ -1763,31 +1781,49 @@ class LearningScheduler:
         lines.extend(
             [
                 "- 你可以保持原样、稍后再看，或安静结束；后台不能替你解释或改写。",
-                "- 想复盘时使用 `nucleus_review_subject_document` 查看状态并记录你的选择。",
+                "- 复盘 SOUL.md 或 USER.md 时使用 `nucleus_review_subject_document`；"
+                "MEMORY.md 只使用统一的 `nucleus_memory_continuity_review` 会话。",
             ]
         )
         if any(item["target_path"] == "MEMORY.md" for item in due):
             lines.append(
-                "- 先用 `nucleus_review_subject_document` 分页看完当前精确 MEMORY；"
-                "对其中很长但仍需保留的原文，优先用 "
-                "`nucleus_create_memory_boundary_from_subject_range` 按 UTF-8 字节范围"
-                "直接封存，避免重新转写；不来自当前 MEMORY 的完整经历仍可用 "
-                "`nucleus_create_memory_boundary`。之后只能由你把返回的精确索引写进"
-                "完整 MEMORY.md 候选；移除索引不会删除历史正文。"
+                "- 用 `nucleus_memory_continuity_review` 的 open/read_source 固定统一"
+                " SOUL+USER+MEMORY revision 并分页读完当前 MEMORY；在同一个"
+                " prepare_candidate 中，把仍重要的长原文按精确 UTF-8 范围保存成"
+                "不可变 Boundary 并替换为索引，也可用 text_edits 明确新增、修订或"
+                "删除短文字。随后必须分页读完完整候选并另行 decide；移除索引只会"
+                "改变当前 MEMORY，不会删除 Boundary 正文或历史版本。"
             )
+            if any(
+                "candidate_decision_pending" in item.get("due_reasons", [])
+                and item["target_path"] == "MEMORY.md"
+                for item in due
+            ):
+                lines.append(
+                    "- 若这是统一会话上线前遗留的 MEMORY 通用候选，只能用 "
+                    "`nucleus_list_subject_candidates` 和 `nucleus_read_subject_candidate` "
+                    "作只读迁移审计；通用决定/接受入口会明确拒绝，不会自动转换或写入主体。"
+                    "新的 MEMORY 候选与决定只能重新从 `nucleus_memory_continuity_review` "
+                    "开始，并完成精确全文投递证明。"
+                )
         if any(
-            "candidate_decision_pending" in item.get("due_reasons", []) for item in due
+            "candidate_decision_pending" in item.get("due_reasons", [])
+            and item["target_path"] != "MEMORY.md"
+            for item in due
         ):
             lines.append(
                 "- 使用 `nucleus_list_subject_candidates` 和 "
                 "`nucleus_read_subject_candidate` 重新核对候选；只有另行调用 "
                 "`nucleus_decide_subject_candidate` 才会形成决定。"
             )
-        if snapshot["authority_status"] == "selected_ready":
+        if snapshot["authority_status"] == "selected_ready" and any(
+            item["target_path"] != "MEMORY.md" for item in due
+        ):
             lines.append(
-                "- 若你形成了完整新版本，只能先提交候选，再单独使用主体候选决定工具接受；不会自动合并或自动接受。"
+                "- 若你为 SOUL.md 或 USER.md 形成了完整新版本，只能先提交候选，"
+                "再单独使用主体候选决定工具接受；不会自动合并或自动接受。"
             )
-        else:
+        elif snapshot["authority_status"] != "selected_ready":
             lines.append(
                 "- 当前正式 Subject Authority 迁移尚未完成：可以记录保持不变或稍后再看，但新版本提交会明确拒绝，绝不退回直接写文件。"
             )
@@ -2083,6 +2119,160 @@ class LearningScheduler:
         )
         return occurred_at, snooze_until, str(result.events[0].event_sha256)
 
+    @classmethod
+    def _validate_selected_unchanged_event(
+        cls,
+        record: Any,
+        *,
+        occurrence_id: str,
+        target_path: SubjectDocumentPath,
+        actor_consciousness_instance_id: str,
+        subject_revision: str,
+        current_content_sha256: str,
+        reason: str,
+    ) -> datetime:
+        """Validate one immutable explicit no-change review occurrence."""
+
+        payload = getattr(record, "payload", None)
+        provenance = getattr(record, "provenance", None)
+        expected_payload = {
+            "schema_version": 1,
+            "target_path": target_path,
+            "outcome": "unchanged",
+            "actor_consciousness_instance_id": actor_consciousness_instance_id,
+            "subject_revision": subject_revision,
+            "current_content_sha256": current_content_sha256,
+            "source_occurrence_id": occurrence_id,
+            "reason": reason,
+            "authority": "review_evidence_only",
+        }
+        identity_matches = all(
+            (
+                str(getattr(record, "occurrence_id", "") or "") == occurrence_id,
+                str(getattr(record, "event_kind", "") or "")
+                == _SUBJECT_REVIEW_UNCHANGED_EVENT_KIND,
+                str(getattr(record, "source", "") or "")
+                == "subject.review.active_consciousness",
+                str(getattr(record, "actor_consciousness_instance_id", "") or "")
+                == actor_consciousness_instance_id,
+                str(getattr(record, "subject_revision", "") or "")
+                == subject_revision,
+                isinstance(payload, dict),
+                isinstance(provenance, dict),
+            )
+        )
+        if not identity_matches or any(
+            payload.get(key) != value for key, value in expected_payload.items()
+        ):
+            raise LearningOccurrenceConflict(
+                "SubjectReviewUnchangedOccurrenceConflict"
+            )
+        if (
+            provenance.get("source_occurrence_id") != occurrence_id
+            or provenance.get("current_content_sha256")
+            != current_content_sha256
+        ):
+            raise LearningOccurrenceConflict(
+                "SubjectReviewUnchangedOccurrenceConflict"
+            )
+        occurred_at = cls._parse_review_time(getattr(record, "occurred_at", ""))
+        if occurred_at is None:
+            raise LearningOccurrenceConflict(
+                "SubjectReviewUnchangedOccurrenceConflict"
+            )
+        return occurred_at
+
+    async def _append_selected_unchanged_event(
+        self,
+        *,
+        occurrence_id: str,
+        target_path: SubjectDocumentPath,
+        actor_consciousness_instance_id: str,
+        subject_revision: str,
+        current_content_sha256: str,
+        reason: str,
+    ) -> tuple[datetime, str]:
+        """Append explicit no-change evidence before updating its projection."""
+
+        if self._learning_event_store is None:
+            raise RuntimeError("SubjectReviewImmutableEvidenceRequired")
+        existing = await self._learning_event_store.event_by_occurrence(occurrence_id)
+        if existing is not None:
+            occurred_at = self._validate_selected_unchanged_event(
+                existing,
+                occurrence_id=occurrence_id,
+                target_path=target_path,
+                actor_consciousness_instance_id=actor_consciousness_instance_id,
+                subject_revision=subject_revision,
+                current_content_sha256=current_content_sha256,
+                reason=reason,
+            )
+            return occurred_at, str(existing.event_sha256)
+
+        occurred_at = datetime.now(UTC)
+        draft = LearningEventDraft(
+            occurrence_id=occurrence_id,
+            event_kind=_SUBJECT_REVIEW_UNCHANGED_EVENT_KIND,
+            occurred_at=occurred_at.isoformat(),
+            source="subject.review.active_consciousness",
+            actor_consciousness_instance_id=actor_consciousness_instance_id,
+            subject_revision=subject_revision,
+            provenance={
+                "schema_version": 1,
+                "source_occurrence_id": occurrence_id,
+                "target_path": target_path,
+                "current_content_sha256": current_content_sha256,
+                "authority": "review_evidence_only",
+                "writer_instance_id": self._writer_instance_id,
+            },
+            payload={
+                "schema_version": 1,
+                "target_path": target_path,
+                "outcome": "unchanged",
+                "actor_consciousness_instance_id": (
+                    actor_consciousness_instance_id
+                ),
+                "subject_revision": subject_revision,
+                "current_content_sha256": current_content_sha256,
+                "source_occurrence_id": occurrence_id,
+                "reason": reason,
+                "authority": "review_evidence_only",
+            },
+        )
+        try:
+            result = await self._learning_event_store.commit(
+                events=[draft],
+                projections=[],
+            )
+        except LearningOccurrenceConflict:
+            existing = await self._learning_event_store.event_by_occurrence(
+                occurrence_id
+            )
+            if existing is None:
+                raise
+            occurred_at = self._validate_selected_unchanged_event(
+                existing,
+                occurrence_id=occurrence_id,
+                target_path=target_path,
+                actor_consciousness_instance_id=actor_consciousness_instance_id,
+                subject_revision=subject_revision,
+                current_content_sha256=current_content_sha256,
+                reason=reason,
+            )
+            return occurred_at, str(existing.event_sha256)
+        if len(result.events) != 1:
+            raise RuntimeError("SubjectReviewImmutableEvidenceMissing")
+        occurred_at = self._validate_selected_unchanged_event(
+            result.events[0],
+            occurrence_id=occurrence_id,
+            target_path=target_path,
+            actor_consciousness_instance_id=actor_consciousness_instance_id,
+            subject_revision=subject_revision,
+            current_content_sha256=current_content_sha256,
+            reason=reason,
+        )
+        return occurred_at, str(result.events[0].event_sha256)
+
     @staticmethod
     def _require_review_event_hash(record: Any) -> str:
         digest = str(getattr(record, "event_sha256", "") or "").strip().lower()
@@ -2375,6 +2565,37 @@ class LearningScheduler:
                             separators=(",", ":"),
                         ).encode("utf-8")
                     ).hexdigest()
+            elif normalized_outcome == "unchanged" and selected_review_mode:
+                if self._read_subject_authority is None:
+                    raise RuntimeError("SelectedSubjectAuthorityReaderRequired")
+                revision = await self.validate_subject_review_context(
+                    actor_consciousness_instance_id=actor,
+                    expected_subject_revision=revision,
+                )
+                authority_snapshot = await self._read_subject_authority()
+                snapshot_revision = (
+                    str(getattr(authority_snapshot, "revision", "") or "")
+                    .strip()
+                    .lower()
+                )
+                if snapshot_revision and snapshot_revision != revision:
+                    raise RuntimeError("LearningSubjectRevisionConflict")
+                current_content, _ = self._subject_observation_from_snapshot(
+                    authority_snapshot,
+                    target_path,
+                )
+                current_content_sha256 = hashlib.sha256(current_content).hexdigest()
+                current_size_bytes = len(current_content)
+                occurred_at, evidence_sha256 = (
+                    await self._append_selected_unchanged_event(
+                        occurrence_id=occurrence_text,
+                        target_path=target_path,
+                        actor_consciousness_instance_id=actor,
+                        subject_revision=revision,
+                        current_content_sha256=current_content_sha256,
+                        reason=reason_text,
+                    )
+                )
             else:
                 current_content = await self.read_subject_document(target_path)
                 current_content_sha256 = hashlib.sha256(current_content).hexdigest()
@@ -2469,6 +2690,138 @@ class LearningScheduler:
             await self.flush()
             return dict(record)
 
+    async def _advance_subject_review_outcome_cursor(
+        self,
+        position: int,
+        *,
+        frontier: int,
+    ) -> None:
+        """Persist one monotonic derived-consumer cursor after projection."""
+
+        async with self._subject_review_lock:
+            state, review = self._subject_review_state()
+            current = max(
+                0,
+                int(review.get("outcome_event_cursor", 0) or 0),
+            )
+            review["outcome_event_cursor"] = max(current, int(position))
+            review["outcome_event_frontier"] = max(0, int(frontier))
+            review["outcome_reconcile_last_success_at"] = _now_iso()
+            review["outcome_reconcile_last_error_type"] = ""
+            state[_SUBJECT_REVIEW_STATE_KEY] = review
+            self.store.save_state(state)
+            await self.flush()
+
+    async def _record_subject_review_reconcile_failure(
+        self,
+        exc: Exception,
+    ) -> None:
+        async with self._subject_review_lock:
+            state, review = self._subject_review_state()
+            review["outcome_reconcile_last_error_type"] = type(exc).__name__
+            review["outcome_reconcile_last_failure_at"] = _now_iso()
+            state[_SUBJECT_REVIEW_STATE_KEY] = review
+            self.store.save_state(state)
+            await self.flush()
+
+    async def reconcile_subject_review_outcomes(self) -> int:
+        """Recover committed subject-review projections from immutable events.
+
+        A subject authority commit is final even if the process dies before the
+        scheduler's bounded current-state projection is updated.  This consumer
+        replays ``candidate.committed`` evidence in position order, projects it
+        idempotently, and only then advances its durable cursor.
+        """
+
+        store = self._learning_event_store
+        if store is None or self._projector_quiesced:
+            return 0
+        try:
+            _, review = self._subject_review_state()
+            cursor = max(0, int(review.get("outcome_event_cursor", 0) or 0))
+            page = await store.read_events(
+                cursor,
+                limit=_SUBJECT_REVIEW_RECONCILE_PAGE_SIZE,
+                event_kinds=("candidate.committed",),
+            )
+            recovered = 0
+            for authority_event in page:
+                payload = authority_event.payload
+                provenance = authority_event.provenance
+                if not isinstance(payload, dict) or not isinstance(provenance, dict):
+                    raise RuntimeError("SubjectReviewAuthorityEvidenceCorrupt")
+                decision_occurrence_id = str(
+                    payload.get("decision_occurrence_id") or ""
+                ).strip()
+                authority_occurrence_id = str(
+                    provenance.get("authority_occurrence_id") or ""
+                ).strip()
+                decision = await store.event_by_occurrence(decision_occurrence_id)
+                if decision is None or decision.event_kind != "candidate.accept_requested":
+                    raise RuntimeError("SubjectReviewDecisionEvidenceMissing")
+                decision_payload = decision.payload
+                if not isinstance(decision_payload, dict):
+                    raise RuntimeError("SubjectReviewDecisionEvidenceCorrupt")
+                target_path = str(decision_payload.get("target_path") or "")
+                if target_path not in SUBJECT_AUTHORITY_PATHS:
+                    raise RuntimeError("SubjectReviewDecisionTargetInvalid")
+                candidate_id = str(decision_payload.get("candidate_id") or "")
+                candidate_sha256 = str(
+                    decision_payload.get("candidate_sha256") or ""
+                ).lower()
+                reason = str(decision_payload.get("reason") or "").strip()
+                new_revision = str(
+                    payload.get("new_subject_revision")
+                    or authority_event.subject_revision
+                    or ""
+                ).lower()
+                if not all(
+                    (
+                        candidate_id,
+                        len(candidate_sha256) == 64,
+                        reason,
+                        len(new_revision) == 64,
+                        authority_occurrence_id,
+                        decision.actor_consciousness_instance_id,
+                    )
+                ):
+                    raise RuntimeError("SubjectReviewCommitEvidenceIncomplete")
+                await self.record_subject_review_outcome(
+                    target_path=target_path,  # type: ignore[arg-type]
+                    outcome="committed",
+                    actor_consciousness_instance_id=(
+                        decision.actor_consciousness_instance_id
+                    ),
+                    subject_revision=new_revision,
+                    occurrence_id=decision_occurrence_id,
+                    reason=reason,
+                    candidate_id=candidate_id,
+                    candidate_sha256=candidate_sha256,
+                    authority_occurrence_id=authority_occurrence_id,
+                )
+                await self._advance_subject_review_outcome_cursor(
+                    authority_event.position,
+                    frontier=authority_event.position,
+                )
+                cursor = authority_event.position
+                recovered += 1
+            return recovered
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - retryable derived projection
+            try:
+                await self._record_subject_review_reconcile_failure(exc)
+            except Exception as record_exc:  # noqa: BLE001
+                logger.warning(
+                    "主体复盘结果恢复状态入账失败: %s",
+                    type(record_exc).__name__,
+                )
+            logger.warning(
+                "主体复盘结果恢复失败，将从原游标重试: %s",
+                type(exc).__name__,
+            )
+            return 0
+
     # ── 心跳驱动入口 ─────────────────────────────────────────
 
     async def on_heartbeat(self) -> None:
@@ -2479,6 +2832,7 @@ class LearningScheduler:
         if self._projector_quiesced:
             return
         async with self._maintenance_lock:
+            await self.reconcile_subject_review_outcomes()
             await self._ingest_reflection_events()
             run_id = f"learning_heartbeat_{uuid4().hex}"
             phases: tuple[
@@ -2716,76 +3070,13 @@ class LearningScheduler:
             # to promote it into subject or self-authoritative content.
             await self.flush()
             self._snapshot_metrics_now()
-        await self._bridge_pending_knowledge_candidate()
 
     def _compression_work_due(self) -> bool:
-        if self.compressor.should_compress():
-            return True
-        if self.decision_ledger is None:
-            return False
-        state = self.store.load_state()
-        return int(state.get("last_knowledge_candidate_version", 0) or 0) > int(
-            state.get("last_knowledge_candidate_ledgered_version", 0) or 0
-        )
-
-    async def _bridge_pending_knowledge_candidate(self) -> None:
-        """Persist a deterministic subject proposal without accepting it."""
-
-        if self.decision_ledger is None:
-            return
-        state = self.store.load_state()
-        version = int(state.get("last_knowledge_candidate_version", 0) or 0)
-        ledgered = int(state.get("last_knowledge_candidate_ledgered_version", 0) or 0)
-        if version <= 0 or version <= ledgered:
-            return
-        if self._current_subject_revision is None:
-            raise RuntimeError("LearningSubjectAuthorityRevisionUnavailable")
-        content = self.store.read_knowledge_version(version)
-        content_bytes = content.encode("utf-8")
-        content_sha256 = hashlib.sha256(content_bytes).hexdigest()
-        manifest = self.store.load_knowledge_manifest()
-        versions = manifest.get("versions", [])
-        version_record = next(
-            (
-                item
-                for item in versions
-                if isinstance(item, dict)
-                and int(item.get("version", 0) or 0) == version
-            ),
-            None,
-        )
-        if version_record is None:
-            raise RuntimeError("LearningKnowledgeCandidateManifestMissing")
-        occurred_at = str(version_record.get("timestamp", ""))
-        if not occurred_at:
-            raise RuntimeError("LearningKnowledgeCandidateTimestampMissing")
-        subject_revision = await self._current_subject_revision()
-        candidate_id = f"learning_knowledge_v{version}_{content_sha256[:16]}"
-        candidate = LearningCandidate.create(
-            candidate_id=candidate_id,
-            candidate_revision=1,
-            candidate_occurrence_id=f"learning_candidate:{candidate_id}:1",
-            candidate_kind="derived_observation_document",
-            candidate_content_bytes=content_bytes,
-            source_occurrence_id=(f"knowledge_version:{version}:{content_sha256}"),
-            source="learning.knowledge_compression",
-            subject_revision=subject_revision,
-            target_path="MEMORY.md",
-            occurred_at=occurred_at,
-            provenance={
-                "knowledge_version": version,
-                "independent_gate_recommended": bool(
-                    state.get("last_knowledge_candidate_recommended", False)
-                ),
-                "authority": "candidate_only",
-            },
-        )
-        await self.decision_ledger.append_candidate(candidate)
-        state = self.store.load_state()
-        state["last_knowledge_candidate_ledgered_version"] = version
-        state["last_knowledge_candidate_id"] = candidate_id
-        self.store.save_state(state)
-        await self.flush()
+        # Compression versions are durable epistemic/knowledge artifacts.  They
+        # are deliberately not bridged into a subject-document candidate: the
+        # only producer and acceptance path for MEMORY.md is the continuity
+        # review session with exact full-candidate delivery proof.
+        return self.compressor.should_compress()
 
     async def _backfill_epistemic_claims(self) -> None:
         """一次性回填：将所有历史 validated 洞察投影到认识论层。
@@ -3040,11 +3331,44 @@ class LearningScheduler:
 
     # ── 状态 ─────────────────────────────────────────────────
 
+    def _subject_review_outcome_reconcile_health(
+        self,
+        review: dict[str, Any],
+    ) -> dict[str, Any]:
+        if self._learning_event_store is None:
+            return {
+                "status": "disabled",
+                "reason": "immutable_learning_event_store_unavailable",
+            }
+        cursor = max(0, int(review.get("outcome_event_cursor", 0) or 0))
+        frontier = max(
+            cursor,
+            int(review.get("outcome_event_frontier", cursor) or cursor),
+        )
+        error_type = str(
+            review.get("outcome_reconcile_last_error_type") or ""
+        )
+        return {
+            "status": "degraded" if error_type else "healthy",
+            "cursor": cursor,
+            "frontier": frontier,
+            "backlog_lower_bound": max(0, frontier - cursor),
+            "last_success_at": str(
+                review.get("outcome_reconcile_last_success_at") or ""
+            ),
+            "last_failure_at": str(
+                review.get("outcome_reconcile_last_failure_at") or ""
+            ),
+            "last_error_type": error_type,
+            "authority_commit_replay": True,
+        }
+
     def _subject_review_health_snapshot(self) -> dict[str, Any]:
         try:
             _, review = self._subject_review_state()
             documents = review["documents"]
             assert isinstance(documents, dict)
+            outcome_reconcile = self._subject_review_outcome_reconcile_health(review)
             if self._read_subject_authority is not None:
                 now = datetime.now(UTC)
                 snapshots: list[dict[str, Any]] = []
@@ -3198,7 +3522,7 @@ class LearningScheduler:
                         "disabled"
                         if not self._subject_review_enabled
                         else "degraded"
-                        if missing
+                        if missing or outcome_reconcile["status"] == "degraded"
                         else "healthy"
                     ),
                     "authority_status": (
@@ -3217,6 +3541,7 @@ class LearningScheduler:
                         review.get("last_observed_subject_revision") or ""
                     ),
                     "last_observed_at": str(review.get("last_observed_at") or ""),
+                    "outcome_reconciliation": outcome_reconcile,
                     "documents": snapshots,
                 }
             now = datetime.now(UTC)
@@ -3333,7 +3658,7 @@ class LearningScheduler:
                 "disabled"
                 if not self._subject_review_enabled
                 else "degraded"
-                if missing
+                if missing or outcome_reconcile["status"] == "degraded"
                 else "healthy"
             )
             return {
@@ -3352,6 +3677,7 @@ class LearningScheduler:
                     review.get("last_observed_subject_revision") or ""
                 ),
                 "last_observed_at": str(review.get("last_observed_at") or ""),
+                "outcome_reconciliation": outcome_reconcile,
                 "documents": snapshots,
             }
         except Exception as exc:  # noqa: BLE001 - health must not raise

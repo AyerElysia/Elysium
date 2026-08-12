@@ -11,6 +11,7 @@ import pytest
 
 from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.memory import EdgeType, LifeMemoryService
+from plugins.life_engine.memory.nodes import MemoryNode
 from plugins.life_engine.tools.file_tools import FetchLifeMemoryTool
 
 
@@ -39,11 +40,72 @@ def _make_plugin(tmp_path: Path) -> _DummyPlugin:
     return _DummyPlugin(config=config)
 
 
-def test_dream_system_lineage_keeps_old_memory_and_resolves_current_file(
+async def _seed_legacy_migration_node(
+    service: LifeMemoryService,
+    file_path: str,
+    *,
+    title: str = "",
+    content: str = "",
+) -> MemoryNode:
+    """Seed one historical node through the local migration-only adapter."""
+    return await service._require_memory_storage().legacy_graph.get_or_create_file_node(
+        file_path,
+        title,
+        content,
+    )
+
+
+async def _seed_legacy_migration_edge(
+    service: LifeMemoryService,
+    source: MemoryNode,
+    target: MemoryNode,
+    edge_type: EdgeType,
+    *,
+    reason: str,
+    strength: float = 0.7,
+) -> None:
+    """Seed immutable legacy lineage evidence for migration/read tests."""
+    await service._require_memory_storage().legacy_graph.create_or_update_edge(
+        source.node_id,
+        target.node_id,
+        edge_type.value,
+        reason=reason,
+        strength=strength,
+        bidirectional=False,
+    )
+
+
+async def _seed_legacy_migration_correction(
+    service: LifeMemoryService,
+    *,
+    topic: str,
+    message: str,
+    related_node: MemoryNode,
+    query: str,
+) -> None:
+    """Seed one old correction row without exposing it as a runtime capability."""
+    await service._require_memory_storage().legacy_graph.insert_correction(
+        topic=topic,
+        message=message,
+        source="migration_fixture",
+        related_node_id=related_node.node_id,
+        query=query,
+        stream_id=None,
+    )
+
+
+def _legacy_row_counts(service: LifeMemoryService) -> tuple[int, int, int]:
+    return tuple(
+        service._db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in ("memory_nodes", "memory_edges", "memory_corrections")
+    )
+
+
+def test_historical_dream_system_lineage_remains_readable_but_not_authorable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """旧研究笔记不应被删掉，而应指向后来的当前文件。"""
+    """旧 lineage/correction 可读，但正式运行时不能再写第二套语义。"""
 
     async def _run() -> None:
         plugin = _make_plugin(tmp_path)
@@ -70,14 +132,22 @@ def test_dream_system_lineage_keeps_old_memory_and_resolves_current_file(
 
         old_file = tmp_path / old_path
         old_file.write_text("旧笔记内容", encoding="utf-8")
-        await service.get_or_create_file_node(
+        old_node = await _seed_legacy_migration_node(
+            service,
             old_path,
             title="dream_system_research",
             content="做梦系统还在研究阶段，旧笔记只记录了早期方案。",
         )
-        await service.create_memory_lineage_edge(
-            old_path,
+        current_node = await _seed_legacy_migration_node(
+            service,
             current_path,
+            title="dream_system",
+            content=current_file.read_text(encoding="utf-8"),
+        )
+        await _seed_legacy_migration_edge(
+            service,
+            old_node,
+            current_node,
             EdgeType.RENAMES,
             reason="显式整理到当前笔记",
         )
@@ -87,18 +157,42 @@ def test_dream_system_lineage_keeps_old_memory_and_resolves_current_file(
         assert resolution["resolved_path"] == current_path
         assert resolution["lineage"][0]["relation"] == "renames"
 
-        await service.record_memory_correction(
+        correction_message = (
+            "做梦系统早就做好了；旧研究笔记只能作为早期轨迹，不代表当前状态。"
+        )
+        await _seed_legacy_migration_correction(
+            service,
             topic="做梦系统",
-            message="做梦系统早就做好了；旧研究笔记只能作为早期轨迹，不代表当前状态。",
-            related_paths=[current_path],
+            message=correction_message,
+            related_node=current_node,
             query="做梦系统",
         )
+
+        before_rejected_writes = _legacy_row_counts(service)
+        with pytest.raises(RuntimeError, match="LegacyLineageMutationRetired"):
+            await service.create_memory_lineage_edge(
+                old_path,
+                current_path,
+                EdgeType.RENAMES,
+                reason="runtime authoring is retired",
+            )
+        with pytest.raises(RuntimeError, match="LegacyCorrectionMutationRetired"):
+            await service.record_memory_correction(
+                topic="做梦系统",
+                message="runtime correction authoring is retired",
+                related_paths=[current_path],
+                query="做梦系统",
+            )
+        assert _legacy_row_counts(service) == before_rejected_writes
 
         bundles = await service.search_memory_bundles("做梦系统", top_k=3)
         assert bundles
         bundle = bundles[0]
         assert bundle.primary_path == current_path
-        assert "早就做好了" in bundle.current_understanding
+        assert "已经做好了" in bundle.current_understanding
+        assert correction_message in {
+            correction.message for correction in bundle.corrections
+        }
 
         evidence_paths = {item.file_path for item in bundle.evidence}
         assert old_path in evidence_paths
@@ -144,33 +238,33 @@ async def test_explicit_lineage_prefers_deep_existing_target_over_source_and_dea
     for path in (source_path, middle_path, current_path):
         (tmp_path / path).write_text(path, encoding="utf-8")
 
-    source = await service.get_or_create_file_node(source_path, title="A")
-    middle = await service.get_or_create_file_node(middle_path, title="B")
-    current = await service.get_or_create_file_node(current_path, title="C")
-    dead = await service.get_or_create_file_node("notes/dead.md", title="dead")
-    await service.create_or_update_edge(
-        source.node_id,
-        dead.node_id,
+    source = await _seed_legacy_migration_node(service, source_path, title="A")
+    middle = await _seed_legacy_migration_node(service, middle_path, title="B")
+    current = await _seed_legacy_migration_node(service, current_path, title="C")
+    dead = await _seed_legacy_migration_node(service, "notes/dead.md", title="dead")
+    await _seed_legacy_migration_edge(
+        service,
+        source,
+        dead,
         EdgeType.RENAMES,
         reason="dead preferred branch",
         strength=0.99,
-        bidirectional=False,
     )
-    await service.create_or_update_edge(
-        source.node_id,
-        middle.node_id,
+    await _seed_legacy_migration_edge(
+        service,
+        source,
+        middle,
         EdgeType.RENAMES,
         reason="explicit first step",
         strength=0.5,
-        bidirectional=False,
     )
-    await service.create_or_update_edge(
-        middle.node_id,
-        current.node_id,
+    await _seed_legacy_migration_edge(
+        service,
+        middle,
+        current,
         EdgeType.REFINES,
         reason="explicit current step",
         strength=0.5,
-        bidirectional=False,
     )
 
     resolution = await service.resolve_canonical_path(source_path, max_depth=3)
@@ -228,7 +322,7 @@ async def test_fetch_does_not_persist_guessed_lineage(
     ) == before
 
 
-async def test_lineage_rejects_missing_unindexed_path_but_keeps_history(
+async def test_runtime_lineage_authoring_fails_closed_and_keeps_historical_rows(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -246,21 +340,32 @@ async def test_lineage_rejects_missing_unindexed_path_but_keeps_history(
     current_path = "notes/current.md"
     (tmp_path / current_path).write_text("current", encoding="utf-8")
     historical_path = "notes/old.md"
-    await service.get_or_create_file_node(
+    historical = await _seed_legacy_migration_node(
+        service,
         historical_path,
         title="old",
         content="historical evidence",
     )
-
-    await service.create_memory_lineage_edge(
-        historical_path,
+    current = await _seed_legacy_migration_node(
+        service,
         current_path,
+        title="current",
+        content="current",
+    )
+    await _seed_legacy_migration_edge(
+        service,
+        historical,
+        current,
         EdgeType.RENAMES,
         reason="保留旧文件作为历史证据",
     )
 
-    before = service._db.execute("SELECT COUNT(*) FROM memory_nodes").fetchone()[0]
-    with pytest.raises(ValueError, match="记忆文档不存在或不可访问"):
+    resolution = await service.resolve_canonical_path(historical_path)
+    assert resolution["resolved"] is True
+    assert resolution["resolved_path"] == current_path
+
+    before = _legacy_row_counts(service)
+    with pytest.raises(RuntimeError, match="LegacyLineageMutationRetired"):
         await service.create_memory_lineage_edge(
             "notes/typo.md",
             current_path,
@@ -268,5 +373,5 @@ async def test_lineage_rejects_missing_unindexed_path_but_keeps_history(
             reason="此路径不应创建空白节点",
         )
 
-    assert service._db.execute("SELECT COUNT(*) FROM memory_nodes").fetchone()[0] == before
+    assert _legacy_row_counts(service) == before
     assert await service.get_node_by_file_path(historical_path) is not None

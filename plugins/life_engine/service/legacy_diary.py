@@ -45,7 +45,8 @@ def parse_legacy_diary_file(path: Path, *, root: Path) -> list[LegacyDiaryEntry]
         logger.warning(f"跳过无法识别日期的旧日记: {relative}")
         return []
     entries = []
-    for index, match in enumerate(_ENTRY_PATTERN.finditer(raw)):
+    duplicate_ordinals: dict[tuple[str, str], int] = {}
+    for match in _ENTRY_PATTERN.finditer(raw):
         content = match.group("content").strip()
         if not content:
             continue
@@ -54,8 +55,16 @@ def parse_legacy_diary_file(path: Path, *, root: Path) -> list[LegacyDiaryEntry]
             hour=hour,
             minute=minute,
         )
+        occurred_text = occurred.isoformat()
+        content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        duplicate_key = (occurred_text, content_hash)
+        duplicate_ordinal = duplicate_ordinals.get(duplicate_key, 0)
+        duplicate_ordinals[duplicate_key] = duplicate_ordinal + 1
         migration_key = hashlib.sha256(
-            f"{relative}\0{source_hash}\0{index}\0{content}".encode("utf-8")
+            (
+                f"{relative}\0{occurred_text}\0{content_hash}\0"
+                f"{duplicate_ordinal}"
+            ).encode("utf-8")
         ).hexdigest()
         entries.append(
             LegacyDiaryEntry(
@@ -63,8 +72,8 @@ def parse_legacy_diary_file(path: Path, *, root: Path) -> list[LegacyDiaryEntry]
                 source_hash=source_hash,
                 migration_key=migration_key,
                 content=content,
-                valid_from=occurred.isoformat(),
-                recorded_at=occurred.isoformat(),
+                valid_from=occurred_text,
+                recorded_at=occurred_text,
             )
         )
     return entries

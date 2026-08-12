@@ -18,7 +18,6 @@ _PARALLEL_SAFE_TOOL_NAMES: frozenset[str] = frozenset(
         "nucleus_list_todos",
         "nucleus_memory_stats",
         "nucleus_read_file",
-        "nucleus_view_relations",
         "nucleus_web_search",
     }
 )

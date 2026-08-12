@@ -12,11 +12,11 @@ from typing import TYPE_CHECKING, Any
 from src.app.plugin_system.api.log_api import get_logger
 
 from .event_builder import (
+    INTERNAL_PLATFORM,
     EventType,
     _format_time_display,
     _now_iso,
     _shorten_text,
-    INTERNAL_PLATFORM,
     is_life_heartbeat_event,
 )
 
@@ -69,8 +69,9 @@ def to_jsonable(value: Any) -> Any:
 class DFCIntegration:
     """DFC 集成管理器。
 
-    负责与 DFC（对话流控制器）的交互，包括状态摘要生成、
-    梦记录注入、异步消息传递等。
+    负责与 DFC（对话流控制器）的交互，包括运行状态摘要生成与
+    异步消息传递。长期经历和日记不在这里另建旁路；需要回忆时统一
+    通过 LifeMemoryService 的可追溯检索与记忆边界读取链取得。
     """
 
     def __init__(self, service: "LifeEngineService") -> None:
@@ -102,18 +103,18 @@ class DFCIntegration:
         这个快照是 DFC 的单一状态来源：
         - state_digest: 给 prompt / 状态查询用的简短摘要
         - active_todo_lines: 活跃 TODO 的短行摘要
-        - recent_diary_lines: 最近日记的短行摘要
+
+        日记和长期记忆不复制到该瞬时快照，避免绕过统一记忆检索、
+        来源版本和边界回读证明。
         """
         async with self._service._get_lock():
             state_digest = self._build_state_digest_locked()
             todo_lines = self._load_active_todo_lines()
-            diary_lines = self._load_recent_diary_lines()
 
         return {
             "generated_at": _now_iso(),
             "state_digest": state_digest,
             "active_todo_lines": todo_lines,
-            "recent_diary_lines": diary_lines,
         }
 
     def _build_state_digest_locked(self) -> str:
@@ -179,7 +180,7 @@ class DFCIntegration:
         return ""
 
     async def query_actor_context(self) -> str:
-        """供 DFC 同步查询当前状态、TODO 与最近日记。
+        """供 DFC 同步查询当前运行状态与 TODO。
 
         Returns:
             格式化的上下文摘要
@@ -194,10 +195,6 @@ class DFCIntegration:
         todo_lines = [str(line).strip() for line in snapshot.get("active_todo_lines") or [] if str(line).strip()]
         if todo_lines:
             parts.append("【活跃 TODO】\n" + "\n".join(todo_lines))
-
-        diary_lines = [str(line).strip() for line in snapshot.get("recent_diary_lines") or [] if str(line).strip()]
-        if diary_lines:
-            parts.append("【最近日记】\n" + "\n".join(diary_lines))
 
         return "\n\n".join(part for part in parts if part.strip())
 
@@ -223,29 +220,11 @@ class DFCIntegration:
             lines.append(f"- {todo.title} ({todo.status}/{todo.priority}){suffix}")
         return lines
 
-    def _load_recent_diary_lines(self, *, limit: int = 2) -> list[str]:
-        """读取最近几篇日记的预览。"""
-        diary_dir = self._workspace_dir() / "diary"
-        if not diary_dir.exists():
-            return []
-
-        lines: list[str] = []
-        for diary_file in sorted(diary_dir.glob("*.md"), reverse=True)[:limit]:
-            try:
-                content = " ".join(diary_file.read_text(encoding="utf-8").split())
-            except Exception:
-                continue
-            if not content:
-                continue
-            preview = _shorten_text(content, max_length=120)
-            lines.append(f"- {diary_file.stem}: {preview}")
-        return lines
-
-
 class MemoryIntegration:
     """记忆系统集成管理器。
 
-    负责记忆服务的初始化与日常衰减任务。
+    负责把记忆服务接入 Life Engine 拥有的唯一 coherent runtime。
+    旧日衰减入口只保留为显式 no-op 兼容边界。
     """
 
     def __init__(self, service: "LifeEngineService") -> None:
@@ -255,10 +234,9 @@ class MemoryIntegration:
             service: LifeEngineService 实例
         """
         self._service = service
-        self._last_decay_date: str | None = None
 
     async def init_memory_service(self) -> None:
-        """初始化仿生记忆服务。"""
+        """初始化可追溯生命记忆服务。"""
         try:
             from ..memory.service import LifeMemoryService
 
@@ -285,26 +263,17 @@ class MemoryIntegration:
                 selectable_storage_enabled=storage_enabled,
             )
             await self._service._memory_service.initialize()
-            logger.info("life_engine 仿生记忆服务已初始化")
+            logger.info("life_engine 生命记忆服务已初始化")
         except Exception as e:
             logger.error(f"记忆服务初始化失败: {e}", exc_info=True)
             self._service._memory_service = None
 
     async def maybe_run_daily_decay(self) -> None:
-        """每日运行一次记忆衰减任务。"""
-        if not self._service._memory_service:
-            return
+        """Compatibility no-op for the retired score-driven decay loop.
 
-        today = datetime.now().strftime("%Y-%m-%d")
-        if self._last_decay_date == today:
-            return
+        Recall history and explicit subject interpretation now drive living
+        accessibility.  Infrastructure must not delete or weaken a relation
+        because a score, age, access count, or emotion field crossed a limit.
+        """
 
-        try:
-            update_count = await self._service._memory_service.apply_decay()
-            self._last_decay_date = today
-            if update_count > 0:
-                logger.info(
-                    f"life_engine 记忆衰减完成: 更新节点={update_count}"
-                )
-        except Exception as e:
-            logger.error(f"记忆衰减任务失败: {e}", exc_info=True)
+        return None

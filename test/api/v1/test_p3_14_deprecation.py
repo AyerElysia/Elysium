@@ -1,8 +1,8 @@
 """P3-14 阶段三旧插件路由迁移期契约测试。
 
-阶段三 /api/v1 统一接口上线后，被取代的旧插件路由必须在迁移期保留，
+阶段三 /api/v1 统一接口上线后，仍处于迁移期的旧插件路由必须保留，
 并通过声明式 deprecation 标记附加 Deprecation / Sunset / Link 响应头，
-提示旧客户端迁移。本测试验证四组旧 Router 的弃用契约，且不删除旧路由。
+提示旧客户端迁移。MemoryRouter 已完全退出正式组件，不属于这组兼容路由。
 """
 
 from __future__ import annotations
@@ -11,7 +11,6 @@ from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
-from plugins.life_engine.memory.router import MemoryRouter
 from plugins.livestream.router import LivestreamRouter
 from plugins.neko_surface.router import NekoSurfaceRouter
 from plugins.voice_live.router import VoiceLiveRouter
@@ -21,7 +20,6 @@ LEGACY_ROUTERS = (
     (LivestreamRouter, "/livestream", "/api/v1/livestream"),
     (VoiceLiveRouter, "/voice-live", "/api/v1/voice-calls"),
     (NekoSurfaceRouter, "/api/neko-surface", "/api/v1/surfaces"),
-    (MemoryRouter, "/memory_vis", "/api/v1/admin/memory"),
 )
 
 
@@ -76,16 +74,11 @@ def _instantiate(router_cls: type, *, plugin: object):
 
         gateway.bind_input_handler(handle_input)
         return router_cls(plugin=SimpleNamespace(gateway=gateway))
-    # MemoryRouter 需要 plugin.service._memory_service（可空，health 返回 disabled）
-    return router_cls(
-        plugin=SimpleNamespace(
-            service=SimpleNamespace(_memory_service=None),
-        )
-    )
+    raise AssertionError(f"unsupported legacy router: {router_cls.__name__}")
 
 
 def test_every_legacy_router_declares_deprecation() -> None:
-    """四组旧路由都必须声明弃用标记。"""
+    """仍在迁移期的三组旧路由都必须声明弃用标记。"""
     for router_cls, mount, replaced_by in LEGACY_ROUTERS:
         assert router_cls.deprecation_notice, (
             f"{router_cls.__name__} ({mount}) 必须声明 deprecation_notice"
@@ -107,7 +100,6 @@ def test_legacy_routers_still_serve_and_return_deprecation_headers() -> None:
         LivestreamRouter: "/health",
         VoiceLiveRouter: "/health",
         NekoSurfaceRouter: "/status",
-        MemoryRouter: "/",
     }
     for router_cls, _mount, _replaced_by in LEGACY_ROUTERS:
         router = _instantiate(router_cls, plugin=object())

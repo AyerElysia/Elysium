@@ -7,13 +7,11 @@ from typing import Any
 
 import pytest
 
+from plugins.life_engine.memory import tools as memory_tools
 from plugins.life_engine.memory.living import SemanticRelation
 from plugins.life_engine.memory.tools import (
     LEGACY_RELATION_MUTATION_RETIRED,
     MEMORY_TOOLS,
-    LifeEngineForgetRelationTool,
-    LifeEngineRelateFileTool,
-    LifeEngineViewRelationsTool,
     NucleusRelationsTool,
 )
 from plugins.life_engine.service import registry as service_registry
@@ -99,7 +97,7 @@ def _install_runtime(
 ) -> _ConsciousnessRegistry:
     registry = _ConsciousnessRegistry(active=active)
     life_service = SimpleNamespace(
-        _memory_service=memory_service,
+        memory_service=memory_service,
         consciousness_registry=registry,
     )
     monkeypatch.setattr(
@@ -192,8 +190,9 @@ async def test_same_tool_occurrence_with_changed_relation_fails_closed(
 ) -> None:
     memory_service = _MemoryService()
     _install_runtime(monkeypatch, memory_service)
-    tool = _tool(LifeEngineRelateFileTool)
+    tool = _tool(NucleusRelationsTool)
     success, _ = await tool.execute(
+        action="add",
         source_path="notes/a.md",
         target_path="notes/b.md",
         relation_type="有联系",
@@ -202,6 +201,7 @@ async def test_same_tool_occurrence_with_changed_relation_fails_closed(
     assert success is True
 
     conflict_success, conflict = await tool.execute(
+        action="add",
         source_path="notes/a.md",
         target_path="notes/b.md",
         relation_type="已经不是同一种联系",
@@ -230,9 +230,10 @@ async def test_relation_append_requires_active_actor_and_stable_tool_occurrence(
     _install_runtime(monkeypatch, memory_service, active=active)
 
     success, payload = await _tool(
-        LifeEngineRelateFileTool,
+        NucleusRelationsTool,
         tool_call_id=tool_call_id,
     ).execute(
+        action="add",
         source_path="notes/a.md",
         target_path="notes/b.md",
         relation_type="有联系",
@@ -266,8 +267,9 @@ async def test_view_reads_semantic_history_before_read_only_legacy_projection(
     async def get_service(_self: Any) -> _MemoryService:
         return memory_service
 
-    monkeypatch.setattr(LifeEngineViewRelationsTool, "_get_service", get_service)
-    success, payload = await _tool(LifeEngineViewRelationsTool).execute(
+    monkeypatch.setattr(NucleusRelationsTool, "_get_service", get_service)
+    success, payload = await _tool(NucleusRelationsTool).execute(
+        action="view",
         file_path="notes/a.md",
         depth=2,
         min_strength=0.4,
@@ -300,8 +302,9 @@ async def test_legacy_only_relation_is_not_promoted_to_semantic_history(
     async def get_service(_self: Any) -> _MemoryService:
         return memory_service
 
-    monkeypatch.setattr(LifeEngineViewRelationsTool, "_get_service", get_service)
-    success, payload = await _tool(LifeEngineViewRelationsTool).execute(
+    monkeypatch.setattr(NucleusRelationsTool, "_get_service", get_service)
+    success, payload = await _tool(NucleusRelationsTool).execute(
+        action="view",
         file_path="notes/a.md",
         depth=2,
         min_strength=0.4,
@@ -325,16 +328,6 @@ async def test_destructive_relation_actions_are_retired_without_side_effects() -
     assert payload["error"] == LEGACY_RELATION_MUTATION_RETIRED
     assert payload["mutated"] is False
 
-    legacy = _tool(LifeEngineForgetRelationTool)
-    legacy_success, legacy_payload = await legacy.execute(
-        source_path="notes/a.md",
-        target_path="notes/b.md",
-        mode="delete",
-    )
-    assert legacy_success is False
-    assert legacy_payload["error"] == LEGACY_RELATION_MUTATION_RETIRED
-    assert legacy_payload["mutated"] is False
-
 
 def test_relation_schema_exposes_only_append_and_view() -> None:
     schema = NucleusRelationsTool.to_schema()
@@ -351,8 +344,24 @@ def test_relation_schema_exposes_only_append_and_view() -> None:
         "depth",
         "min_strength",
     } <= properties.keys()
-    assert LifeEngineForgetRelationTool not in MEMORY_TOOLS
+    assert MEMORY_TOOLS.count(NucleusRelationsTool) == 1
+    assert NucleusRelationsTool.chatter_allow == [
+        "life_engine_internal",
+        "life_chatter",
+    ]
 
-    relate_schema = LifeEngineRelateFileTool.to_schema()
-    relate_properties = relate_schema["function"]["parameters"]["properties"]
-    assert "strength" not in relate_properties
+
+def test_ghost_relation_tools_are_physically_absent() -> None:
+    legacy_class_suffixes = (
+        "RelateFileTool",
+        "ViewRelationsTool",
+        "ForgetRelationTool",
+    )
+    legacy_tool_suffixes = ("relate_file", "view_relations", "forget_relation")
+
+    for suffix in legacy_class_suffixes:
+        assert not hasattr(memory_tools, f"LifeEngine{suffix}")
+    source = memory_tools.__loader__.get_source(memory_tools.__name__)
+    assert source is not None
+    for suffix in legacy_tool_suffixes:
+        assert f"nucleus_{suffix}" not in source

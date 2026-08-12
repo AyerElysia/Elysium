@@ -1,11 +1,11 @@
-"""Life Engine 仿生记忆服务。
+"""Life Engine 可追溯生命记忆服务。
 
-实现基于认知科学的记忆系统：
-- 激活扩散 (Spreading Activation)：联想机制
-- Hebbian 学习：共同激活强化连接
-- 软遗忘：基于 Ebbinghaus 曲线的记忆衰减
+正式语义由不可变 Experience/Witness/Epistemic/Living/Recall 历史与
+可重建的文档、检索、联想投影共同构成。共同回忆只改变未来可达性；
+它不提升事实真值，也不允许基础设施按时间、分数、容量或重复次数
+替主体弱化、删除或改写记忆。
 
-本模块为记忆服务的核心入口，整合 nodes、edges、search、decay 模块。
+旧 nodes/edges/decay 只保留为迁移、诊断和只读兼容面，不是新权威写路径。
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import asyncio
 import hashlib
 import sqlite3
 import uuid
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -24,8 +24,15 @@ from src.app.plugin_system.api import log_api
 from src.kernel.concurrency import get_task_manager
 
 from ..storage.contracts import StorageBackendRuntime
-from ..storage.memory import MemoryStorageBundle, open_mysql_memory_storage
+from ..storage.memory import (
+    ExperienceLedgerStore,
+    LivingMemoryStore,
+    MemoryStorageBundle,
+    WitnessLedgerStore,
+    open_mysql_memory_storage,
+)
 from ..storage.memory.local import create_local_memory_storage_bundle
+from ..storage.memory.contracts import CanonicalDocumentMetadata
 from ..storage.memory.mysql import (
     MySQLMemoryReadinessProbeError,
     inspect_mysql_memory_readiness,
@@ -69,6 +76,8 @@ from .epistemic import (
 from .experience import (
     EvidenceAwareMemoryResult,
     ExperienceAppendReport,
+    ExperienceOccurrenceCursor,
+    ExperienceOccurrencePage,
     ExperienceRecord,
     MemorySearchMode,
     WitnessMemory,
@@ -84,7 +93,6 @@ from .indexing import (
 )
 from .lineage import (
     CANONICAL_EDGE_TYPES,
-    LINEAGE_EDGE_TYPES,
     MemoryBundle,
     MemoryCorrection,
     MemoryEvidence,
@@ -347,24 +355,108 @@ class LifeMemoryService:
         self._workspace_projection_lock = asyncio.Lock()
         self._workspace_projection_binding: WorkspaceProjectionBinding | None = None
         self._workspace_projection_permit: WorkspaceProjectionWritePermit | None = None
+        self._behavior_health_provider: (
+            Callable[[], Awaitable[dict[str, Any]]] | None
+        ) = None
 
-    def _emit_visual_event(
+    @property
+    def storage_runtime(self) -> StorageBackendRuntime | None:
+        """Return the injected coherent runtime without transferring ownership."""
+
+        return self._storage_runtime
+
+    @property
+    def living_memory_store(self) -> LivingMemoryStore:
+        """Expose only the canonical living/artifact Port to trusted coordinators.
+
+        The full coherent bundle remains private because it also contains
+        migration-only legacy graph mutators.  Continuity coordination needs
+        exactly the append-only LivingMemoryStore and no wider storage surface.
+        """
+
+        return self._require_memory_storage().living
+
+    @property
+    def experience_store(self) -> ExperienceLedgerStore:
+        """Expose the immutable Experience Port to the owned witness pipeline."""
+
+        return self._require_memory_storage().experiences
+
+    @property
+    def witness_store(self) -> WitnessLedgerStore:
+        """Expose the durable Witness Port to the owned witness pipeline."""
+
+        return self._require_memory_storage().witnesses
+
+    def set_behavior_health_provider(
         self,
-        event_type: str,
-        payload: Dict[str, Any],
-        source: str = "memory_service",
+        provider: Callable[[], Awaitable[dict[str, Any]]] | None,
     ) -> None:
-        """向可视化层广播事件，不影响主流程。"""
-        try:
-            from .router import MemoryRouter
+        """Attach service-owned behavioral diagnostics to storage health.
 
-            MemoryRouter.broadcast(event_type, payload, source=source)
-        except (ImportError, RuntimeError, ConnectionError, AttributeError) as e:
-            # 预期的异常：模块未加载、路由未初始化、网络问题等
-            logger.debug(f"可视化事件广播失败 ({event_type}): {e}")
-        except Exception as e:
-            # 可视化属于非关键路径，不应影响主流程
-            logger.debug(f"可视化事件遇到意外错误 ({event_type}): {e}")
+        Storage ports can prove durability and projection readiness, but they
+        cannot know whether the Experience/Witness workers are advancing.
+        Keeping this as an injected read-only provider avoids a dependency from
+        Memory onto the Life Engine runtime while still making backlog and last
+        success visible through the existing Memory health endpoint.
+        """
+
+        self._behavior_health_provider = provider
+
+    async def _merge_behavior_health(
+        self,
+        snapshot: dict[str, Any],
+    ) -> dict[str, Any]:
+        provider = self._behavior_health_provider
+        if provider is None:
+            snapshot["behavior"] = {
+                "status": "disabled",
+                "component": "memory_behavior",
+                "owner": "life_engine",
+                "reason": "behavior health provider is not attached",
+            }
+            return snapshot
+        try:
+            behavior = await provider()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - health stays content-free
+            behavior = {
+                "status": "failed",
+                "component": "memory_behavior",
+                "owner": "life_engine",
+                "error_type": type(exc).__name__,
+            }
+        if not isinstance(behavior, dict):
+            behavior = {
+                "status": "failed",
+                "component": "memory_behavior",
+                "owner": "life_engine",
+                "error_type": "InvalidBehaviorHealthPayload",
+            }
+        snapshot["behavior"] = behavior
+        behavior_status = str(behavior.get("status") or "failed")
+        if behavior_status not in {"healthy", "ok", "disabled"}:
+            if str(snapshot.get("status") or "") in {"healthy", "ok"}:
+                snapshot["status"] = "degraded"
+            degradations = snapshot.setdefault("degradations", [])
+            if isinstance(degradations, list):
+                degradations.append(
+                    {
+                        "component": str(
+                            behavior.get("component") or "memory_behavior"
+                        ),
+                        "owner": str(behavior.get("owner") or "life_engine"),
+                        "reason": str(
+                            behavior.get("reason")
+                            or behavior.get("error_type")
+                            or "behavior pipeline degraded"
+                        ),
+                        "last_success_at": str(behavior.get("last_success_at") or ""),
+                        "backlog": int(behavior.get("backlog") or 0),
+                    }
+                )
+        return snapshot
 
     def _get_config(self) -> Any:
         """获取配置。"""
@@ -781,9 +873,7 @@ class LifeMemoryService:
             and runtime.backend == BackendKind.MYSQL
         ):
             try:
-                async with asyncio.timeout(
-                    _MYSQL_MEMORY_STARTUP_PROBE_TIMEOUT_SECONDS
-                ):
+                async with asyncio.timeout(_MYSQL_MEMORY_STARTUP_PROBE_TIMEOUT_SECONDS):
                     try:
                         shared_health = await runtime.health()
                     except Exception as exc:  # noqa: BLE001 - sanitize backend error
@@ -1232,9 +1322,10 @@ class LifeMemoryService:
                 "Memory workspace recovery retained scan-absent documents: "
                 f"count={len(missing_node_ids)}; explicit deletion evidence required"
             )
-        orphaned = await storage.legacy_graph.prune_orphan_edges()
-        if orphaned:
-            logger.info(f"启动清理：删除 {orphaned} 条孤立边")
+        # Legacy graph rows are migration evidence, not a rebuildable runtime
+        # cache. A missing endpoint is reported by the read-only health probe;
+        # startup must never turn a partial import, an old tombstone, or a
+        # temporarily incomplete projection into destructive cleanup.
 
         versioned = await self._reconcile_workspace_artifact_versions_via_ports(
             loaded,
@@ -1526,7 +1617,9 @@ class LifeMemoryService:
         观察到与真实批次相同的配置；本方法提供该权威来源。生产 MySQL 后端
         通过 ``document_index.read_chunk_index_state()`` 读取 memory_index_state。
         """
-        return await self._require_memory_storage().document_index.read_chunk_index_state()
+        return (
+            await self._require_memory_storage().document_index.read_chunk_index_state()
+        )
 
     async def close(self) -> None:
         """幂等释放 Memory 自有资源；注入的 coherent runtime 由 Life Engine 关闭。"""
@@ -1584,24 +1677,37 @@ class LifeMemoryService:
             overlap_chars=overlap_chars,
         )
 
+    async def get_document_metadata(
+        self,
+        path: str,
+    ) -> CanonicalDocumentMetadata | None:
+        """Read canonical document identity without crossing into the legacy graph."""
+
+        return await self._require_memory_storage().document_index.get_document_metadata(
+            path
+        )
+
     async def delete_document(self, path: str) -> bool:
-        """删除文档及其 SQLite 索引、分块和 outbox 记录。"""
-        storage = self._require_memory_storage()
-        if storage.backend == BackendKind.MYSQL:
-            raise WorkspaceProjectionDeleteEvidenceError(
-                "selected workspace deletion requires an occurrence-bound "
-                "audited deletion port"
-            )
-        return await storage.document_index.delete_document(path)
+        """Reject unaudited deletion for every backend.
+
+        A missing file or a scan miss is not proof that historical memory may
+        be erased. Projection adapters keep their maintenance primitive for
+        offline migration/repair, while the runtime service requires a future
+        occurrence-bound deletion contract.
+        """
+
+        del path
+        raise WorkspaceProjectionDeleteEvidenceError(
+            "workspace deletion requires an occurrence-bound audited deletion port"
+        )
 
     async def move_document(self, old_path: str, new_path: str) -> bool:
-        """移动文档索引；目标已有节点时明确拒绝合并。"""
-        storage = self._require_memory_storage()
-        if storage.backend == BackendKind.MYSQL:
-            raise WorkspaceProjectionDeleteEvidenceError(
-                "selected workspace moves require an occurrence-bound audited port"
-            )
-        return await storage.document_index.move_document(old_path, new_path)
+        """Reject unaudited path moves that rewrite historical identity."""
+
+        del old_path, new_path
+        raise WorkspaceProjectionDeleteEvidenceError(
+            "workspace moves require an occurrence-bound audited port"
+        )
 
     async def enqueue_index_job(self, node_id: str, content_hash: str) -> str:
         """加入一个待处理索引任务，不触发 embedding 或网络请求。"""
@@ -1701,35 +1807,40 @@ class LifeMemoryService:
         self,
         episode: RetrievalEpisode,
     ) -> RetrievalEpisode:
-        """记录一次检索上下文；候选曝光不是事实证据。"""
-        return await self._require_memory_storage().epistemic.append_retrieval_episode(
-            episode
-        )
+        """Reject new writes to the superseded retrieval-trace ledger.
+
+        RecallEpisode/RecallEvent now provide the only production retrieval
+        audit because they are bound to content that actually reached a
+        consciousness context. Historical Retrieval rows remain readable.
+        """
+
+        del episode
+        raise RuntimeError("LegacyRetrievalTraceRetired")
 
     async def record_retrieval_exposure(
         self,
         exposure: RetrievalExposure,
     ) -> RetrievalExposure:
-        """记录候选被展示；不自动建立语义边或提高事实状态。"""
-        return await self._require_memory_storage().epistemic.append_retrieval_exposure(
-            exposure
-        )
+        """Reject new writes to the superseded retrieval exposure ledger."""
+
+        del exposure
+        raise RuntimeError("LegacyRetrievalTraceRetired")
 
     async def record_retrieval_feedback(
         self,
         feedback: RetrievalFeedback,
     ) -> RetrievalFeedback:
-        """追加主体对候选的采用、拒绝或修正反馈。"""
-        return await self._require_memory_storage().epistemic.append_retrieval_feedback(
-            feedback
-        )
+        """Reject new writes to the superseded retrieval feedback ledger."""
+
+        del feedback
+        raise RuntimeError("LegacyRetrievalTraceRetired")
 
     async def get_retrieval_plasticity(
         self,
         entity_type: str,
         entity_id: str,
     ) -> RetrievalPlasticity:
-        """读取仅用于候选排序的可塑性提示，不替代认识论判断。"""
+        """Read historical compatibility hints without changing ranking/truth."""
         return await self._require_memory_storage().epistemic.get_retrieval_plasticity(
             entity_type,
             entity_id,
@@ -2146,10 +2257,16 @@ class LifeMemoryService:
         random_seed: int,
         limit: int,
     ) -> List[SearchResult]:
-        """Add replayable contextual document neighbours to direct recall."""
+        """Add replayable neighbours from the canonical living-memory ledgers.
+
+        Explicit ``SemanticRelation`` records and contextual co-recall events
+        share this one read path.  Neither source is converted into a truth or
+        importance score.  A deterministic hash selection makes a bounded
+        page replayable without reviving the mutable legacy edge weights.
+        """
 
         seed_refs = [f"document:{item.file_path}" for item in results if item.file_path]
-        selections = (
+        corecall_selections = (
             await self._require_memory_storage().living.choose_association_neighbours(
                 seed_refs,
                 context_key=context_key,
@@ -2157,29 +2274,96 @@ class LifeMemoryService:
                 limit=max(0, int(limit)),
             )
         )
-        expanded = list(results)
-        seen_paths = {item.file_path for item in expanded}
-        for index, selection in enumerate(selections):
+        living = self._require_memory_storage().living
+        candidate_signals: dict[str, set[str]] = {}
+        candidate_sources: dict[str, set[str]] = {}
+        candidate_identities: dict[str, set[str]] = {}
+        for seed_ref in seed_refs:
+            relations = await living.list_relations(seed_ref)
+            for relation in relations:
+                target_ref = (
+                    relation.target_ref
+                    if relation.source_ref == seed_ref
+                    else relation.source_ref
+                )
+                if not target_ref.startswith("document:") or target_ref == seed_ref:
+                    continue
+                candidate_signals.setdefault(target_ref, set()).add(
+                    f"semantic_relation:{relation.predicate}"
+                )
+                candidate_sources.setdefault(target_ref, set()).add("semantic_relation")
+                candidate_identities.setdefault(target_ref, set()).add(
+                    f"semantic_relation:{relation.relation_id}"
+                )
+        for selection in corecall_selections:
             if not selection.entity_ref.startswith("document:"):
                 continue
-            path = selection.entity_ref.removeprefix("document:")
+            candidate_signals.setdefault(selection.entity_ref, set()).update(
+                selection.signals
+            )
+            candidate_sources.setdefault(selection.entity_ref, set()).add(
+                "contextual_corecall"
+            )
+            candidate_identities.setdefault(selection.entity_ref, set()).add(
+                "contextual_corecall:"
+                + hashlib.sha256(
+                    "\0".join(
+                        (
+                            selection.entity_ref,
+                            str(selection.event_count),
+                            selection.last_event_at,
+                            *selection.signals,
+                        )
+                    ).encode("utf-8")
+                ).hexdigest()
+            )
+
+        def replay_order(entity_ref: str) -> tuple[str, str]:
+            evidence = "\0".join(sorted(candidate_identities.get(entity_ref, set())))
+            digest = hashlib.sha256(
+                f"{context_key}\0{int(random_seed)}\0{entity_ref}\0{evidence}".encode(
+                    "utf-8"
+                )
+            ).hexdigest()
+            return digest, entity_ref
+
+        selected_refs = sorted(candidate_signals, key=replay_order)[
+            : max(0, int(limit))
+        ]
+        expanded = list(results)
+        seen_paths = {item.file_path for item in expanded}
+        for index, entity_ref in enumerate(selected_refs):
+            path = entity_ref.removeprefix("document:")
             if not path or path in seen_paths:
                 continue
-            node = await self.get_node_by_file_path(path, migrate_identity=False)
-            if node is None:
+            metadata = await self._require_memory_storage().document_index.get_document_metadata(
+                path
+            )
+            if metadata is None or metadata.is_deleted:
                 continue
+            path = metadata.file_path
+            if path in seen_paths:
+                continue
+            sources = candidate_sources.get(entity_ref, set())
+            signals = tuple(sorted(candidate_signals.get(entity_ref, set())))
             expanded.append(
                 SearchResult(
                     file_path=path,
-                    title=node.title,
-                    snippet=await self._get_snippet_wrapper(node.node_id),
+                    title=metadata.title,
+                    snippet=(
+                        await self._require_memory_storage().document_index.get_snippet(
+                            metadata.node_id
+                        )
+                    ),
                     relevance=1.0 / float(self.RRF_K + index + 1),
-                    source="associated",
+                    source=(
+                        "semantic_relation"
+                        if sources == {"semantic_relation"}
+                        else "associated"
+                    ),
                     association_path=list(seed_refs),
                     association_reason=(
-                        "living recall evidence: "
-                        + ", ".join(selection.signals)
-                        + f"; events={selection.event_count}"
+                        "living memory evidence: " + ", ".join(signals)
                     ),
                     score_kind="accessibility_rank_not_truth",
                 )
@@ -2199,6 +2383,23 @@ class LifeMemoryService:
             sequence,
             limit=limit,
             stream_scope=stream_scope,
+        )
+
+    async def list_experience_occurrence_page(
+        self,
+        *,
+        position_after: int = 0,
+        after: ExperienceOccurrenceCursor | None = None,
+        through: ExperienceOccurrenceCursor | None = None,
+        limit: int = 100,
+    ) -> ExperienceOccurrencePage:
+        """Read one bounded occurrence page through the coherent Experience Port."""
+
+        return await self._require_memory_storage().experiences.list_occurrence_page(
+            position_after=position_after,
+            after=after,
+            through=through,
+            limit=limit,
         )
 
     async def record_witness_memory(self, **kwargs: Any) -> WitnessMemory:
@@ -2697,17 +2898,21 @@ class LifeMemoryService:
         title: str = "",
         content: str = "",
     ) -> MemoryNode:
-        """Create a reference node or atomically index one document body."""
-        async with self._index_write_lock:
-            return await self._require_memory_storage().legacy_graph.get_or_create_file_node(
-                file_path,
-                title,
-                content,
-            )
+        """Reject runtime creation of legacy graph nodes.
+
+        Canonical documents enter through ``upsert_document`` and explicit
+        relations enter through ``SemanticRelation``.  The adapter-level
+        method remains available only to the offline migration copier.
+        """
+
+        del file_path, title, content
+        raise RuntimeError("LegacyGraphNodeMutationRetired")
 
     async def get_or_create_workspace_document_node(self, file_path: str) -> MemoryNode:
-        """Index an eligible workspace document before using it in a relation."""
-        return await self._get_or_create_file_node_from_workspace(file_path)
+        """Reject the retired runtime node-before-edge authoring path."""
+
+        del file_path
+        raise RuntimeError("LegacyGraphNodeMutationRetired")
 
     async def get_node_by_file_path(
         self,
@@ -2721,12 +2926,18 @@ class LifeMemoryService:
         )
 
     async def migrate_file_path(self, old_path: str, new_path: str) -> bool:
-        """Explicitly move a canonical document identity inside SQLite."""
-        return await self.move_document(old_path, new_path)
+        """Reject unaudited runtime re-keying of memory identities."""
+
+        del old_path, new_path
+        raise WorkspaceProjectionDeleteEvidenceError(
+            "document identity migration requires an occurrence-bound audited port"
+        )
 
     async def increment_access(self, node_id: str) -> None:
-        """增加节点访问计数并更新激活强度。"""
-        await self._require_memory_storage().legacy_graph.increment_access(node_id)
+        """Reject score mutation caused merely by reading a memory."""
+
+        del node_id
+        raise RuntimeError("LegacyGraphActivationMutationRetired")
 
     async def _get_node_by_id_wrapper(self, node_id: str) -> Optional[MemoryNode]:
         """根据 ID 获取节点的包装函数。"""
@@ -2763,15 +2974,10 @@ class LifeMemoryService:
         strength: float = 0.5,
         bidirectional: bool = True,
     ) -> MemoryEdge:
-        """创建或更新边。"""
-        return await self._require_memory_storage().legacy_graph.create_or_update_edge(
-            source_id,
-            target_id,
-            edge_type.value,
-            reason=reason,
-            strength=strength,
-            bidirectional=bidirectional,
-        )
+        """Reject runtime writes to the compatibility weighted graph."""
+
+        del source_id, target_id, edge_type, reason, strength, bidirectional
+        raise RuntimeError("LegacyGraphMutationRetired")
 
     async def get_edges_from(
         self, node_id: str, min_weight: float = 0.0
@@ -2797,19 +3003,16 @@ class LifeMemoryService:
         target_path: str,
         edge_type: Optional[EdgeType] = None,
     ) -> bool:
-        """删除边。"""
-        return await self._require_memory_storage().legacy_graph.delete_edge(
-            source_path,
-            target_path,
-            edge_type=edge_type,
-        )
+        """Reject deletion of historical compatibility evidence."""
+
+        del source_path, target_path, edge_type
+        raise RuntimeError("LegacyGraphMutationRetired")
 
     async def _reinforce_coactivated_wrapper(self, node_ids: List[str]) -> None:
-        """Hebbian 强化的包装函数。"""
-        await self._require_memory_storage().legacy_graph.reinforce_coactivated(
-            node_ids,
-            learning_rate=self.LEARNING_RATE,
-        )
+        """Reject the retired second co-activation write path."""
+
+        del node_ids
+        raise RuntimeError("LegacyGraphMutationRetired")
 
     # --------------------------------------------------------
     # 检索操作（封装模块函数）
@@ -2819,7 +3022,7 @@ class LifeMemoryService:
         self,
         query: str,
         top_k: int = 5,
-        enable_association: bool = True,
+        enable_association: bool = False,
         file_types: Optional[List[str]] = None,
         time_range_days: int = 0,
         *,
@@ -2827,12 +3030,14 @@ class LifeMemoryService:
         workspace_path: str | Path | None = None,
         return_bundles: bool = True,
     ) -> List[MemoryBundle] | List[SearchResult]:
-        """混合检索 + 联想，默认返回完整的可追溯记忆包。
+        """执行文档检索；legacy edge 扩散只能被显式开启作诊断。
 
         Args:
             query: 检索查询
             top_k: 返回结果数量
-            enable_association: 是否启用联想扩散
+            enable_association: 是否显式启用 legacy weighted-edge 读取兼容扩散。
+                正式调用者应保持 False，并使用
+                ``expand_living_document_associations`` 消费 SemanticRelation/co-recall。
             file_types: 文件类型过滤
             time_range_days: 时间范围过滤（天数）
             now: 时间基准（测试用）
@@ -2851,7 +3056,7 @@ class LifeMemoryService:
             enable_association=enable_association,
             file_types=file_types,
             time_range_days=time_range_days,
-            emit_visual_event=self._emit_visual_event,
+            emit_visual_event=None,
             now=self._clock if now is None else now,
             workspace_path=(
                 self._get_workspace_path() if workspace_path is None else workspace_path
@@ -2874,7 +3079,7 @@ class LifeMemoryService:
         self,
         query: str,
         top_k: int = 5,
-        enable_association: bool = True,
+        enable_association: bool = False,
         file_types: Optional[List[str]] = None,
         time_range_days: int = 0,
         *,
@@ -2890,7 +3095,7 @@ class LifeMemoryService:
             enable_association=enable_association,
             file_types=file_types,
             time_range_days=time_range_days,
-            emit_visual_event=self._emit_visual_event,
+            emit_visual_event=None,
             now=self._clock if now is None else now,
             workspace_path=(
                 self._get_workspace_path() if workspace_path is None else workspace_path
@@ -2950,24 +3155,10 @@ class LifeMemoryService:
         reason: str = "",
         strength: float = 0.7,
     ) -> MemoryEdge:
-        """记录一条从旧理解到新理解的演化关系。"""
-        if isinstance(relation_type, EdgeType):
-            edge_type = relation_type
-        else:
-            edge_type = EdgeType(str(relation_type).strip().lower())
-        if edge_type not in LINEAGE_EDGE_TYPES:
-            raise ValueError(f"{edge_type.value} 不是记忆演化关系")
+        """Reject legacy lineage authoring; use artifact derivation/relation history."""
 
-        source_node = await self._get_or_create_file_node_from_workspace(source_path)
-        target_node = await self._get_or_create_file_node_from_workspace(target_path)
-        return await self.create_or_update_edge(
-            source_id=source_node.node_id,
-            target_id=target_node.node_id,
-            edge_type=edge_type,
-            reason=reason.strip(),
-            strength=max(0.1, min(1.0, float(strength))),
-            bidirectional=False,
-        )
+        del source_path, target_path, relation_type, reason, strength
+        raise RuntimeError("LegacyLineageMutationRetired")
 
     async def record_memory_correction(
         self,
@@ -2978,49 +3169,16 @@ class LifeMemoryService:
         query: str = "",
         stream_id: str | None = None,
     ) -> List[MemoryCorrection]:
-        """记录显式修正，不删除旧记忆。"""
-        topic_text = str(topic or "").strip()
-        message_text = str(message or "").strip()
-        if not topic_text or not message_text:
-            raise ValueError("topic 和 message 不能为空")
+        """Reject the duplicate correction writer retained for old migrations.
 
-        corrections: list[MemoryCorrection] = []
-        canonical_paths: list[str] = []
-        for raw_path in related_paths or []:
-            if not raw_path:
-                continue
-            eligibility = assess_document_path(raw_path)
-            if not eligibility.eligible:
-                raise ValueError(f"不支持索引的记忆文档路径: {eligibility.reason}")
-            canonical_paths.append(eligibility.path)
-        if not canonical_paths:
-            corrections.append(
-                await self._require_memory_storage().legacy_graph.insert_correction(
-                    topic=topic_text,
-                    message=message_text,
-                    source=source,
-                    related_node_id=None,
-                    query=query,
-                    stream_id=stream_id,
-                )
-            )
-            await self._record_correction_claims(corrections)
-            return corrections
+        New corrections are expressed as sourced claims, interpretations,
+        artifact derivations or explicit ``SemanticRelation`` records.  They
+        must not first mutate ``memory_corrections`` and then dual-write a
+        second ontology.
+        """
 
-        for path in canonical_paths:
-            node = await self._get_or_create_file_node_from_workspace(path)
-            corrections.append(
-                await self._require_memory_storage().legacy_graph.insert_correction(
-                    topic=topic_text,
-                    message=message_text,
-                    source=source,
-                    related_node_id=node.node_id,
-                    query=query,
-                    stream_id=stream_id,
-                )
-            )
-        await self._record_correction_claims(corrections)
-        return corrections
+        del topic, message, related_paths, source, query, stream_id
+        raise RuntimeError("LegacyCorrectionMutationRetired")
 
     async def _record_correction_claims(
         self,
@@ -3677,7 +3835,7 @@ class LifeMemoryService:
         return " ".join(notes)
 
     # --------------------------------------------------------
-    # 衰减与统计（封装模块函数）
+    # 历史图读取兼容与统计
     # --------------------------------------------------------
 
     def compute_memory_strength(self, node: MemoryNode) -> float:
@@ -3685,8 +3843,14 @@ class LifeMemoryService:
         return compute_memory_strength(node, self.DECAY_LAMBDA)
 
     async def apply_decay(self) -> int:
-        """应用遗忘衰减。"""
-        return await self._require_memory_storage().legacy_graph.apply_decay()
+        """Reject the retired score/time-driven mutation path.
+
+        Historical graph rows remain readable for migration and diagnostics,
+        but no caller may weaken or delete them by invoking this compatibility
+        method directly.
+        """
+
+        raise RuntimeError("LegacyMemoryDecayRetired")
 
     async def get_file_relations(
         self,
@@ -3707,8 +3871,16 @@ class LifeMemoryService:
         )
 
     async def get_stats(self) -> Dict[str, Any]:
-        """获取记忆系统统计信息。"""
-        return await self._require_memory_storage().legacy_graph.stats()
+        """返回旧图读取投影统计，不把它冒充为全部记忆。"""
+
+        stats = dict(await self._require_memory_storage().legacy_graph.stats())
+        return {
+            "projection_kind": "legacy_memory_graph_statistics",
+            "authority": False,
+            "read_only": True,
+            "canonical_health_entrypoint": "memory.health_snapshot",
+            "legacy": stats,
+        }
 
     async def health_snapshot(self) -> Dict[str, Any]:
         """获取隔离的只读记忆健康快照，不修复或删除任何数据。"""
@@ -3795,15 +3967,17 @@ class LifeMemoryService:
                 "failed",
             }:
                 status = "degraded"
-            return {
-                "status": status,
-                "backend": storage.backend.value,
-                "ports": ports,
-                "runtime": runtime_health,
-                "vector_expected": self._vector_backend_enabled,
-                "vector_collection_loaded": collection is not None,
-                "startup_recovery": recovery,
-            }
+            return await self._merge_behavior_health(
+                {
+                    "status": status,
+                    "backend": storage.backend.value,
+                    "ports": ports,
+                    "runtime": runtime_health,
+                    "vector_expected": self._vector_backend_enabled,
+                    "vector_collection_loaded": collection is not None,
+                    "startup_recovery": recovery,
+                }
+            )
 
         statuses = await asyncio.gather(
             *(getattr(storage, name).availability() for name in names)
@@ -3821,7 +3995,7 @@ class LifeMemoryService:
             )
             snapshot.update(backend=storage.backend.value, ports=ports)
             snapshot["startup_recovery"] = recovery
-            return snapshot
+            return await self._merge_behavior_health(snapshot)
         runtime_health = (
             await self._storage_runtime.health()
             if self._storage_runtime is not None
@@ -3840,15 +4014,17 @@ class LifeMemoryService:
             "failed",
         }:
             status = "degraded"
-        return {
-            "status": status,
-            "backend": storage.backend.value,
-            "ports": ports,
-            "runtime": runtime_health,
-            "vector_expected": self._vector_backend_enabled,
-            "vector_collection_loaded": collection is not None,
-            "startup_recovery": recovery,
-        }
+        return await self._merge_behavior_health(
+            {
+                "status": status,
+                "backend": storage.backend.value,
+                "ports": ports,
+                "runtime": runtime_health,
+                "vector_expected": self._vector_backend_enabled,
+                "vector_collection_loaded": collection is not None,
+                "startup_recovery": recovery,
+            }
+        )
 
     # --------------------------------------------------------
     # 做梦系统接口（封装模块函数）
@@ -3863,31 +4039,38 @@ class LifeMemoryService:
         learning_rate: float = 0.05,
         persist_learning: bool = False,
     ) -> Dict[str, Any]:
-        """REM 做梦游走，默认只读。"""
+        """Return the legacy read-only graph walk for compatibility.
+
+        The historical write mode inferred relations from scores and is not a
+        valid subject decision.  It remains explicitly unavailable even when
+        an old caller passes ``persist_learning=True``.
+        """
+        if persist_learning:
+            raise RuntimeError("LegacyDreamMutationRetired")
         return await self._require_memory_storage().legacy_graph.dream_walk(
             num_seeds=num_seeds,
             seed_ids=seed_ids,
             max_depth=max_depth,
             decay_factor=decay_factor,
             learning_rate=learning_rate,
-            emit_visual_event=self._emit_visual_event,
-            persist_learning=persist_learning,
+            emit_visual_event=None,
+            persist_learning=False,
         )
 
     async def list_dream_candidate_nodes(self, limit: int = 12) -> List[Dict[str, Any]]:
-        """列出适合做梦选种的长期主题候选节点。"""
+        """读取旧图中的历史候选投影，仅用于迁移与诊断。"""
         return await self._require_memory_storage().legacy_graph.list_dream_candidate_nodes(
             limit
         )
 
     async def list_random_file_nodes(self, limit: int = 15) -> List[Dict[str, Any]]:
-        """随机采样文件节点。"""
+        """读取旧图的历史随机样本，仅用于迁移与诊断。"""
         return await self._require_memory_storage().legacy_graph.list_random_file_nodes(
             limit
         )
 
     async def prune_weak_edges(self, threshold: float = 0.08) -> int:
-        """修剪弱 ASSOCIATES 边。"""
-        return await self._require_memory_storage().legacy_graph.prune_weak_edges(
-            threshold
-        )
+        """Reject retired score-driven deletion of historical graph evidence."""
+
+        del threshold
+        raise RuntimeError("LegacyMemoryPruningRetired")

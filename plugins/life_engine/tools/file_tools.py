@@ -360,9 +360,14 @@ def _subject_authority_path(plugin: Any, target: Path) -> str | None:
 
 
 def _subject_direct_mutation_error(path: str) -> str:
+    review_tool = (
+        "nucleus_memory_continuity_review"
+        if path == "MEMORY.md"
+        else "nucleus_review_subject_document"
+    )
     return (
         f"SubjectAuthorityDirectMutationBlocked: `{path}` 是统一主体权威的一部分，"
-        "通用 file 工具不能直接修改。请使用 nucleus_review_subject_document "
+        f"通用 file 工具不能直接修改。请使用 {review_tool} "
         "查看精确 revision、记录保持不变/稍后再看，或在正式 Subject Authority "
         "可用后提交候选并另行作出接受决定。"
     )
@@ -590,7 +595,9 @@ class LifeEngineWakeDFCTool(BaseTool):
 
         try:
             from src.core.managers.stream_manager import get_stream_manager
-            from src.core.transport.distribution.stream_loop_manager import get_stream_loop_manager
+            from src.core.transport.distribution.stream_loop_manager import (
+                get_stream_loop_manager,
+            )
         except Exception as e:  # noqa: BLE001
             return False, f"加载核心管理器失败: {e}"
 
@@ -632,7 +639,9 @@ class LifeEngineWakeDFCTool(BaseTool):
                 person_id = str(stream_info.get("person_id") or "").strip() if stream_info else ""
                 if person_id:
                     try:
-                        from src.core.utils.user_query_helper import get_user_query_helper
+                        from src.core.utils.user_query_helper import (
+                            get_user_query_helper,
+                        )
 
                         person = await get_user_query_helper().person_crud.get_by(
                             person_id=person_id
@@ -648,7 +657,9 @@ class LifeEngineWakeDFCTool(BaseTool):
                 person_id = str(stream_info.get("person_id") or "").strip() if stream_info else ""
                 if person_id:
                     try:
-                        from src.core.utils.user_query_helper import get_user_query_helper
+                        from src.core.utils.user_query_helper import (
+                            get_user_query_helper,
+                        )
 
                         person = await get_user_query_helper().person_crud.get_by(
                             person_id=person_id
@@ -913,7 +924,7 @@ class LifeEngineWriteFileTool(BaseTool):
         "修改文件的局部内容，优先使用 nucleus_edit_file。\n"
         "SOUL.md、USER.md、MEMORY.md 不能由本工具直接修改；请走主体复盘候选与显式决定链。\n"
         "**💡 记忆提示：** 写入新文件后，想一想它和已有文件有没有关联？"
-        "用 nucleus_relate_file 建立关联可以帮助未来的回忆。"
+        "如需由当前主体明确表达关系，请使用 nucleus_relations(action=add)。"
     )
     chatter_allow: list[str] = ["life_engine_internal"]
 

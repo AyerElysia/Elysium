@@ -21,15 +21,20 @@ from .continuity_session import (
     ContinuityReviewInputError,
     ContinuityReviewRuntimeUnavailable,
     ContinuityReviewSession,
+    SubjectTextEdit,
 )
 
 ContinuityReviewAction = Literal[
     "open",
     "read_source",
+    "open_auxiliary_source",
+    "read_auxiliary_source",
     "prepare_candidate",
     "read_candidate",
     "status",
     "decide",
+    "unchanged",
+    "snooze",
 ]
 
 
@@ -71,9 +76,15 @@ class LifeMemoryContinuityReviewSessionTool(BaseTool):
     tool_name = "nucleus_memory_continuity_review"
     tool_description = (
         "在一个工具中分阶段复盘 MEMORY.md：打开并精确分页读取当前版本，"
-        "把你明确选择的长记忆范围机械保存为不可变 Boundary，生成只含精确 URI 锚点的"
-        "完整 MEMORY 候选，再分页核对候选并生成独立决定请求。基础设施不会替你写文字、"
-        "不会自动接受候选，也不会直接修改 SOUL/USER/MEMORY。"
+        "也可打开并精确分页读取 Subject Authority 中受控 diaries 根下的辅助不可变文档（优先 "
+        "Witness 投影）。把你明确选择的长记忆范围机械保存为不可变 Boundary；Boundary 正文"
+        "只能来自固定 MEMORY 或辅助文档版本的精确 UTF-8 字节切片，source_refs 与来源 occurrence "
+        "只由服务端构造，禁止提交正文或引用。外部长记忆可用零长度 MEMORY anchor 新增链接，也可"
+        "替换旧索引。你也可以在同一次 prepare_candidate 中用有界 SubjectTextEdit "
+        "显式新增、更新或删除短文本；这些文字只来自当前活跃意识的 edit，基础设施仅按精确"
+        "UTF-8 字节范围机械应用。工具生成完整 MEMORY 候选后仍须分页核对并另行决定；它不会"
+        "自动接受候选，也不会直接修改 SOUL/USER/MEMORY。若本次明确不改或稍后再看，请在同一"
+        "固定会话使用 unchanged 或 1–720 小时的 snooze 留下可重放的主体决定证据。"
     )
     chatter_allow: ClassVar[list[str]] = ["life_engine_internal", "life_chatter"]
 
@@ -81,7 +92,8 @@ class LifeMemoryContinuityReviewSessionTool(BaseTool):
         self,
         action: Annotated[
             ContinuityReviewAction,
-            "阶段：open/read_source/prepare_candidate/read_candidate/status/decide",
+            "阶段：open/read_source/open_auxiliary_source/read_auxiliary_source/"
+            "prepare_candidate/read_candidate/status/decide/unchanged/snooze",
         ],
         session_id: Annotated[str, "open 返回的固定会话 ID"] = "",
         expected_subject_revision: Annotated[
@@ -89,16 +101,38 @@ class LifeMemoryContinuityReviewSessionTool(BaseTool):
         ] = "",
         memory_version_id: Annotated[str, "open 返回的 MEMORY 版本 ID"] = "",
         memory_sha256: Annotated[str, "open 返回的 MEMORY 精确字节哈希"] = "",
-        offset: Annotated[int, "read_source/read_candidate 的 UTF-8 字节偏移"] = 0,
+        auxiliary_logical_path: Annotated[
+            str,
+            "辅助来源的受控 Subject logical_path，仅允许 diaries 根",
+        ] = "",
+        auxiliary_version_id: Annotated[
+            str,
+            "open_auxiliary_source 返回的不可变版本 ID",
+        ] = "",
+        auxiliary_content_hash: Annotated[
+            str,
+            "open_auxiliary_source 返回的精确内容 SHA-256",
+        ] = "",
+        offset: Annotated[
+            int,
+            "read_source/read_auxiliary_source/read_candidate 的 UTF-8 字节偏移",
+        ] = 0,
         max_bytes: Annotated[int, "本页最大 UTF-8 字节数，硬上限 32768"] = 32768,
         boundaries: Annotated[
             list[dict[str, Any]] | None,
-            "prepare_candidate 的主体 Boundary 计划；不得包含 content/source_refs",
+            "prepare_candidate 的主体 Boundary 计划；辅助 segment 只提供 "
+            "logical_path/version_id/content_hash/精确范围，任何 segment 均不得包含 "
+            "content/source_refs/source_occurrence_ids",
         ] = None,
         edits: Annotated[
             list[dict[str, Any]] | None,
             "prepare_candidate 的机械替换范围与主体书写的锚点文字",
         ] = None,
+        text_edits: Annotated[
+            list[dict[str, Any]] | None,
+            "prepare_candidate 的主体短文本精确 UTF-8 字节编辑；默认空列表",
+        ] = None,
+        snooze_hours: Annotated[int, "snooze 的严格延后小时数，范围 1–720"] = 0,
         reason: Annotated[str, "主体书写的候选或决定理由"] = "",
         candidate_id: Annotated[str, "候选 ID"] = "",
         candidate_revision: Annotated[int, "候选 revision"] = 0,
@@ -135,14 +169,76 @@ class LifeMemoryContinuityReviewSessionTool(BaseTool):
                     "page": page.as_dict(),
                     "authority_written": False,
                 }
+            if action == "open_auxiliary_source":
+                opened_source = await session.open_auxiliary_source(
+                    actor,
+                    session_id=session_id,
+                    expected_subject_revision=expected_subject_revision,
+                    memory_version_id=memory_version_id,
+                    memory_sha256=memory_sha256,
+                    logical_path=auxiliary_logical_path,
+                    offset=offset,
+                    max_bytes=max_bytes,
+                )
+                return True, opened_source.as_dict()
+            if action == "read_auxiliary_source":
+                source_page = await session.read_auxiliary_source(
+                    actor,
+                    session_id=session_id,
+                    expected_subject_revision=expected_subject_revision,
+                    memory_version_id=memory_version_id,
+                    memory_sha256=memory_sha256,
+                    logical_path=auxiliary_logical_path,
+                    version_id=auxiliary_version_id,
+                    content_hash=auxiliary_content_hash,
+                    offset=offset,
+                    max_bytes=max_bytes,
+                )
+                return True, source_page.as_dict()
+            if action == "unchanged":
+                recording = await session.unchanged(
+                    actor,
+                    session_id=session_id,
+                    expected_subject_revision=expected_subject_revision,
+                    memory_version_id=memory_version_id,
+                    memory_sha256=memory_sha256,
+                    reason=reason,
+                )
+                return recording.status == "recorded", {
+                    "action": "unchanged",
+                    "outcome_recording": recording.as_dict(),
+                    "candidate_created": False,
+                    "authority_written": False,
+                }
+            if action == "snooze":
+                recording = await session.snooze(
+                    actor,
+                    session_id=session_id,
+                    expected_subject_revision=expected_subject_revision,
+                    memory_version_id=memory_version_id,
+                    memory_sha256=memory_sha256,
+                    reason=reason,
+                    snooze_hours=snooze_hours,
+                )
+                return recording.status == "recorded", {
+                    "action": "snooze",
+                    "snooze_hours": snooze_hours,
+                    "outcome_recording": recording.as_dict(),
+                    "candidate_created": False,
+                    "authority_written": False,
+                }
             if action == "prepare_candidate":
                 raw_boundaries = boundaries if boundaries is not None else []
                 raw_edits = edits if edits is not None else []
+                raw_text_edits = text_edits if text_edits is not None else []
                 parsed_boundaries = tuple(
                     ContinuityBoundaryPlan.from_payload(item) for item in raw_boundaries
                 )
                 parsed_edits = tuple(
                     BoundaryAnchorEdit.from_payload(item) for item in raw_edits
+                )
+                parsed_text_edits = tuple(
+                    SubjectTextEdit.from_payload(item) for item in raw_text_edits
                 )
                 prepared = await session.prepare_candidate(
                     actor,
@@ -153,6 +249,7 @@ class LifeMemoryContinuityReviewSessionTool(BaseTool):
                     boundaries=parsed_boundaries,
                     edits=parsed_edits,
                     reason=reason,
+                    text_edits=parsed_text_edits,
                 )
                 return True, prepared.as_dict()
             if action == "read_candidate":

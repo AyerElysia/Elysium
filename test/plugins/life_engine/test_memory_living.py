@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from plugins.life_engine.memory.health import collect_health_snapshot
 from plugins.life_engine.memory.living import (
     ArtifactHeadConflict,
     CoRecallEvent,
@@ -14,6 +15,7 @@ from plugins.life_engine.memory.living import (
     MemoryDerivation,
     MemoryInterpretation,
     RecallEvent,
+    SemanticRelation,
     append_artifact_version,
     append_corecall_event,
     append_interpretation,
@@ -29,7 +31,6 @@ from plugins.life_engine.memory.living import (
     rebuild_association_projection,
     search_interpretations,
 )
-from plugins.life_engine.memory.health import collect_health_snapshot
 from plugins.life_engine.memory.search import SearchResult
 from plugins.life_engine.memory.service import LifeMemoryService
 
@@ -450,6 +451,62 @@ async def test_document_association_expansion_loads_snippet_from_node_storage(
     associated = next(item for item in expanded if item.file_path == target.file_path)
     assert "associated body" in associated.snippet
     assert associated.source == "associated"
+    await service.close()
+
+
+async def test_explicit_semantic_relation_participates_in_canonical_recall(
+    tmp_path: Path,
+) -> None:
+    service = LifeMemoryService(tmp_path)
+    service._vector_backend_enabled = False
+    await service.initialize()
+    await service.upsert_document("notes/seed.md", "seed body", title="Seed")
+    target = await service.upsert_document(
+        "notes/explicit.md",
+        "subject-linked body",
+        title="Explicit",
+    )
+    await service.record_memory_semantic_relation(
+        SemanticRelation(
+            relation_id="relation-explicit-recall",
+            source_ref="document:notes/seed.md",
+            target_ref="document:notes/explicit.md",
+            predicate="让我想起",
+            reason="这是主体明确写下的联系。",
+            actor="consciousness-1",
+            consciousness_instance_id="consciousness-1",
+            stream_scope="chat:one",
+            recorded_at="2026-08-12T10:00:00+08:00",
+        )
+    )
+
+    direct = [
+        SearchResult(
+            file_path="notes/seed.md",
+            title="Seed",
+            snippet="seed body",
+            relevance=1.0,
+            source="direct",
+        )
+    ]
+    first = await service.expand_living_document_associations(
+        direct,
+        context_key="life_engine/explicit-relation",
+        random_seed=41,
+        limit=3,
+    )
+    replay = await service.expand_living_document_associations(
+        direct,
+        context_key="life_engine/explicit-relation",
+        random_seed=41,
+        limit=3,
+    )
+
+    associated = next(item for item in first if item.file_path == target.file_path)
+    assert associated.source == "semantic_relation"
+    assert "semantic_relation:让我想起" in associated.association_reason
+    assert associated.score_kind == "accessibility_rank_not_truth"
+    assert [item.file_path for item in replay] == [item.file_path for item in first]
     await service.close()
 
 

@@ -503,14 +503,16 @@ async def test_outbox_surfaces_stale_reasons_and_last_completed_success(
     node_id = _node_with_pending_job(db, tmp_path, pending_created_at=time.time() - 7200.0)
     db.execute(
         "INSERT INTO memory_index_jobs"
-        "(job_id, node_id, content_hash, status, created_at, updated_at, attempts, error) "
-        "VALUES (?, ?, ?, 'stale', 1, 1, 0, 'SupersededContent')",
+        "(job_id, node_id, content_hash, status, created_at, updated_at, attempts, "
+        "error, index_revision) "
+        "VALUES (?, ?, ?, 'stale', 1, 1, 0, 'SupersededContent', 2)",
         ("job-stale", node_id, "hash-stale"),
     )
     db.execute(
         "INSERT INTO memory_index_jobs"
-        "(job_id, node_id, content_hash, status, created_at, updated_at, attempts, error) "
-        "VALUES (?, ?, ?, 'completed', 1, 1234.5, 1, '')",
+        "(job_id, node_id, content_hash, status, created_at, updated_at, attempts, "
+        "error, index_revision) "
+        "VALUES (?, ?, ?, 'completed', 1, 1234.5, 1, '', 3)",
         ("job-done", node_id, "hash-done"),
     )
     db.commit()

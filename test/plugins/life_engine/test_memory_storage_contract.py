@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 import sqlite3
 from types import SimpleNamespace
@@ -12,8 +13,11 @@ import pytest
 from plugins.life_engine.memory.edges import EdgeType
 from plugins.life_engine.memory.epistemic import MemoryClaim, create_epistemic_schema
 from plugins.life_engine.memory.experience import (
+    ExperienceOccurrenceCursor,
     ExperienceRecord,
+    WitnessIdentityConflict,
     create_life_memory_schema,
+    insert_witness_memory,
 )
 from plugins.life_engine.memory.indexing import create_memory_schema
 from plugins.life_engine.memory.living import (
@@ -39,6 +43,10 @@ from plugins.life_engine.storage.memory import (
 from plugins.life_engine.storage.memory import factory as memory_factory_module
 from plugins.life_engine.storage.memory import mysql as mysql_memory
 from plugins.life_engine.storage.memory import schema as memory_schema_module
+from plugins.life_engine.storage.memory.contracts import (
+    StableLedgerCursor,
+    WitnessReconciliationStateCorrupt,
+)
 from plugins.life_engine.storage.memory.schema import (
     MEMORY_IMMUTABILITY_MIGRATIONS,
     MEMORY_IMMUTABILITY_TRIGGER_CONTRACT,
@@ -56,7 +64,7 @@ from plugins.life_engine.storage.memory.schema import (
     MemoryImmutabilityPolicyError,
 )
 from plugins.life_engine.storage.models import BackendKind
-from src.kernel.storage import CursorConflict
+from src.kernel.storage import CursorConflict, canonical_json
 
 
 def _database() -> sqlite3.Connection:
@@ -575,6 +583,19 @@ async def test_local_memory_bundle_satisfies_every_public_port() -> None:
         assert indexed.chunks
         assert indexed.job_id
         assert replay.job_id == indexed.job_id
+        metadata = await bundle.document_index.get_document_metadata(
+            "notes/contract.md"
+        )
+        assert metadata is not None
+        assert metadata.node_id == indexed.node_id
+        assert metadata.file_path == indexed.file_path
+        assert metadata.content_hash == indexed.content_hash
+        assert metadata.title == "contract"
+        assert metadata.index_revision == 1
+        assert metadata.is_deleted is False
+        assert await bundle.document_index.get_document_metadata(
+            "notes/missing.md"
+        ) is None
         assert len(await bundle.document_index.claim_jobs(limit=1)) == 1
 
         report = await bundle.experiences.append((_experience(),))
@@ -665,6 +686,288 @@ async def test_local_memory_bundle_satisfies_every_public_port() -> None:
         assert (await bundle.legacy_graph.get_edges_from(left.node_id))[
             0
         ].target_id == right.node_id
+    finally:
+        await asyncio.to_thread(db.close)
+
+
+@pytest.mark.asyncio
+async def test_experience_composite_pages_cover_more_than_one_thousand_same_position(
+) -> None:
+    db = _database()
+    try:
+        bundle = create_local_memory_storage_bundle(lambda: db)
+        records = tuple(
+            _experience(f"event-{index:04d}", sequence=7) for index in range(1005)
+        )
+        report = await bundle.experiences.append(records)
+        assert report.inserted_count == 1005
+
+        page = await bundle.experiences.list_occurrence_page(
+            position_after=0,
+            limit=137,
+        )
+        assert page.frontier == ExperienceOccurrenceCursor(7, "event-1004")
+        first_frontier = page.frontier
+        delivered = list(page.items)
+
+        await bundle.experiences.append((_experience("event-new", sequence=8),))
+        restarted = create_local_memory_storage_bundle(lambda: db)
+        while page.has_more:
+            assert page.next_cursor is not None
+            page = await restarted.experiences.list_occurrence_page(
+                position_after=0,
+                after=page.next_cursor,
+                through=first_frontier,
+                limit=137,
+            )
+            delivered.extend(page.items)
+
+        assert len(delivered) == 1005
+        assert len({item.occurrence_id for item in delivered}) == 1005
+        assert {item.ingest_position for item in delivered} == {7}
+        assert (
+            await restarted.experiences.list_occurrence_page(position_after=7)
+        ).items[0].occurrence_id == "event-new"
+        with pytest.raises(ValueError, match="BeyondFrontier"):
+            await restarted.experiences.list_occurrence_page(
+                position_after=0,
+                after=ExperienceOccurrenceCursor(8, "event-new"),
+                through=first_frontier,
+            )
+    finally:
+        await asyncio.to_thread(db.close)
+
+
+@pytest.mark.asyncio
+async def test_witness_text_and_identity_are_exact_utf8_bytes() -> None:
+    db = _database()
+    try:
+        bundle = create_local_memory_storage_bundle(lambda: db)
+        await bundle.experiences.append((_experience(),))
+        exact_text = "\n  我见证了这一刻。\t\n"
+        kwargs = {
+            "witness_id": "witness-exact",
+            "content": exact_text,
+            "consciousness_instance_id": "core",
+            "perspective_subject_id": "elysia",
+            "epistemic_kind": "subjective_witness",
+            "source_kind": "experience_window",
+            "stream_scope": "qq:group:1",
+            "visibility": "private",
+            "valid_from": "2026-08-04T10:00:00+08:00",
+            "valid_to": "2026-08-04T10:00:00+08:00",
+            "source_event_ids": ("event-1",),
+            "source_sequence_start": 1,
+            "source_sequence_end": 1,
+            "recorded_at": "2026-08-04T10:00:02+08:00",
+        }
+        witness = await bundle.witnesses.append(**kwargs)
+        replay = await bundle.witnesses.append(**kwargs)
+
+        assert witness.content.encode("utf-8") == exact_text.encode("utf-8")
+        assert replay.content == exact_text
+        assert len(witness.payload_sha256) == 64
+        assert replay.payload_sha256 == witness.payload_sha256
+        with pytest.raises(WitnessIdentityConflict, match="WitnessIdentityConflict"):
+            await bundle.witnesses.append(
+                **{**kwargs, "content": exact_text.strip()}
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="AuthorityImmutable"):
+            db.execute(
+                "UPDATE memory_witnesses SET content = ? WHERE witness_id = ?",
+                (exact_text.strip(), "witness-exact"),
+            )
+        db.rollback()
+        assert await bundle.witnesses.mark_projection(
+            "witness-exact",
+            projection_path="diaries/witness/exact.md",
+            status="succeeded",
+        )
+        assert (
+            await bundle.witnesses.get_by_projection_path(
+                "diaries/witness/exact.md"
+            )
+        ).content == exact_text  # type: ignore[union-attr]
+        assert (await bundle.witnesses.append(**kwargs)).payload_sha256 == (
+            witness.payload_sha256
+        )
+    finally:
+        await asyncio.to_thread(db.close)
+
+
+@pytest.mark.asyncio
+async def test_witness_reconciliation_cursor_is_durable_and_same_time_safe() -> None:
+    db = _database()
+    try:
+        recorded_at = "2026-08-04T11:00:00+08:00"
+        for index in range(1005):
+            insert_witness_memory(
+                db,
+                witness_id=f"witness-page-{index:04d}",
+                content=f"legacy witness {index}",
+                consciousness_instance_id="memory_witness",
+                perspective_subject_id="elysia",
+                epistemic_kind="legacy_witness",
+                source_kind="legacy_diary",
+                stream_scope="",
+                visibility="private",
+                valid_from=recorded_at,
+                valid_to=recorded_at,
+                source_event_ids=(),
+                projection_path=f"diaries/witness/{index:04d}.md",
+                recorded_at=recorded_at,
+            )
+        bundle = create_local_memory_storage_bundle(lambda: db)
+        state = await bundle.witnesses.get_reconciliation_state("pending:v1")
+        page = await bundle.witnesses.list_pending_page(limit=113)
+        assert len(page.items) == 113
+        assert page.has_more is True
+        assert page.frontier == StableLedgerCursor(
+            recorded_at,
+            "witness-page-1004",
+        )
+        assert page.next_cursor is not None
+        state = await bundle.witnesses.compare_and_advance_reconciliation_state(
+            "pending:v1",
+            expected_revision=state.revision,
+            next_cursor=page.next_cursor,
+            frontier=page.frontier,
+            completed=False,
+        )
+        assert len(state.state_sha256) == 64
+
+        restarted = create_local_memory_storage_bundle(lambda: db)
+        assert await restarted.witnesses.get_reconciliation_state("pending:v1") == state
+        with pytest.raises(CursorConflict):
+            await restarted.witnesses.compare_and_advance_reconciliation_state(
+                "pending:v1",
+                expected_revision=0,
+                next_cursor=page.next_cursor,
+                frontier=page.frontier,
+                completed=False,
+            )
+
+        delivered = len(page.items)
+        while True:
+            page = await restarted.witnesses.list_pending_page(
+                after=state.cursor,
+                through=state.frontier,
+                limit=113,
+            )
+            delivered += len(page.items)
+            completed = not page.has_more
+            state = await restarted.witnesses.compare_and_advance_reconciliation_state(
+                "pending:v1",
+                expected_revision=state.revision,
+                next_cursor=None if completed else page.next_cursor,
+                frontier=None if completed else page.frontier,
+                completed=completed,
+            )
+            if completed:
+                break
+        assert delivered == 1005
+        assert state.cursor is None and state.frontier is None
+        assert state.last_completed_at
+
+        race_state = await restarted.witnesses.get_reconciliation_state("race:v1")
+        race_page = await restarted.witnesses.list_pending_page(limit=2)
+        assert race_page.next_cursor is not None and race_page.frontier is not None
+        results = await asyncio.gather(
+            *(
+                restarted.witnesses.compare_and_advance_reconciliation_state(
+                    "race:v1",
+                    expected_revision=race_state.revision,
+                    next_cursor=race_page.next_cursor,
+                    frontier=race_page.frontier,
+                    completed=False,
+                )
+                for _ in range(2)
+            ),
+            return_exceptions=True,
+        )
+        assert sum(isinstance(item, CursorConflict) for item in results) == 1
+        assert sum(not isinstance(item, BaseException) for item in results) == 1
+
+        tamper_state = await restarted.witnesses.get_reconciliation_state(
+            "tamper:v1"
+        )
+        await restarted.witnesses.compare_and_advance_reconciliation_state(
+            "tamper:v1",
+            expected_revision=tamper_state.revision,
+            next_cursor=race_page.next_cursor,
+            frontier=race_page.frontier,
+            completed=False,
+        )
+        db.execute(
+            """UPDATE memory_witness_reconciliation_state
+            SET cursor_identity = 'witness-page-0999'
+            WHERE scan_name = 'tamper:v1'"""
+        )
+        with pytest.raises(
+            WitnessReconciliationStateCorrupt,
+            match="ChecksumMismatch",
+        ):
+            await restarted.witnesses.get_reconciliation_state("tamper:v1")
+
+        delivery_rows = []
+        for index in range(5):
+            payload = {
+                "witness_id": f"witness-page-{index:04d}",
+                "projection_path": f"diaries/witness/{index:04d}.md",
+            }
+            payload_json = canonical_json(payload)
+            delivery_rows.append(
+                (
+                    f"projection-job-{index:04d}",
+                    f"decision-{index:04d}",
+                    f"window-{index:04d}",
+                    "projection",
+                    payload_json,
+                    hashlib.sha256(payload_json.encode("utf-8")).hexdigest(),
+                    recorded_at,
+                    "succeeded",
+                    1,
+                    1,
+                    "",
+                    "",
+                    "",
+                    "",
+                    recorded_at,
+                    recorded_at,
+                )
+            )
+        db.executemany(
+            """INSERT INTO memory_witness_delivery_jobs (
+                job_id, decision_id, window_id, delivery_kind, payload_json,
+                payload_sha256, created_at, status, revision, attempt_count,
+                available_at, lease_owner, lease_expires_at, last_error_type,
+                updated_at, completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            delivery_rows,
+        )
+        first_projection_page = await restarted.witnesses.list_projection_records_page(
+            statuses=("succeeded",),
+            limit=2,
+        )
+        projection_jobs = list(first_projection_page.items)
+        projection_page = first_projection_page
+        while projection_page.has_more:
+            assert projection_page.next_cursor is not None
+            projection_page = (
+                await restarted.witnesses.list_projection_records_page(
+                    statuses=("succeeded",),
+                    after=projection_page.next_cursor,
+                    through=first_projection_page.frontier,
+                    limit=2,
+                )
+            )
+            projection_jobs.extend(projection_page.items)
+        assert [item.job_id for item in projection_jobs] == [
+            f"projection-job-{index:04d}" for index in range(5)
+        ]
+        delivery_health = await restarted.witnesses.delivery_health()
+        assert delivery_health["exact"] is True
+        assert delivery_health["counts"]["projection"]["succeeded"] == 5
     finally:
         await asyncio.to_thread(db.close)
 
