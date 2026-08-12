@@ -118,6 +118,11 @@ data/life_engine_workspace/*
 
 plugins/*
 
+!plugins/ayla_adapter/
+!plugins/ayla_adapter/**
+plugins/ayla_adapter/**/__pycache__/
+plugins/ayla_adapter/**/*.py[cod]
+
 !plugins/emoji/
 !plugins/emoji/**
 plugins/emoji/**/__pycache__/

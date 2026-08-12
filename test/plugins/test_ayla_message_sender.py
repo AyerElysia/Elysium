@@ -13,10 +13,10 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
+from plugins.ayla_adapter.plugin import AylaAdapter
 from src.core.components.types import ComponentType
 from src.core.models.message import Message, MessageType
 from src.core.transport.message_send.message_sender import MessageSender
-from plugins.ayla_adapter.plugin import AylaAdapter
 
 _SIGNATURE = "ayla_adapter:adapter:ayla_adapter"
 
