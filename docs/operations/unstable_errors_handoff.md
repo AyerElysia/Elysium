@@ -298,3 +298,75 @@ _heartbeat_loop
 - 没有执行真实 MySQL 写入、没有重启 Elysium、没有进行故障注入；
 - 没有把历史“重复墓碑修复”的测试结果当作当前结论；
 - 本文是交接调查记录，不是修复方案，也不是稳定性验收结论。
+
+## 7. 双实例共享 MySQL：Lost connection 与 CAS 竞争（2026-08-12）
+
+> 状态：已定位、已修复、已提交（`8e96bd2` 与后续 merge），文档记录完整结论。
+>
+> 记录时间：2026-08-12
+>
+> 适用分支：`main`，提交 `f4a61eb` 之后。
+
+### 7.1 背景
+
+Elysium 以 **multi-writer 双实例**（`elysium-windows-primary` 与 `elysium-linux-primary`）共享同一个远端 MySQL（frp 隧道 `frp-one.com:65429`，库 `elysium`）。这是有意的架构（`core.toml` 中 `multi_writer_enabled = true`），heartbeat/presence/rolling_context 均需在数据库内做写入仲裁。
+
+### 7.2 问题一：`2013 Lost connection during query`（根因：Clash 代理劫持）
+
+现象：`memory_witness` 循环反复报 `asyncmy.errors.OperationalError (2013, 'Lost connection to MySQL server during query')`，本机 MySQL（127.0.0.1:3306）却完全正常。
+
+根因：
+
+- 本机 Clash Verge 开启 **TUN 模式**（`Meta` 网卡持有 `198.18.0.1/16`）与 **fake-ip DNS 劫持**；
+- WSL2 NAT 网络下，`frp-one.com` 被解析为 fake-ip `198.18.0.238`，MySQL 长连接被强制走代理；
+- 代理切换节点/抖动时 TCP 长连接被掐断，客户端读到 0 字节 → `IncompleteReadError` → 2013。
+
+修复（Clash 侧，无需改代码）：
+
+- 当前订阅 `R7k9CaxLtblM`（赔钱机场）的 rules 扩展 `r5yXhN2t3jTK.yaml`：
+  `prepend: - DOMAIN-SUFFIX,frp-one.com,DIRECT`
+- merge 扩展 `mgKpMFTxdNnf.yaml`：
+  `dns.fake-ip-filter: ["+.frp-one.com"]`
+- 重启 Clash Verge 使配置合并生效；验证 `getent hosts frp-one.com` 返回真实 IP `117.162.35.233`，连接直连 65429。
+
+### 7.3 问题二：`RuntimeStateRevisionConflict` / `PresenceRevisionConflict`（根因：双实例 CAS 竞争）
+
+现象（11:58 / 12:12 日志）：
+
+- `RuntimeStateRevisionConflict:life_chatter.rolling_context:chat_global:expected=444:actual=445`
+- `PresenceRevisionConflict: presence revision conflict for 'memory_witness': expected 1814, actual 1815`
+- `PerceptionCursorConflict: stale perception cursor for 'memory_witness'`
+
+根因：两个实例同时对同一 key 做 CAS 写入（`expected_revision` 校验），另一实例先推进 revision 后本实例失败。`life_chatter.rolling_context:chat_global` 是共享的“主意识滚动上下文”，heartbeat 已有按 sequence 的 claim 仲裁，但 **rolling_context 快照保存没有仲裁**。
+
+修复（`plugins/life_engine/core/chatter.py`，提交 `8e96bd2`）：
+
+- `_save_rolling_context_snapshot` 写入前先 `acquire_singleton_writer`（30s 租约，`runtime_singleton_writer_claims` 表）；
+- 持有租约后在租约保护下重读最新 revision 再 `put_state(writer_claim=claim)`，写毕释放；
+- 拿不到租约（另一实例持有）→ 跳过本轮保存，同步本地 revision 缓存，不再抛冲突。
+
+配套（`src/core/transport/distribution/loop.py`，提交 `8e96bd2`）：
+
+- `RuntimeStateConflict` 识别增加类型名兜底，双实例 CAS 竞争正确归为可恢复路径（WARNING）而非 ERROR。
+
+验证：本地 MySQL 建独立测试库 `elysium_mw_test`（用户 `mwtest`），双 runtime 实测：
+
+- 旧路径（无仲裁）：10/10 次 stale 写入全部冲突；
+- 新路径顺序保存 ×20：20 成功 0 异常；
+- 新路径并发竞争 ×10：0 异常（A/B 交替 saved/skipped，revision 单调推进）；
+- loop.py 分类器：3 用例（import 失败兜底 / import 成功 / 非冲突异常）全部正确。
+
+### 7.4 遗留观察
+
+- `memory_witness` 的 `PresenceRevisionConflict` / `PerceptionCursorConflict` 已有 try/except 容错与 refresh 重试，属可恢复路径；若旧进程未加载新代码会以 ERROR 形式逃逸到 loop，**重启 main.py 即可**（当前进程 2168584 为 11:22 启动，早于 10:43 的 rebase 后编译，需重启加载当前磁盘代码）。
+- 12:12:22 仍有一次性 `2013 Lost connection`（frp 隧道瞬断，非 Clash——规则仍生效、DNS 仍直连）；SQLAlchemy 池会自动重连。若高频复发需检查 frp 服务端。
+- 启动等待：旧进程强杀后新进程需等 `selected_persistence` 租约过期接管（最长 120s，`authority_lease_seconds`）。优雅停止（Ctrl+C）可避免；强杀后可手动清理 `runtime_singleton_writer_claims` 中 `released_at IS NULL` 且确认旧实例已死的行。
+
+### 7.5 数据迁移核对（协作者提法）
+
+协作者建议“只需数据迁移，不用改代码”，核对结果：
+
+- `storage_schema_migrations` 两条（v1/v2）均已应用，checksum 匹配；
+- `memory_witness_migrations` 已有 1785 条，`memory_witnesses` 3347 条——旧日记迁移早已完成且幂等；
+- `runtime_states` / `storage_authority_registry` 等表结构与代码完全对齐，无缺列；
+- 结论：本仓库不存在“代码有字段但库没有”的待迁移项；迁移方案不解决 7.2/7.3 两类问题，7.3 仍需代码仲裁（若双实例都继续运行）。
