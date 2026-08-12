@@ -313,6 +313,7 @@ class LifeEngineGrepEventsTool(BaseTool):
                 items=source_items,
                 item_refs=item_refs,
                 continuation=continuation,
+                tolerate_frontier_change=True,
             )
             if len(str(projected).encode("utf-8")) > projected["budget_bytes"]:
                 raise ValueError("event grep projection exceeded its byte budget")

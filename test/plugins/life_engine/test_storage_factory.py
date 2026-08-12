@@ -99,6 +99,7 @@ def test_global_mysql_mode_uses_only_core_mysql_configuration() -> None:
             mysql_database="elysium_prod",
             mysql_user="elysia",
             mysql_password="resolved-secret",
+            mysql_pool_recycle_seconds=120,
         ),
     )
 
@@ -119,6 +120,60 @@ def test_global_mysql_mode_uses_only_core_mysql_configuration() -> None:
     assert settings.mysql.user == "elysia"
     assert settings.mysql.password == "resolved-secret"
     assert not hasattr(config, "storage_mysql")
+
+
+def test_mysql_mode_reads_idle_session_timeout_from_config() -> None:
+    """The engine-side wait_timeout must come from config, not a hardcoded 180."""
+
+    settings = settings_from_life_engine_config(
+        LifeEngineConfig(),
+        global_config=CoreConfig(
+            storage=CoreConfig.StorageSection(
+                backend="mysql",
+                backend_generation="remote-adopted-v1",
+                authority_owner_id="primary-writer",
+            ),
+            database=CoreConfig.DatabaseSection(
+                mysql_host="db.example",
+                mysql_port=3307,
+                mysql_database="elysium_prod",
+                mysql_user="elysia",
+                mysql_password="resolved-secret",
+                mysql_pool_recycle_seconds=120,
+                mysql_idle_session_timeout_seconds=240,
+            ),
+        ),
+    )
+
+    assert settings.mysql.pool_recycle_seconds == 120
+    assert settings.mysql.idle_session_timeout_seconds == 240
+
+
+async def test_mysql_mode_rejects_recycle_not_below_wait_timeout() -> None:
+    """recycle >= wait_timeout is a startup error: idle connections would be
+    killed by the server before the pool recycles them (MySQL 2013)."""
+
+    settings = StorageFactorySettings(
+        enabled=True,
+        authoritative_backend=BackendKind.MYSQL,
+        backend_generation="remote-adopted-v1",
+        authority_provider="mysql",
+        authority_owner_id="primary-writer",
+        mysql=MySQLBackendSettings(
+            host="db.example",
+            port=3307,
+            database="elysium_prod",
+            user="elysia",
+            password="resolved-secret",
+            pool_recycle_seconds=1800,
+            idle_session_timeout_seconds=180,
+        ),
+    )
+    with pytest.raises(
+        factory_module.StorageConfigurationError,
+        match="must be smaller than",
+    ):
+        await open_storage_backend(settings)
 
 
 async def test_disabled_factory_does_not_create_local_files(tmp_path: Path) -> None:
@@ -283,7 +338,7 @@ async def test_mysql_factory_auto_acquires_without_static_epoch_or_token(
             authority_provider="mysql",
             authority_epoch=0,
             authority_owner_id="primary-writer",
-            mysql=MySQLBackendSettings(password="secret"),
+            mysql=MySQLBackendSettings(password="secret", pool_recycle_seconds=120),
         ),
         environment={},
     )
@@ -357,7 +412,7 @@ async def test_mysql_factory_joins_live_shared_generation(
             registry_id="factory-live-shared",
             authority_provider="mysql",
             authority_owner_id="developer-two",
-            mysql=MySQLBackendSettings(password="secret"),
+            mysql=MySQLBackendSettings(password="secret", pool_recycle_seconds=120),
         ),
         environment={},
     )

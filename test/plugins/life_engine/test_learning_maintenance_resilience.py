@@ -1152,3 +1152,125 @@ def test_reflection_projects_real_skill_pattern_names(tmp_path: Path) -> None:
 
     assert "<your_skills>" in section
     assert "temperature-before-proof" in section
+
+
+class _FailingStartEvidenceJournal(_MemoryJournal):
+    """Journal whose start-evidence append always fails (claim lost)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.append_calls = 0
+
+    async def append(self, event: LearningMaintenanceEvent) -> None:
+        self.append_calls += 1
+        raise RuntimeError("SingletonWriterClaimLost")
+
+
+async def test_start_evidence_append_failure_marks_cycle_for_backoff(
+    tmp_path: Path,
+) -> None:
+    """A failed start-evidence append must flag the cycle and stay observable."""
+
+    journal = _FailingStartEvidenceJournal()
+    scheduler = _scheduler(tmp_path, journal)
+
+    async def noop() -> None:
+        return None
+
+    await scheduler._run_maintenance_phase(
+        run_id="run-1",
+        phase=LearningPhase.REFLECTION,
+        is_due=lambda: True,
+        operation=noop,
+        pending_count=lambda: 0,
+    )
+
+    assert journal.append_calls == 1
+    assert scheduler._maintenance_start_evidence_failed_this_cycle is True
+    worker_health = scheduler.get_state()["worker"]
+    assert worker_health["maintenance_start_evidence_failures"] == 0
+
+
+async def test_worker_backs_off_poll_after_repeated_start_evidence_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated append failures must grow the poll delay via owner jitter and
+    reset once a cycle succeeds (F1-B)."""
+
+    scheduler = _scheduler(tmp_path, _FailingStartEvidenceJournal())
+    stop_event = asyncio.Event()
+    backoff_calls: list[tuple[int, str]] = []
+
+    def fake_backoff(failure_count: int, *, owner_instance_id: str) -> float:
+        backoff_calls.append((failure_count, owner_instance_id))
+        return 0.05
+
+    monkeypatch.setattr(
+        "plugins.life_engine.learning.scheduler"
+        "._maintenance_start_evidence_backoff_seconds",
+        fake_backoff,
+    )
+
+    cycles = 0
+
+    async def cycle() -> None:
+        nonlocal cycles
+        cycles += 1
+        # simulate the phase-level flag set by _run_maintenance_phase
+        scheduler._maintenance_start_evidence_failed_this_cycle = True
+        if cycles >= 2:
+            stop_event.set()
+
+    scheduler.on_heartbeat = cycle  # type: ignore[method-assign]
+
+    await asyncio.wait_for(
+        scheduler.run(stop_event, poll_interval_seconds=60),
+        timeout=1,
+    )
+
+    assert cycles == 2
+    assert scheduler._maintenance_start_evidence_failures == 2
+    assert backoff_calls == [(1, scheduler._writer_instance_id), (2, scheduler._writer_instance_id)]
+    worker_health = scheduler.get_state()["worker"]
+    assert worker_health["maintenance_start_evidence_failures"] == 2
+
+
+async def test_worker_resets_backoff_after_start_evidence_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One successful cycle resets the consecutive failure counter (F1-B)."""
+
+    scheduler = _scheduler(tmp_path, _MemoryJournal())
+    stop_event = asyncio.Event()
+    calls: list[int] = []
+
+    def fake_backoff(failure_count: int, *, owner_instance_id: str) -> float:
+        calls.append(failure_count)
+        return 0.05
+
+    monkeypatch.setattr(
+        "plugins.life_engine.learning.scheduler"
+        "._maintenance_start_evidence_backoff_seconds",
+        fake_backoff,
+    )
+
+    scheduler._maintenance_start_evidence_failures = 3
+    cycles = 0
+
+    async def cycle() -> None:
+        nonlocal cycles
+        cycles += 1
+        if cycles >= 1:
+            stop_event.set()
+
+    scheduler.on_heartbeat = cycle  # type: ignore[method-assign]
+
+    await asyncio.wait_for(
+        scheduler.run(stop_event, poll_interval_seconds=60),
+        timeout=1,
+    )
+
+    assert scheduler._maintenance_start_evidence_failures == 0
+    assert calls == []

@@ -1602,7 +1602,10 @@ async def test_skill_candidate_requires_active_actor_and_exact_subject_revision(
                 expected_subject_revision="a" * 64,
                 reason="I choose this.",
             )
-        with pytest.raises(RuntimeError, match="SubjectRevisionConflict"):
+        with pytest.raises(
+            RuntimeError,
+            match=f"LearningDecisionSubjectRevisionConflict:actual={'a' * 64}",
+        ):
             await scheduler.decide_skill_candidate(
                 candidate_id=candidate.candidate_id,
                 candidate_revision=candidate.candidate_revision,

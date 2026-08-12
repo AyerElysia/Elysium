@@ -874,6 +874,75 @@ async def test_learning_claim_loss_quiesces_only_projector_and_keeps_events(
     assert learning_health["event_append_available"] is True
 
 
+async def test_learning_claim_loss_snapshot_mismatch_quiesces_worker_too(
+    tmp_path: Path,
+) -> None:
+    """removed=False (snapshot mismatch) must quiesce the learning worker as
+    well as failing closed, so worker and renewal loop die together (F1-A)."""
+
+    service = _selected_service(tmp_path, BackendKind.MYSQL)
+    runtime = _FakeRuntime(BackendKind.MYSQL)
+
+    def _refuse_invalidation(claim: Any) -> bool:
+        runtime.invalidated_claims.append(claim)
+        return False  # snapshot mismatch: the local claim cannot be removed
+
+    runtime.invalidate_managed_singleton_writer = _refuse_invalidation  # type: ignore[method-assign]
+    service._storage_runtime = runtime
+    service._stop_event = asyncio.Event()
+    service._storage_factory_settings = replace(
+        service._storage_factory_settings,
+        authority_lease_seconds=3,
+        authority_renew_interval_seconds=0,
+    )
+    claim = SingletonWriterClaim(
+        generation_id="generation-a",
+        namespace="life_engine.learning",
+        state_key="selected_persistence",
+        owner_instance_id="writer-a",
+        lease_epoch=7,
+        lease_until="2026-08-11T00:00:00+00:00",
+        fencing_token="opaque",
+    )
+    loss = ManagedSingletonWriterClaimLost(
+        claim,
+        SingletonWriterClaimLost("expired"),
+    )
+    runtime.renew_error = loss
+
+    class _OwnedScheduler:
+        projector_owner = True
+
+        def __init__(self) -> None:
+            self.quiesced = False
+
+        def quiesce_projector(self, **_kwargs: Any) -> None:
+            self.quiesced = True
+
+    owned_scheduler = _OwnedScheduler()
+    event_store = _FakeLearningStore()
+    service._learning_writer_claim = claim
+    service._learning_event_store = event_store
+    service._learning_stores = SimpleNamespace(store=event_store)
+    service._learning_scheduler = owned_scheduler
+
+    await asyncio.wait_for(service._renew_storage_authority_loop(), timeout=10)
+
+    assert runtime.invalidated is True
+    assert runtime.invalidated_claims == [claim]
+    assert owned_scheduler.quiesced is True
+    assert service._learning_writer_claim is None
+    assert service._learning_stores is None
+    assert service._learning_scheduler.projector_owner is False
+    assert not hasattr(service._learning_scheduler, "store")
+    health = service.health()["storage_runtime"]
+    assert health["status"] == "failed"
+    learning_health = health["learning"]
+    assert learning_health["status"] == "degraded"
+    assert learning_health["projector_owner"] is False
+    assert learning_health["event_append_available"] is True
+
+
 async def test_selected_service_close_releases_runtime_after_flush_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

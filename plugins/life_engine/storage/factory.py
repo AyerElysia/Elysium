@@ -152,7 +152,9 @@ def settings_from_life_engine_config(
             pool_timeout_seconds=int(database.mysql_pool_timeout_seconds),
             query_timeout_seconds=int(database.mysql_query_timeout_seconds),
             lock_wait_timeout_seconds=int(database.mysql_lock_wait_timeout_seconds),
-            idle_session_timeout_seconds=180,
+            idle_session_timeout_seconds=int(
+                database.mysql_idle_session_timeout_seconds
+            ),
         ),
     )
 
@@ -242,6 +244,16 @@ async def open_storage_backend(
         engine = create_sqlite_storage_engine(sqlite_config)
         backend_identity = sqlite_config.safe_identity
     elif settings.authoritative_backend == BackendKind.MYSQL:
+        if (
+            settings.mysql.pool_recycle_seconds
+            >= settings.mysql.idle_session_timeout_seconds
+        ):
+            raise StorageConfigurationError(
+                "mysql_pool_recycle_seconds must be smaller than "
+                "mysql_idle_session_timeout_seconds (server-side wait_timeout); "
+                "otherwise idle connections are killed before the pool recycles "
+                "them and dead connections get reused (MySQL 2013)"
+            )
         password = settings.mysql.password
         password_env = settings.mysql.password_env.strip()
         if not password and password_env:

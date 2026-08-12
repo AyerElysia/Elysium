@@ -31,6 +31,8 @@ from ..memory.continuity_index import (
     diagnose_continuity_memory_index,
 )
 from ..storage.learning_contracts import (
+    LEARNING_WRITER_CLAIM_NAMESPACE,
+    LEARNING_WRITER_CLAIM_STATE_KEY,
     LearningEventDraft,
     LearningOccurrenceConflict,
     LearningStorePort,
@@ -99,11 +101,37 @@ _DEFAULT_SUBJECT_REVIEW_OFFER_COOLDOWN_HOURS = 24.0
 _SUBJECT_REVIEW_STATE_KEY = "subject_review_v1"
 _SUBJECT_REVIEW_SNOOZED_EVENT_KIND = "subject_review.snoozed"
 _DEFAULT_MAINTENANCE_POLL_SECONDS = 15.0
+_MAINTENANCE_START_EVIDENCE_BACKOFF_BASE_SECONDS = 1.0
+_MAINTENANCE_START_EVIDENCE_BACKOFF_MAX_SECONDS = 60.0
 _REFLECTION_FAILURE_BACKOFF_BASE_SECONDS = 30.0
 _REFLECTION_FAILURE_BACKOFF_MAX_SECONDS = 15.0 * 60.0
 _REFLECTION_EVENT_CURSOR_STATE_KEY = "reflection_event_cursor_v1"
 _REFLECTION_ENQUEUED_EVENT_KIND = "reflection.enqueued"
 _REFLECTION_EVENT_PAGE_SIZE = 500
+
+
+def _maintenance_start_evidence_backoff_seconds(
+    failure_count: int,
+    *,
+    owner_instance_id: str,
+) -> float:
+    """Return bounded deterministic jitter for one maintenance owner.
+
+    Mirrors the storage renewal backoff shape (service/core.py) so two nodes
+    with the same failure count do not stampede: 1s -> 2s -> ... -> 60s cap.
+    """
+
+    exponent = min(max(0, int(failure_count) - 1), 8)
+    base = min(
+        _MAINTENANCE_START_EVIDENCE_BACKOFF_MAX_SECONDS,
+        _MAINTENANCE_START_EVIDENCE_BACKOFF_BASE_SECONDS * (2**exponent),
+    )
+    digest = hashlib.sha256(
+        f"{owner_instance_id}:maintenance:{failure_count}".encode()
+    ).digest()
+    fraction = int.from_bytes(digest[:2], "big") / 65535
+    jittered = base * (0.8 + (0.4 * fraction))
+    return min(_MAINTENANCE_START_EVIDENCE_BACKOFF_MAX_SECONDS, max(0.1, jittered))
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,6 +238,8 @@ class LearningScheduler:
         self._writer_instance_id = (
             str(writer_instance_id).strip() or f"learning_writer_{uuid4().hex}"
         )
+        self._maintenance_start_evidence_failures = 0
+        self._maintenance_start_evidence_failed_this_cycle = False
         if learning_store is None:
             self.store = InsightStore(self._workspace)
             self.skill_store = SkillStore(self._workspace)
@@ -394,6 +424,7 @@ class LearningScheduler:
                 if self._projector_quiesced:
                     return
                 self._maintenance_wakeup.clear()
+                self._maintenance_start_evidence_failed_this_cycle = False
                 self._worker_last_started_at = _now_iso()
                 try:
                     await self.on_heartbeat()
@@ -408,12 +439,21 @@ class LearningScheduler:
                 else:
                     self._worker_last_completed_at = _now_iso()
                     self._worker_last_error_type = ""
+                if self._maintenance_start_evidence_failed_this_cycle:
+                    self._maintenance_start_evidence_failures += 1
+                    sleep_seconds = _maintenance_start_evidence_backoff_seconds(
+                        self._maintenance_start_evidence_failures,
+                        owner_instance_id=self._writer_instance_id,
+                    )
+                else:
+                    self._maintenance_start_evidence_failures = 0
+                    sleep_seconds = poll_seconds
                 if stop_event.is_set():
                     break
                 try:
                     await asyncio.wait_for(
                         self._maintenance_wakeup.wait(),
-                        timeout=poll_seconds,
+                        timeout=sleep_seconds,
                     )
                 except TimeoutError:
                     pass
@@ -448,7 +488,9 @@ class LearningScheduler:
         current_revision = str(await self._current_subject_revision()).strip().lower()
         expected_revision = str(expected_subject_revision).strip().lower()
         if current_revision != expected_revision:
-            raise RuntimeError("LearningDecisionSubjectRevisionConflict")
+            raise RuntimeError(
+                f"LearningDecisionSubjectRevisionConflict:actual={current_revision}"
+            )
 
         context = (
             self._selected_persistence.mutation_context(
@@ -1859,7 +1901,7 @@ class LearningScheduler:
         current = str(await self._current_subject_revision()).strip().lower()
         expected = str(expected_subject_revision or "").strip().lower()
         if not expected or current != expected:
-            raise RuntimeError("LearningSubjectRevisionConflict")
+            raise RuntimeError(f"LearningSubjectRevisionConflict:actual={current}")
         return current
 
     async def current_subject_revision(self) -> str:
@@ -2509,6 +2551,23 @@ class LearningScheduler:
         await self._backfill_epistemic_claims()
         self._epistemic_backfilled = True
 
+    def _claim_lease_epoch_for_log(self, exc: BaseException) -> str:
+        """Best-effort lease epoch from the exception chain for diagnostics."""
+
+        cursor: BaseException | None = exc
+        seen = 0
+        while cursor is not None and seen < 8:
+            value = getattr(cursor, "claim", None)
+            if value is None:
+                value = getattr(cursor, "lease_epoch", None)
+            if value is not None:
+                epoch = getattr(value, "lease_epoch", value)
+                if epoch is not None:
+                    return str(int(epoch))
+            cursor = cursor.__cause__ or cursor.__context__
+            seen += 1
+        return "-"
+
     async def _run_maintenance_phase(
         self,
         *,
@@ -2548,10 +2607,16 @@ class LearningScheduler:
         try:
             await self.maintenance_journal.append(started)
         except Exception as exc:  # noqa: BLE001 - fail this phase closed
+            self._maintenance_start_evidence_failed_this_cycle = True
             logger.warning(
-                "学习维护阶段无法记录开始证据，已拒绝执行 %s: %s",
+                "学习维护阶段无法记录开始证据，已拒绝执行 %s: %s "
+                "claim=(namespace=%s state_key=%s owner=%s lease_epoch=%s)",
                 phase.value,
                 type(exc).__name__,
+                LEARNING_WRITER_CLAIM_NAMESPACE,
+                LEARNING_WRITER_CLAIM_STATE_KEY,
+                self._writer_instance_id,
+                self._claim_lease_epoch_for_log(exc),
             )
             return
 
@@ -3360,6 +3425,9 @@ class LearningScheduler:
             "last_started_at": self._worker_last_started_at,
             "last_completed_at": self._worker_last_completed_at,
             "last_error_type": self._worker_last_error_type,
+            "maintenance_start_evidence_failures": (
+                self._maintenance_start_evidence_failures
+            ),
         }
         component_statuses = {
             str(maintenance_health.get("status") or "healthy"),

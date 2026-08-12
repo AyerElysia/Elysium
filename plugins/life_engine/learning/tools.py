@@ -925,7 +925,14 @@ class LifeDecideSubjectCandidateTool(BaseTool):
                 else await ledger.record_decision(decision_record)
             )
         except Exception as exc:  # noqa: BLE001 - explicit tool refusal
-            return False, f"主体候选决定未提交: {type(exc).__name__}"
+            from ..memory.boundary_tools import _recoverable_conflict_payload
+
+            return False, await _recoverable_conflict_payload(
+                exc,
+                scheduler=scheduler,
+                error=type(exc).__name__,
+                detail=f"主体候选决定未提交: {type(exc).__name__}: {exc}",
+            )
         review_health_warning = ""
         try:
             recorded_revision = (

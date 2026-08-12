@@ -419,6 +419,15 @@ class CoreConfig(ConfigBase):
             le=86400,
             description="Life Engine MySQL 连接回收间隔（秒）。",
         )
+        mysql_idle_session_timeout_seconds: int = Field(
+            default=180,
+            ge=30,
+            le=86400,
+            description=(
+                "Life Engine MySQL 会话空闲超时（秒），对齐服务端 wait_timeout；"
+                "必须大于 mysql_pool_recycle_seconds，否则池回收前连接已被服务端杀死。"
+            ),
+        )
         mysql_pool_timeout_seconds: int = Field(
             default=10,
             ge=1,

@@ -364,6 +364,56 @@ async def test_witness_loop_recovers_presence_conflict_without_losing_cursor(
 
 
 @pytest.mark.asyncio
+async def test_witness_concurrency_conflict_escalates_only_after_eight_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PresenceRevisionConflict is normal contention on a shared presence row:
+    it must not spam ERROR. Only the 9th consecutive conflict escalates (F3-B)."""
+
+    service, _memory, _event_store, _perception_commits = _service(
+        timeout_seconds=600.0
+    )
+    coordinator = MemoryWitnessCoordinator(service)
+    attempts = 0
+    error_records: list[tuple[str, dict[str, Any]]] = []
+
+    async def author(*_args: object) -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts >= 9:
+            service._state.running = False
+        raise PresenceRevisionConflict("stale witness presence")
+
+    async def no_wait(delay: float) -> None:
+        return None
+
+    def capture_error(message: str, **metadata: Any) -> None:
+        error_records.append((message, metadata))
+
+    monkeypatch.setattr(coordinator, "_author_witness", author)
+    monkeypatch.setattr(
+        "plugins.life_engine.service.memory_witness.asyncio.sleep",
+        no_wait,
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.service.memory_witness.logger.error",
+        capture_error,
+    )
+    for level in ("warning", "debug", "info"):
+        monkeypatch.setattr(
+            f"plugins.life_engine.service.memory_witness.logger.{level}",
+            lambda *_args, **_kwargs: None,
+        )
+
+    await coordinator.loop()
+
+    assert attempts == 9
+    assert len(error_records) == 1
+    assert "可恢复并发冲突" in error_records[0][0]
+    assert "failure_count=9" in error_records[0][0]
+
+
+@pytest.mark.asyncio
 async def test_witness_loop_retries_mysql_2013_with_same_experience_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

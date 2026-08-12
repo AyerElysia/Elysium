@@ -1286,3 +1286,22 @@ async def test_review_context_rejects_stale_revision_and_inactive_actor(
             actor_consciousness_instance_id="inactive",
             expected_subject_revision="a" * 64,
         )
+
+
+async def test_review_context_conflict_carries_actual_revision(
+    tmp_path: Path,
+) -> None:
+    """The conflict error must embed the current revision so the model can
+    re-read and retry instead of guessing (F9-A)."""
+
+    _workspace(tmp_path)
+    scheduler = _scheduler(tmp_path)
+
+    with pytest.raises(
+        RuntimeError,
+        match=f"LearningSubjectRevisionConflict:actual={'a' * 64}",
+    ):
+        await scheduler.validate_subject_review_context(
+            actor_consciousness_instance_id="consciousness-1",
+            expected_subject_revision="b" * 64,
+        )

@@ -109,11 +109,29 @@ def _cursor_checksum(
     *,
     offset_field: str,
     offset: int,
+    strict: bool = False,
 ) -> str:
+    """Checksum the cursor identity; ``strict`` excludes the frontier field.
+
+    The frontier is a freshness signal: event-stream sources advance it
+    between pages on a multi-writer deployment, so it must not participate in
+    the binding checksum. It is still carried in the cursor text so strict
+    (file/content) projections can compare it.
+    """
+
+    checksum_identity = (
+        {
+            key: value
+            for key, value in identity.items()
+            if key != "frontier_sha256"
+        }
+        if strict
+        else dict(identity)
+    )
     return sha256_json(
         {
             "cursor_version": BOUNDED_TOOL_CURSOR_VERSION,
-            "identity": dict(identity),
+            "identity": checksum_identity,
             "offset_field": offset_field,
             "offset": int(offset),
         }
@@ -126,7 +144,12 @@ def _encode_cursor(
     offset_field: str,
     offset: int,
 ) -> str:
-    """Encode a short, model-copyable cursor bound to the full source identity."""
+    """Encode a short, model-copyable cursor bound to the full source identity.
+
+    Format: ``brc1.<field>.<offset>.<frontier8|->.<checksum16>``. The frontier
+    prefix is informational (compared in strict mode, tolerated in relaxed
+    mode); the checksum binds only the query-semantics identity.
+    """
 
     field_code = {"offset": "i", "byte_offset": "b"}.get(offset_field)
     if field_code is None:
@@ -135,8 +158,14 @@ def _encode_cursor(
         identity,
         offset_field=offset_field,
         offset=offset,
+        strict=True,
     )
-    return f"{BOUNDED_TOOL_CURSOR_VERSION}.{field_code}.{int(offset)}.{checksum}"
+    frontier = identity.get("frontier_sha256")
+    frontier_prefix = str(frontier)[:8] if frontier is not None else "-"
+    return (
+        f"{BOUNDED_TOOL_CURSOR_VERSION}.{field_code}.{int(offset)}."
+        f"{frontier_prefix}.{checksum}"
+    )
 
 
 def _decode_cursor(
@@ -144,13 +173,27 @@ def _decode_cursor(
     *,
     identity: Mapping[str, Any],
     offset_field: str,
-) -> int:
-    """Decode compact cursors while accepting already-issued legacy cursors."""
+    tolerate_frontier_change: bool = False,
+) -> tuple[int, bool]:
+    """Decode compact cursors while accepting already-issued legacy cursors.
+
+    Returns ``(offset, source_changed)``. Binding (query-semantics) mismatches
+    always raise; a changed frontier raises only in strict mode.
+    """
 
     normalized = str(token or "")
     if normalized.startswith(f"{BOUNDED_TOOL_CURSOR_VERSION}."):
         try:
-            version, field_code, raw_offset, checksum = normalized.split(".")
+            parts = normalized.split(".")
+            if len(parts) == 5:
+                version, field_code, raw_offset, frontier_prefix, checksum = parts
+                strict = True
+            elif len(parts) == 4:
+                version, field_code, raw_offset, checksum = parts
+                frontier_prefix = None
+                strict = False
+            else:
+                raise ValueError("cursor format mismatch")
             expected_field_code = {"offset": "i", "byte_offset": "b"}[
                 offset_field
             ]
@@ -167,21 +210,41 @@ def _decode_cursor(
             identity,
             offset_field=offset_field,
             offset=offset,
+            strict=strict,
         )
         if not hmac.compare_digest(checksum, expected_checksum):
             raise BoundedContinuationError(
-                "bounded-result continuation does not match query/task/frontier"
+                "bounded-result continuation 与本次查询参数不一致："
+                "续读必须携带与上一页完全相同的参数"
+                "（query/order/limit/stream_ids 等），或放弃上一页重新查询"
             )
-        return offset
+        source_changed = False
+        current_frontier = identity.get("frontier_sha256")
+        if (
+            strict
+            and current_frontier is not None
+            and frontier_prefix not in {None, "-"}
+            and frontier_prefix != str(current_frontier)[:8]
+        ):
+            if not tolerate_frontier_change:
+                raise BoundedContinuationError(
+                    "bounded-result continuation 与本次查询参数不一致："
+                    "续读必须携带与上一页完全相同的参数"
+                    "（query/order/limit/stream_ids 等），或放弃上一页重新查询"
+                )
+            source_changed = True
+        return offset, source_changed
 
     state = _decode_legacy_cursor(normalized)
     for field, expected in identity.items():
         if state.get(field) != expected:
             raise BoundedContinuationError(
-                "bounded-result continuation does not match query/task/frontier"
+                "bounded-result continuation 与本次查询参数不一致："
+                "续读必须携带与上一页完全相同的参数"
+                "（query/order/limit/stream_ids 等），或放弃上一页重新查询"
             )
     try:
-        return int(state.get(offset_field))
+        return int(state.get(offset_field)), False
     except (TypeError, ValueError) as exc:
         raise BoundedContinuationError(
             "bounded-result continuation offset is invalid"
@@ -213,8 +276,15 @@ def project_bounded_items(
     items: Sequence[Mapping[str, Any]],
     item_refs: Sequence[str],
     continuation: str = "",
+    tolerate_frontier_change: bool = False,
 ) -> dict[str, Any]:
-    """Project stable source items into one exact UTF-8-bounded model page."""
+    """Project stable source items into one exact UTF-8-bounded model page.
+
+    ``tolerate_frontier_change`` is for event-stream projections whose source is
+    appended by multiple writers: the frontier advances between pages, which is
+    freshness, not tampering. File/content snapshots must keep strict frontier
+    binding (the source changed means the page is no longer meaningful).
+    """
 
     name = str(projection_name or "").strip()
     key = str(items_key or "").strip()
@@ -253,11 +323,13 @@ def project_bounded_items(
     }
 
     start = 0
+    source_changed = False
     if continuation:
-        start = _decode_cursor(
+        start, source_changed = _decode_cursor(
             continuation,
             identity=cursor_identity,
             offset_field="offset",
+            tolerate_frontier_change=tolerate_frontier_change,
         )
         if start < 0 or start > len(source_items):
             raise BoundedContinuationError(
@@ -307,6 +379,11 @@ def project_bounded_items(
                     excerpted or len(delivered) != original_items
                 ),
                 "continuation": cursor_for(next_offset),
+                **(
+                    {"source_changed": True}
+                    if source_changed
+                    else {}
+                ),
             }
         )
         _finalize_delivered_bytes(payload)
@@ -448,7 +525,7 @@ def project_bounded_text(
     }
     start = 0
     if continuation:
-        start = _decode_cursor(
+        start, _ = _decode_cursor(
             continuation,
             identity=cursor_identity,
             offset_field="byte_offset",

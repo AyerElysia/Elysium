@@ -132,7 +132,7 @@ def test_bounded_items_reject_tampered_or_stale_continuations() -> None:
     with pytest.raises(ValueError, match="continuation"):
         project_bounded_items(**kwargs, continuation=cursor[:-1] + replacement)
 
-    with pytest.raises(ValueError, match="query/task/frontier"):
+    with pytest.raises(ValueError, match="continuation"):
         project_bounded_items(
             **{**kwargs, "frontier": {"revision": 2}},
             continuation=cursor,
@@ -196,7 +196,7 @@ def test_bounded_text_cursor_is_short_copyable_and_source_bound() -> None:
     second = project_bounded_text(**kwargs, continuation=cursor)
     assert second["page_start_byte"] == first["page_end_byte"]
 
-    with pytest.raises(ValueError, match="query/task/frontier"):
+    with pytest.raises(ValueError, match="continuation"):
         project_bounded_text(
             **{**kwargs, "frontier": {"content_sha256": "source-v2"}},
             continuation=cursor,
@@ -257,7 +257,7 @@ async def test_autonomy_list_is_bounded_but_mutations_are_unchanged() -> None:
 
 
 @pytest.mark.asyncio
-async def test_event_grep_projection_pages_and_rejects_source_change(
+async def test_event_grep_projection_tolerates_source_frontier_change(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source_revision = {"value": 1}
@@ -304,14 +304,26 @@ async def test_event_grep_projection_pages_and_rejects_source_change(
         first["matches"][0]["_projection"]["ref"]
         != second["matches"][0]["_projection"]["ref"]
     )
+    assert "source_changed" not in second
 
+    # The source frontier advancing (another writer appended) is freshness,
+    # not tampering: the page must continue with a source_changed marker.
     source_revision["value"] = 2
-    ok, error = await tool.execute(
+    ok, third = await tool.execute(
         query="事件",
         continuation=first["continuation"],
     )
+    assert ok is True
+    assert isinstance(third, dict)
+    assert third.get("source_changed") is True
+
+    # Changing query parameters is still rejected with actionable guidance.
+    ok, error = await tool.execute(
+        query="别的事件",
+        continuation=first["continuation"],
+    )
     assert ok is False
-    assert "query/task/frontier" in str(error)
+    assert "continuation" in str(error)
 
 
 @pytest.mark.asyncio
@@ -373,7 +385,7 @@ async def test_read_file_rejects_continuation_after_file_change(
         continuation=first["continuation"],
     )
     assert ok is False
-    assert "query/task/frontier" in str(error)
+    assert "continuation" in str(error)
     assert not [record for record in caplog.records if record.levelname == "ERROR"]
 
 
@@ -427,7 +439,7 @@ async def test_list_files_recursive_pages_are_stable_and_change_safe(
         continuation=first_cursor,
     )
     assert ok is False
-    assert "query/task/frontier" in str(error)
+    assert "continuation" in str(error)
 
 
 @pytest.mark.asyncio
@@ -477,4 +489,4 @@ async def test_file_grep_pages_are_bounded_and_reject_changed_files(
         continuation=first["continuation"],
     )
     assert ok is False
-    assert "query/task/frontier" in str(error)
+    assert "continuation" in str(error)

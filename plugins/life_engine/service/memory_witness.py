@@ -41,7 +41,9 @@ logger = get_logger("life_engine.memory_witness")
 MEMORY_WITNESS_INSTANCE_ID = "memory_witness"
 _NO_WITNESS = "<no_witness>"
 _TRANSIENT_ERROR_ESCALATION_COUNT = 3
-_CONCURRENCY_ERROR_ESCALATION_COUNT = 3
+# 双实例共享同一 witness presence 行时，PresenceRevisionConflict 是常态合法竞争；
+# 前 8 次只记 debug/warning，第 9 次才升级 ERROR，避免常态竞争刷 ERROR。
+_CONCURRENCY_ERROR_ESCALATION_COUNT = 9
 _MYSQL_LOST_CONNECTION_ERROR_CODE = 2013
 
 _SELF_PRESENCE_SIDE_EFFECT_EVENT_TYPES = frozenset(

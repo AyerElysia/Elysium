@@ -28,7 +28,10 @@ from plugins.life_engine.memory.boundary_tools import (
     LifeInspectMemoryContinuityTool,
     LifeProposeMemoryContinuityRevisionTool,
 )
-from plugins.life_engine.memory.living import new_artifact_version
+from plugins.life_engine.memory.living import (
+    ArtifactHeadConflict,
+    new_artifact_version,
+)
 from plugins.life_engine.service.tool_manifests import get_tool_manifest
 
 SUBJECT_REVISION = "c" * 64
@@ -77,6 +80,13 @@ class _Repository:
         if uri not in self.records:
             raise MemoryBoundaryNotFound(uri)
         return self.records[uri]
+
+    async def read_current(self, boundary_id: str) -> StoredMemoryBoundary | None:
+        return next(
+            (stored for stored in self.records.values()
+             if stored.manifest.boundary_id == boundary_id),
+            None,
+        )
 
 
 class _Ledger:
@@ -597,3 +607,174 @@ def test_chat_can_follow_a_continuity_link_without_loading_maintenance_tools() -
     assert "tool-nucleus_create_memory_boundary" not in manifest
     assert "tool-nucleus_create_memory_boundary_from_subject_range" not in manifest
     assert "tool-nucleus_propose_memory_continuity_revision" not in manifest
+
+
+def test_boundary_tool_schemas_describe_cas_semantics() -> None:
+    """expected_head_revision/expected_subject_revision 参数描述必须说明乐观锁语义。
+
+    真实缺陷（2026-08-12）：模型传"读取时快照"被冲突后困惑"我看的就是 34"——
+    工具描述没告诉它是 CAS（提交时可能已过期、冲突后重读重试）。
+    """
+    for tool_type in MEMORY_BOUNDARY_TOOLS:
+        schema: dict[str, Any] = tool_type.to_schema()
+        parameters = schema["function"]["parameters"]
+        props: dict[str, Any] = parameters.get("properties", {})
+        for param_name, param in props.items():
+            if param_name in ("expected_head_revision", "expected_subject_revision"):
+                description = str(param.get("description", ""))
+                assert ("乐观锁" in description or "CAS" in description), (
+                    f"{tool_type.tool_name}.{param_name} 描述缺少乐观锁语义说明: {description}"
+                )
+                assert "重新读取" in description and "revision" in description
+
+
+async def test_resolve_runtime_permission_errors_are_actionable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """无聊天流/实例不活跃时，PermissionError 消息必须可操作（说明为什么+怎么办）。
+
+    真实缺陷（2026-08-12）：心跳里调边界工具收到裸 `PermissionError` 空 detail，
+    模型不知道被拒原因只能放弃。
+    """
+    from types import SimpleNamespace as _NS
+
+    class _FakeRegistry:
+        @staticmethod
+        def get_for_stream(stream: str):
+            assert stream == "stream-1"
+            return None  # 无活跃实例
+
+    class _FakeService:
+        _memory_service = object()
+        _learning_scheduler = object()
+        consciousness_registry = _FakeRegistry()
+
+    monkeypatch.setattr(
+        "plugins.life_engine.service.registry.get_life_engine_service",
+        lambda: _FakeService(),
+    )
+
+    tool = _NS(get_current_stream_id=lambda: "stream-1")
+    with pytest.raises(PermissionError) as excinfo:
+        await boundary_tools._resolve_runtime(tool)  # type: ignore[arg-type]
+    message = str(excinfo.value)
+    assert "聊天流" in message, f"错误消息应可操作（含聊天流指引）: {message}"
+
+
+async def test_create_boundary_conflict_returns_current_revisions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ArtifactHeadConflict must return a structured, recoverable error with
+    the latest subject/head revisions and no server-side replay (F9-A)."""
+
+    repository = _Repository()
+
+    async def append(manifest, *, expected_head_revision):
+        raise ArtifactHeadConflict(
+            "memory boundary head revision conflict: "
+            f"boundary_id='one-morning', expected={expected_head_revision}, actual=2"
+        )
+
+    repository.append = append  # type: ignore[method-assign]
+    scheduler = _Scheduler(b"# MEMORY\n")
+
+    async def resolve(_tool):
+        return _runtime(repository, scheduler)
+
+    monkeypatch.setattr(boundary_tools, "_resolve_runtime", resolve)
+    success, payload = await _tool(LifeCreateMemoryBoundaryTool).execute(
+        boundary_id="one-morning",
+        title="那一天",
+        scope="当时发生的交谈",
+        current_meaning="我现在愿意这样记住它。",
+        non_generalization="不推及所有未来。",
+        segments=[
+            {
+                "segment_id": "scene",
+                "title": "完整场景",
+                "content": "正文。",
+                "source_refs": ["experience:one"],
+            }
+        ],
+        expected_head_revision=0,
+        source_occurrence_id="event:one",
+    )
+
+    assert success is False
+    assert payload["error"] == "ArtifactHeadConflict"
+    assert payload["detail"]
+    assert payload["current_subject_revision"] == SUBJECT_REVISION
+    assert payload["current_head_revision"] == 0
+    assert payload["recoverable"] is True
+    assert "重新调用读取工具" in payload["hint"]
+
+
+async def test_propose_conflict_returns_recoverable_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale subject revision must yield the current revision so the model
+    can re-read and retry instead of giving up (F9-A)."""
+
+    repository = _Repository()
+    scheduler = _Scheduler(b"# MEMORY\n", ledger=_Ledger())
+
+    async def resolve(_tool):
+        return _runtime(repository, scheduler)
+
+    monkeypatch.setattr(boundary_tools, "_resolve_runtime", resolve)
+    success, payload = await _tool(
+        LifeProposeMemoryContinuityRevisionTool
+    ).execute(
+        proposed_content="# MEMORY\n\n新的常驻线索。\n",
+        reviewed_content_sha256="a" * 64,
+        expected_subject_revision="stale-revision",
+        reason="我想更新对这段记忆的理解。",
+    )
+
+    assert success is False
+    assert payload["error"] == "LearningSubjectRevisionConflict"
+    assert payload["detail"]
+    assert payload["current_subject_revision"] == SUBJECT_REVISION
+    assert payload["recoverable"] is True
+    assert "重新调用读取工具" in payload["hint"]
+
+
+async def test_create_boundary_non_conflict_failure_keeps_original_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-conflict failures keep the original error shape (no recoverable
+    fields), so only revision conflicts advertise a retry path."""
+
+    repository = _Repository()
+
+    async def append(manifest, *, expected_head_revision):
+        raise RuntimeError("boom")
+
+    repository.append = append  # type: ignore[method-assign]
+    scheduler = _Scheduler(b"# MEMORY\n")
+
+    async def resolve(_tool):
+        return _runtime(repository, scheduler)
+
+    monkeypatch.setattr(boundary_tools, "_resolve_runtime", resolve)
+    success, payload = await _tool(LifeCreateMemoryBoundaryTool).execute(
+        boundary_id="one-morning",
+        title="那一天",
+        scope="当时发生的交谈",
+        current_meaning="我现在愿意这样记住它。",
+        non_generalization="不推及所有未来。",
+        segments=[
+            {
+                "segment_id": "scene",
+                "title": "完整场景",
+                "content": "正文。",
+                "source_refs": ["experience:one"],
+            }
+        ],
+        expected_head_revision=0,
+        source_occurrence_id="event:one",
+    )
+
+    assert success is False
+    assert payload == {"error": "RuntimeError", "detail": "boom"}
+    assert "recoverable" not in payload

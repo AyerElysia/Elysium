@@ -599,6 +599,9 @@ class LifeEngineService(BaseService):
         self._legacy_config_warning_emitted: bool = False
         self._state = LifeEngineState()
         self._state_dirty: bool = False
+        # record_message 接近 EventBus 硬截止的连续慢计数：单次偶发（远端 MySQL
+        # 网络波动）记 INFO，连续 2 次才 WARNING（真实性能问题信号）。
+        self._slow_record_message_streak: int = 0
         self._heartbeat_task_id: str | None = None
         self._learning_maintenance_task_id: str | None = None
         self._storage_authority_renew_task_id: str | None = None
@@ -1505,6 +1508,11 @@ class LifeEngineService(BaseService):
     ) -> None:
         """Stop derived Learning work and retain immutable event intake."""
 
+        if (
+            self._learning_writer_claim is None
+            and self._learning_maintenance_task_id is None
+        ):
+            return  # already quiesced or never owned the projector
         scheduler = self._learning_scheduler
         quiesce = getattr(scheduler, "quiesce_projector", None)
         if callable(quiesce):
@@ -1561,6 +1569,16 @@ class LifeEngineService(BaseService):
             "local_claim_invalidated": bool(removed),
         }
         if not removed:
+            try:
+                await self._quiesce_learning_projector(
+                    reason="managed singleton loss did not match the local snapshot",
+                    error_type=str(exc.failure_type),
+                )
+            except Exception as quiesce_error:  # noqa: BLE001 - keep the claim failure
+                logger.warning(
+                    "learning projector quiesce failed after snapshot mismatch: %s",
+                    type(quiesce_error).__name__,
+                )
             self._cache_storage_renewal_state(
                 status="failed",
                 reason="managed singleton loss did not match the local snapshot",
@@ -1578,10 +1596,20 @@ class LifeEngineService(BaseService):
             self._runtime_context_writer_claim = None
         return True
 
-    def _fail_storage_authority(self, exc: BaseException) -> None:
+    async def _fail_storage_authority(self, exc: BaseException) -> None:
         runtime = self._storage_runtime
         if runtime is not None:
             runtime.invalidate_writer()
+        try:
+            await self._quiesce_learning_projector(
+                reason="storage authority was conclusively lost",
+                error_type=type(exc).__name__,
+            )
+        except Exception as quiesce_error:  # noqa: BLE001 - keep the original failure
+            logger.warning(
+                "learning projector quiesce failed during authority loss: %s",
+                type(quiesce_error).__name__,
+            )
         self._storage_renewal_health = {
             "status": "failed",
             "last_success_at": self._storage_renewal_health.get(
@@ -1639,7 +1667,7 @@ class LifeEngineService(BaseService):
                 raise
             except ManagedSingletonWriterClaimLost as exc:
                 if not await self._handle_managed_singleton_loss(exc):
-                    self._fail_storage_authority(
+                    await self._fail_storage_authority(
                         RuntimeError("ManagedSingletonLossSnapshotMismatch")
                     )
                     return
@@ -1670,11 +1698,11 @@ class LifeEngineService(BaseService):
                 GenerationConflict,
                 GenerationNotVerified,
             ) as exc:
-                self._fail_storage_authority(exc)
+                await self._fail_storage_authority(exc)
                 return
             except Exception as exc:  # noqa: BLE001 - classify before failing closed
                 if not _is_storage_renewal_connectivity_unknown(exc):
-                    self._fail_storage_authority(exc)
+                    await self._fail_storage_authority(exc)
                     return
                 transient_failures += 1
                 next_delay = _storage_renewal_backoff_seconds(
@@ -4261,16 +4289,26 @@ class LifeEngineService(BaseService):
             direction=direction,
             pending_message_count=self._state.pending_event_count,
         )
-        # 接近 EventBus 5 秒硬截止时告警，暴露冷路径竞态的具体慢阶段
+        # 接近 EventBus 5 秒硬截止时告警，暴露冷路径竞态的具体慢阶段。
+        # 单次偶发（远端 MySQL 网络波动）记 INFO；连续 2 次才 WARNING，
+        # 避免单次网络抖动刷高噪声。
         _total_elapsed = time.monotonic() - _phase_start
         if _total_elapsed >= 4.0:
-            logger.warning(
+            self._slow_record_message_streak += 1
+            _slow_log = (
+                logger.warning
+                if self._slow_record_message_streak >= 2
+                else logger.info
+            )
+            _slow_log(
                 f"life_engine record_message 接近 EventBus 超时阈值: "
                 f"total={_total_elapsed:.2f}s enqueue={_phase_enqueue:.2f}s "
                 f"facts={_phase_facts:.2f}s context={_phase_context:.2f}s "
                 f"message_id={event.event_id} stream_id={event.stream_id or ''} "
                 f"direction={direction}"
             )
+        else:
+            self._slow_record_message_streak = 0
 
     def _get_curiosity_engine(self) -> CuriosityEngine:
         cfg = self._cfg()
@@ -7346,6 +7384,7 @@ class LifeEngineService(BaseService):
             "3. **沉淀** — 把内在感受、梦后余韵、长期线索写入私有记忆或思考流。",
             "4. **补充信息差** — 只在表达层当前看不到事实、背景、线索或风险时，使用 `nucleus_tell_dfc`。",
             "5. **安静结束** — 没有明确需要时，可以安静结束本轮；如果精力需要恢复，可以主动休息。",
+            "6. **尊重工具预算** — 心跳每轮最多 3 次工具调用：优先轻量动作（观察/沉淀/`nucleus_tell_dfc`/TODO），不要在心跳里做长查询（如翻完整对话历史、多轮检索）；需要完整上下文时交给表达层在聊天流里处理。",
             "",
             "### `nucleus_manage_todo` — 承诺记录",
             "",

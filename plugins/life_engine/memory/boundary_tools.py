@@ -39,6 +39,60 @@ class _BoundaryToolRuntime:
     stream_scope: str
 
 
+_RECOVERABLE_CONFLICT_HINT = "请重新调用读取工具确认最新 revision 后再提交"
+
+
+async def _recoverable_conflict_payload(
+    exc: BaseException,
+    *,
+    scheduler: Any = None,
+    repository: Any = None,
+    boundary_id: str = "",
+    error: str,
+    detail: str,
+) -> dict[str, Any]:
+    """Attach the latest revisions to a revision-conflict error payload.
+
+    Read-only: the tool must never replay or auto-apply the candidate with the
+    refreshed revision (AGENTS.md §4.1 subject-file sovereignty). Non-conflict
+    failures keep their original shape.
+    """
+
+    payload: dict[str, Any] = {"error": error, "detail": detail}
+    name = type(exc).__name__
+    message = str(exc)
+    conflict_markers = (
+        "LearningSubjectRevisionConflict",
+        "LearningDecisionSubjectRevisionConflict",
+        "ArtifactHeadConflict",
+    )
+    matched = next(
+        (marker for marker in conflict_markers if marker in name or marker in message),
+        None,
+    )
+    if matched is None:
+        return payload
+    payload["error"] = matched
+    if scheduler is not None:
+        try:
+            payload["current_subject_revision"] = (
+                str(await scheduler.current_subject_revision()).strip().lower()
+            )
+        except BaseException:  # noqa: BLE001 - diagnostics must not mask the conflict
+            pass
+    if repository is not None and boundary_id:
+        try:
+            current = await repository.read_current(str(boundary_id))
+            payload["current_head_revision"] = (
+                current.head_revision if current is not None else 0
+            )
+        except BaseException:  # noqa: BLE001 - diagnostics must not mask the conflict
+            pass
+    payload["recoverable"] = True
+    payload["hint"] = _RECOVERABLE_CONFLICT_HINT
+    return payload
+
+
 def _canonical_hash(value: Any) -> str:
     return hashlib.sha256(
         json.dumps(
@@ -148,13 +202,21 @@ async def _resolve_runtime(tool: BaseTool) -> _BoundaryToolRuntime:
         raise RuntimeError("LearningSchedulerUnavailable")
     stream_scope = str(tool.get_current_stream_id() or "")
     if not stream_scope:
-        raise PermissionError("MemoryBoundaryStreamOwnerRequired")
+        # 可操作化：心跳等无聊天流上下文时，模型看到这条就知道为什么被拒、该怎么办
+        raise PermissionError(
+            "当前不在聊天流上下文中（如心跳），无流归属，不可读写记忆边界；"
+            "请在聊天流对话中再调用"
+        )
     instance = service.consciousness_registry.get_for_stream(stream_scope)
     if instance is None or not instance.is_active:
-        raise PermissionError("MemoryBoundaryActorIsNotActive")
+        raise PermissionError(
+            "当前意识实例不活跃（无有效聊天流），不可读写记忆边界；请在聊天流对话中再调用"
+        )
     actor = str(instance.instance_id or "").strip()
     if not actor:
-        raise PermissionError("MemoryBoundaryActorIdentityRequired")
+        raise PermissionError(
+            "无法解析当前意识实例身份，不可读写记忆边界；请在聊天流对话中再调用"
+        )
     living = memory_service._require_memory_storage().living
     return _BoundaryToolRuntime(
         service=service,
@@ -300,7 +362,11 @@ class LifeCreateMemoryBoundaryTool(BaseTool):
             "有序完整分段：segment_id/title/content/source_refs，可选 source_occurrence_ids/scope/visibility",
         ],
         expected_head_revision: Annotated[
-            int, "新建为 0；更新使用 history 返回的 head revision"
+            int,
+            "新建为 0；更新使用 history 返回的 head revision。"
+            "注意：这是乐观锁（CAS）——必须传你读取时拿到的值；"
+            "若提交时已被他人/其他实例推进，服务端会返回冲突和当前实际 revision，"
+            "请重新读取最新值后再提交，不要编造 revision",
         ] = 0,
         source_occurrence_id: Annotated[
             str,
@@ -308,6 +374,7 @@ class LifeCreateMemoryBoundaryTool(BaseTool):
         ] = "",
         visibility: Annotated[str, "开放文本可见范围"] = "private",
     ) -> tuple[bool, dict[str, Any]]:
+        runtime: _BoundaryToolRuntime | None = None
         try:
             runtime = await _resolve_runtime(self)
             subject_revision = (
@@ -386,7 +453,14 @@ class LifeCreateMemoryBoundaryTool(BaseTool):
             }
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"长期记忆边界记录失败: error_type={type(exc).__name__}")
-            return False, {"error": type(exc).__name__, "detail": str(exc)}
+            return False, await _recoverable_conflict_payload(
+                exc,
+                scheduler=(runtime.scheduler if runtime is not None else None),
+                repository=(runtime.repository if runtime is not None else None),
+                boundary_id=str(boundary_id),
+                error=type(exc).__name__,
+                detail=str(exc),
+            )
 
 
 class LifeCreateMemoryBoundaryFromSubjectRangeTool(BaseTool):
@@ -413,7 +487,11 @@ class LifeCreateMemoryBoundaryFromSubjectRangeTool(BaseTool):
             "有序精确范围：segment_id/title/byte_start/byte_end，可选 scope/visibility；不得传 content/source_refs",
         ],
         expected_subject_revision: Annotated[
-            str, "status 返回的统一 SOUL+USER+MEMORY revision"
+            str,
+            "status 返回的统一 SOUL+USER+MEMORY revision。"
+            "注意：这是乐观锁（CAS）——必须传你读取时拿到的值；"
+            "若提交时已被他人/其他实例推进，服务端会返回冲突和当前实际 revision，"
+            "请重新读取最新值后再提交，不要编造 revision",
         ],
         reviewed_memory_version_id: Annotated[
             str, "status 返回的 MEMORY.md 精确 version_id"
@@ -422,7 +500,11 @@ class LifeCreateMemoryBoundaryFromSubjectRangeTool(BaseTool):
             str, "status 返回的 MEMORY.md 完整内容 SHA-256"
         ],
         expected_head_revision: Annotated[
-            int, "新建为 0；更新使用 history 返回的 head revision"
+            int,
+            "新建为 0；更新使用 history 返回的 head revision。"
+            "注意：这是乐观锁（CAS）——必须传你读取时拿到的值；"
+            "若提交时已被他人/其他实例推进，服务端会返回冲突和当前实际 revision，"
+            "请重新读取最新值后再提交，不要编造 revision",
         ] = 0,
         visibility: Annotated[str, "开放文本可见范围"] = "private",
     ) -> tuple[bool, dict[str, Any]]:
@@ -807,10 +889,15 @@ class LifeProposeMemoryContinuityRevisionTool(BaseTool):
         proposed_content: Annotated[str, "完整的 MEMORY.md 新候选，不能只传 diff"],
         reviewed_content_sha256: Annotated[str, "本次已阅读的当前 MEMORY.md 精确哈希"],
         expected_subject_revision: Annotated[
-            str, "本次已阅读的统一 SOUL+USER+MEMORY revision"
+            str,
+            "本次已阅读的统一 SOUL+USER+MEMORY revision。"
+            "注意：这是乐观锁（CAS）——必须传你读取时拿到的值；"
+            "若提交时已被他人/其他实例推进，服务端会返回冲突和当前实际 revision，"
+            "请重新读取最新值后再提交，不要编造 revision",
         ],
         reason: Annotated[str, "你为什么提出这一完整版本；开放文本"],
     ) -> tuple[bool, dict[str, Any]]:
+        runtime: _BoundaryToolRuntime | None = None
         try:
             runtime = await _resolve_runtime(self)
             current_revision = await runtime.scheduler.validate_subject_review_context(
@@ -911,7 +998,12 @@ class LifeProposeMemoryContinuityRevisionTool(BaseTool):
             }
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"长期记忆索引候选提交失败: error_type={type(exc).__name__}")
-            return False, {"error": type(exc).__name__, "detail": str(exc)}
+            return False, await _recoverable_conflict_payload(
+                exc,
+                scheduler=(runtime.scheduler if runtime is not None else None),
+                error=type(exc).__name__,
+                detail=str(exc),
+            )
 
 
 MEMORY_BOUNDARY_TOOLS = [
