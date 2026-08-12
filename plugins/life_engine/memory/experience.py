@@ -11,13 +11,18 @@ import hashlib
 import json
 import re
 import sqlite3
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
-from typing import Any, Sequence
+from typing import Any
 from uuid import uuid4
 
-from src.kernel.storage import CursorConflict, compare_and_advance_cursor
+from src.kernel.storage import (
+    CursorConflict,
+    canonical_json,
+    compare_and_advance_cursor,
+)
 
 from .indexing import transaction
 
@@ -62,11 +67,26 @@ class ExperienceRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class ExperienceOccurrenceRef:
+    """One immutable ingest occurrence resolved to canonical evidence."""
+
+    occurrence_id: str
+    source_event_id: str
+    ingest_position: int
+    canonical_event_id: str
+    canonical_payload_sha256: str
+    recorded_at: str
+    experience: ExperienceRecord
+    is_alias: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class ExperienceAppendReport:
     """Canonical records affected by an idempotent ledger append."""
 
     inserted: tuple[ExperienceRecord, ...] = ()
     existing: tuple[ExperienceRecord, ...] = ()
+    occurrences: tuple[ExperienceOccurrenceRef, ...] = ()
 
     @property
     def inserted_count(self) -> int:
@@ -126,7 +146,7 @@ class EvidenceAwareMemoryResult:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).astimezone().isoformat()
+    return datetime.now(UTC).astimezone().isoformat()
 
 
 def _json_dict(value: str | None) -> dict[str, Any]:
@@ -287,6 +307,62 @@ def create_life_memory_schema(db: sqlite3.Connection) -> None:
                 "ADD COLUMN revision INTEGER NOT NULL DEFAULT 0"
             )
 
+    # Kept additive so historical local ledgers gain the staged pipeline
+    # without replacing any existing authority table.
+    from .witness_pipeline import create_witness_pipeline_schema
+
+    create_witness_pipeline_schema(db)
+
+
+def experience_evidence_body(record: ExperienceRecord) -> dict[str, Any]:
+    """Canonical source evidence shared by local and selected backends."""
+
+    return {
+        "occurred_at": record.occurred_at,
+        "source": record.source,
+        "channel": record.channel,
+        "event_type": record.event_type,
+        "content": record.content,
+        "stream_id": record.stream_id,
+        "consciousness_instance_id": record.consciousness_instance_id,
+        "actor": record.actor,
+        "visibility": record.visibility,
+        "valid_from": record.valid_from or record.occurred_at,
+        "valid_to": record.valid_to,
+        "metadata": record.metadata,
+    }
+
+
+def experience_payload_sha256(record: ExperienceRecord) -> str:
+    return hashlib.sha256(
+        canonical_json(experience_evidence_body(record)).encode("utf-8")
+    ).hexdigest()
+
+
+def make_experience_occurrence_ref(
+    experience: ExperienceRecord,
+    *,
+    occurrence_id: str | None = None,
+    source_event_id: str | None = None,
+    ingest_position: int | None = None,
+    recorded_at: str | None = None,
+    is_alias: bool = False,
+) -> ExperienceOccurrenceRef:
+    return ExperienceOccurrenceRef(
+        occurrence_id=str(occurrence_id or experience.event_id),
+        source_event_id=str(source_event_id or experience.source_event_id),
+        ingest_position=(
+            int(experience.sequence)
+            if ingest_position is None
+            else int(ingest_position)
+        ),
+        canonical_event_id=experience.event_id,
+        canonical_payload_sha256=experience_payload_sha256(experience),
+        recorded_at=str(recorded_at or experience.recorded_at),
+        experience=experience,
+        is_alias=bool(is_alias),
+    )
+
 
 def _same_experience_occurrence(
     persisted: ExperienceRecord,
@@ -325,6 +401,7 @@ def append_experiences_detailed(
 
     inserted: list[ExperienceRecord] = []
     existing_records: list[ExperienceRecord] = []
+    occurrences: list[ExperienceOccurrenceRef] = []
     with transaction(db):
         for raw_record in records:
             source_event_id = str(
@@ -345,10 +422,11 @@ def append_experiences_detailed(
                 if not _same_experience_occurrence(persisted, record):
                     raise ValueError(f"ExperienceIdentityConflict:{record.event_id}")
                 existing_records.append(persisted)
+                occurrences.append(make_experience_occurrence_ref(persisted))
                 continue
 
             alias = db.execute(
-                """SELECT event_id FROM memory_experience_occurrence_aliases
+                """SELECT * FROM memory_experience_occurrence_aliases
                 WHERE occurrence_id = ?""",
                 (record.event_id,),
             ).fetchone()
@@ -359,7 +437,24 @@ def append_experiences_detailed(
                 ).fetchone()
                 if row is None:
                     raise RuntimeError(f"ExperienceAliasTargetMissing:{record.event_id}")
-                existing_records.append(_experience_from_row(row))
+                persisted = _experience_from_row(row)
+                if (
+                    not _same_experience_occurrence(persisted, record)
+                    or str(alias["source_event_id"]) != source_event_id
+                    or int(alias["ingest_position"]) != int(record.sequence)
+                ):
+                    raise ValueError(f"ExperienceAliasConflict:{record.event_id}")
+                existing_records.append(persisted)
+                occurrences.append(
+                    make_experience_occurrence_ref(
+                        persisted,
+                        occurrence_id=record.event_id,
+                        source_event_id=str(alias["source_event_id"]),
+                        ingest_position=int(alias["ingest_position"]),
+                        recorded_at=str(alias["recorded_at"]),
+                        is_alias=True,
+                    )
+                )
                 continue
 
             legacy = None
@@ -371,6 +466,7 @@ def append_experiences_detailed(
             if legacy is not None:
                 persisted = _experience_from_row(legacy)
                 if _same_experience_occurrence(persisted, record):
+                    alias_recorded_at = _now_iso()
                     db.execute(
                         """INSERT INTO memory_experience_occurrence_aliases (
                             occurrence_id, event_id, source_event_id,
@@ -381,10 +477,20 @@ def append_experiences_detailed(
                             persisted.event_id,
                             source_event_id,
                             int(record.sequence),
-                            _now_iso(),
+                            alias_recorded_at,
                         ),
                     )
                     existing_records.append(persisted)
+                    occurrences.append(
+                        make_experience_occurrence_ref(
+                            persisted,
+                            occurrence_id=record.event_id,
+                            source_event_id=source_event_id,
+                            ingest_position=int(record.sequence),
+                            recorded_at=alias_recorded_at,
+                            is_alias=True,
+                        )
+                    )
                     continue
 
             db.execute(
@@ -416,9 +522,11 @@ def append_experiences_detailed(
                 ),
             )
             inserted.append(record)
+            occurrences.append(make_experience_occurrence_ref(record))
     return ExperienceAppendReport(
         inserted=tuple(inserted),
         existing=tuple(existing_records),
+        occurrences=tuple(occurrences),
     )
 
 
@@ -451,6 +559,102 @@ def list_experiences_after(
         params,
     ).fetchall()
     return [_experience_from_row(row) for row in rows]
+
+
+_EXPERIENCE_OCCURRENCE_VIEW_SQL = """
+SELECT
+    occurrence.occurrence_id,
+    occurrence.canonical_event_id,
+    occurrence.occurrence_source_event_id,
+    occurrence.ingest_position,
+    occurrence.occurrence_recorded_at,
+    occurrence.is_alias,
+    experience.*
+FROM (
+    SELECT
+        event_id AS occurrence_id,
+        event_id AS canonical_event_id,
+        source_event_id AS occurrence_source_event_id,
+        sequence AS ingest_position,
+        recorded_at AS occurrence_recorded_at,
+        0 AS is_alias
+    FROM memory_experiences
+    UNION ALL
+    SELECT
+        occurrence_id,
+        event_id AS canonical_event_id,
+        source_event_id AS occurrence_source_event_id,
+        ingest_position,
+        recorded_at AS occurrence_recorded_at,
+        1 AS is_alias
+    FROM memory_experience_occurrence_aliases
+) AS occurrence
+JOIN memory_experiences AS experience
+  ON experience.event_id = occurrence.canonical_event_id
+"""
+
+
+def _experience_occurrence_from_row(row: sqlite3.Row) -> ExperienceOccurrenceRef:
+    experience = _experience_from_row(row)
+    return make_experience_occurrence_ref(
+        experience,
+        occurrence_id=str(row["occurrence_id"]),
+        source_event_id=str(row["occurrence_source_event_id"]),
+        ingest_position=int(row["ingest_position"]),
+        recorded_at=str(row["occurrence_recorded_at"]),
+        is_alias=bool(row["is_alias"]),
+    )
+
+
+def get_experience_occurrence(
+    db: sqlite3.Connection,
+    occurrence_id: str,
+) -> ExperienceOccurrenceRef | None:
+    row = db.execute(
+        _EXPERIENCE_OCCURRENCE_VIEW_SQL + " WHERE occurrence.occurrence_id = ?",
+        (occurrence_id,),
+    ).fetchone()
+    return _experience_occurrence_from_row(row) if row is not None else None
+
+
+def list_experience_occurrences_after(
+    db: sqlite3.Connection,
+    position: int,
+    limit: int = 100,
+) -> list[ExperienceOccurrenceRef]:
+    rows = db.execute(
+        _EXPERIENCE_OCCURRENCE_VIEW_SQL
+        + """ WHERE occurrence.ingest_position > ?
+        ORDER BY occurrence.ingest_position, occurrence.occurrence_id LIMIT ?""",
+        (max(0, int(position)), max(1, min(int(limit), 1000))),
+    ).fetchall()
+    return [_experience_occurrence_from_row(row) for row in rows]
+
+
+def experience_health_snapshot(db: sqlite3.Connection) -> dict[str, Any]:
+    row = db.execute(
+        """SELECT
+            (SELECT COUNT(*) FROM memory_experiences) AS canonical_count,
+            (SELECT COUNT(*) FROM memory_experience_occurrence_aliases) AS alias_count,
+            (SELECT MAX(sequence) FROM memory_experiences) AS canonical_frontier,
+            (SELECT MAX(ingest_position)
+             FROM memory_experience_occurrence_aliases) AS alias_frontier,
+            (SELECT MAX(recorded_at) FROM memory_experiences) AS latest_recorded_at
+        """
+    ).fetchone()
+    canonical_count = int(row["canonical_count"] or 0)
+    alias_count = int(row["alias_count"] or 0)
+    return {
+        "status": "healthy",
+        "canonical_count": canonical_count,
+        "alias_count": alias_count,
+        "occurrence_count": canonical_count + alias_count,
+        "frontier": max(
+            int(row["canonical_frontier"] or 0),
+            int(row["alias_frontier"] or 0),
+        ),
+        "latest_recorded_at": str(row["latest_recorded_at"] or ""),
+    }
 
 
 def insert_witness_memory(
@@ -871,19 +1075,26 @@ def _witness_from_row(db: sqlite3.Connection, row: sqlite3.Row) -> WitnessMemory
 __all__ = [
     "EpistemicKind",
     "EvidenceAwareMemoryResult",
-    "ExperienceRecord",
     "ExperienceAppendReport",
+    "ExperienceOccurrenceRef",
+    "ExperienceRecord",
     "MemorySearchMode",
     "WitnessMemory",
     "WitnessSearchResult",
-    "create_life_memory_schema",
     "append_experiences_detailed",
+    "create_life_memory_schema",
+    "experience_evidence_body",
+    "experience_health_snapshot",
+    "experience_payload_sha256",
+    "get_experience_occurrence",
     "get_witness_by_projection_path",
     "get_witness_state",
     "insert_experiences",
     "insert_witness_memory",
+    "list_experience_occurrences_after",
     "list_experiences_after",
     "list_pending_witness_projections",
+    "make_experience_occurrence_ref",
     "mark_witness_projection",
     "migrate_legacy_witness",
     "migration_exists",

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -61,12 +61,15 @@ from ...memory.epistemic import (
 )
 from ...memory.experience import (
     ExperienceAppendReport,
+    ExperienceOccurrenceRef,
     ExperienceRecord,
     WitnessMemory,
     append_experiences_detailed,
+    experience_health_snapshot,
     get_witness_by_projection_path,
     get_witness_state,
     insert_witness_memory,
+    list_experience_occurrences_after,
     list_experiences_after,
     list_pending_witness_projections,
     mark_witness_projection,
@@ -150,6 +153,20 @@ from ...memory.search import (
     vector_search,
 )
 from ...memory.sqlite_runtime import run_db
+from ...memory.witness_pipeline import (
+    WitnessDecision,
+    WitnessDeliveryJob,
+    WitnessWindow,
+    append_witness_decision,
+    append_witness_window,
+    get_witness_decision,
+    get_witness_window,
+    list_witness_delivery_jobs,
+    list_witness_projection_records,
+    mark_witness_delivery_job,
+    next_pending_witness_window,
+    witness_projection_health,
+)
 from ...memory.worker import (
     IndexWorkerReport,
     process_index_jobs,
@@ -496,6 +513,21 @@ class LocalExperienceLedgerStore(_LocalPort):
             stream_scope=stream_scope,
         )
 
+    async def list_occurrences_after(
+        self,
+        position: int,
+        limit: int = 100,
+    ) -> list[ExperienceOccurrenceRef]:
+        return await run_db(
+            list_experience_occurrences_after,
+            self._db(),
+            position,
+            limit,
+        )
+
+    async def health_snapshot(self) -> dict[str, Any]:
+        return await run_db(experience_health_snapshot, self._db())
+
 
 class LocalWitnessLedgerStore(_LocalPort):
     async def append(self, **kwargs: Any) -> WitnessMemory:
@@ -593,6 +625,97 @@ class LocalWitnessLedgerStore(_LocalPort):
     async def record_migration(self, **kwargs: Any) -> None:
         async with self._write_scope():
             await run_db(record_witness_migration, self._db(), **kwargs)
+
+    async def append_window(self, window: WitnessWindow) -> WitnessWindow:
+        async with self._write_scope():
+            return await run_db(append_witness_window, self._db(), window)
+
+    async def get_window(self, window_id: str) -> WitnessWindow | None:
+        return await run_db(get_witness_window, self._db(), window_id)
+
+    async def next_pending_window(
+        self,
+        consciousness_instance_id: str | None = None,
+    ) -> WitnessWindow | None:
+        return await run_db(
+            next_pending_witness_window,
+            self._db(),
+            consciousness_instance_id,
+        )
+
+    async def append_decision(
+        self,
+        decision: WitnessDecision,
+        *,
+        delivery_payloads: Mapping[str, Mapping[str, Any]],
+    ) -> WitnessDecision:
+        async with self._write_scope():
+            return await run_db(
+                append_witness_decision,
+                self._db(),
+                decision,
+                delivery_payloads=delivery_payloads,
+            )
+
+    async def get_decision(self, decision_id: str) -> WitnessDecision | None:
+        return await run_db(get_witness_decision, self._db(), decision_id)
+
+    async def list_delivery_jobs(
+        self,
+        *,
+        delivery_kind: str | None = None,
+        statuses: Sequence[str] = ("pending", "failed"),
+        limit: int = 100,
+    ) -> list[WitnessDeliveryJob]:
+        return await run_db(
+            list_witness_delivery_jobs,
+            self._db(),
+            delivery_kind=delivery_kind,
+            statuses=statuses,
+            limit=limit,
+        )
+
+    async def mark_delivery_job(
+        self,
+        job_id: str,
+        *,
+        expected_revision: int,
+        status: str,
+        error_type: str = "",
+        available_at: str = "",
+        lease_owner: str = "",
+        lease_expires_at: str = "",
+        completed_at: str = "",
+    ) -> WitnessDeliveryJob:
+        async with self._write_scope():
+            return await run_db(
+                mark_witness_delivery_job,
+                self._db(),
+                job_id,
+                expected_revision=expected_revision,
+                status=status,
+                error_type=error_type,
+                available_at=available_at,
+                lease_owner=lease_owner,
+                lease_expires_at=lease_expires_at,
+                completed_at=completed_at,
+            )
+
+    async def list_projection_records(
+        self,
+        *,
+        statuses: Sequence[str] = (),
+        limit: int = 100,
+    ) -> list[WitnessDeliveryJob]:
+        return await run_db(
+            list_witness_projection_records,
+            self._db(),
+            statuses=statuses,
+            limit=limit,
+        )
+
+    async def projection_health(self) -> dict[str, Any]:
+        return await run_db(witness_projection_health, self._db())
 
 
 class LocalLivingMemoryStore(_LocalPort):

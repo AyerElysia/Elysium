@@ -7,7 +7,7 @@ remain open strings in the domain records consumed by these interfaces.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -32,6 +32,7 @@ from ...memory.epistemic import (
 )
 from ...memory.experience import (
     ExperienceAppendReport,
+    ExperienceOccurrenceRef,
     ExperienceRecord,
     WitnessMemory,
 )
@@ -54,6 +55,11 @@ from ...memory.living import (
 )
 from ...memory.nodes import MemoryNode
 from ...memory.search import DetailedSearchResult, LineageNodeView
+from ...memory.witness_pipeline import (
+    WitnessDecision,
+    WitnessDeliveryJob,
+    WitnessWindow,
+)
 from ...memory.worker import IndexWorkerReport
 from ...memory.workspace_projection_identity import WorkspaceProjectionBindingStore
 from ..models import BackendKind, StorageAvailability
@@ -270,6 +276,14 @@ class ExperienceLedgerStore(MemoryStorePort, Protocol):
         stream_scope: str | None = None,
     ) -> list[ExperienceRecord]: ...
 
+    async def list_occurrences_after(
+        self,
+        position: int,
+        limit: int = 100,
+    ) -> list[ExperienceOccurrenceRef]: ...
+
+    async def health_snapshot(self) -> dict[str, Any]: ...
+
 
 @runtime_checkable
 class WitnessLedgerStore(MemoryStorePort, Protocol):
@@ -322,6 +336,54 @@ class WitnessLedgerStore(MemoryStorePort, Protocol):
     async def migration_exists(self, migration_key: str) -> bool: ...
 
     async def record_migration(self, **kwargs: Any) -> None: ...
+
+    async def append_window(self, window: WitnessWindow) -> WitnessWindow: ...
+
+    async def get_window(self, window_id: str) -> WitnessWindow | None: ...
+
+    async def next_pending_window(
+        self,
+        consciousness_instance_id: str | None = None,
+    ) -> WitnessWindow | None: ...
+
+    async def append_decision(
+        self,
+        decision: WitnessDecision,
+        *,
+        delivery_payloads: Mapping[str, Mapping[str, Any]],
+    ) -> WitnessDecision: ...
+
+    async def get_decision(self, decision_id: str) -> WitnessDecision | None: ...
+
+    async def list_delivery_jobs(
+        self,
+        *,
+        delivery_kind: str | None = None,
+        statuses: Sequence[str] = ("pending", "failed"),
+        limit: int = 100,
+    ) -> list[WitnessDeliveryJob]: ...
+
+    async def mark_delivery_job(
+        self,
+        job_id: str,
+        *,
+        expected_revision: int,
+        status: str,
+        error_type: str = "",
+        available_at: str = "",
+        lease_owner: str = "",
+        lease_expires_at: str = "",
+        completed_at: str = "",
+    ) -> WitnessDeliveryJob: ...
+
+    async def list_projection_records(
+        self,
+        *,
+        statuses: Sequence[str] = (),
+        limit: int = 100,
+    ) -> list[WitnessDeliveryJob]: ...
+
+    async def projection_health(self) -> dict[str, Any]: ...
 
 
 @runtime_checkable

@@ -45,8 +45,11 @@ from plugins.life_engine.storage.memory.schema import (
     MEMORY_IMMUTABLE_TABLE_COLUMNS,
     MEMORY_IMMUTABLE_TABLES,
     MEMORY_MIGRATIONS,
+    MEMORY_MIXED_TABLES,
     MEMORY_MUTABLE_TABLES,
     MEMORY_SCHEMA_VERSION,
+    MEMORY_WITNESS_DELIVERY_IMMUTABLE_COLUMNS,
+    MEMORY_WITNESS_DELIVERY_MUTABLE_COLUMNS,
     MEMORY_WITNESS_IMMUTABLE_COLUMNS,
     MEMORY_WITNESS_MUTABLE_PROJECTION_COLUMNS,
     MemoryDatabaseImmutabilityError,
@@ -188,7 +191,7 @@ def test_mysql_memory_immutability_classification_is_exhaustive() -> None:
     mutable_tables = set(MEMORY_MUTABLE_TABLES)
 
     assert immutable_tables.isdisjoint(mutable_tables)
-    assert created_tables == immutable_tables | mutable_tables | {"memory_witnesses"}
+    assert created_tables == immutable_tables | mutable_tables | set(MEMORY_MIXED_TABLES)
     assert set(MEMORY_IMMUTABLE_TABLE_COLUMNS) == immutable_tables
 
     trigger_ddl = "\n".join(
@@ -210,6 +213,16 @@ def test_mysql_memory_immutability_classification_is_exhaustive() -> None:
     for column in MEMORY_WITNESS_MUTABLE_PROJECTION_COLUMNS:
         assert f"OLD.{column} <=> NEW.{column}" not in trigger_ddl
     assert "memory_witnesses_immutable_delete" in trigger_ddl
+    for column in MEMORY_WITNESS_DELIVERY_IMMUTABLE_COLUMNS:
+        assert f"OLD.{column} <=> NEW.{column}" in trigger_ddl
+    for column in MEMORY_WITNESS_DELIVERY_MUTABLE_COLUMNS:
+        delivery_trigger = next(
+            statement
+            for statement in MEMORY_IMMUTABILITY_MIGRATIONS[-1].statements
+            if "memory_witness_delivery_authority_immutable_update" in statement
+        )
+        assert f"OLD.{column} <=> NEW.{column}" not in delivery_trigger
+    assert "memory_witness_delivery_immutable_delete" in trigger_ddl
 
 
 @pytest.mark.asyncio
@@ -376,16 +389,15 @@ async def test_memory_immutability_verifier_detects_trigger_drift() -> None:
             if "information_schema.TRIGGERS" in str(statement):
                 rows: list[dict[str, str]] = []
                 for name, event, table in MEMORY_IMMUTABILITY_TRIGGER_CONTRACT[:-1]:
-                    marker = (
-                        "MemoryWitnessAuthorityImmutable"
-                        if table == "memory_witnesses"
-                        else "MemoryAuthorityRecordImmutable"
-                    )
-                    protected_columns = (
-                        MEMORY_WITNESS_IMMUTABLE_COLUMNS
-                        if table == "memory_witnesses"
-                        else MEMORY_IMMUTABLE_TABLE_COLUMNS[table]
-                    )
+                    if table == "memory_witnesses":
+                        marker = "MemoryWitnessAuthorityImmutable"
+                        protected_columns = MEMORY_WITNESS_IMMUTABLE_COLUMNS
+                    elif table == "memory_witness_delivery_jobs":
+                        marker = "MemoryWitnessDeliveryAuthorityImmutable"
+                        protected_columns = MEMORY_WITNESS_DELIVERY_IMMUTABLE_COLUMNS
+                    else:
+                        marker = "MemoryAuthorityRecordImmutable"
+                        protected_columns = MEMORY_IMMUTABLE_TABLE_COLUMNS[table]
                     comparisons = " ".join(
                         f"OLD.{column} <=> NEW.{column}" for column in protected_columns
                     )
@@ -655,3 +667,11 @@ async def test_local_memory_bundle_satisfies_every_public_port() -> None:
         ].target_id == right.node_id
     finally:
         await asyncio.to_thread(db.close)
+
+
+def test_mysql_memory_adapters_satisfy_new_pipeline_ports_structurally() -> None:
+    experiences = object.__new__(mysql_memory.MySQLExperienceLedgerStore)
+    witnesses = object.__new__(mysql_memory.MySQLWitnessLedgerStore)
+
+    assert isinstance(experiences, ExperienceLedgerStore)
+    assert isinstance(witnesses, WitnessLedgerStore)
