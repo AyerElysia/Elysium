@@ -17,9 +17,9 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends
 
-from src.core.components.types import EventType
-from src.core.managers.event_manager import get_event_manager
 from src.core.models.message import Message
+from src.core.transport.message_receive import get_message_receiver
+from src.kernel.logger import get_logger
 
 from .auth_store import SessionRecord
 from .chat import ChatQueryFailure, ChatQueryService
@@ -30,6 +30,8 @@ from .schemas.inbound_message import (
 )
 
 _INJECT_PLATFORM = "api"
+_AYLA_ADAPTER_SIGNATURE = "ayla_adapter:adapter:ayla_adapter"
+logger = get_logger("ayla_adapter", display="AylaAdapter")
 
 
 class InboundInjector:
@@ -40,14 +42,18 @@ class InboundInjector:
         *,
         queries: ChatQueryService,
         store_provider: Callable[[], Any] | None = None,
+        receiver_provider: Callable[[], Any] | None = None,
     ) -> None:
         self._queries = queries
         self._store_provider = store_provider or getattr(
             queries, "_store_provider", None
         )
+        self._receiver_provider = receiver_provider
 
-    def _event_manager(self) -> Any:
-        return get_event_manager()
+    def _message_receiver(self) -> Any:
+        if self._receiver_provider is not None:
+            return self._receiver_provider()
+        return get_message_receiver()
 
     async def inject(
         self,
@@ -103,15 +109,29 @@ class InboundInjector:
             },
         )
 
-        event_manager = self._event_manager()
-        await event_manager.publish_event(
-            EventType.ON_MESSAGE_RECEIVED,
-            {
-                "message": message,
-                "envelope": {},
-                "adapter_signature": "api-inject",
-            },
+        adapter_signature = (
+            _AYLA_ADAPTER_SIGNATURE if platform == "ayla" else "api-inject"
         )
+        if platform == "ayla":
+            logger.info(
+                "收到 Ayla 消息: "
+                f"chat_type={chat_type} sender={message.sender_name or message.sender_id} "
+                f"content={request.content[:80]}"
+            )
+
+        receiver = self._message_receiver()
+        accepted = await receiver.receive_message(
+            message,
+            adapter_signature,
+            envelope={},
+        )
+        if not accepted:
+            raise APIError(
+                "message_not_accepted",
+                "消息未被标准接收管线接受，请检查重复消息或接收器状态。",
+                status_code=503,
+                retryable=True,
+            )
         return InboundMessageInjectResult(
             message_id=message_id,
             stream_id=request.stream_id,

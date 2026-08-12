@@ -127,6 +127,47 @@ async def test_receive_envelope_dedups_same_message_in_window() -> None:
     assert event_manager.publish_event.await_count == 1
 
 
+async def test_receive_standardized_message_uses_full_receive_pipeline() -> None:
+    """已标准化消息仍需统一去重、用户更新和事件发布。"""
+    message = Message(
+        message_id="msg-inject-1",
+        content="hello from ayla",
+        processed_plain_text="hello from ayla",
+        sender_id="app-user-1",
+        sender_name="汐汐",
+        platform="ayla",
+        chat_type="private",
+        stream_id="explicit-ayla-stream",
+    )
+    receiver = MessageReceiver()
+    receiver._update_person_info = AsyncMock()  # type: ignore[method-assign]
+    event_manager = MagicMock()
+    event_manager.publish_event = AsyncMock(
+        return_value={"decision": "SUCCESS", "params": {}}
+    )
+    receiver._event_manager = event_manager
+
+    first = await receiver.receive_message(
+        message,
+        "ayla_adapter:adapter:ayla_adapter",
+        envelope={},
+    )
+    duplicate = await receiver.receive_message(
+        message,
+        "ayla_adapter:adapter:ayla_adapter",
+        envelope={},
+    )
+
+    assert first is True
+    assert duplicate is False
+    receiver._update_person_info.assert_awaited_once_with(message)
+    event_manager.publish_event.assert_awaited_once()
+    kwargs = event_manager.publish_event.await_args.args[1]
+    assert kwargs["message"] is message
+    assert kwargs["message"].stream_id == "explicit-ayla-stream"
+    assert kwargs["adapter_signature"] == "ayla_adapter:adapter:ayla_adapter"
+
+
 async def test_receive_envelope_different_message_ids_not_deduped() -> None:
     """不同 message_id 的入站消息应正常分别分发。"""
     message1 = Message(

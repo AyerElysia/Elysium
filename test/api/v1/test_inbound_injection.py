@@ -130,23 +130,27 @@ def publishing(
     client, store = _build_app(tmp_path)
     published: list[dict[str, Any]] = []
 
-    class _FakeEventManager:
-        async def publish_event(
-            self, event: Any, kwargs: dict[str, Any] | None = None
-        ) -> dict[str, Any]:
-            kwargs = kwargs or {}
+    class _FakeMessageReceiver:
+        async def receive_message(
+            self,
+            message: Any,
+            adapter_signature: str,
+            *,
+            envelope: Any = None,
+        ) -> bool:
             published.append(
                 {
-                    "event": getattr(event, "value", str(event)),
-                    "message": kwargs.get("message"),
-                    "adapter_signature": kwargs.get("adapter_signature"),
+                    "event": "on_message_received",
+                    "message": message,
+                    "adapter_signature": adapter_signature,
+                    "envelope": envelope,
                 }
             )
-            return {"decision": "SUCCESS", "params": kwargs}
+            return True
 
     monkeypatch.setattr(
-        "src.app.api.v1.inbound_messages.get_event_manager",
-        lambda: _FakeEventManager(),
+        "src.app.api.v1.inbound_messages.get_message_receiver",
+        lambda: _FakeMessageReceiver(),
     )
     store.published = published
     return client, store
@@ -199,6 +203,7 @@ class TestInboundInjection:
         assert message.platform == "feishu"  # 来自账本投影，而非凭空猜测
         assert message.chat_type == "private"
         assert record["adapter_signature"] == "api-inject"
+        assert record["envelope"] == {}
 
     def test_inject_with_sender_metadata(
         self, publishing: tuple[TestClient, _PublishingStore]
@@ -218,6 +223,29 @@ class TestInboundInjection:
         assert message.sender_id == "app-user-1"
         assert message.sender_name == "外部应用"
         assert message.sender_cardname == "卡片名"
+
+    def test_ayla_injection_uses_ayla_adapter_signature(
+        self, publishing: tuple[TestClient, _PublishingStore]
+    ) -> None:
+        client, store = publishing
+        response = client.post(
+            "/chat/messages:inject",
+            json=_inject_payload(
+                stream_id="stream-ayla",
+                platform="ayla",
+                chat_type="private",
+                sender_id="app-user-1",
+                sender_name="汐汐",
+            ),
+            headers=_headers(client),
+        )
+        assert response.status_code == 202, response.text
+        record = store.published[0]
+        assert record["message"].platform == "ayla"
+        assert record["message"].stream_id == "stream-ayla"
+        assert record["adapter_signature"] == (
+            "ayla_adapter:adapter:ayla_adapter"
+        )
 
     def test_explicit_platform_overrides_ledger_projection(
         self, publishing: tuple[TestClient, _PublishingStore]
@@ -283,15 +311,19 @@ class TestInboundInjection:
         # 只有 chat:read 凭据不能注入
         client, store = _build_app(tmp_path)
 
-        class _FakeEventManager:
-            async def publish_event(
-                self, event: Any, kwargs: dict[str, Any] | None = None
-            ) -> dict[str, Any]:
-                return {"decision": "SUCCESS", "params": kwargs or {}}
+        class _FakeMessageReceiver:
+            async def receive_message(
+                self,
+                message: Any,
+                adapter_signature: str,
+                *,
+                envelope: Any = None,
+            ) -> bool:
+                return True
 
         monkeypatch.setattr(
-            "src.app.api.v1.inbound_messages.get_event_manager",
-            lambda: _FakeEventManager(),
+            "src.app.api.v1.inbound_messages.get_message_receiver",
+            lambda: _FakeMessageReceiver(),
         )
         store.published = []
 
@@ -326,9 +358,20 @@ class TestInboundInjectorService:
     async def _inject(
         self, queries: ChatQueryService, request: InboundMessageInjectRequest
     ) -> Any:
-        return await InboundInjector(queries=queries).inject(
-            request=request, session=_session()
-        )
+        class _AcceptingReceiver:
+            async def receive_message(
+                self,
+                message: Any,
+                adapter_signature: str,
+                *,
+                envelope: Any = None,
+            ) -> bool:
+                return True
+
+        return await InboundInjector(
+            queries=queries,
+            receiver_provider=lambda: _AcceptingReceiver(),
+        ).inject(request=request, session=_session())
 
     def test_store_unavailable_raises_component_unavailable(
         self, tmp_path: Path

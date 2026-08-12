@@ -572,10 +572,10 @@ class Bot:
         assert self.config is not None
 
         # Step 1: 初始化 MessageReceiver 和 SinkManager
-        from src.core.transport import MessageReceiver, SinkManager
+        from src.core.transport import SinkManager, init_message_receiver
         from src.core.transport.sink import set_sink_manager
 
-        self.message_receiver = MessageReceiver()
+        self.message_receiver = init_message_receiver()
         self.sink_manager = SinkManager(self.message_receiver)
         set_sink_manager(self.sink_manager)
         self.ui.update_phase_status("消息接收器", "已初始化")

@@ -36,8 +36,12 @@ async def test_initialize_core_initializes_mcp_manager() -> None:
     fake_mcp_manager = MagicMock()
     fake_mcp_manager.initialize = AsyncMock(return_value=None)
 
+    fake_receiver = MagicMock()
     with (
-        patch("src.core.transport.MessageReceiver", return_value=MagicMock()),
+        patch(
+            "src.core.transport.init_message_receiver",
+            return_value=fake_receiver,
+        ) as init_receiver,
         patch(
             "src.core.transport.SinkManager",
             return_value=MagicMock(),
@@ -54,6 +58,8 @@ async def test_initialize_core_initializes_mcp_manager() -> None:
     ):
         await bot._initialize_core()
 
+    assert bot.message_receiver is fake_receiver
+    init_receiver.assert_called_once_with()
     assert bot.mcp_manager is fake_mcp_manager
     fake_mcp_manager.initialize.assert_awaited_once()
 

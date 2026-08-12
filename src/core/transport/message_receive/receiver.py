@@ -181,6 +181,59 @@ class MessageReceiver:
     # 公共接口
     # ──────────────────────────────────────────
 
+    async def receive_message(
+        self,
+        message: Message,
+        adapter_signature: str,
+        *,
+        envelope: MessageEnvelope | None = None,
+    ) -> bool:
+        """接收已标准化的 ``Message`` 并走完整标准接收链。
+
+        供已经在可信边界内完成协议解析、且必须保留显式 ``stream_id`` 的
+        入站来源使用（例如独立应用 ``messages:inject``）。该入口与平台
+        envelope 共用同一去重窗口、可观测日志、用户信息更新和事件发布，
+        避免 API 直接发布事件而绕过标准接收语义。
+        """
+        if not await self._claim_message(
+            adapter_signature=adapter_signature,
+            platform=message.platform,
+            message_id=message.message_id,
+        ):
+            logger.debug(
+                f"忽略去重窗口内的重复消息: id={message.message_id}, "
+                f"platform={message.platform}, adapter={adapter_signature}"
+            )
+            return False
+
+        try:
+            handled = await self._dispatch_message(
+                message,
+                envelope=envelope or {},
+                adapter_signature=adapter_signature,
+            )
+        except BaseException:
+            await self._release_message(
+                adapter_signature=adapter_signature,
+                platform=message.platform,
+                message_id=message.message_id,
+            )
+            raise
+
+        if handled:
+            await self._complete_message(
+                adapter_signature=adapter_signature,
+                platform=message.platform,
+                message_id=message.message_id,
+            )
+        else:
+            await self._release_message(
+                adapter_signature=adapter_signature,
+                platform=message.platform,
+                message_id=message.message_id,
+            )
+        return handled
+
     async def receive_envelope(
         self,
         envelope: MessageEnvelope,
@@ -295,22 +348,42 @@ class MessageReceiver:
             )
             return False
 
-        # 构建人类可读的日志 (Rich 格式)
-        msg_info = envelope.get("message_info", {})
-        platform = str(msg_info.get("platform", "unknown"))
-        group_info = msg_info.get("group_info")
-        sender_display = escape(message.sender_cardname or message.sender_name or message.sender_id)
+        return await self._dispatch_message(
+            message,
+            envelope=envelope,
+            adapter_signature=adapter_signature,
+        )
+
+    async def _dispatch_message(
+        self,
+        message: Message,
+        *,
+        envelope: MessageEnvelope,
+        adapter_signature: str,
+    ) -> bool:
+        """记录、更新用户并发布一条已标准化消息。"""
+        extra = getattr(message, "extra", {}) or {}
+        sender_display = escape(
+            message.sender_cardname or message.sender_name or message.sender_id
+        )
         sender_colored = f"[#89DCEB]{sender_display}[/#89DCEB]"
 
-        if group_info:
-            stream_name = escape(group_info.get("group_name") or group_info.get("group_id", ""))
+        group_name = str(extra.get("group_name") or "").strip()
+        group_id = str(extra.get("group_id") or "").strip()
+        if message.chat_type == "group" and (group_name or group_id):
+            stream_name = escape(group_name or group_id)
             location = f"[#F092B0]{stream_name}[/#F092B0] | {sender_colored}"
         else:
             location = sender_colored
 
-        content_preview = escape((message.processed_plain_text or str(message.content) or "")[:80])
+        content_preview = escape(
+            (message.processed_plain_text or str(message.content) or "")[:80]
+        )
         content_colored = f"[#A6E3A1]{content_preview}[/#A6E3A1]"
-        logger.info(f"<[b]{escape(platform)}[/b]> {location}: {content_colored}")
+        logger.info(
+            f"<[b]{escape(message.platform or 'unknown')}[/b]> "
+            f"{location}: {content_colored}"
+        )
 
         await self._update_person_info(message)
 
