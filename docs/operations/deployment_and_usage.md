@@ -60,10 +60,10 @@ Elysium 是数字生命系统，不是通用聊天机器人框架。修改配置
 | 文本与图片模型 | 需按部署环境配置 | 所选模型必须声明并实际支持所需的文本、视觉和工具调用能力 |
 | Life Memory 文本向量生成 | 需单独验收 | 向量维度必须与活动索引一致；完整记忆检索功能需单独验收 |
 | 主体媒体能力 | 图片与语音四项已验收 | 飞书图片保存/发送、语音接收识别和语音合成发送均已通过真实端到端验收；所有能力由主体主动调用 |
-| Ayla 独立应用通道 | 注册级已接入（非端到端） | `plugins/ayla_adapter`（platform=`ayla`）注册进 registry，出站虚拟确认，不接收入站（入站走 `messages:inject`），投递由 Ayla 侧 SSE 投影完成；契约测试覆盖注册/出站/命令能力空。真实 Ayla 后端端到端未验收，见接入文档 §8.2 |
+| Ayla 独立应用通道 | 已验证（端到端） | `plugins/ayla_adapter`（platform=`ayla`）注册进 registry，出站虚拟确认，不接收入站（入站走 `messages:inject` 进标准接收链），投递由 Ayla 侧 SSE 投影完成；2026-08-12 完成真实 Ayla 前端 Playwright 端到端验收（收发 + 刷新持久化），见接入文档 §8.2 |
 | 其他功能 | 暂不验收 | 包括群聊、视频、普通文件、直播、Minecraft、屏幕观察、MCP 等；配置或代码存在不代表已验证 |
 
-当前仍有效的真实端到端验收记录包括：**QQ 聊天、飞书聊天、QQ 查看图片、飞书查看图片、飞书保存图片、飞书发送图片、飞书语音接收识别、飞书语音合成发送**。验收记录只说明相关链路曾经通过，不记录或规定任何个人部署环境当前是否启用该能力。
+当前仍有效的真实端到端验收记录包括：**QQ 聊天、飞书聊天、QQ 查看图片、飞书查看图片、飞书保存图片、飞书发送图片、飞书语音接收识别、飞书语音合成发送、Ayla 独立应用聊天**。验收记录只说明相关链路曾经通过，不记录或规定任何个人部署环境当前是否启用该能力。
 
 ---
 
@@ -1192,7 +1192,7 @@ Ctrl+C
 - [x] QQ 私聊图片能进入统一媒体链并完成真实视觉识别。
 - [ ] 群聊、语音、文件、视频及图片保存暂不验收。
 
-### 12.7 Ayla 独立应用通道（注册级验收，见接入文档 §8.1）
+### 12.7 Ayla 独立应用通道（端到端验收，见接入文档 §8）
 
 - [x] `plugins/ayla_adapter` 已注册，`AylaAdapter.platform == "ayla"`。
 - [x] foundation 能识别 `ayla_adapter`（provider=`ayla`）。
@@ -1201,8 +1201,10 @@ Ctrl+C
 - [x] `life_send_text` 在 ayla 流出站返回成功（虚拟确认），不 `ConnectError`/「未找到匹配 Adapter」。
 - [x] ayla 流命令返回 `capability_disabled`（不误路由到 feishu/qq/kook）。
 - [x] 契约测试全绿（`test_ayla_adapter.py` / `test_ayla_message_sender.py` / API 相关）。
-- [ ] Ayla 侧 profile `stream_id` 为 `generate_stream_id("ayla", ...)` 独立流，inject/SSE 订阅三处一致（代码已对齐，需真实 Ayla 后端确认）。
-- [ ] Ayla 真实端到端未验收（用户经 Ayla 应用发消息 → 回复经 SSE 投影到前端）。
+- [x] Ayla 侧 profile `stream_id` 为 `generate_stream_id("ayla", ...)` 独立流，inject/SSE 订阅三处一致（2026-08-12 数据迁移 + 运行时校验）。
+- [x] Ayla 真实端到端验收通过（2026-08-12）：Ayla 前端 Playwright 发送 → inject 进标准接收链 → life_engine 回复 → SSE → bridge 投影 → 前端实时显示；刷新后历史持久化。
+- [x] 入站可观测日志：`AylaAdapter | INFO | 收到 Ayla 消息…` / `消息接收器 | INFO | <ayla> 汐汐: …` / `UserQuery | INFO | …`（2026-08-12 起）。
+- [x] SSE 长连接稳定：heartbeat 独立于 `has_more`，不再 60 秒读超时断线；Elysium 重启后 bridge 走 `reset_session` secret 重签恢复（2026-08-12 起）。
 
 ---
 
@@ -1269,7 +1271,7 @@ Ayla 注册级契约（接入文档 §8.1）由以下测试保护：
 
 2026-08-11 该组测试结果为 `52 passed`（14 个 Ayla 相关 + 38 个 API 相关）。Windows 沙箱下若 pytest 退出阶段触发 safe-delete bulk guard，用 `PYTEST_DEBUG_TEM_ROOT=$TEMP/pytest_tmp_root` + `-p no:cacheprovider -o cache_dir=/dev/null` 规避。
 
-Ayla 侧（跨仓库子模块 `Ayla/backend/apps/elysia_bridge`）契约测试：`test_models.py`/`test_profile_api.py`/`test_inject.py`/`test_elysia_client.py`/`test_outbound.py`/`test_bridge_loop.py` 全绿（platform 默认 `ayla`、stream_id 自动生成、inject 带 `ayla`、SSE 投影过滤匹配）。测试环境需安装 `Pillow`（`apps.media` 导入链依赖）；`test_voice_*` 的 `MockTransport.get` 失败为既有 voice 测试环境问题，与 Ayla 接入无关。
+Ayla 侧（跨仓库子模块 `Ayla/backend/apps/elysia_bridge`）契约测试：`test_models.py`/`test_profile_api.py`/`test_inject.py`/`test_elysia_client.py`/`test_outbound.py`/`test_bridge_loop.py` 全绿（platform 默认 `ayla`、stream_id 自动生成、inject 带 `ayla`、SSE 投影过滤匹配）。2026-08-12 补充：桥接方向过滤（`test_loop_skips_received_and_requested_chat_events`，只投影 delivered）与 401 secret 重签恢复（`test_loop_unauth_reissues_from_secret_when_refresh_fails`）。Elysium 侧 `test/api/v1/test_events_api.py` 补充 SSE 心跳独立于 `has_more` 的用例（`test_stream_heartbeat_survives_busy_tail`）。测试环境需安装 `Pillow`（`apps.media` 导入链依赖）；`test_voice_*` 的 `MockTransport.get` 失败为既有 voice 测试环境问题，与 Ayla 接入无关。
 
 该组测试用于适配器离线回归，但测试通过不等于对应能力已完成端到端验收。飞书语音接收识别与语音合成发送之所以列为可用，是因为已经完成真实飞书端到端验收，而不是因为音频相关用例存在；QQ/NapCat 语音仍不能据此宣称可用。
 

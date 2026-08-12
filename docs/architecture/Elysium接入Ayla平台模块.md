@@ -1,6 +1,6 @@
 # Elysium 接入 Ayla 平台模块
 
-> 文档状态：待实施（本文是新增 Ayla 平台的权威契约与实施步骤，供 AI 直接执行；实施后以代码与契约测试为准，不以本文行数为验收证据）
+> 文档状态：**已实施并完成真实端到端验收**（2026-08-12，真实 Ayla 前端 Playwright + 真实 Elysium + service credential）。
 >
 > 文档性质：权威文档。Elysium 侧新增「第四个聊天通道」Ayla 的接入方案，与 [平台适配器.md](./平台适配器.md) 同级的接入契约；凡与本文冲突，以本文与当前代码为准。
 >
@@ -75,13 +75,17 @@ Ayla 出站有**两条可能路径**，必须明确主次，避免重复投递�
 
 ```
 Ayla 前端 ──应用 WS──> Ayla 后端(chat consumer)
-   └─ on_user_message_to_elysia (elysia_bridge/services.py:406)
-        └─ inject_user_message (elysia_bridge/services.py:442)
-             └─ elysia_client.inject_message (elysia_client.py:288)
+   └─ on_user_message_to_elysia (elysia_bridge/services.py)
+        └─ inject_user_message (elysia_bridge/services.py)
+             └─ elysia_client.inject_message (elysia_client.py)
                   └─ POST /api/v1/chat/messages:inject
-                       └─ InboundInjector.inject (src/app/api/v1/inbound_messages.py:52)
-                            └─ ON_MESSAGE_RECEIVED → Distributor → Chatter
+                       └─ InboundInjector.inject (src/app/api/v1/inbound_messages.py)
+                            └─ MessageReceiver.receive_message（标准接收链，2026-08-12 起）
+                                 └─ 去重 + 用户信息更新 + 统一入站日志
+                                      └─ ON_MESSAGE_RECEIVED → Distributor → Chatter
 ```
+
+> **注入链路说明（2026-08-12 变更）**：`InboundInjector` 不再直接 `publish_event(ON_MESSAGE_RECEIVED)`，改为调用全局标准 `MessageReceiver.receive_message()`（adapter_signature=`ayla_adapter:adapter:ayla_adapter`），复用标准链的去重、用户信息更新、统一入站日志（`AylaAdapter | INFO | 收到 Ayla 消息…` / `消息接收器 | INFO | <ayla> 汐汐: …` / `UserQuery | INFO | …`）与事件发布；保留显式 `stream_id` 绑定（不走 converter 重算，避免破坏 `ElysiaProfile.stream_id` 的应用级绑定）。
 
 ### 2.2 注入请求关键字段（`InboundMessageInjectRequest`）
 
@@ -236,9 +240,15 @@ Ayla 后端 run_bridge_loop（SSE 订阅 stream_id=ayla流）
 
 ### 4.3 SSE 事件类型与投影
 
-Ayla `_handle_envelope`（`elysia_bridge/services.py:506`）按 `envelope.stream_id == profile.stream_id` 过滤，命中后 `aproject_elysia_reply` 投影为应用内消息（幂等键 `elysia-<event_id 哈希>`）并广播 `elysia.reply`。
+Ayla `_handle_envelope`（`elysia_bridge/services.py`）先按 `envelope.stream_id == profile.stream_id` 过滤，再对 `chat.message` 事件按 **`metadata.chat.direction`** 过滤，命中后 `aproject_elysia_reply` 投影为应用内消息（幂等键 `elysia-<event_id 哈希>`）并广播 `elysia.reply`。
+
+**方向过滤（2026-08-12 变更）**：只投影 `direction=delivered`（最终交付事实）；`received`（入站消息已由 Ayla 后端自行落库，桥接不得再投影，否则会把用户消息投影成爱莉回复）与 `requested`（发送请求，非交付，投影会与 delivered 重复）一律跳过。非 `chat.message` 事件（如 `voice_call`）不套用该过滤，保持既有行为。
 
 **依赖条件**：Ayla 侧 `ElysiaProfile.stream_id` 必须是 ayla 独立流（§5），SSE 订阅的 `stream_id` 与之一致。若仍是历史飞书流，SSE 过滤永远不匹配 → 爱莉回复投影不到应用内（这正是本次修复的核心之一）。
+
+**SSE 心跳（2026-08-12 修复）**：`EventQueryService.stream()` 的 heartbeat 检查独立于 `has_more`。事件库尾部持续有新事件（如潜意识 heartbeat）时，query 的 probe 恒返回结果 → `has_more` 恒 True；若心跳只在 `has_more=False` 分支发出，SSE 客户端会每 60 秒读超时断线。修复后超过 heartbeat 间隔无事件产出必发心跳注释帧，长连接稳定（Ayla bridge 每 15 秒收到心跳）。
+
+**会话恢复（2026-08-12 修复）**：Elysium 重启后旧 access/refresh token 签名失效，SSE 401；若 refresh 也失败且 `ensure_session` 复用内存失效 token，会陷入 401 重试循环。`ElysiaCredentialManager.reset_session()` 清除内存状态并强制用落盘 secret 重签，`run_bridge_loop` 的 401 处理在 refresh 失败后回退到它。
 
 ---
 
@@ -289,53 +299,63 @@ Ayla `_handle_envelope`（`elysia_bridge/services.py:506`）按 `envelope.stream
 | 入站 Adapter | AylaAdapter 不接收入站 | 入站走 inject，Adapter 只出站 + 状态展示 |
 | Adapter 出站实现 | 本期虚拟确认 | 不 POST 到 Ayla 后端（避免与 SSE 双写）；后续如需主动推送再实现 POST + 幂等 |
 | `_should_use_virtual_send` | 不改 | virtual 平台集合不含 ayla；ayla 走真实 Adapter |
-| Ayla 侧默认值 | `elysia-app` → `ayla` | 跨仓库契约，需 Ayla 侧一并改 |
+| Ayla 侧默认值 | `elysia-app` → `ayla` | 跨仓库契约，Ayla 侧一并改（已完成，含旧记录数据迁移） |
+| 投影方向过滤 | 只投影 `direction=delivered` | received/requested 不投影，避免误投影与重复（2026-08-12 起） |
+| SSE 心跳 | heartbeat 独立于 `has_more` | 尾部持续有新事件时不再 60 秒读超时断线（2026-08-12 起） |
+| 401 恢复 | refresh 失败回退 secret 重签 | `reset_session()` 强制重签，避免 Elysium 重启后 401 死循环（2026-08-12 起） |
+| bridge 首扫耗时 | 约 3 分钟扫 10.5 万条历史事件 | 远程 MySQL 性能限制，非缺陷；扫描期间仅心跳，扫到尾部后实时工作 |
 
 ---
 
-## 7. 实施清单（供 AI 直接执行）
+## 7. 实施清单
 
 ### 7.1 Elysium 侧
 
-- [ ] 新增 `plugins/ayla_adapter/`（plugin.py + config.py + sender.py），`AylaAdapter.platform="ayla"`，覆写 `health_check`/`get_bot_info`/`from_platform_message`/`_send_platform_message`
-- [ ] `src/app/api/v1/foundation.py` `_KNOWN_ADAPTER_PLUGINS` 追加 `"ayla_adapter": "ayla"`
-- [ ] `src/app/api/v1/chat_platforms.py` 新增 `AylaChatFacade`（capabilities 全 False）
-- [ ] `src/app/api/v1/chat_runtime.py` `ProviderFacadeRegistry` 追加 `"ayla": AylaChatFacade(...)`
-- [ ] 契约测试：AylaAdapter 出站不抛错 + `_infer_adapter_signature("ayla")` 命中；foundation 识别 ayla_adapter；chat_commands 对 ayla 流返回 `capability_disabled`
+- [x] 新增 `plugins/ayla_adapter/`（plugin.py + config.py + sender.py），`AylaAdapter.platform="ayla"`，覆写 `health_check`/`get_bot_info`/`from_platform_message`/`_send_platform_message`
+- [x] `src/app/api/v1/foundation.py` `_KNOWN_ADAPTER_PLUGINS` 追加 `"ayla_adapter": "ayla"`
+- [x] `src/app/api/v1/chat_platforms.py` 新增 `AylaChatFacade`（capabilities 全 False）
+- [x] `src/app/api/v1/chat_runtime.py` `ProviderFacadeRegistry` 追加 `"ayla": AylaChatFacade(...)`
+- [x] 契约测试：AylaAdapter 出站不抛错 + `_infer_adapter_signature("ayla")` 命中；foundation 识别 ayla_adapter；chat_commands 对 ayla 流返回 `capability_disabled`
+- [x] 入站走标准接收链：`InboundInjector` 调用全局 `MessageReceiver.receive_message()`（adapter_signature=`ayla_adapter:adapter:ayla_adapter`）；`Bot` 启动用 `init_message_receiver()` 消除全局单例分裂
+- [x] `EventQueryService.stream()` heartbeat 独立于 `has_more`，长连接不再 60 秒读超时断线
 
 ### 7.2 Ayla 侧（跨仓库）
 
-- [ ] `ElysiaProfile.platform` 默认 `elysia-app` → `ayla`
-- [ ] `ElysiaProfile.stream_id` 用 `generate_stream_id("ayla", ...)` 重新生成（避开历史飞书流）
-- [ ] inject 显式传 `platform="ayla"` + 新 `stream_id`
-- [ ] SSE 订阅 `stream_id` 与 profile 一致
-- [ ] 契约测试：profile 默认值、inject 带 ayla 平台、SSE 过滤匹配 ayla 流
+- [x] `ElysiaProfile.platform` 默认 `elysia-app` → `ayla`
+- [x] `ElysiaProfile.stream_id` 用 `generate_stream_id("ayla", ...)` 重新生成（避开历史飞书流），并提供 `0003_migrate_legacy_ayla_profiles` 数据迁移回迁旧记录
+- [x] inject 显式传 `platform="ayla"` + 新 `stream_id`
+- [x] SSE 订阅 `stream_id` 与 profile 一致
+- [x] 契约测试：profile 默认值、inject 带 ayla 平台、SSE 过滤匹配 ayla 流
+- [x] `_handle_envelope` 按 `direction=delivered` 过滤投影；`reset_session()` 处理 Elysium 重启后的 401 恢复
 
 ### 7.3 文档登记
 
-- [ ] `docs/README.md` 「从这里开始」补一条本文链接
+- [x] `docs/README.md` 补本文链接（如尚未登记，见「下一步」）
+- [x] `docs/operations/deployment_and_usage.md` 将 Ayla 标注为端到端已验证
 
 ---
 
 ## 8. 验收标准
 
-### 8.1 注册级验收（本期）
+### 8.1 注册级验收
 
-| 项 | 标准 |
-|----|------|
-| 平台标识 | `ayla` 注册进 registry，`_infer_adapter_signature("ayla")` 命中 `ayla_adapter` |
-| 出站 | `life_send_text` 在 ayla 流上出站返回成功（虚拟确认），不再 `ConnectError`/「未找到匹配 Adapter」 |
-| 路由 | ayla 流不误路由到 feishu/qq/kook |
-| 命令 | ayla 流命令返回 `capability_disabled`（可观测、不误路由） |
-| 契约测试 | 上述全部有对应契约测试且全绿 |
-| 独立流 | Ayla profile `stream_id` 为 ayla 独立流，三处一致 |
+| 项 | 标准 | 状态 |
+|----|------|------|
+| 平台标识 | `ayla` 注册进 registry，`_infer_adapter_signature("ayla")` 命中 `ayla_adapter` | ✅ 契约测试通过 |
+| 出站 | `life_send_text` 在 ayla 流上出站返回成功（虚拟确认），不再 `ConnectError`/「未找到匹配 Adapter」 | ✅ 真实日志确认 |
+| 路由 | ayla 流不误路由到 feishu/qq/kook | ✅ 真实日志确认 |
+| 命令 | ayla 流命令返回 `capability_disabled`（可观测、不误路由） | ✅ 契约测试通过 |
+| 契约测试 | 上述全部有对应契约测试且全绿 | ✅ |
+| 独立流 | Ayla profile `stream_id` 为 ayla 独立流，三处一致 | ✅ 数据迁移 + 运行时校验 |
 
-### 8.2 端到端验收（待真实环境，如实标注）
+### 8.2 端到端验收（真实环境，2026-08-12 完成）
 
-以下需真实 Ayla 后端 + 真实 Elysium + service credential 才可验收，本期**未验收**，如实标注：
+以下在真实 Ayla 后端 + 真实 Elysium + service credential 环境下完成（Ayla 前端经 Playwright 驱动）：
 
-- [ ] 用户经 Ayla 应用发消息 → 爱莉回复经 SSE 投影显示在 Ayla 前端（未验收）
-- [ ] Ayla 断线重连后按 cursor 续传，不重复/不丢（未验收）
+- [x] 用户经 Ayla 应用发消息 → 爱莉回复经 SSE 投影显示在 Ayla 前端（已验收：浏览器发送「爱莉爱莉」→ 爱莉实时回复「收到，Ayla稳定♪」显示在前端）
+- [x] 刷新页面后发送与回复历史均持久化（已验收）
+- [x] Ayla 断线重连后按 cursor 续传，不重复/不丢（已验收：Elysium 重启后 bridge 401 恢复 + SSE 心跳稳定；bridge 首扫 10.5 万条历史事件后按幂等键去重投影）
+- [x] 入站可观测日志（已验收：`AylaAdapter | INFO | 收到 Ayla 消息…` / `消息接收器 | INFO | <ayla> 汐汐: …` / `UserQuery | INFO | …`）
 - [ ] Ayla 平台真实消息撤回/已读（本期 capabilities 全 False，未开放）（未验收）
 
 ---
