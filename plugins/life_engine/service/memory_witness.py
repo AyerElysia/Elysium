@@ -754,10 +754,33 @@ class MemoryWitnessCoordinator:
                     lease_seconds=lease_seconds,
                 )
             else:
-                self._author_claim = await renew(
-                    self._author_claim,
-                    lease_seconds=lease_seconds,
-                )
+                try:
+                    self._author_claim = await renew(
+                        self._author_claim,
+                        lease_seconds=lease_seconds,
+                    )
+                except Exception as renew_exc:
+                    # 续租线程可能在 2013/claim lost 后 invalidate 了本地管理表
+                    # （_handle_managed_singleton_loss），本协程仍持有旧 claim
+                    # 引用，renew 会报 "not managed locally"。此时丢弃旧 claim
+                    # 重新 acquire，而不是让见证循环卡死。
+                    self._author_claim = None
+                    self._author_claim_mode = "selected_runtime_claim_failed"
+                    logger.warning(
+                        "memory witness authoring claim renew 失败，重置后重新获取: "
+                        f"error_type={type(renew_exc).__name__}"
+                    )
+                    authority = getattr(runtime, "authority_token", None)
+                    owner = str(getattr(authority, "owner_id", "runtime") or "runtime")
+                    owner_instance_id = (
+                        f"{owner}:{MEMORY_WITNESS_INSTANCE_ID}:pid-{os.getpid()}"
+                    )[:255]
+                    self._author_claim = await acquire(
+                        namespace=_AUTHOR_CLAIM_NAMESPACE,
+                        state_key=MEMORY_WITNESS_INSTANCE_ID,
+                        owner_instance_id=owner_instance_id,
+                        lease_seconds=lease_seconds,
+                    )
         except asyncio.CancelledError:
             raise
         except Exception:
