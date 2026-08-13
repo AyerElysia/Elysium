@@ -19,7 +19,10 @@ from plugins.life_engine.service.consciousness import (
     ConsciousnessRegistry,
 )
 from plugins.life_engine.service.event_bus import LifeEvent
-from plugins.life_engine.service.memory_witness import MemoryWitnessCoordinator
+from plugins.life_engine.service.memory_witness import (
+    MemoryWitnessCoordinator,
+    MemoryWitnessProjectionFilesystemChanged,
+)
 from plugins.life_engine.service.presence_store import PresenceRevisionConflict
 
 
@@ -482,6 +485,71 @@ async def test_witness_concurrency_conflict_escalates_only_after_eight_attempts(
     assert len(error_records) == 1
     assert "可恢复并发冲突" in error_records[0][0]
     assert "failure_count=9" in error_records[0][0]
+
+
+@pytest.mark.asyncio
+async def test_witness_loop_treats_projection_filesystem_change_as_recoverable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A projection source changing mid-scan is normal contention with the
+    subject author (filesystem has no transaction). It must be retried as a
+    recoverable concurrency conflict, not logged as a fatal ERROR (F3-B)."""
+
+    service, _memory, _event_store, _perception_commits = _service(
+        timeout_seconds=600.0
+    )
+    coordinator = MemoryWitnessCoordinator(service)
+    attempts = 0
+    error_records: list[tuple[str, dict[str, Any]]] = []
+    warning_records: list[tuple[str, dict[str, Any]]] = []
+
+    async def author(*_args: object) -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 2:
+            service._state.running = False
+        raise MemoryWitnessProjectionFilesystemChanged(
+            "WitnessProjectionFilesystemSourceChanged"
+        )
+
+    async def no_wait(delay: float) -> None:
+        return None
+
+    def capture_error(message: str, **metadata: Any) -> None:
+        error_records.append((message, metadata))
+
+    def capture_warning(message: str, **metadata: Any) -> None:
+        warning_records.append((message, metadata))
+
+    monkeypatch.setattr(coordinator, "run_once", author)
+    monkeypatch.setattr(
+        "plugins.life_engine.service.memory_witness.asyncio.sleep",
+        no_wait,
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.service.memory_witness.logger.error",
+        capture_error,
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.service.memory_witness.logger.warning",
+        capture_warning,
+    )
+    for level in ("debug", "info"):
+        monkeypatch.setattr(
+            f"plugins.life_engine.service.memory_witness.logger.{level}",
+            lambda *_args, **_kwargs: None,
+        )
+
+    await coordinator.loop()
+
+    assert attempts == 2
+    assert error_records == []  # never treated as fatal
+    assert len(warning_records) == 1
+    assert "可恢复并发冲突" in warning_records[0][0]
+    assert (
+        warning_records[0][1]["exc_info"].__class__
+        is MemoryWitnessProjectionFilesystemChanged
+    )
 
 
 @pytest.mark.asyncio
