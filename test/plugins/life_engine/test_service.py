@@ -70,6 +70,20 @@ def _write_subject_authority(tmp_path: Path) -> None:
         (tmp_path / name).write_text(name, encoding="utf-8")
 
 
+def _workspace_file_hashes(workspace: Path) -> dict[str, str]:
+    """Return content hashes without interpreting subject-owned text."""
+
+    if not workspace.exists():
+        return {}
+    return {
+        path.relative_to(workspace).as_posix(): hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()
+        for path in sorted(workspace.rglob("*"))
+        if path.is_file()
+    }
+
+
 def _heartbeat_result(text: str, world_perception: Any) -> HeartbeatModelResult:
     return HeartbeatModelResult(
         text=text,
@@ -148,6 +162,26 @@ async def test_memory_behavior_health_combines_witness_and_continuity(
     monkeypatch.setattr(
         "plugins.life_engine.memory.continuity_health.collect_continuity_memory_health",
         collect,
+    )
+
+    class _IdleRecallDelivery:
+        def __init__(self, component: str) -> None:
+            self._component = component
+
+        def health_snapshot(self) -> dict[str, object]:
+            return {
+                "status": "healthy",
+                "component": self._component,
+                "pending_count": 0,
+            }
+
+    monkeypatch.setattr(
+        "plugins.life_engine.memory.boundary_resolver.get_memory_boundary_recall_coordinator",
+        lambda: _IdleRecallDelivery("memory_recall_exact_delivery"),
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.memory.recall_delivery.get_memory_search_recall_delivery_coordinator",
+        lambda: _IdleRecallDelivery("memory_search_recall_delivery"),
     )
 
     snapshot = await service._memory_behavior_health_snapshot()
@@ -382,17 +416,27 @@ async def test_heartbeat_system_prompt_filters_memory_sections(tmp_path: Path) -
     assert "给编辑者看的说明" not in prompt
 
 
-def test_ensure_workspace_templates_creates_user_md(tmp_path: Path) -> None:
-    """显式 local 模式应能为新工作空间补齐 USER.md 空模板。"""
+@pytest.mark.parametrize("missing_name", ("SOUL.md", "USER.md", "MEMORY.md"))
+async def test_local_subject_authority_missing_is_read_only(
+    tmp_path: Path,
+    missing_name: str,
+) -> None:
+    """Missing subject authority must fail without minting replacement text."""
+
+    for name in ("SOUL.md", "USER.md", "MEMORY.md"):
+        if name != missing_name:
+            (tmp_path / name).write_bytes(f"exact-{name}".encode())
     service = _make_service(tmp_path)
+    before = _workspace_file_hashes(tmp_path)
 
-    service._ensure_workspace_templates()
+    with pytest.raises(RuntimeError) as exc_info:
+        await service.start()
 
-    content = (tmp_path / "USER.md").read_text(encoding="utf-8")
-    assert "这份文档用于记录" in content
-    assert "具体内容由爱莉" in content
-    assert "爱莉可以在这里慢慢填写" in content
-    assert "什么时候更新" in content
+    assert str(exc_info.value) == f"SubjectAuthoritySourceMissing: {missing_name}"
+    assert _workspace_file_hashes(tmp_path) == before
+    assert not (tmp_path / missing_name).exists()
+    assert service._stop_event is None
+    assert service._memory_integration is None
 
 
 @pytest.mark.parametrize("backend", ["local", "mysql"])
@@ -423,60 +467,15 @@ def test_retired_thought_manager_is_not_a_runtime_authority(
     assert not (tmp_path / "thoughts").exists()
 
 
-def test_selected_storage_does_not_create_local_subject_template(
-    tmp_path: Path,
-) -> None:
-    """MySQL selected 模式不得生成无远端 revision 的本地主体文件。"""
-
-    config = LifeEngineConfig()
-    config.settings.workspace_path = str(tmp_path)
-    global_config = CoreConfig(
-        storage=CoreConfig.StorageSection(
-            backend="mysql",
-            backend_generation="subject-template-contract-v1",
-            authority_owner_id="subject-template-contract",
-        )
-    )
-    service = LifeEngineService(
-        _DummyPlugin(config=config, global_storage_config=global_config)
-    )
-
-    service._ensure_workspace_templates()
-
-    assert not (tmp_path / "USER.md").exists()
-    assert not (tmp_path / "runtime").exists()
-
-
-async def test_local_startup_validation_requires_complete_subject_authority(
-    tmp_path: Path,
-) -> None:
-    """Local startup must fail before acquiring runtime when MEMORY is absent."""
-
-    (tmp_path / "SOUL.md").write_text("SOUL", encoding="utf-8")
-    service = _make_service(tmp_path)
-
-    service._ensure_workspace_templates()
-
-    with pytest.raises(
-        RuntimeError,
-        match=r"^SubjectAuthoritySourceMissing: MEMORY\.md$",
-    ):
-        await service._validate_local_subject_authority()
-
-    assert (tmp_path / "USER.md").is_file()
-    assert not (tmp_path / "MEMORY.md").exists()
-    assert service._stop_event is None
-    assert service._memory_integration is None
-
-
 async def test_local_start_fails_before_runtime_acquisition(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An incomplete local snapshot must abort before runtime acquisition."""
+    """Public startup preflight must not create an absent workspace on failure."""
 
-    (tmp_path / "SOUL.md").write_text("SOUL", encoding="utf-8")
-    service = _make_service(tmp_path)
+    workspace = tmp_path / "absent-workspace"
+    service = _make_service(workspace)
+    assert not workspace.exists()
 
     async def forbidden_runtime_open() -> None:
         raise AssertionError("runtime acquisition must not start")
@@ -489,10 +488,11 @@ async def test_local_start_fails_before_runtime_acquisition(
 
     with pytest.raises(
         RuntimeError,
-        match=r"^SubjectAuthoritySourceMissing: MEMORY\.md$",
+        match=r"^SubjectAuthoritySourceMissing: SOUL\.md$",
     ):
-        await service._start_impl()
+        await service.start()
 
+    assert not workspace.exists()
     assert service._stop_event is None
     assert service._memory_integration is None
 
@@ -505,9 +505,12 @@ async def test_local_startup_validation_accepts_exact_subject_snapshot(
     for name in ("SOUL.md", "USER.md", "MEMORY.md"):
         (tmp_path / name).write_text(name, encoding="utf-8")
     service = _make_service(tmp_path)
+    before = _workspace_file_hashes(tmp_path)
 
     await service._validate_local_subject_authority()
 
+    assert set(before) == {"SOUL.md", "USER.md", "MEMORY.md"}
+    assert _workspace_file_hashes(tmp_path) == before
     assert service._stop_event is None
     assert service._memory_integration is None
 
