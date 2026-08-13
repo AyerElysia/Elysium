@@ -13,9 +13,9 @@
 |---|------|------|------|
 | 一 | ClaimConflict 双类漏捕 | 已治标 `c2b447cb` | memory_witness 包内导入改相对导入 |
 | 二 | Presence 双类漏捕 | 已治标 `d3008707` | 捕获面双身份类兼容（`_PRESENCE_CONFLICT_TYPES`/`_WRITER_CLAIM_TYPES`） |
-| 三 | 包内显式导入统一相对导入 | **待做（阶段 1）** | life_engine 包内 ~12 文件 |
-| 四 | 统一插件加载身份（治本） | **待做（阶段 2）** | 消除"同一模块两份类"的机制根因 |
-| 五 | 双类兼容代码回收 | 待阶段 2 后评估 | 单身份达成后可简化/移除 |
+| 三 | 包内显式导入统一相对导入 | ✅ 已完成（13 文件 17 处） | 2026-08-13 13:00-13:25 实施，纯导入改写 |
+| 四 | 统一插件加载身份（治本） | ✅ 已完成（方案 C） | `plugin_manager._load_from_folder` 以 `plugins.<name>` 身份加载，不插 sys.path |
+| 五 | 双类兼容代码回收 | 待评估 | 单身份达成后 memory_witness 兼容元组已退化为单类（保留无副作用） |
 
 **症状链**：plugin_manager 造顶层包身份 → 同一源码两份类 → except/isinstance 漏捕 → 常态并发竞争被刷成 fatal ERROR（每轮刷 traceback，日志噪音 + 掩盖真实故障）。
 
@@ -93,10 +93,14 @@
 
 ### 阶段 2：统一插件加载身份（核心，先评估后实施）
 
-三选一，按此优先级评估（**先写对比结论给用户确认再动代码**）：
+> ✅ 已实施（2026-08-13 13:40-14:00，方案 C，用户确认）。改动见 `git diff src/core/managers/plugin_manager.py`：
+> 1. `_load_from_folder`：`module_name` 统一加 `plugins.` 前缀；**移除** `sys.path.insert(0, parent_dir)`（仓库根本就在 sys.path，plugins namespace 包可直接解析）；`__package__` 的 else 分支防御性改为 `f"plugins.{package_name}"`（防止根级入口点解析回顶层身份）；
+> 2. `_load_from_archive`：**保持顶层身份**（ZIP 解压目录不在仓库根，`plugins.<name>` 父包无法从 sys.path 解析；当前 14 个插件全为 folder 类型，archive 未在用，且不与 src 互引时顶层身份自洽）；已加注释标注，若未来启用需专门设计解压目录映射；
+> 3. `_cleanup_sys_modules`：folder 插件清理前缀同步改为 `plugins.{folder.name}`，archive 保持 `plugin_name`。
+> 验证：`test/plugins/life_engine/test_runtime_package_identity.py` 已更新为"真实加载顺序单身份闭环"契约测试（src 先 plugins 身份导入 → spec 加载插件入口 → 断言顶层不可达/单实例/捕获类 is 抛出类）。
 
-- **方案 C（推荐）**：`plugin_manager` 不再往 sys.path 插 `plugins` 目录，插件入口以 `plugins.<package_name>.xxx` 身份加载（`module_name = f"plugins.{package_name}.{...}"`）。`plugins` 在仓库根下、根目录本就在 sys.path，普通 import 即可解析。收益：全仓统一 plugins 前缀 → 单身份 → 双类问题从根上消失，阶段 1 之后插件内部相对导入不受影响。
-  - 风险点：插件间互引（如 A 插件 import B 插件）现在若用顶层名（`feishu_adapter.xxx`）会失效，需同步改 `plugins.feishu_adapter.xxx` 或相对路径；manifest `entry_point` 的相对解析依赖 `submodule_search_locations`，要确认不改 `spec_from_file_location` 的此参数。
+- **方案 C（推荐，已实施）**：`plugin_manager` 不再往 sys.path 插 `plugins` 目录，插件入口以 `plugins.<package_name>.xxx` 身份加载（`module_name = f"plugins.{package_name}.{...}"`）。`plugins` 在仓库根下、根目录本就在 sys.path，普通 import 即可解析。收益：全仓统一 plugins 前缀 → 单身份 → 双类问题从根上消失，阶段 1 之后插件内部相对导入不受影响。
+  - 风险点（实施前已核实）：插件间**零**顶层身份互引（全 `plugins/` grep 无匹配）；src 侧引用插件全部 `plugins.xxx` 前缀（life_engine 14 处 + voice_live/livestream/feishu_adapter/werewolf_game）；`plugins/` 内跨插件引用也全 `plugins.xxx` 前缀（life_engine→emoji、voice_live→life_engine）；manifest `entry_point` 的相对解析依赖 `submodule_search_locations`，未改动 `spec_from_file_location` 的此参数。
 - **方案 A**：`plugin_manager` 加载方式不动，把 `src/` 全部 `plugins.life_engine` 引用改为顶层 `life_engine.*`。影响面大（跨包改写 + 测试环境 sys.path 需加 plugins 目录），不推荐。
 - **方案 B**：维持双身份，但把"双类兼容"下沉为公共工具（如 `life_engine._identity` 提供双身份异常合并元组），所有捕获点统一使用。治标不治本，仅当 A/C 均不可行时兜底。
 
@@ -120,15 +124,8 @@
 
 ## 6. 测试与工具
 
-- Windows 沙箱 pytest：`PYTEST_DEBUG_TEM_ROOT=$TEMP/pytest_tmp_root` + `-p no:cacheprovider --no-cov -o cache_dir=/dev/null`（规避 atexit 批量删除 guard）。
-- 双身份模拟验证脚本（阶段 2 用）：
-  ```python
-  import sys
-  sys.path.insert(0, "<repo>/plugins")          # 模拟 plugin_manager 插入
-  from life_engine.service.memory_witness import _PRESENCE_CONFLICT_TYPES as T
-  from plugins.life_engine.service.presence_store import PresenceRevisionConflict as P
-  assert P in T and isinstance(P("x"), T)        # 双身份下捕获命中
-  ```
+- Windows 沙箱 pytest：`PYTEST_DEBUG_TEM_ROOT=$TEMP/pytest_tmp_root` + `-p no:cacheprovider --no-cov -o cache_dir=/dev/null`（规避 atexit 批量删除 guard）；全量目录跑在沙箱可能因 MySQL 集成测试等连接而挂起，局部验证用 `--timeout=90` 保护或跑相关文件子集。
+- 单身份闭环验证（阶段 2 验收，已固化为 `test/plugins/life_engine/test_runtime_package_identity.py`）：模拟真实加载顺序——src 侧先 `plugins.xxx` 身份导入 → `spec_from_file_location` 以 `plugins.<name>` 加载插件入口 → 断言顶层 `life_engine.*` 不可达、sys.modules 无顶层副本、memory_witness 捕获元组退化为单类、关键模块单实例。
 
 ## 7. 参考材料
 

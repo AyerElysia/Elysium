@@ -384,11 +384,11 @@ class PluginManager:
             # 获取插件文件夹名（作为包名）
             folder = Path(plugin_path)
             if plugin_path.endswith((".zip", ".mfp")):
-                # 压缩包插件的包名就是插件名
+                # 压缩包插件的包名就是插件名（_load_from_archive 仍以顶层身份加载）
                 package_prefix = plugin_name
             else:
-                # 文件夹插件的包名是文件夹名
-                package_prefix = folder.name
+                # 文件夹插件以 plugins.<包名> 前缀加载（与 _load_from_folder 一致）
+                package_prefix = f"plugins.{folder.name}"
 
             # 清理所有以该包名开头的模块
             modules_to_remove = [
@@ -647,6 +647,11 @@ class PluginManager:
                     return None
 
             # 将插件根的父目录添加到 sys.path（使包导入正常工作）
+            # 注意：archive 插件保持顶层包身份（{package_name}.xxx），与
+            # _load_from_folder 的 plugins.<name> 身份不同——ZIP 解压目录不在仓库根，
+            # plugins.<name> 的父包无法从 sys.path 解析；archive 插件不与 src/ 互引时
+            # 顶层身份内部自洽，无双类风险。若未来启用与 src 互引的 archive 插件，
+            # 需专门设计解压目录到 plugins 结构的映射。
             parent_dir = str(plugin_root.parent)
             sys.path.insert(0, parent_dir)
 
@@ -703,10 +708,12 @@ class PluginManager:
         try:
             folder = Path(folder_path)
 
-            # 添加插件目录的父目录到 sys.path（保留以支持插件延迟导入）
-            parent_dir = str(folder.parent)
-            sys.path.insert(0, parent_dir)
-
+            # 统一插件加载身份：插件以 plugins.<package_name> 前缀加载（与 src/ 侧
+            # `from plugins.xxx import` 的常规导入完全同一身份）。仓库根本就在
+            # sys.path（main.py 运行环境 / pytest 根），plugins namespace 包可直接
+            # 解析，因此不再把 plugins 目录插入 sys.path——此前插入会让同一源码
+            # 以顶层包身份（life_engine.*）再加载一份，产生两份异常类导致
+            # except/isinstance 漏捕（2026-08-13 双身份分裂问题根因）。
             entry_point = folder / manifest.entry_point
             if not entry_point.exists():
                 logger.error(f"入口点不存在: {manifest.entry_point}")
@@ -723,9 +730,9 @@ class PluginManager:
                     entry_relative.stem
                 ]
                 module_name = (
-                    f"{package_name}.{'.'.join(module_parts)}"
+                    f"plugins.{package_name}.{'.'.join(module_parts)}"
                     if module_parts[0] != entry_relative.stem
-                    else package_name + "." + entry_relative.stem
+                    else f"plugins.{package_name}.{entry_relative.stem}"
                 )
             except ValueError:
                 logger.error(f"入口点不在插件文件夹内: {entry_point}")
@@ -743,11 +750,12 @@ class PluginManager:
 
             module = importlib.util.module_from_spec(spec)
 
-            # 设置 __package__ 以支持相对导入
+            # 设置 __package__ 以支持相对导入（必须带 plugins. 前缀，
+            # 否则根级入口点会解析回顶层 life_engine.* 身份，双类问题复发）
             if "." in module_name:
                 module.__package__ = module_name.rsplit(".", 1)[0]
             else:
-                module.__package__ = package_name
+                module.__package__ = f"plugins.{package_name}"
 
             sys.modules[module_name] = module
             spec.loader.exec_module(module)
