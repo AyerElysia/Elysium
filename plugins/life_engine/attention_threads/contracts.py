@@ -24,7 +24,25 @@ ATTENTION_THREAD_MIN_PAGE_BYTES = 4 * 1024
 
 
 class AttentionThreadConflict(RuntimeError):
-    """Raised for occurrence reuse, stale revision, or concurrent mutation."""
+    """Raised for occurrence reuse, stale revision, or concurrent mutation.
+
+    ``thread_id`` / ``current_revision`` / ``thread_exists`` are optional
+    structured hints so the subject tool can recover without guessing;
+    message-only construction stays supported for internal callers.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        thread_id: str = "",
+        current_revision: int | None = None,
+        thread_exists: bool | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.thread_id = thread_id
+        self.current_revision = current_revision
+        self.thread_exists = thread_exists
 
 
 class AttentionThreadActorInactive(RuntimeError):

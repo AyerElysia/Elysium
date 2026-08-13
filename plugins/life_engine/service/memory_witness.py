@@ -470,7 +470,14 @@ class MemoryWitnessCoordinator:
                 raise
             except Exception as exc:  # noqa: BLE001 - managed worker boundary
                 await self._record_error_safely(exc)
-                if isinstance(exc, (PresenceRevisionConflict, CursorConflict)):
+                if isinstance(
+                    exc,
+                    (
+                        PresenceRevisionConflict,
+                        CursorConflict,
+                        MemoryWitnessProjectionFilesystemChanged,
+                    ),
+                ):
                     transient_failures = 0
                     concurrency_failures += 1
                     next_delay = retry_delay

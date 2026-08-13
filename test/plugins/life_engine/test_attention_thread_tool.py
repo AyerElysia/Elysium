@@ -9,6 +9,7 @@ import pytest
 
 from plugins.life_engine.attention_threads import (
     AttentionThreadCommit,
+    AttentionThreadConflict,
     build_attention_thread_projection,
 )
 from plugins.life_engine.attention_threads.tools import (
@@ -132,6 +133,82 @@ async def test_attention_tool_rejects_inactive_runtime_actor(
     assert not ok
     assert result == "持续关注线索操作失败: PermissionError"
     assert service.commands == []
+
+
+class _ConflictingService(_Service):
+    """decide raises a structured conflict as the real authority would."""
+
+    def __init__(
+        self,
+        *,
+        thread_id: str,
+        current_revision: int | None,
+        thread_exists: bool | None,
+    ) -> None:
+        super().__init__()
+        self._thread_id = thread_id
+        self._current_revision = current_revision
+        self._thread_exists = thread_exists
+
+    async def decide_attention_thread(self, command: Any) -> AttentionThreadCommit:
+        self.commands.append(command)
+        raise AttentionThreadConflict(
+            self._thread_id,
+            thread_id=self._thread_id,
+            current_revision=self._current_revision,
+            thread_exists=self._thread_exists,
+        )
+
+
+async def test_attention_tool_conflict_returns_structured_recoverable_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # stale revision on an existing thread
+    service = _ConflictingService(
+        thread_id="attention:thread:continuity",
+        current_revision=1,
+        thread_exists=True,
+    )
+    tool = _tool(service, monkeypatch)
+    ok, result = await tool.execute(
+        "note",
+        thread_id="attention:thread:continuity",
+        expected_revision=9,
+        statement="基于过期版本的决定不得自动合并。",
+    )
+    assert not ok
+    assert isinstance(result, dict)
+    assert result["error"] == "AttentionThreadConflict"
+    assert result["thread_id"] == "attention:thread:continuity"
+    assert result["current_revision"] == 1
+    assert result["thread_exists"] is True
+    assert result["recoverable"] is True
+    assert "current_revision" in result["hint"]
+    assert "thread_ref" in result["hint"]
+
+
+async def test_attention_tool_conflict_hints_missing_thread_format(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # thread does not exist -> hint points at full thread_ref, not revision guessing
+    service = _ConflictingService(
+        thread_id="f85d1b7569d048318031c8f3a16644f9",
+        current_revision=0,
+        thread_exists=False,
+    )
+    tool = _tool(service, monkeypatch)
+    ok, result = await tool.execute(
+        "note",
+        thread_id="f85d1b7569d048318031c8f3a16644f9",
+        expected_revision=9,
+        statement="指向不存在线索的提交应携带 not-exists 提示。",
+    )
+    assert not ok
+    assert isinstance(result, dict)
+    assert result["thread_exists"] is False
+    assert result["current_revision"] == 0
+    assert "完整 thread_ref" in result["detail"]
+    assert "thread_ref" in result["hint"]
 
 
 async def test_learning_consumes_only_explicit_close_statement(
