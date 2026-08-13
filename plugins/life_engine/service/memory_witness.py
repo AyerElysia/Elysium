@@ -182,6 +182,12 @@ class MemoryWitnessAuthoringEmptyResponse(RuntimeError):
     """An empty model response is not an explicit no-witness decision."""
 
 
+class MemoryWitnessAuthoringProjectionUnavailable(RuntimeError):
+    """Subject projection could not be produced for this authoring round
+    (shared-projection contention). Retryable: the window stays pending and
+    the authoring cursor must not advance."""
+
+
 class MemoryWitnessProjectionFilesystemChanged(RuntimeError):
     """The projection source changed before one durable scan cycle completed."""
 
@@ -691,6 +697,22 @@ class MemoryWitnessCoordinator:
                         projections_rebuilt=reconciliation.rebuilt,
                         author_claim_conflict=True,
                     )
+                except MemoryWitnessAuthoringProjectionUnavailable:
+                    # 共享投影竞争下本轮无法产出 subject projection：跳过
+                    # authoring 但不推进游标（窗口保持 pending，下轮重试），
+                    # 不当作 fatal ERROR 刷屏。
+                    self._last_error_type = (
+                        "MemoryWitnessAuthoringProjectionUnavailable"
+                    )
+                    return WitnessRunReport(
+                        synced_experiences=ingest.inserted_count,
+                        considered_events=ingest.raw_event_count,
+                        raw_ingest_cursor=ingest.raw_cursor,
+                        occurrence_count=ingest.occurrence_count,
+                        deliveries_succeeded=delivery.succeeded,
+                        deliveries_failed=delivery.failed,
+                        projections_rebuilt=reconciliation.rebuilt,
+                    )
 
                 now = _now_iso()
                 self._last_success_at = now
@@ -792,6 +814,15 @@ class MemoryWitnessCoordinator:
             batches=batches,
         )
 
+    def _author_owner_instance_id(self, runtime: Any) -> str:
+        """Build the durable claim owner id (authority + witness pid)."""
+
+        authority = getattr(runtime, "authority_token", None)
+        owner = str(getattr(authority, "owner_id", "runtime") or "runtime")
+        return (
+            f"{owner}:{MEMORY_WITNESS_INSTANCE_ID}:pid-{os.getpid()}"
+        )[:255]
+
     async def _ensure_authoring_claim(self) -> None:
         """Prove one selected-backend author or state process-only isolation.
 
@@ -821,22 +852,35 @@ class MemoryWitnessCoordinator:
         try:
             await validate_writer()
             if self._author_claim is None:
-                authority = getattr(runtime, "authority_token", None)
-                owner = str(getattr(authority, "owner_id", "runtime") or "runtime")
-                owner_instance_id = (
-                    f"{owner}:{MEMORY_WITNESS_INSTANCE_ID}:pid-{os.getpid()}"
-                )[:255]
                 self._author_claim = await acquire(
                     namespace=_AUTHOR_CLAIM_NAMESPACE,
                     state_key=MEMORY_WITNESS_INSTANCE_ID,
-                    owner_instance_id=owner_instance_id,
+                    owner_instance_id=self._author_owner_instance_id(runtime),
                     lease_seconds=lease_seconds,
                 )
             else:
-                self._author_claim = await renew(
-                    self._author_claim,
-                    lease_seconds=lease_seconds,
-                )
+                try:
+                    self._author_claim = await renew(
+                        self._author_claim,
+                        lease_seconds=lease_seconds,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # The claim we held was retired by the runtime's own
+                    # renewal loop (managed-singleton loss invalidated the
+                    # local registry) or taken over by another instance.
+                    # The stale reference is no longer trusted: drop it and
+                    # re-acquire.  A re-acquire conflict simply returns the
+                    # caller to the guest role; success restores the writer.
+                    self._author_claim = None
+                    self._author_claim_mode = "selected_runtime_claim_failed"
+                    self._author_claim = await acquire(
+                        namespace=_AUTHOR_CLAIM_NAMESPACE,
+                        state_key=MEMORY_WITNESS_INSTANCE_ID,
+                        owner_instance_id=self._author_owner_instance_id(runtime),
+                        lease_seconds=lease_seconds,
+                    )
         except asyncio.CancelledError:
             raise
         except SingletonWriterClaimLost:
@@ -2857,10 +2901,20 @@ class MemoryWitnessCoordinator:
         )
         if not callable(getter):
             raise RuntimeError("MemoryWitnessSubjectProjectionUnavailable")
-        snapshot = await getter(
-            projection_kind="memory_witness",
-            max_bytes=_SUBJECT_CONTEXT_MAX_BYTES,
-        )
+        try:
+            snapshot = await getter(
+                projection_kind="memory_witness",
+                max_bytes=_SUBJECT_CONTEXT_MAX_BYTES,
+            )
+        except RuntimeError as projection_error:
+            # 双实例共享投影时，只读节点从远端恢复版本可能失败（manifest
+            # profile/digest 竞争，如 "projection manifest profile is
+            # incompatible"）。这是可恢复的外部依赖失败：本轮跳过 authoring、
+            # 不推进游标，由上层按可恢复路径静默重试。
+            raise MemoryWitnessAuthoringProjectionUnavailable(
+                f"MemoryWitnessAuthoringProjectionUnavailable: "
+                f"{type(projection_error).__name__}: {projection_error}"
+            ) from projection_error
         if not isinstance(snapshot, dict):
             raise RuntimeError("MemoryWitnessSubjectProjectionInvalid")
         text = str(snapshot.get("text") or "")

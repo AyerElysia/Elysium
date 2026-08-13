@@ -1603,8 +1603,8 @@ async def test_author_claim_lost_skips_and_drops_stale_claim(
     tmp_path: Path,
 ) -> None:
     """Losing the author lease (takeover/expiry) must not spam ERROR forever:
-    run_once surfaces a bounded skip and the stale claim is dropped so the
-    next cycle re-acquires instead of renewing a dead lease."""
+    the stale claim is dropped and the immediate re-acquire conflict surfaces
+    as a bounded skip (guest role)."""
 
     coordinator, service = _coordinator(tmp_path, [_event(1)])
 
@@ -1616,7 +1616,12 @@ async def test_author_claim_lost_skips_and_drops_stale_claim(
             return None
 
         async def acquire_singleton_writer(self, **_kwargs: Any) -> Any:
-            raise AssertionError("acquire must not run while a claim is held")
+            # After the loss the node immediately re-acquires; another live
+            # instance holds the lease, so the re-acquire conflicts.
+            raise SingletonWriterClaimConflict(
+                "SingletonWriterAlreadyClaimed:life_engine.memory_witness:"
+                "memory_witness:owner=remote:pid-1:epoch=3"
+            )
 
         async def renew_singleton_writer(
             self,
@@ -1642,7 +1647,7 @@ async def test_author_claim_lost_skips_and_drops_stale_claim(
 async def test_author_claim_lost_then_reacquires_on_next_cycle(
     tmp_path: Path,
 ) -> None:
-    """After the lease is lost, the next cycle re-acquires cleanly instead of
+    """After the lease is lost, the same round re-acquires cleanly instead of
     being stuck renewing a dead lease forever."""
 
     coordinator, service = _coordinator(tmp_path, [])
@@ -1674,15 +1679,10 @@ async def test_author_claim_lost_then_reacquires_on_next_cycle(
 
     service.storage_runtime = _Runtime()
     coordinator._author_claim = SimpleNamespace(owner_id="stale")
-    with pytest.raises(SingletonWriterClaimLost):
-        await coordinator._ensure_authoring_claim()
-    assert coordinator._author_claim is None
-    assert coordinator._author_claim_mode == "selected_runtime_claim_failed"
-
-    # next cycle re-acquires cleanly and becomes the durable writer again
+    # renew 失败 → 丢弃旧引用 → 同一轮内立即重新 acquire 成功，恢复 writer 角色
     await coordinator._ensure_authoring_claim()
-    assert coordinator._author_claim_mode == "durable_singleton_claim"
     assert coordinator._author_claim is not None
+    assert coordinator._author_claim_mode == "durable_singleton_claim"
 
 
 @pytest.mark.asyncio
@@ -1756,3 +1756,108 @@ async def test_presence_conflict_capture_covers_plugins_identity() -> None:
         for mod in list(sys.modules):
             if mod.startswith("life_engine.") and mod not in modules_before:
                 del sys.modules[mod]
+
+
+@pytest.mark.asyncio
+async def test_author_claim_renew_loss_reacquires(
+    tmp_path: Path,
+) -> None:
+    """runtime 后台续期循环 invalidate 本地 managed 注册表后，renew 会抛
+    StorageRuntimeError("not managed locally")。本机必须丢弃旧引用重新
+    acquire（成功恢复 writer / Conflict 走 guest），而不是残留旧对象导致
+    renew 永远失败刷 ERROR。"""
+
+    from plugins.life_engine.storage.contracts import StorageRuntimeError
+
+    coordinator, service = _coordinator(tmp_path, [])
+    counters = {"acquire": 0, "renew": 0}
+
+    class _Runtime:
+        enabled = True
+        authority_token = SimpleNamespace(owner_id="elysium-linux-primary")
+
+        async def validate_writer(self) -> None:
+            return None
+
+        async def acquire_singleton_writer(self, **_kwargs: Any) -> Any:
+            counters["acquire"] += 1
+            return SimpleNamespace(
+                generation_id="g",
+                namespace="life_engine.memory_witness",
+                state_key="memory_witness",
+                owner_instance_id="elysium-linux-primary:memory_witness:pid-x",
+                lease_epoch=2,
+                lease_until="2099-01-01T00:00:00+00:00",
+                fencing_token="tok",
+            )
+
+        async def renew_singleton_writer(
+            self,
+            current: Any,
+            **_kwargs: Any,
+        ) -> Any:
+            counters["renew"] += 1
+            raise StorageRuntimeError(
+                "singleton writer is not managed locally: "
+                "life_engine.memory_witness:memory_witness"
+            )
+
+    service.storage_runtime = _Runtime()
+    coordinator._author_claim = SimpleNamespace(owner_id="stale")
+    await coordinator._ensure_authoring_claim()
+
+    assert counters["renew"] == 1
+    assert counters["acquire"] == 1  # 丢弃旧引用后重新获取
+    assert coordinator._author_claim is not None
+    assert coordinator._author_claim_mode == "durable_singleton_claim"
+
+
+@pytest.mark.asyncio
+async def test_author_projection_unavailable_skips_without_advancing(
+    tmp_path: Path,
+) -> None:
+    """共享投影竞争（远端 manifest profile 不兼容）下本轮 authoring 应跳过：
+    run_once 返回 bounded report、游标不推进、不抛异常（不 ERROR）。"""
+
+    coordinator, service = _coordinator(tmp_path, [_event(1)])
+
+    async def fail_getter(**_kwargs: Any) -> Any:
+        raise RuntimeError("projection manifest profile is incompatible")
+
+    service.get_subject_context_projection_snapshot = fail_getter  # type: ignore[attr-defined]
+    report = await coordinator.run_once()
+
+    assert report.decisions_committed == 0
+    assert report.written_witnesses == ()
+    # 游标不推进：窗口保持 pending，下轮重试
+    state = await service.memory_service.bundle.witnesses.get_state(
+        MEMORY_WITNESS_INSTANCE_ID
+    )
+    assert state["last_sequence"] == 0
+
+
+@pytest.mark.asyncio
+async def test_build_system_prompt_wraps_projection_failure(
+    tmp_path: Path,
+) -> None:
+    """投影 getter 抛 RuntimeError（如 manifest 竞争）必须被包装成
+    MemoryWitnessAuthoringProjectionUnavailable，供 run_once 按可恢复处理。"""
+
+    coordinator, service = _coordinator(tmp_path, [])
+
+    async def fail_getter(**_kwargs: Any) -> Any:
+        raise RuntimeError("projection manifest profile is incompatible")
+
+    service.get_subject_context_projection_snapshot = fail_getter  # type: ignore[attr-defined]
+    from plugins.life_engine.service.memory_witness import (
+        MemoryWitnessAuthoringProjectionUnavailable,
+    )
+
+    with pytest.raises(MemoryWitnessAuthoringProjectionUnavailable) as exc_info:
+        await coordinator._build_system_prompt(
+            ConsciousnessInstance(
+                instance_id=MEMORY_WITNESS_INSTANCE_ID,
+                kind="memory_witness",
+            )
+        )
+    assert "projection manifest profile is incompatible" in str(exc_info.value)
