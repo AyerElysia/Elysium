@@ -256,10 +256,17 @@ class StorageBackendRuntime:
             )
         key = (claim.namespace, claim.state_key)
         managed = self._managed_singleton_claims.get(key)
-        if managed is None or managed[0] != claim:
+        if managed is None:
             raise StorageRuntimeError(
                 f"singleton writer is not managed locally: {key[0]}:{key[1]}"
             )
+        # 不做 managed[0] != claim 的对象身份检查：后台续期循环
+        # (_renew_managed_singleton_writers) 每次 renew 都会把注册表对象替换
+        # 为新 lease_until 的副本（frozen dataclass，字段比较不相等），持有方
+        # 持有的旧引用（owner/epoch/fencing token 相同）再 renew 会误判为
+        # "not managed locally"，随后 re-acquire 又撞 "already managed
+        # locally"。renew 的真实安全性由底层 writer_claims.renew 的 fencing
+        # 校验（owner + lease_epoch + token + lease_until）保证。
         renewed = await self._singleton_writer_claims.renew(
             claim,
             lease_seconds=lease_seconds,

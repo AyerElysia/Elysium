@@ -155,7 +155,7 @@ class LifeScheduleFollowupMessageAction(BaseAction):
             "续话类型，例如 add_detail / clarify / soft_emotion / share_new_thought。",
         ] = "share_new_thought",
     ) -> tuple[bool, str]:
-        from plugins.life_engine.service.core import LifeEngineService
+        from ..service.core import LifeEngineService
 
         service = LifeEngineService.get_instance()
         if service is None:

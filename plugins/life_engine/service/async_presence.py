@@ -20,7 +20,7 @@ from .consciousness import (
     ConsciousnessRegistry,
 )
 from .event_bus import LifeEvent, LifeEventChannel, LifeEventPriority
-from plugins.life_engine.service.presence_store import (
+from .presence_store import (
     PresenceRevisionConflict,
     StreamOwnershipConflict,
 )

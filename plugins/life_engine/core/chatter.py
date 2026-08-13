@@ -3620,7 +3620,7 @@ class LifeChatter(BaseChatter):
             )
 
         try:
-            from plugins.life_engine.core.router import route_should_respond
+            from .router import route_should_respond
 
             result = await self._await_with_watchdog_keepalive(
                 route_should_respond(

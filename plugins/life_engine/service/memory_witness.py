@@ -30,7 +30,6 @@ from typing import TYPE_CHECKING, Any
 
 from sqlalchemy.exc import DBAPIError
 
-from plugins.life_engine.service.presence_store import PresenceRevisionConflict
 from src.app.plugin_system.api.llm_api import get_model_set_by_task
 from src.app.plugin_system.api.log_api import get_logger
 from src.kernel.llm import ROLE, LLMPayload, LLMRequest, Text
@@ -54,6 +53,10 @@ from ..memory.witness_pipeline import (
     witness_window_source_digest,
 )
 from ..storage.contracts import StorageRuntimeError
+from ..storage import (
+    SingletonWriterClaimConflict,
+    SingletonWriterClaimLost,
+)
 from ..storage.memory.contracts import (
     StableLedgerCursor,
     StableLedgerPage,
@@ -65,7 +68,41 @@ from .perception_gateway import (
     PerceptionCommitCheckpoint,
     PerceptionDeliveryReceipt,
 )
+from .presence_store import PresenceRevisionConflict
 from .world_state import PerceptionFilter
+
+# 双路径加载身份兼容。plugin_manager 以顶层包身份（life_engine.*）加载插件，
+# 而 main.py/src 可能先以 plugins 前缀导入同一子模块 → 同一源码出现两份类
+# （__module__ 不同）。捕获方必须同时匹配两个身份，否则 except/isinstance
+# 漏捕并把常态并发竞争刷成 ERROR（2026-08-13 线上两次：ClaimConflict 漏捕、
+# PresenceRevisionConflict 漏捕均为此因）。
+try:
+    from plugins.life_engine.service.presence_store import (  # type: ignore[import-not-found]
+        PresenceRevisionConflict as _PluginsPresenceRevisionConflict,
+    )
+except ImportError:  # pragma: no cover - 单一路径环境不会触发
+    _PluginsPresenceRevisionConflict = PresenceRevisionConflict
+try:
+    from plugins.life_engine.storage import (  # type: ignore[import-not-found]
+        SingletonWriterClaimConflict as _PluginsWriterClaimConflict,
+    )
+    from plugins.life_engine.storage import (
+        SingletonWriterClaimLost as _PluginsWriterClaimLost,
+    )
+except ImportError:  # pragma: no cover
+    _PluginsWriterClaimConflict = SingletonWriterClaimConflict
+    _PluginsWriterClaimLost = SingletonWriterClaimLost
+
+_PRESENCE_CONFLICT_TYPES = (
+    PresenceRevisionConflict,
+    _PluginsPresenceRevisionConflict,
+)
+_WRITER_CLAIM_TYPES = (
+    SingletonWriterClaimConflict,
+    _PluginsWriterClaimConflict,
+    SingletonWriterClaimLost,
+    _PluginsWriterClaimLost,
+)
 
 if TYPE_CHECKING:
     from .core import LifeEngineService
@@ -147,6 +184,12 @@ class MemoryWitnessOccurrencePaginationUnavailable(RuntimeError):
 
 class MemoryWitnessAuthoringEmptyResponse(RuntimeError):
     """An empty model response is not an explicit no-witness decision."""
+
+
+class MemoryWitnessAuthoringProjectionUnavailable(RuntimeError):
+    """Subject projection could not be produced for this authoring round
+    (shared-projection contention). Retryable: the window stays pending and
+    the authoring cursor must not advance."""
 
 
 class MemoryWitnessProjectionFilesystemChanged(RuntimeError):
@@ -253,6 +296,7 @@ class WitnessRunReport:
     deliveries_succeeded: int = 0
     deliveries_failed: int = 0
     projections_rebuilt: int = 0
+    author_claim_conflict: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -490,16 +534,19 @@ class MemoryWitnessCoordinator:
                 if isinstance(
                     exc,
                     (
-                        PresenceRevisionConflict,
+                        *_PRESENCE_CONFLICT_TYPES,
                         CursorConflict,
                         MemoryWitnessProjectionFilesystemChanged,
+                        *_WRITER_CLAIM_TYPES,
                     ),
                 ):
                     transient_failures = 0
                     concurrency_failures += 1
                     next_delay = retry_delay
-                    if isinstance(exc, PresenceRevisionConflict):
+                    if isinstance(exc, _PRESENCE_CONFLICT_TYPES):
                         await self._refresh_presence_snapshot_safely()
+                    elif isinstance(exc, SingletonWriterClaimLost):
+                        self._author_claim = None
                     message = (
                         "记忆见证遇到可恢复并发冲突，待处理经历已保留: "
                         f"failure_count={concurrency_failures}, "
@@ -588,53 +635,100 @@ class MemoryWitnessCoordinator:
                 reconciliation = await self._reconcile_projections(storage.witnesses)
                 self._last_reconciliation = reconciliation
 
-                await self._ensure_authoring_claim()
-                window, state = await self._next_authoring_window(
-                    instance,
-                    storage.experiences,
-                    storage.witnesses,
-                )
-                written: list[str] = []
-                skipped: list[str] = []
-                suppressed = 0
-                decisions_committed = 0
-                if window is not None:
-                    witnessable = tuple(
-                        item
-                        for item in window.occurrences
-                        if not self._is_self_presence_side_effect(
-                            item.experience,
-                            instance_id=instance.instance_id,
-                        )
-                    )
-                    suppressed = len(window.occurrences) - len(witnessable)
-                    decision, witness = await self._decide_window(
+                try:
+                    await self._ensure_authoring_claim()
+                    window, state = await self._next_authoring_window(
                         instance,
-                        window,
-                        witnessable,
+                        storage.experiences,
                         storage.witnesses,
                     )
-                    decisions_committed = 1
-                    if witness is None:
-                        skipped.append(window.stream_scope)
+                    written: list[str] = []
+                    skipped: list[str] = []
+                    suppressed = 0
+                    decisions_committed = 0
+                    if window is not None:
+                        witnessable = tuple(
+                            item
+                            for item in window.occurrences
+                            if not self._is_self_presence_side_effect(
+                                item.experience,
+                                instance_id=instance.instance_id,
+                            )
+                        )
+                        suppressed = len(window.occurrences) - len(witnessable)
+                        decision, witness = await self._decide_window(
+                            instance,
+                            window,
+                            witnessable,
+                            storage.witnesses,
+                        )
+                        decisions_committed = 1
+                        if witness is None:
+                            skipped.append(window.stream_scope)
+                        else:
+                            written.append(witness.witness_id)
+                        state = await self._advance_author_cursor(
+                            storage.witnesses,
+                            state,
+                            window,
+                            success_at=decision.decided_at,
+                        )
                     else:
-                        written.append(witness.witness_id)
-                    state = await self._advance_author_cursor(
-                        storage.witnesses,
-                        state,
-                        window,
-                        success_at=decision.decided_at,
+                        now = _now_iso()
+                        state = (
+                            await storage.witnesses.compare_and_advance_state(
+                                instance.instance_id,
+                                expected_sequence=int(
+                                    state.get("last_sequence", 0) or 0
+                                ),
+                                expected_revision=int(
+                                    state.get("revision", 0) or 0
+                                ),
+                                next_sequence=int(
+                                    state.get("last_sequence", 0) or 0
+                                ),
+                                last_run_at=now,
+                                last_success_at=now,
+                                last_error="",
+                            )
+                        )
+                except _WRITER_CLAIM_TYPES as claim_issue:
+                    # Another live instance (the resident writer) holds the
+                    # durable author claim.  This is the expected multi-writer
+                    # guest role, not a failure: ingest/delivery/reconciliation
+                    # already completed and must not be rolled back, but this
+                    # node must not author witnesses without the singleton.
+                    # ClaimLost additionally means our own lease was taken over
+                    # or expired; the stale claim was already dropped so the
+                    # next cycle re-acquires instead of renewing a dead lease.
+                    # Surface it as a bounded skip instead of a fatal ERROR.
+                    self._author_claim_mode = "not_authoring_writer"
+                    self._last_error_type = type(claim_issue).__name__
+                    return WitnessRunReport(
+                        synced_experiences=ingest.inserted_count,
+                        considered_events=ingest.raw_event_count,
+                        raw_ingest_cursor=ingest.raw_cursor,
+                        occurrence_count=ingest.occurrence_count,
+                        deliveries_succeeded=delivery.succeeded,
+                        deliveries_failed=delivery.failed,
+                        projections_rebuilt=reconciliation.rebuilt,
+                        author_claim_conflict=True,
                     )
-                else:
-                    now = _now_iso()
-                    state = await storage.witnesses.compare_and_advance_state(
-                        instance.instance_id,
-                        expected_sequence=int(state.get("last_sequence", 0) or 0),
-                        expected_revision=int(state.get("revision", 0) or 0),
-                        next_sequence=int(state.get("last_sequence", 0) or 0),
-                        last_run_at=now,
-                        last_success_at=now,
-                        last_error="",
+                except MemoryWitnessAuthoringProjectionUnavailable:
+                    # 共享投影竞争下本轮无法产出 subject projection：跳过
+                    # authoring 但不推进游标（窗口保持 pending，下轮重试），
+                    # 不当作 fatal ERROR 刷屏。
+                    self._last_error_type = (
+                        "MemoryWitnessAuthoringProjectionUnavailable"
+                    )
+                    return WitnessRunReport(
+                        synced_experiences=ingest.inserted_count,
+                        considered_events=ingest.raw_event_count,
+                        raw_ingest_cursor=ingest.raw_cursor,
+                        occurrence_count=ingest.occurrence_count,
+                        deliveries_succeeded=delivery.succeeded,
+                        deliveries_failed=delivery.failed,
+                        projections_rebuilt=reconciliation.rebuilt,
                     )
 
                 now = _now_iso()
@@ -737,6 +831,15 @@ class MemoryWitnessCoordinator:
             batches=batches,
         )
 
+    def _author_owner_instance_id(self, runtime: Any) -> str:
+        """Build the durable claim owner id (authority + witness pid)."""
+
+        authority = getattr(runtime, "authority_token", None)
+        owner = str(getattr(authority, "owner_id", "runtime") or "runtime")
+        return (
+            f"{owner}:{MEMORY_WITNESS_INSTANCE_ID}:pid-{os.getpid()}"
+        )[:255]
+
     async def _ensure_authoring_claim(self) -> None:
         """Prove one selected-backend author or state process-only isolation.
 
@@ -766,15 +869,10 @@ class MemoryWitnessCoordinator:
         try:
             await validate_writer()
             if self._author_claim is None:
-                authority = getattr(runtime, "authority_token", None)
-                owner = str(getattr(authority, "owner_id", "runtime") or "runtime")
-                owner_instance_id = (
-                    f"{owner}:{MEMORY_WITNESS_INSTANCE_ID}:pid-{os.getpid()}"
-                )[:255]
                 self._author_claim = await acquire(
                     namespace=_AUTHOR_CLAIM_NAMESPACE,
                     state_key=MEMORY_WITNESS_INSTANCE_ID,
-                    owner_instance_id=owner_instance_id,
+                    owner_instance_id=self._author_owner_instance_id(runtime),
                     lease_seconds=lease_seconds,
                 )
             else:
@@ -798,22 +896,27 @@ class MemoryWitnessCoordinator:
                     # 重新 acquire，而不是让见证循环卡死。
                     self._author_claim = None
                     self._author_claim_mode = "selected_runtime_claim_failed"
-                    logger.warning(
-                        "memory witness authoring claim renew 失败，重置后重新获取: "
-                        f"error_type={type(renew_exc).__name__}"
-                    )
-                    authority = getattr(runtime, "authority_token", None)
-                    owner = str(getattr(authority, "owner_id", "runtime") or "runtime")
-                    owner_instance_id = (
-                        f"{owner}:{MEMORY_WITNESS_INSTANCE_ID}:pid-{os.getpid()}"
-                    )[:255]
                     self._author_claim = await acquire(
                         namespace=_AUTHOR_CLAIM_NAMESPACE,
                         state_key=MEMORY_WITNESS_INSTANCE_ID,
-                        owner_instance_id=owner_instance_id,
+                        owner_instance_id=self._author_owner_instance_id(runtime),
                         lease_seconds=lease_seconds,
                     )
         except asyncio.CancelledError:
+            raise
+        except SingletonWriterClaimLost:
+            # The lease we held was taken over or expired while renewing.
+            # Drop the stale local claim so the next attempt re-acquires
+            # instead of renewing a dead lease forever; the caller decides
+            # whether to skip authoring (guest) or retry (writer).
+            self._author_claim = None
+            self._author_claim_mode = "selected_runtime_claim_failed"
+            raise
+        except _PluginsWriterClaimLost:
+            # plugins 前缀身份的 SingletonWriterClaimLost（双路径加载的另一份
+            # 类）；与同身份分支完全同语义，仅类身份不同。
+            self._author_claim = None
+            self._author_claim_mode = "selected_runtime_claim_failed"
             raise
         except Exception:
             self._author_claim_mode = "selected_runtime_claim_failed"
@@ -1802,52 +1905,67 @@ class MemoryWitnessCoordinator:
             filesystem_state = await get_scan_state(
                 _FILESYSTEM_RECONCILIATION_SCAN_NAME
             )
-            filesystem_page = await asyncio.to_thread(
-                self._projection_filesystem_page,
-                projection_root,
-                after=filesystem_state.cursor,
-                through=filesystem_state.frontier,
-                limit=limit,
-            )
-            files = tuple(filesystem_page.items)
-            truncated = bool(filesystem_page.has_more)
+            try:
+                filesystem_page = await asyncio.to_thread(
+                    self._projection_filesystem_page,
+                    projection_root,
+                    after=filesystem_state.cursor,
+                    through=filesystem_state.frontier,
+                    limit=limit,
+                )
+                files = tuple(filesystem_page.items)
+                truncated = bool(filesystem_page.has_more)
+                for absolute in files:
+                    try:
+                        relative = absolute.relative_to(workspace).as_posix()
+                    except ValueError:
+                        orphan += 1
+                        continue
+                    if (
+                        await witness_store.get_by_projection_path(relative)
+                        is None
+                    ):
+                        orphan += 1
+                # The filesystem has no transaction.  Recompute the content-free
+                # manifest immediately before cursor CAS so a mid-page add/
+                # remove/rewrite cannot be mistaken for a completed stable scan.
+                await asyncio.to_thread(
+                    self._projection_filesystem_page,
+                    projection_root,
+                    after=filesystem_page.next_cursor,
+                    through=filesystem_page.frontier,
+                    limit=1,
+                )
+                filesystem_completed = not bool(filesystem_page.has_more)
+                filesystem_state = await advance_scan_state(
+                    _FILESYSTEM_RECONCILIATION_SCAN_NAME,
+                    expected_revision=filesystem_state.revision,
+                    next_cursor=(
+                        None
+                        if filesystem_completed
+                        else filesystem_page.next_cursor
+                    ),
+                    frontier=(
+                        None
+                        if filesystem_completed
+                        else filesystem_page.frontier
+                    ),
+                    completed=filesystem_completed,
+                )
+            except MemoryWitnessProjectionFilesystemChanged:
+                # The subject is still writing its own witness diary while this
+                # scan runs.  The filesystem has no transaction, so a mid-page
+                # rewrite is normal contention, not corruption.  Skip this scan
+                # page and retry on the next cycle instead of aborting the whole
+                # reconciliation (or spamming ERROR/traceback through the loop).
+                filesystem_scan_blocker = (
+                    "WitnessProjectionFilesystemSourceChangedRetryNextCycle"
+                )
+                files = ()
+                truncated = False
         else:
             filesystem_scan_blocker = (
                 "WitnessProjectionFilesystemReconciliationStateUnavailable"
-            )
-        for absolute in files:
-            try:
-                relative = absolute.relative_to(workspace).as_posix()
-            except ValueError:
-                orphan += 1
-                continue
-            if await witness_store.get_by_projection_path(relative) is None:
-                orphan += 1
-        if durable_reconciliation_state:
-            assert filesystem_state is not None and filesystem_page is not None
-            # The filesystem has no transaction.  Recompute the content-free
-            # manifest immediately before cursor CAS so a mid-page add/remove/
-            # rewrite cannot be mistaken for a completed stable scan.
-            await asyncio.to_thread(
-                self._projection_filesystem_page,
-                projection_root,
-                after=filesystem_page.next_cursor,
-                through=filesystem_page.frontier,
-                limit=1,
-            )
-            filesystem_completed = not bool(filesystem_page.has_more)
-            filesystem_state = await advance_scan_state(
-                _FILESYSTEM_RECONCILIATION_SCAN_NAME,
-                expected_revision=filesystem_state.revision,
-                next_cursor=(
-                    None
-                    if filesystem_completed
-                    else filesystem_page.next_cursor
-                ),
-                frontier=(
-                    None if filesystem_completed else filesystem_page.frontier
-                ),
-                completed=filesystem_completed,
             )
         ledger_scan_complete = bool(legacy_completed and projection_completed)
         ledger_scan_blocker = (
@@ -2804,10 +2922,20 @@ class MemoryWitnessCoordinator:
         )
         if not callable(getter):
             raise RuntimeError("MemoryWitnessSubjectProjectionUnavailable")
-        snapshot = await getter(
-            projection_kind="memory_witness",
-            max_bytes=_SUBJECT_CONTEXT_MAX_BYTES,
-        )
+        try:
+            snapshot = await getter(
+                projection_kind="memory_witness",
+                max_bytes=_SUBJECT_CONTEXT_MAX_BYTES,
+            )
+        except RuntimeError as projection_error:
+            # 双实例共享投影时，只读节点从远端恢复版本可能失败（manifest
+            # profile/digest 竞争，如 "projection manifest profile is
+            # incompatible"）。这是可恢复的外部依赖失败：本轮跳过 authoring、
+            # 不推进游标，由上层按可恢复路径静默重试。
+            raise MemoryWitnessAuthoringProjectionUnavailable(
+                f"MemoryWitnessAuthoringProjectionUnavailable: "
+                f"{type(projection_error).__name__}: {projection_error}"
+            ) from projection_error
         if not isinstance(snapshot, dict):
             raise RuntimeError("MemoryWitnessSubjectProjectionInvalid")
         text = str(snapshot.get("text") or "")

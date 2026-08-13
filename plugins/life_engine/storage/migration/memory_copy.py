@@ -18,7 +18,9 @@ from typing import Any
 
 from sqlalchemy import text
 
-from plugins.life_engine.memory.epistemic import (
+from src.kernel.storage import canonical_json
+
+from ...memory.epistemic import (
     ClaimEvidence,
     EpistemicConflict,
     MemoryBelief,
@@ -28,8 +30,8 @@ from plugins.life_engine.memory.epistemic import (
     RetrievalExposure,
     RetrievalFeedback,
 )
-from plugins.life_engine.memory.experience import ExperienceRecord
-from plugins.life_engine.memory.living import (
+from ...memory.experience import ExperienceRecord
+from ...memory.living import (
     CoRecallEvent,
     InterpretationSource,
     MemoryArtifactVersion,
@@ -39,8 +41,6 @@ from plugins.life_engine.memory.living import (
     RecallEvent,
     SemanticRelation,
 )
-from src.kernel.storage import canonical_json
-
 from ..contracts import StorageBackendRuntime, StorageWriterRole
 from ..memory.schema import ensure_memory_storage_schema
 from .copy_authority import CopyAuthorityToken, MySQLCopyAuthorityRegistry

@@ -5,8 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
-from plugins.life_engine.service.event_bus import LifeEvent
-from plugins.life_engine.service.world_projection import (
+from ..service.event_bus import LifeEvent
+from ..service.world_projection import (
     WorldAssertion,
     WorldAssertionReferencePage,
     WorldChangeReferencePage,

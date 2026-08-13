@@ -24,7 +24,7 @@ from src.kernel.sync.local_store import create_local_sync_schema, enqueue_in_tra
 from .event_builder import EventType, LifeEngineEvent
 
 if TYPE_CHECKING:
-    from plugins.life_engine.storage.event_contracts import LifeEventStorePort
+    from ..storage.event_contracts import LifeEventStorePort
 
 RAW_EVENT_LOG_FILE = "life_events.jsonl"
 RAW_EVENT_DB_FILE = "life_events.sqlite3"

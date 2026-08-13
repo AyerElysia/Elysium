@@ -13,12 +13,12 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from plugins.life_engine.service.presence_store import (
+from src.kernel.storage import canonical_json
+
+from ..service.presence_store import (
     PresenceRevisionConflict,
     StreamOwnershipConflict,
 )
-from src.kernel.storage import canonical_json
-
 from .contracts import StorageBackendRuntime
 from .domain_contracts import (
     PresenceCommitResult,
