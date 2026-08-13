@@ -52,7 +52,7 @@ authority_lease_seconds = 120
 authority_renew_interval_seconds = 40
 
 [database]
-sqlite_path = "data/Elysium.db"
+sqlite_path = "data/MoFox.db"
 connection_pool_size = 10
 connection_timeout = 10
 echo = false

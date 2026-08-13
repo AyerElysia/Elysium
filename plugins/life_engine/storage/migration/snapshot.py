@@ -53,7 +53,7 @@ class LifeStorageLayout:
     """Explicit inventory of authoritative/operational files to preserve."""
 
     sqlite_sources: tuple[Path, ...] = (
-        Path("Elysium.db"),
+        Path("MoFox.db"),
         Path("life_engine_workspace/.memory/memory.db"),
         Path("life_engine_workspace/life_events.sqlite3"),
         Path("life_engine_workspace/runtime/consciousness_presence.sqlite3"),

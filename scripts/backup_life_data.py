@@ -7,6 +7,7 @@ import argparse
 import json
 import sqlite3
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -30,16 +31,35 @@ def create_life_backup(
     output: Path,
     *,
     writer_frozen: bool = False,
+    core_sqlite_relative: Path = Path("MoFox.db"),
+    precreated_output: bool = False,
 ) -> dict[str, Any]:
     """Compatibility wrapper around the versioned snapshot implementation."""
 
-    if output.resolve().exists():
+    if output.resolve().exists() and not precreated_output:
         raise LifeBackupError("输出目录已存在，拒绝覆盖")
+
+    default_layout = LifeStorageLayout()
+    if (
+        core_sqlite_relative.is_absolute()
+        or not core_sqlite_relative.parts
+        or any(part in {"", ".", ".."} for part in core_sqlite_relative.parts)
+    ):
+        raise LifeBackupError("Core SQLite 路径必须是 data 下的安全相对路径")
+    layout = replace(
+        default_layout,
+        sqlite_sources=(
+            core_sqlite_relative,
+            *default_layout.sqlite_sources[1:],
+        ),
+    )
 
     manifest = create_local_snapshot(
         data_root,
         output,
+        layout=layout,
         writer_frozen=writer_frozen,
+        precreated_output=precreated_output,
     )
     verification = verify_local_snapshot(output)
     if not verification["verified"]:
@@ -79,6 +99,17 @@ def main() -> int:
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
+        "--core-sqlite-relative",
+        type=Path,
+        default=Path("MoFox.db"),
+        help="Core SQLite path relative to --data-root (default: MoFox.db)",
+    )
+    parser.add_argument(
+        "--precreated-output",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--writer-frozen",
         action="store_true",
         help=(
@@ -92,9 +123,13 @@ def main() -> int:
             args.data_root,
             args.output,
             writer_frozen=args.writer_frozen,
+            core_sqlite_relative=args.core_sqlite_relative,
+            precreated_output=args.precreated_output,
         )
     except (LifeBackupError, OSError, sqlite3.Error) as error:
-        print(json.dumps({"status": "failed", "reason": str(error)}, ensure_ascii=False))
+        print(
+            json.dumps({"status": "failed", "reason": str(error)}, ensure_ascii=False)
+        )
         return 2
     summary = {
         "output": result["output"],

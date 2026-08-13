@@ -40,6 +40,17 @@ class ArchiveCLIError(RuntimeError):
     """Invalid CLI scope or missing secret environment configuration."""
 
 
+RESTORE_SQLITE_TARGETS = {
+    "core": Path("MoFox.db"),
+    "life_events": Path("life_engine_workspace/life_events.sqlite3"),
+    "life_memory": Path("life_engine_workspace/.memory/memory.db"),
+    "consciousness_presence": Path(
+        "life_engine_workspace/runtime/consciousness_presence.sqlite3"
+    ),
+    "world_projection": Path("life_engine_workspace/runtime/world_projection.sqlite3"),
+}
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="安全同步 Elysium 统一记忆到追加式 MySQL 归档",
@@ -194,18 +205,7 @@ async def _restore(args: argparse.Namespace, remote: RemoteMemoryArchive) -> dic
             output_root=output,
         )
     ]
-    targets = {
-        "core": Path("Elysium.db"),
-        "life_events": Path("life_engine_workspace/life_events.sqlite3"),
-        "life_memory": Path("life_engine_workspace/.memory/memory.db"),
-        "consciousness_presence": Path(
-            "life_engine_workspace/runtime/consciousness_presence.sqlite3"
-        ),
-        "world_projection": Path(
-            "life_engine_workspace/runtime/world_projection.sqlite3"
-        ),
-    }
-    for domain, relative in targets.items():
+    for domain, relative in RESTORE_SQLITE_TARGETS.items():
         if domain not in domains:
             if domain == "world_projection":
                 continue
