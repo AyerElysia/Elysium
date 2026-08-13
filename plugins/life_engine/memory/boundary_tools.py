@@ -1,4 +1,4 @@
-"""Life Engine tools for subject-owned long-memory boundaries and indexes."""
+"""Exact read-only tools for subject-owned long-memory boundaries."""
 
 from __future__ import annotations
 
@@ -176,11 +176,7 @@ def _stable_recall_time(tool: BaseTool) -> str:
     text = str(value or "").strip()
     if text:
         try:
-            return (
-                datetime.fromisoformat(text)
-                .astimezone(UTC)
-                .isoformat()
-            )
+            return datetime.fromisoformat(text).astimezone(UTC).isoformat()
         except ValueError:
             pass
     # The tool-call identity still prevents replay ambiguity.  This fallback is
@@ -194,7 +190,7 @@ async def _resolve_runtime(tool: BaseTool) -> _BoundaryToolRuntime:
     service = get_life_engine_service()
     if service is None:
         raise RuntimeError("LifeEngineServiceUnavailable")
-    memory_service = getattr(service, "_memory_service", None)
+    memory_service = getattr(service, "memory_service", None)
     if memory_service is None:
         raise RuntimeError("LifeMemoryServiceUnavailable")
     scheduler = getattr(service, "_learning_scheduler", None)
@@ -204,20 +200,23 @@ async def _resolve_runtime(tool: BaseTool) -> _BoundaryToolRuntime:
     if not stream_scope:
         # 可操作化：心跳等无聊天流上下文时，模型看到这条就知道为什么被拒、该怎么办
         raise PermissionError(
+            "MemoryBoundaryStreamOwnerRequired: "
             "当前不在聊天流上下文中（如心跳），无流归属，不可读写记忆边界；"
             "请在聊天流对话中再调用"
         )
     instance = service.consciousness_registry.get_for_stream(stream_scope)
     if instance is None or not instance.is_active:
         raise PermissionError(
+            "MemoryBoundaryActorIsNotActive: "
             "当前意识实例不活跃（无有效聊天流），不可读写记忆边界；请在聊天流对话中再调用"
         )
     actor = str(instance.instance_id or "").strip()
     if not actor:
         raise PermissionError(
+            "MemoryBoundaryActorIdentityRequired: "
             "无法解析当前意识实例身份，不可读写记忆边界；请在聊天流对话中再调用"
         )
-    living = memory_service._require_memory_storage().living
+    living = memory_service.living_memory_store
     return _BoundaryToolRuntime(
         service=service,
         memory_service=memory_service,
@@ -339,6 +338,10 @@ def _segment_from_subject_range(
     )
 
 
+# Compatibility quarantine only.  These legacy classes are intentionally not
+# exported or registered; the formal authoring/inspection/decision surface is
+# nucleus_memory_continuity_review.  Keeping the class bodies importable avoids
+# breaking old serialized references while preventing a second authority path.
 class LifeCreateMemoryBoundaryTool(BaseTool):
     """Create or revise one complete immutable long-memory boundary."""
 
@@ -621,7 +624,6 @@ class LifeCreateMemoryBoundaryFromSubjectRangeTool(BaseTool):
                 f"权威 MEMORY 精确范围封存失败: error_type={type(exc).__name__}"
             )
             return False, {"error": type(exc).__name__, "detail": str(exc)}
-
 
 class LifeReadMemoryBoundaryTool(BaseTool):
     """Read exact boundary context, provenance, segments, or history."""
@@ -1006,20 +1008,14 @@ class LifeProposeMemoryContinuityRevisionTool(BaseTool):
             )
 
 
-MEMORY_BOUNDARY_TOOLS = [
-    LifeCreateMemoryBoundaryTool,
-    LifeCreateMemoryBoundaryFromSubjectRangeTool,
-    LifeReadMemoryBoundaryTool,
-    LifeInspectMemoryContinuityTool,
-    LifeProposeMemoryContinuityRevisionTool,
-]
+# Exact immutable recall remains a small standalone capability. Boundary
+# authoring, current-index inspection, candidate preparation, and decisions are
+# exposed only through nucleus_memory_continuity_review, which keeps one pinned
+# subject revision and one recoverable decision chain.
+MEMORY_BOUNDARY_TOOLS = [LifeReadMemoryBoundaryTool]
 
 
 __all__ = [
     "MEMORY_BOUNDARY_TOOLS",
-    "LifeCreateMemoryBoundaryFromSubjectRangeTool",
-    "LifeCreateMemoryBoundaryTool",
-    "LifeInspectMemoryContinuityTool",
-    "LifeProposeMemoryContinuityRevisionTool",
     "LifeReadMemoryBoundaryTool",
 ]

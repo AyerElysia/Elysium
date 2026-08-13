@@ -679,7 +679,11 @@ def _memory_trigger_contracts() -> tuple[MySQLTriggerContract, ...]:
             action_fragment=(
                 "MemoryWitnessAuthorityImmutable"
                 if table == "memory_witnesses"
-                else "MemoryAuthorityRecordImmutable"
+                else (
+                    "MemoryWitnessDeliveryAuthorityImmutable"
+                    if table == "memory_witness_delivery_jobs"
+                    else "MemoryAuthorityRecordImmutable"
+                )
             ),
         )
         for name, event_name, table in MEMORY_IMMUTABILITY_TRIGGER_CONTRACT
@@ -935,6 +939,29 @@ def _expected_migration_evidence(
     ]
 
 
+def _content_evidence(value: dict[str, Any]) -> dict[str, Any]:
+    """Project a table audit down to immutable row-content evidence.
+
+    Schema upgrades may intentionally change indexes, primary keys, or other table
+    metadata while preserving every authoritative row.  Migration completeness and
+    table readiness are verified independently, so the no-data-change invariant must
+    compare only the table frontier and exact content hashes.
+    """
+
+    tables = {
+        str(item["table_name"]): {
+            "row_count": int(item["row_count"]),
+            "root_sha256": str(item["root_sha256"]),
+        }
+        for item in value.get("tables") or []
+    }
+    return {
+        "row_count": int(value.get("row_count") or 0),
+        "root_sha256": str(value.get("root_sha256") or ""),
+        "tables": tables,
+    }
+
+
 def _assert_memory_upgrade_invariants(
     before: dict[str, Any],
     after: dict[str, Any],
@@ -951,7 +978,9 @@ def _assert_memory_upgrade_invariants(
         raise RuntimeError(
             "authority generation/epoch/owner changed during Memory upgrade"
         )
-    if before["existing_memory"] != after["existing_memory"]:
+    if _content_evidence(before["existing_memory"]) != _content_evidence(
+        after["existing_memory"]
+    ):
         raise RuntimeError("existing Memory content changed during schema upgrade")
     if after["schema_migrations"] != _expected_migration_evidence(MEMORY_MIGRATIONS):
         raise RuntimeError("Memory schema migration contract is incomplete or drifted")
@@ -983,7 +1012,13 @@ def _assert_memory_upgrade_invariants(
                     f"new Memory table was not initialized empty: {table_name}"
                 )
             continue
-        if before_tables[table_name] != after_tables[table_name]:
+        if {
+            "row_count": int(before_tables[table_name]["row_count"]),
+            "root_sha256": str(before_tables[table_name]["root_sha256"]),
+        } != {
+            "row_count": int(after_tables[table_name]["row_count"]),
+            "root_sha256": str(after_tables[table_name]["root_sha256"]),
+        }:
             raise RuntimeError(
                 f"existing Memory workspace projection table changed: {table_name}"
             )

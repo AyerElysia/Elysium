@@ -9,6 +9,10 @@ from typing import Any
 
 import pytest
 
+from plugins.life_engine.memory.experience import (
+    ExperienceOccurrenceCursor,
+    ExperienceOccurrencePage,
+)
 from plugins.life_engine.memory.indexing import IndexJob
 from plugins.life_engine.memory.service import LifeMemoryService
 from plugins.life_engine.memory.workspace_projection_identity import (
@@ -40,6 +44,17 @@ class _AvailablePort:
     async def availability(self) -> StorageAvailability:
         self.availability_calls += 1
         return self._availability
+
+
+class _OccurrencePort(_AvailablePort):
+    def __init__(self, pages: tuple[ExperienceOccurrencePage, ...]) -> None:
+        super().__init__()
+        self.pages = pages
+        self.calls: list[dict[str, Any]] = []
+
+    async def list_occurrence_page(self, **kwargs: Any) -> ExperienceOccurrencePage:
+        self.calls.append(dict(kwargs))
+        return self.pages[len(self.calls) - 1]
 
 
 class _InjectedRuntime:
@@ -200,6 +215,74 @@ async def test_service_forwards_full_index_job_lease_and_legacy_id_fails_closed(
     assert document_index.calls == [
         (claimed, "completed", ""),
         ("job-1", "completed", ""),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_service_preserves_composite_experience_occurrence_pagination(
+    tmp_path: Path,
+) -> None:
+    same_position_page_end = ExperienceOccurrenceCursor(42, "occurrence-1000")
+    same_position_frontier = ExperienceOccurrenceCursor(42, "occurrence-1001")
+    pages = (
+        ExperienceOccurrencePage(
+            items=(),
+            next_cursor=same_position_page_end,
+            frontier=same_position_frontier,
+            has_more=True,
+        ),
+        ExperienceOccurrencePage(
+            items=(),
+            next_cursor=same_position_frontier,
+            frontier=same_position_frontier,
+            has_more=False,
+        ),
+    )
+    experiences = _OccurrencePort(pages)
+    passive = _AvailablePort()
+    storage = MemoryStorageBundle(
+        backend=BackendKind.MYSQL,
+        document_index=passive,  # type: ignore[arg-type]
+        experiences=experiences,  # type: ignore[arg-type]
+        witnesses=passive,  # type: ignore[arg-type]
+        living=passive,  # type: ignore[arg-type]
+        epistemic=passive,  # type: ignore[arg-type]
+        legacy_graph=passive,  # type: ignore[arg-type]
+    )
+    service = LifeMemoryService(
+        tmp_path,
+        vector_backend_enabled=False,
+        memory_storage=storage,
+    )
+    service._memory_storage = storage
+    service._initialized = True
+
+    first = await service.list_experience_occurrence_page(
+        position_after=41,
+        limit=1000,
+    )
+    second = await service.list_experience_occurrence_page(
+        position_after=41,
+        after=first.next_cursor,
+        through=first.frontier,
+        limit=1000,
+    )
+
+    assert first is pages[0]
+    assert second is pages[1]
+    assert experiences.calls == [
+        {
+            "position_after": 41,
+            "after": None,
+            "through": None,
+            "limit": 1000,
+        },
+        {
+            "position_after": 41,
+            "after": same_position_page_end,
+            "through": same_position_frontier,
+            "limit": 1000,
+        },
     ]
 
 
@@ -1050,17 +1133,17 @@ async def test_default_local_service_restarts_without_behavior_change(
 ) -> None:
     first = LifeMemoryService(tmp_path, vector_backend_enabled=False)
     await first.initialize()
-    node = await first.get_or_create_file_node(
+    indexed = await first.upsert_document(
         "notes/restart.md",
-        title="restart",
         content="local remains the compatibility default",
+        title="restart",
     )
     await first.close()
 
     second = LifeMemoryService(tmp_path, vector_backend_enabled=False)
     await second.initialize()
-    restored = await second.get_node_by_file_path("notes/restart.md")
-    assert restored is not None and restored.node_id == node.node_id
+    restored = await second.get_document_metadata("notes/restart.md")
+    assert restored is not None and restored.node_id == indexed.node_id
     await second.close()
 
 

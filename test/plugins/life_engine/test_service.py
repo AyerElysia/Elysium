@@ -87,6 +87,7 @@ class _FakeMemoryIndexService:
     def __init__(self) -> None:
         self.run_calls = 0
         self.close_calls = 0
+        self.behavior_health_provider: object | None = None
 
     async def run_index_worker(self, **_: object) -> object:
         self.run_calls += 1
@@ -94,6 +95,9 @@ class _FakeMemoryIndexService:
 
     async def close(self) -> None:
         self.close_calls += 1
+
+    def set_behavior_health_provider(self, provider: object | None) -> None:
+        self.behavior_health_provider = provider
 
 
 def test_memory_service_property_aliases_private_field(tmp_path: Path) -> None:
@@ -106,6 +110,105 @@ def test_memory_service_property_aliases_private_field(tmp_path: Path) -> None:
     service._memory_service = sentinel  # type: ignore[assignment]
 
     assert service.memory_service is sentinel
+
+
+async def test_memory_behavior_health_combines_witness_and_continuity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _make_service(tmp_path)
+    living = object()
+
+    class _Memory:
+        def __init__(self) -> None:
+            self.living_memory_store = living
+
+    class _Witness:
+        async def health_snapshot(self) -> dict[str, object]:
+            return {
+                "status": "healthy",
+                "component": "memory_witness_pipeline",
+                "raw_ingest": {"backlog": 3},
+                "author": {"backlog": 2},
+                "runtime": {"last_success_at": "2026-08-12T00:00:00+00:00"},
+            }
+
+    subject_store = object()
+    service._selectable_storage_enabled = True
+    service._memory_service = _Memory()  # type: ignore[assignment]
+    service._subject_document_store = subject_store  # type: ignore[assignment]
+    service._memory_witness_coordinator = _Witness()
+    collect = AsyncMock(
+        return_value={
+            "status": "healthy",
+            "component": "memory_continuity",
+            "verified_boundary_count": 4,
+        }
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.memory.continuity_health.collect_continuity_memory_health",
+        collect,
+    )
+
+    snapshot = await service._memory_behavior_health_snapshot()
+
+    assert snapshot["status"] == "healthy"
+    assert snapshot["backlog"] == 5
+    assert snapshot["last_success_at"] == "2026-08-12T00:00:00+00:00"
+    assert snapshot["continuity"]["verified_boundary_count"] == 4
+    assert snapshot["recall_delivery"]["boundary"]["component"] == (
+        "memory_recall_exact_delivery"
+    )
+    assert snapshot["recall_delivery"]["search"]["component"] == (
+        "memory_search_recall_delivery"
+    )
+    collect.assert_awaited_once_with(
+        subject_store=subject_store,
+        living_store=living,
+    )
+
+
+async def test_memory_behavior_health_marks_missing_selected_runtime_failed(
+    tmp_path: Path,
+) -> None:
+    service = _make_service(tmp_path)
+    service._selectable_storage_enabled = True
+
+    snapshot = await service._memory_behavior_health_snapshot()
+
+    assert snapshot["status"] == "failed"
+    assert snapshot["witness"]["status"] == "disabled"
+    assert snapshot["continuity"]["error_type"] == (
+        "ContinuityHealthCoherentRuntimeUnavailable"
+    )
+
+
+async def test_dfc_memory_search_uses_canonical_living_associations() -> None:
+    calls: dict[str, object] = {}
+
+    class _Memory:
+        async def search_memory(self, query: str, **kwargs: object) -> list[object]:
+            calls["search"] = (query, kwargs)
+            return [object()]
+
+        async def expand_living_document_associations(
+            self,
+            results: list[object],
+            **kwargs: object,
+        ) -> list[object]:
+            calls["expand"] = (results, kwargs)
+            return []
+
+    service = object.__new__(LifeEngineService)
+    service._memory_service = _Memory()  # type: ignore[assignment]
+
+    assert await service.search_actor_memory("shared memory", top_k=3) == ""
+    query, search_kwargs = calls["search"]  # type: ignore[misc]
+    assert query == "shared memory"
+    assert search_kwargs["enable_association"] is False
+    _results, expansion_kwargs = calls["expand"]  # type: ignore[misc]
+    assert expansion_kwargs["context_key"] == "life_engine/dfc"
+    assert expansion_kwargs["limit"] == 3
 
 
 async def test_learning_maintenance_only_wakes_independent_worker(
@@ -1302,6 +1405,7 @@ async def test_memory_index_lifecycle_start_toggle_and_stop_close(
         assert fake_memory.run_calls == 0
     assert service._memory_witness_task_id is not None
     assert service._memory_witness_coordinator is not None
+    assert fake_memory.behavior_health_provider is not None
 
     await service.stop()
 
@@ -1309,6 +1413,7 @@ async def test_memory_index_lifecycle_start_toggle_and_stop_close(
     assert service._memory_witness_task_id is None
     assert service._memory_witness_coordinator is None
     assert service._memory_service is None
+    assert fake_memory.behavior_health_provider is None
     assert fake_memory.close_calls == 1
     assert lifecycle_events.index("witness_wait") < lifecycle_events.index("memory_close")
 

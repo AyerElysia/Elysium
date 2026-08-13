@@ -31,7 +31,7 @@ def test_build_mysql_config_uses_asyncmy_utf8mb4_and_safe_pool() -> None:
     assert kwargs["pool_size"] == 7
     assert kwargs["max_overflow"] == 14
     assert kwargs["pool_pre_ping"] is True
-    assert kwargs["pool_recycle"] == 900
+    assert kwargs["pool_recycle"] == 120
     assert kwargs["connect_args"]["charset"] == "utf8mb4"
     assert kwargs["connect_args"]["connect_timeout"] == 12
 

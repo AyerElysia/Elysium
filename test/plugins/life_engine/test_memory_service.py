@@ -18,6 +18,9 @@ from plugins.life_engine.memory.nodes import (
     generate_file_node_id,
     generate_legacy_file_node_id,
 )
+from plugins.life_engine.memory.workspace_projection_identity import (
+    WorkspaceProjectionDeleteEvidenceError,
+)
 
 
 @dataclass
@@ -121,11 +124,11 @@ async def test_read_chunk_index_state_delegates_to_document_index(
     await service.close()
 
 
-def test_migrate_file_path_keeps_edges_and_fts(
+def test_runtime_migrate_file_path_keeps_historical_identity_unchanged(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """文件重命名后，节点 ID/边/FTS 应随之迁移。"""
+    """Runtime re-keying must fail before rewriting legacy evidence."""
     async def _run() -> None:
         service = _make_service(tmp_path)
         await service.initialize()
@@ -145,45 +148,58 @@ def test_migrate_file_path_keeps_edges_and_fts(
 
         monkeypatch.setattr(service, "_get_chroma_collection", _fake_get_collection)
 
-        source_node = await service.get_or_create_file_node(
+        await service.upsert_document(
             "notes/a.md",
             title="A",
             content="alpha content",
         )
-        target_node = await service.get_or_create_file_node(
+        await service.upsert_document(
             "notes/b.md",
             title="B",
             content="beta content",
         )
-        await service.create_or_update_edge(
-            source_id=source_node.node_id,
-            target_id=target_node.node_id,
-            edge_type=EdgeType.RELATES,
-            reason="test edge",
-            strength=0.8,
-            bidirectional=True,
+        source_node = await service.get_node_by_file_path("notes/a.md")
+        target_node = await service.get_node_by_file_path("notes/b.md")
+        assert source_node is not None
+        assert target_node is not None
+        # Explicit migration fixture: production service writers are retired,
+        # but historical edge rows must still survive document re-keying.
+        assert service._db is not None
+        service._db.execute(
+            """INSERT INTO memory_edges (
+                edge_id, source_id, target_id, edge_type, weight,
+                base_strength, reason, created_at, bidirectional
+            ) VALUES (?, ?, ?, ?, 0.8, 0.8, 'test edge', 1.0, 1)""",
+            (
+                "legacy-migration-fixture",
+                source_node.node_id,
+                target_node.node_id,
+                EdgeType.RELATES.value,
+            ),
         )
+        service._db.commit()
 
-        migrated = await service.migrate_file_path("notes/a.md", "archive/a.md")
-        assert migrated is True
+        before_edges = await service.get_edges_from(source_node.node_id)
+        with pytest.raises(
+            WorkspaceProjectionDeleteEvidenceError,
+            match="occurrence-bound audited port",
+        ):
+            await service.migrate_file_path("notes/a.md", "archive/a.md")
 
         old_node = await service.get_node_by_file_path("notes/a.md")
         new_node = await service.get_node_by_file_path("archive/a.md")
-        assert old_node is None
-        assert new_node is not None
-        assert new_node.file_path == "archive/a.md"
+        assert old_node is not None
+        assert new_node is None
 
-        edges = await service.get_edges_from(new_node.node_id)
+        edges = await service.get_edges_from(source_node.node_id)
+        assert edges == before_edges
         assert any(edge.target_id == target_node.node_id for edge in edges)
 
         cursor = service._db.cursor()
-        cursor.execute("SELECT content FROM memory_fts WHERE node_id = ?", (new_node.node_id,))
+        cursor.execute("SELECT content FROM memory_fts WHERE node_id = ?", (source_node.node_id,))
         fts_row = cursor.fetchone()
         assert fts_row is not None
         assert "alpha content" in (fts_row["content"] or "")
-
-        cursor.execute("SELECT content FROM memory_fts WHERE node_id = ?", (source_node.node_id,))
-        assert cursor.fetchone() is None
 
     asyncio.run(_run())
 
@@ -229,9 +245,16 @@ def test_unified_document_api_updates_sqlite_without_embedding(
 
         await service.upsert_document("notes/source.md", "source body", title="Source")
         await service.upsert_document("notes/target.md", "target body", title="Target")
-        with pytest.raises(FileExistsError, match="目标文档已存在"):
+        with pytest.raises(
+            WorkspaceProjectionDeleteEvidenceError,
+            match="occurrence-bound audited port",
+        ):
             await service.move_document("notes/source.md", "notes/target.md")
-        assert await service.delete_document("notes/target.md") is True
+        with pytest.raises(
+            WorkspaceProjectionDeleteEvidenceError,
+            match="occurrence-bound audited deletion port",
+        ):
+            await service.delete_document("notes/target.md")
 
     asyncio.run(_run())
 
@@ -731,34 +754,93 @@ async def test_service_health_snapshot_uses_isolated_committed_connection(
     await service.close()
 
 
-async def test_get_or_create_document_uses_sqlite_outbox_without_chroma_write(
+async def test_service_health_snapshot_surfaces_behavior_pipeline_degradation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = _make_service(tmp_path)
-    collection = SimpleNamespace(upsert=lambda **_: pytest.fail("unexpected Chroma write"))
 
-    async def fake_collection() -> Any:
-        return collection
+    async def fake_legacy_collection() -> Any:
+        return SimpleNamespace(count=lambda: 0, get=lambda **_: {"ids": []})
 
-    monkeypatch.setattr(service, "_get_chroma_collection", fake_collection)
+    async def behavior_health() -> dict[str, Any]:
+        return {
+            "status": "degraded",
+            "component": "memory_witness",
+            "owner": "life_engine",
+            "reason": "projection backlog",
+            "last_success_at": "2026-08-12T01:02:03+00:00",
+            "backlog": 3,
+        }
+
+    monkeypatch.setattr(service, "_get_chroma_collection", fake_legacy_collection)
+    service.set_behavior_health_provider(behavior_health)
     await service.initialize()
 
-    node = await service.get_or_create_file_node(
-        "notes/compat.md",
-        title="Compat",
-        content="transaction backed content",
-    )
+    snapshot = await service.health_snapshot()
 
-    assert service._db.execute(
-        "SELECT COUNT(*) FROM memory_chunks WHERE node_id = ?", (node.node_id,)
-    ).fetchone()[0] > 0
-    assert service._db.execute(
-        "SELECT COUNT(*) FROM memory_chunks_fts WHERE node_id = ?", (node.node_id,)
-    ).fetchone()[0] > 0
-    assert service._db.execute(
-        "SELECT status FROM memory_index_jobs WHERE node_id = ?", (node.node_id,)
-    ).fetchone()[0] == "pending"
+    assert snapshot["status"] == "degraded"
+    assert snapshot["behavior"]["component"] == "memory_witness"
+    assert snapshot["behavior"]["backlog"] == 3
+    assert snapshot["degradations"][-1] == {
+        "component": "memory_witness",
+        "owner": "life_engine",
+        "reason": "projection backlog",
+        "last_success_at": "2026-08-12T01:02:03+00:00",
+        "backlog": 3,
+    }
+    await service.close()
+
+
+async def test_service_health_snapshot_contains_content_free_provider_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _make_service(tmp_path)
+
+    async def fake_legacy_collection() -> Any:
+        return SimpleNamespace(count=lambda: 0, get=lambda **_: {"ids": []})
+
+    async def broken_health() -> dict[str, Any]:
+        raise ValueError("private witness content must not enter health")
+
+    monkeypatch.setattr(service, "_get_chroma_collection", fake_legacy_collection)
+    service.set_behavior_health_provider(broken_health)
+    await service.initialize()
+
+    snapshot = await service.health_snapshot()
+
+    assert snapshot["status"] == "degraded"
+    assert snapshot["behavior"] == {
+        "status": "failed",
+        "component": "memory_behavior",
+        "owner": "life_engine",
+        "error_type": "ValueError",
+    }
+    assert "private witness content" not in str(snapshot)
+    await service.close()
+
+
+async def test_legacy_graph_stats_are_explicitly_non_authoritative(
+    tmp_path: Path,
+) -> None:
+    service = _make_service(tmp_path)
+
+    class _LegacyGraph:
+        async def stats(self) -> dict[str, int]:
+            return {"total_nodes": 2, "total_edges": 1}
+
+    service._memory_storage = SimpleNamespace(legacy_graph=_LegacyGraph())  # type: ignore[assignment]
+
+    snapshot = await service.get_stats()
+
+    assert snapshot == {
+        "projection_kind": "legacy_memory_graph_statistics",
+        "authority": False,
+        "read_only": True,
+        "canonical_health_entrypoint": "memory.health_snapshot",
+        "legacy": {"total_nodes": 2, "total_edges": 1},
+    }
 
 
 async def test_legacy_node_lookup_is_read_only(tmp_path: Path) -> None:
@@ -804,11 +886,13 @@ async def test_read_rejects_noncanonical_stored_path(tmp_path: Path) -> None:
     assert await service.get_node_by_file_path(path) is None
 
 
-async def test_record_memory_correction_rejects_absolute_related_path(tmp_path: Path) -> None:
+async def test_record_memory_correction_is_retired_before_path_processing(
+    tmp_path: Path,
+) -> None:
     service = _make_service(tmp_path)
     await service.initialize()
 
-    with pytest.raises(ValueError, match="absolute_path"):
+    with pytest.raises(RuntimeError, match="LegacyCorrectionMutationRetired"):
         await service.record_memory_correction(
             "topic",
             "correction",
@@ -980,8 +1064,10 @@ async def test_startup_recovery_never_batches_scan_absence_as_deletion(
     assert deleted == 0
 
 
-async def test_startup_recovery_deletes_orphan_edges(tmp_path: Path) -> None:
-    """指向已删除节点的孤立边，应该被启动恢复清理掉。"""
+async def test_startup_recovery_preserves_orphan_edges_as_migration_evidence(
+    tmp_path: Path,
+) -> None:
+    """Startup diagnoses legacy orphan edges but never deletes evidence."""
     service = _make_service(tmp_path)
     await service.initialize()
 
@@ -1028,11 +1114,11 @@ async def test_startup_recovery_deletes_orphan_edges(tmp_path: Path) -> None:
     # 触发启动恢复
     await service._startup_recovery()
 
-    # 验证孤立边已删除
+    # 启动前后孤立边精确保留；它只能由只读 health 报告。
     orphan_count = service._db.execute(
         "SELECT COUNT(*) FROM memory_edges WHERE edge_id = 'edge_orphan'"
     ).fetchone()[0]
-    assert orphan_count == 0, "孤立边应该被启动恢复删除"
+    assert orphan_count == 1
 
     # 正常边仍然保留
     normal_count = service._db.execute(

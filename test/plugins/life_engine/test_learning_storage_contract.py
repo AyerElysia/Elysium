@@ -880,7 +880,7 @@ async def test_authority_commit_is_the_only_source_of_committed_status(
         ]
 
 
-async def test_compression_persists_reviewable_subject_candidate_without_accepting(
+async def test_compression_persists_epistemic_artifact_without_memory_candidate(
     tmp_path: Path,
 ) -> None:
     async with _local_store(tmp_path / "backend") as (_, store, _, _):
@@ -912,19 +912,15 @@ async def test_compression_persists_reviewable_subject_candidate_without_accepti
 
         assert scheduler.decision_ledger is not None
         summaries = await scheduler.decision_ledger.list_candidates(status="open")
-        assert len(summaries) == 1
-        candidate = await scheduler.decision_ledger.read_candidate(
-            str(summaries[0]["candidate_id"])
-        )
-        assert candidate is not None
-        assert candidate.target_path == "MEMORY.md"
-        assert candidate.subject_revision == "a" * 64
-        assert candidate.candidate_content_bytes == (
-            b"# Derived observation candidate\nExact candidate wording\n"
+        assert summaries == []
+        assert scheduler.store.read_knowledge_version(1) == (
+            "# Derived observation candidate\nExact candidate wording\n"
         )
         assert authority.commands == []
         state = scheduler.store.load_state()
-        assert state["last_knowledge_candidate_ledgered_version"] == 1
+        assert state["last_knowledge_candidate_version"] == 1
+        assert "last_knowledge_candidate_ledgered_version" not in state
+        assert "last_knowledge_candidate_id" not in state
         assert not (tmp_path / "selected-workspace" / ".life_learning").exists()
 
         restarted = LearningScheduler(
@@ -934,7 +930,10 @@ async def test_compression_persists_reviewable_subject_candidate_without_accepti
         )
         await restarted.initialize()
         assert restarted.decision_ledger is not None
-        assert len(await restarted.decision_ledger.list_candidates(status="open")) == 1
+        assert await restarted.decision_ledger.list_candidates(status="open") == []
+        assert restarted.store.read_knowledge_version(1) == (
+            "# Derived observation candidate\nExact candidate wording\n"
+        )
 
 
 async def test_decision_rejects_stale_subject_revision_and_payload_reuse(

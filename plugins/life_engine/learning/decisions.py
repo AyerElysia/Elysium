@@ -157,6 +157,12 @@ class LearningDecisionLedger:
         self._subject_authority = subject_authority
         self._project_subject_commit = project_subject_commit
 
+    @property
+    def storage_runtime(self) -> object | None:
+        """Expose the selected store runtime for coherence validation."""
+
+        return getattr(self._store, "runtime", None)
+
     async def _projection(self) -> LearningProjection | None:
         projection = await self._store.get_projection(_PROJECTION_NAME)
         if projection is not None and projection.rebuild_state != "ready":

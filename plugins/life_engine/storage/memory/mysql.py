@@ -9,7 +9,7 @@ import json
 import math
 import random
 import time
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from itertools import combinations
@@ -51,9 +51,17 @@ from ...memory.epistemic import (
 from ...memory.experience import (
     EpistemicKind,
     ExperienceAppendReport,
+    ExperienceOccurrenceCursor,
+    ExperienceOccurrencePage,
+    ExperienceOccurrenceRef,
     ExperienceRecord,
+    WitnessIdentityConflict,
     WitnessMemory,
     WitnessSearchResult,
+    experience_evidence_body,
+    experience_occurrence_cursor,
+    make_experience_occurrence_ref,
+    witness_append_payload_sha256,
 )
 from ...memory.indexing import (
     ACTIVE_CHUNK_STATE_KEY,
@@ -96,6 +104,18 @@ from ...memory.search import (
     SearchResult,
     vector_search,
 )
+from ...memory.witness_pipeline import (
+    DELIVERY_KINDS,
+    DELIVERY_STATUSES,
+    WitnessDecision,
+    WitnessDeliveryJob,
+    WitnessPipelineConflict,
+    WitnessWindow,
+    build_delivery_jobs,
+    normalize_witness_decision,
+    normalize_witness_window,
+    occurrence_identity_body,
+)
 from ...memory.worker import (
     CHUNK_INDEX_VERSION,
     IndexWorkerReport,
@@ -112,7 +132,16 @@ from ...memory.workspace_projection_identity import (
 )
 from ..contracts import StorageBackendRuntime
 from ..models import BackendKind, StorageAvailability
-from .contracts import MemoryStorageBundle
+from .contracts import (
+    CanonicalDocumentMetadata,
+    MemoryStorageBundle,
+    StableLedgerCursor,
+    StableLedgerPage,
+    WitnessReconciliationState,
+    WitnessReconciliationStateCorrupt,
+    validate_witness_reconciliation_state,
+    witness_reconciliation_state_sha256,
+)
 
 _T = TypeVar("_T")
 _IndexJobIdentity = tuple[str, int]
@@ -191,10 +220,45 @@ _MYSQL_MEMORY_READINESS_REQUIREMENTS: dict[
             "last_sequence",
             "revision",
         ),
+        "memory_witness_reconciliation_state": (
+            "scan_name",
+            "cursor_order_value",
+            "cursor_identity",
+            "frontier_order_value",
+            "frontier_identity",
+            "revision",
+            "state_sha256",
+        ),
         "memory_witness_migrations": (
             "migration_key",
             "source_hash",
             "witness_id",
+        ),
+        "memory_witness_windows": (
+            "window_id",
+            "start_position",
+            "source_digest",
+            "payload_sha256",
+        ),
+        "memory_witness_window_sources": (
+            "window_id",
+            "ordinal",
+            "occurrence_id",
+            "canonical_payload_sha256",
+        ),
+        "memory_witness_decisions": (
+            "decision_id",
+            "window_id",
+            "delivery_manifest_sha256",
+            "payload_sha256",
+        ),
+        "memory_witness_delivery_jobs": (
+            "job_id",
+            "decision_id",
+            "delivery_kind",
+            "status",
+            "revision",
+            "payload_sha256",
         ),
     },
     "living": {
@@ -541,7 +605,7 @@ async def inspect_mysql_memory_readiness(
     }
 
 
-class ImmutableMemoryRecordConflict(RuntimeError):
+class ImmutableMemoryRecordConflict(WitnessIdentityConflict):
     """Raised when one immutable identity is replayed with different evidence."""
 
 
@@ -943,6 +1007,57 @@ class MySQLWorkspaceProjectionBindingStore(_MySQLPort):
 
 
 class MySQLDocumentIndexProjection(_MySQLPort):
+    async def get_document_metadata(
+        self,
+        path: str,
+    ) -> CanonicalDocumentMetadata | None:
+        canonical_path, node_id = canonical_file_node_id(path)
+        assert self.runtime.engine is not None
+        async with self.runtime.engine.connect() as connection:
+            row = (
+                (
+                    await connection.execute(
+                        text(
+                            """SELECT node_id, file_path, content_hash, title,
+                            source_mtime, index_revision, is_deleted, updated_at
+                            FROM memory_nodes
+                            WHERE file_path_sha256 = :path_hash
+                            AND node_type = 'file'"""
+                        ),
+                        {"path_hash": _sha256(canonical_path)},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+        if row is None:
+            return None
+        if (
+            str(row["node_id"]) != node_id
+            or str(row["file_path"] or "") != canonical_path
+        ):
+            raise DocumentIdentityConflict(
+                "document path hash belongs to another canonical path"
+            )
+        return CanonicalDocumentMetadata(
+            node_id=node_id,
+            file_path=canonical_path,
+            content_hash=(
+                str(row["content_hash"])
+                if row["content_hash"] is not None
+                else None
+            ),
+            title=str(row["title"] or ""),
+            source_mtime=(
+                float(row["source_mtime"])
+                if row["source_mtime"] is not None
+                else None
+            ),
+            index_revision=int(row["index_revision"] or 0),
+            is_deleted=bool(row["is_deleted"]),
+            updated_at=float(row["updated_at"] or 0.0),
+        )
+
     @staticmethod
     def _chunk_from_row(row: Any) -> DocumentChunk:
         return DocumentChunk(
@@ -2937,23 +3052,6 @@ class MySQLDocumentIndexProjection(_MySQLPort):
         }
 
 
-def _experience_evidence_body(record: ExperienceRecord) -> dict[str, Any]:
-    return {
-        "occurred_at": record.occurred_at,
-        "source": record.source,
-        "channel": record.channel,
-        "event_type": record.event_type,
-        "content": record.content,
-        "stream_id": record.stream_id,
-        "consciousness_instance_id": record.consciousness_instance_id,
-        "actor": record.actor,
-        "visibility": record.visibility,
-        "valid_from": record.valid_from or record.occurred_at,
-        "valid_to": record.valid_to,
-        "metadata": record.metadata,
-    }
-
-
 def _experience_from_row(row: Any) -> ExperienceRecord:
     return ExperienceRecord(
         event_id=str(row["event_id"]),
@@ -2975,6 +3073,76 @@ def _experience_from_row(row: Any) -> ExperienceRecord:
     )
 
 
+def _experience_occurrence_from_row(row: Any) -> ExperienceOccurrenceRef:
+    experience = _experience_from_row(row)
+    ref = make_experience_occurrence_ref(
+        experience,
+        occurrence_id=str(row["occurrence_id"]),
+        source_event_id=str(row["occurrence_source_event_id"]),
+        ingest_position=int(row["ingest_position"]),
+        recorded_at=str(row["occurrence_recorded_at"]),
+        is_alias=bool(row["is_alias"]),
+    )
+    if ref.canonical_payload_sha256 != str(row["payload_sha256"]):
+        raise ImmutableMemoryRecordConflict(
+            f"ExperiencePayloadHashDrift:{ref.canonical_event_id}"
+        )
+    return ref
+
+
+_MYSQL_EXPERIENCE_OCCURRENCE_VIEW_SQL = """
+SELECT
+    occurrence.occurrence_id,
+    occurrence.canonical_event_id,
+    occurrence.occurrence_source_event_id,
+    occurrence.ingest_position,
+    occurrence.occurrence_recorded_at,
+    occurrence.is_alias,
+    experience.*
+FROM (
+    SELECT
+        event_id AS occurrence_id,
+        event_id AS canonical_event_id,
+        source_event_id AS occurrence_source_event_id,
+        sequence AS ingest_position,
+        recorded_at AS occurrence_recorded_at,
+        FALSE AS is_alias
+    FROM memory_experiences
+    UNION ALL
+    SELECT
+        occurrence_id,
+        event_id AS canonical_event_id,
+        source_event_id AS occurrence_source_event_id,
+        ingest_position,
+        recorded_at AS occurrence_recorded_at,
+        TRUE AS is_alias
+    FROM memory_experience_occurrence_aliases
+) AS occurrence
+JOIN memory_experiences AS experience
+  ON experience.event_id = occurrence.canonical_event_id
+"""
+
+
+async def _mysql_get_experience_occurrence(
+    executor: Any,
+    occurrence_id: str,
+) -> ExperienceOccurrenceRef | None:
+    row = (
+        (
+            await executor.execute(
+                text(
+                    _MYSQL_EXPERIENCE_OCCURRENCE_VIEW_SQL
+                    + " WHERE occurrence.occurrence_id = :occurrence_id"
+                ),
+                {"occurrence_id": occurrence_id},
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+    return _experience_occurrence_from_row(row) if row is not None else None
+
+
 class MySQLExperienceLedgerStore(_MySQLPort):
     async def append(
         self,
@@ -2983,6 +3151,7 @@ class MySQLExperienceLedgerStore(_MySQLPort):
         async def _operation(session: AsyncSession) -> ExperienceAppendReport:
             inserted: list[ExperienceRecord] = []
             existing_records: list[ExperienceRecord] = []
+            occurrences: list[ExperienceOccurrenceRef] = []
             for raw_record in records:
                 source_event_id = str(raw_record.source_event_id or raw_record.event_id)
                 record = replace(
@@ -2991,7 +3160,7 @@ class MySQLExperienceLedgerStore(_MySQLPort):
                     recorded_at=raw_record.recorded_at or _now_iso(),
                     valid_from=raw_record.valid_from or raw_record.occurred_at,
                 )
-                evidence_hash = _record_hash(_experience_evidence_body(record))
+                evidence_hash = _record_hash(experience_evidence_body(record))
                 row = (
                     (
                         await session.execute(
@@ -3011,13 +3180,16 @@ class MySQLExperienceLedgerStore(_MySQLPort):
                             f"ExperienceIdentityConflict:{record.event_id}"
                         )
                     existing_records.append(_experience_from_row(row))
+                    occurrences.append(
+                        make_experience_occurrence_ref(_experience_from_row(row))
+                    )
                     continue
 
                 alias = (
                     (
                         await session.execute(
                             text(
-                                "SELECT event_id FROM memory_experience_occurrence_aliases "
+                                "SELECT * FROM memory_experience_occurrence_aliases "
                                 "WHERE occurrence_id = :occurrence_id FOR UPDATE"
                             ),
                             {"occurrence_id": record.event_id},
@@ -3044,7 +3216,26 @@ class MySQLExperienceLedgerStore(_MySQLPort):
                         raise RuntimeError(
                             f"ExperienceAliasTargetMissing:{record.event_id}"
                         )
-                    existing_records.append(_experience_from_row(target))
+                    persisted = _experience_from_row(target)
+                    if (
+                        str(target["payload_sha256"]) != evidence_hash
+                        or str(alias["source_event_id"]) != source_event_id
+                        or int(alias["ingest_position"]) != int(record.sequence)
+                    ):
+                        raise ImmutableMemoryRecordConflict(
+                            f"ExperienceAliasConflict:{record.event_id}"
+                        )
+                    existing_records.append(persisted)
+                    occurrences.append(
+                        make_experience_occurrence_ref(
+                            persisted,
+                            occurrence_id=record.event_id,
+                            source_event_id=str(alias["source_event_id"]),
+                            ingest_position=int(alias["ingest_position"]),
+                            recorded_at=str(alias["recorded_at"]),
+                            is_alias=True,
+                        )
+                    )
                     continue
 
                 if record.event_id != source_event_id:
@@ -3065,6 +3256,7 @@ class MySQLExperienceLedgerStore(_MySQLPort):
                         legacy is not None
                         and str(legacy["payload_sha256"]) == evidence_hash
                     ):
+                        alias_recorded_at = _now_iso()
                         await session.execute(
                             text(
                                 """INSERT INTO memory_experience_occurrence_aliases (
@@ -3080,10 +3272,21 @@ class MySQLExperienceLedgerStore(_MySQLPort):
                                 "event_id": str(legacy["event_id"]),
                                 "source_event_id": source_event_id,
                                 "ingest_position": int(record.sequence),
-                                "recorded_at": _now_iso(),
+                                "recorded_at": alias_recorded_at,
                             },
                         )
-                        existing_records.append(_experience_from_row(legacy))
+                        persisted = _experience_from_row(legacy)
+                        existing_records.append(persisted)
+                        occurrences.append(
+                            make_experience_occurrence_ref(
+                                persisted,
+                                occurrence_id=record.event_id,
+                                source_event_id=source_event_id,
+                                ingest_position=int(record.sequence),
+                                recorded_at=alias_recorded_at,
+                                is_alias=True,
+                            )
+                        )
                         continue
 
                 await session.execute(
@@ -3109,9 +3312,11 @@ class MySQLExperienceLedgerStore(_MySQLPort):
                     },
                 )
                 inserted.append(record)
+                occurrences.append(make_experience_occurrence_ref(record))
             return ExperienceAppendReport(
                 inserted=tuple(inserted),
                 existing=tuple(existing_records),
+                occurrences=tuple(occurrences),
             )
 
         return await self._write(_operation)
@@ -3142,6 +3347,180 @@ class MySQLExperienceLedgerStore(_MySQLPort):
                 )
             ).mappings()
             return [_experience_from_row(row) for row in rows]
+
+    async def list_occurrences_after(
+        self,
+        position: int,
+        limit: int = 100,
+    ) -> list[ExperienceOccurrenceRef]:
+        assert self.runtime.engine is not None
+        async with self.runtime.engine.connect() as connection:
+            rows = (
+                await connection.execute(
+                    text(
+                        _MYSQL_EXPERIENCE_OCCURRENCE_VIEW_SQL
+                        + " WHERE occurrence.ingest_position > :position "
+                        "ORDER BY occurrence.ingest_position, "
+                        "occurrence.occurrence_id LIMIT :limit"
+                    ),
+                    {
+                        "position": max(0, int(position)),
+                        "limit": _safe_limit(limit),
+                    },
+                )
+            ).mappings()
+            return [_experience_occurrence_from_row(row) for row in rows]
+
+    async def list_occurrence_page(
+        self,
+        *,
+        position_after: int = 0,
+        after: ExperienceOccurrenceCursor | None = None,
+        through: ExperienceOccurrenceCursor | None = None,
+        limit: int = 100,
+    ) -> ExperienceOccurrencePage:
+        lower_position = max(0, int(position_after))
+        page_limit = _safe_limit(limit)
+        if after is not None and int(after.ingest_position) <= lower_position:
+            raise ValueError("ExperienceOccurrenceCursorOutsideScan")
+        frontier = through
+        if frontier is not None and int(frontier.ingest_position) <= lower_position:
+            raise ValueError("ExperienceOccurrenceFrontierOutsideScan")
+        assert self.runtime.engine is not None
+        async with self.runtime.engine.connect() as connection:
+            if frontier is None:
+                frontier_row = (
+                    (
+                        await connection.execute(
+                            text(
+                                _MYSQL_EXPERIENCE_OCCURRENCE_VIEW_SQL
+                                + " WHERE occurrence.ingest_position > :position "
+                                "ORDER BY occurrence.ingest_position DESC, "
+                                "occurrence.occurrence_id DESC LIMIT 1"
+                            ),
+                            {"position": lower_position},
+                        )
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+                if frontier_row is None:
+                    return ExperienceOccurrencePage((), None, None, False)
+                frontier = ExperienceOccurrenceCursor(
+                    ingest_position=int(frontier_row["ingest_position"]),
+                    occurrence_id=str(frontier_row["occurrence_id"]),
+                )
+            if after is not None and after > frontier:
+                raise ValueError("ExperienceOccurrenceCursorBeyondFrontier")
+            clauses = ["occurrence.ingest_position > :position"]
+            params: dict[str, Any] = {
+                "position": lower_position,
+                "frontier_position": frontier.ingest_position,
+                "frontier_identity": frontier.occurrence_id,
+                "limit": page_limit + 1,
+            }
+            if after is not None:
+                clauses.append(
+                    "(occurrence.ingest_position > :after_position OR "
+                    "(occurrence.ingest_position = :after_position AND "
+                    "occurrence.occurrence_id > :after_identity))"
+                )
+                params.update(
+                    {
+                        "after_position": after.ingest_position,
+                        "after_identity": after.occurrence_id,
+                    }
+                )
+            clauses.append(
+                "(occurrence.ingest_position < :frontier_position OR "
+                "(occurrence.ingest_position = :frontier_position AND "
+                "occurrence.occurrence_id <= :frontier_identity))"
+            )
+            rows = (
+                (
+                    await connection.execute(
+                        text(
+                            _MYSQL_EXPERIENCE_OCCURRENCE_VIEW_SQL
+                            + " WHERE "
+                            + " AND ".join(clauses)
+                            + " ORDER BY occurrence.ingest_position, "
+                            "occurrence.occurrence_id LIMIT :limit"
+                        ),
+                        params,
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        has_more = len(rows) > page_limit
+        items = tuple(
+            _experience_occurrence_from_row(row) for row in rows[:page_limit]
+        )
+        next_cursor = experience_occurrence_cursor(items[-1]) if items else after
+        return ExperienceOccurrencePage(items, next_cursor, frontier, has_more)
+
+    async def health_snapshot(self) -> dict[str, Any]:
+        assert self.runtime.engine is not None
+        async with self.runtime.engine.connect() as connection:
+            row = (
+                (
+                    await connection.execute(
+                        text(
+                            """SELECT
+                            (SELECT COUNT(*) FROM memory_experiences)
+                                AS canonical_count,
+                            (SELECT COUNT(*)
+                             FROM memory_experience_occurrence_aliases)
+                                AS alias_count,
+                            (SELECT MAX(sequence) FROM memory_experiences)
+                                AS canonical_frontier,
+                            (SELECT MAX(ingest_position)
+                             FROM memory_experience_occurrence_aliases)
+                                AS alias_frontier,
+                            (SELECT MAX(recorded_at) FROM memory_experiences)
+                                AS latest_recorded_at"""
+                        )
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            frontier_row = (
+                (
+                    await connection.execute(
+                        text(
+                            _MYSQL_EXPERIENCE_OCCURRENCE_VIEW_SQL
+                            + " ORDER BY occurrence.ingest_position DESC, "
+                            "occurrence.occurrence_id DESC LIMIT 1"
+                        )
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+        canonical_count = int(row["canonical_count"] or 0)
+        alias_count = int(row["alias_count"] or 0)
+        return {
+            "status": "healthy",
+            "canonical_count": canonical_count,
+            "alias_count": alias_count,
+            "occurrence_count": canonical_count + alias_count,
+            "frontier": max(
+                int(row["canonical_frontier"] or 0),
+                int(row["alias_frontier"] or 0),
+            ),
+            "frontier_cursor": (
+                {
+                    "ingest_position": int(frontier_row["ingest_position"]),
+                    "occurrence_id_sha256": _sha256(
+                        str(frontier_row["occurrence_id"])
+                    ),
+                }
+                if frontier_row is not None
+                else None
+            ),
+            "latest_recorded_at": str(row["latest_recorded_at"] or ""),
+        }
 
 
 async def _witness_from_row(
@@ -3178,6 +3557,7 @@ async def _witness_from_row(
         projection_status=str(row["projection_status"]),
         projection_error=str(row["projection_error"] or ""),
         metadata=dict(_json_value(row["metadata_json"], default={})),
+        payload_sha256=str(row["payload_sha256"] or ""),
     )
 
 
@@ -3237,7 +3617,7 @@ class _MySQLWitnessAppendStore(_MySQLPort):
         recorded_at = str(kwargs.get("recorded_at") or _now_iso())
         values = {
             "witness_id": witness_id,
-            "content": str(kwargs.get("content") or "").strip(),
+            "content": str(kwargs.get("content") or ""),
             "consciousness_instance_id": str(
                 kwargs.get("consciousness_instance_id") or ""
             ),
@@ -3260,12 +3640,26 @@ class _MySQLWitnessAppendStore(_MySQLPort):
             "projection_error": "",
             "metadata_json": canonical_json(dict(kwargs.get("metadata") or {})),
         }
-        hash_body = {
-            **values,
-            "projection_path": str(values["projection_path"] or ""),
-            "source_event_ids": source_ids,
-        }
-        payload_sha256 = _record_hash(hash_body)
+        payload_sha256 = witness_append_payload_sha256(
+            witness_id=witness_id,
+            content=str(values["content"]),
+            consciousness_instance_id=str(values["consciousness_instance_id"]),
+            perspective_subject_id=str(values["perspective_subject_id"]),
+            epistemic_kind=str(values["epistemic_kind"]),
+            source_kind=str(values["source_kind"]),
+            status=str(values["status"]),
+            stream_scope=str(values["stream_scope"]),
+            visibility=str(values["visibility"]),
+            valid_from=str(values["valid_from"]),
+            valid_to=str(values["valid_to"]),
+            recorded_at=recorded_at,
+            source_sequence_start=int(values["source_sequence_start"]),
+            source_sequence_end=int(values["source_sequence_end"]),
+            model_task_name=str(values["model_task_name"]),
+            projection_path=str(values["projection_path"] or ""),
+            metadata=dict(kwargs.get("metadata") or {}),
+            source_event_ids=source_ids,
+        )
 
         async def _operation(session: AsyncSession) -> WitnessMemory:
             projection_path_sha256 = await _assert_projection_path_available(
@@ -5938,6 +6332,152 @@ class MySQLLegacyGraphStore(_MySQLPort):
             ]
 
 
+async def _mysql_witness_window_from_row(
+    executor: Any,
+    row: Any,
+) -> WitnessWindow:
+    source_rows = (
+        await executor.execute(
+            text(
+                "SELECT occurrence_id FROM memory_witness_window_sources "
+                "WHERE window_id = :window_id ORDER BY ordinal"
+            ),
+            {"window_id": str(row["window_id"])},
+        )
+    ).mappings()
+    occurrences: list[ExperienceOccurrenceRef] = []
+    for source in source_rows:
+        occurrence_id = str(source["occurrence_id"])
+        occurrence = await _mysql_get_experience_occurrence(executor, occurrence_id)
+        if occurrence is None:
+            raise RuntimeError(f"WitnessWindowOccurrenceMissing:{occurrence_id}")
+        occurrences.append(occurrence)
+    return normalize_witness_window(
+        WitnessWindow(
+            window_id=str(row["window_id"]),
+            consciousness_instance_id=str(row["consciousness_instance_id"]),
+            stream_scope=str(row["stream_scope"] or ""),
+            start_position=int(row["start_position"]),
+            end_position=int(row["end_position"]),
+            occurrences=tuple(occurrences),
+            source_digest=str(row["source_digest"]),
+            planner_version=str(row["planner_version"] or ""),
+            created_at=str(row["created_at"]),
+            metadata=dict(_json_value(row["metadata_json"], default={})),
+            payload_sha256=str(row["payload_sha256"]),
+        )
+    )
+
+
+def _mysql_witness_decision_from_row(row: Any) -> WitnessDecision:
+    decision = WitnessDecision(
+        decision_id=str(row["decision_id"]),
+        window_id=str(row["window_id"]),
+        consciousness_instance_id=str(row["consciousness_instance_id"]),
+        decision_kind=str(row["decision_kind"]),
+        witness_id=str(row["witness_id"] or ""),
+        model_task_name=str(row["model_task_name"] or ""),
+        model_request_id=str(row["model_request_id"] or ""),
+        response_sha256=str(row["response_sha256"] or ""),
+        delivery_manifest_sha256=str(row["delivery_manifest_sha256"]),
+        decided_at=str(row["decided_at"]),
+        metadata=dict(_json_value(row["metadata_json"], default={})),
+        payload_sha256=str(row["payload_sha256"]),
+    )
+    body = {
+        "decision_id": decision.decision_id,
+        "window_id": decision.window_id,
+        "consciousness_instance_id": decision.consciousness_instance_id,
+        "decision_kind": decision.decision_kind,
+        "witness_id": decision.witness_id,
+        "model_task_name": decision.model_task_name,
+        "model_request_id": decision.model_request_id,
+        "response_sha256": decision.response_sha256,
+        "delivery_manifest_sha256": decision.delivery_manifest_sha256,
+        "decided_at": decision.decided_at,
+        "metadata": decision.metadata,
+    }
+    if _record_hash(body) != decision.payload_sha256:
+        raise WitnessPipelineConflict(
+            f"WitnessDecisionPayloadDrift:{decision.decision_id}"
+        )
+    return decision
+
+
+def _mysql_witness_delivery_job_from_row(row: Any) -> WitnessDeliveryJob:
+    job = WitnessDeliveryJob(
+        job_id=str(row["job_id"]),
+        decision_id=str(row["decision_id"]),
+        window_id=str(row["window_id"]),
+        delivery_kind=str(row["delivery_kind"]),
+        payload=dict(_json_value(row["payload_json"], default={})),
+        payload_sha256=str(row["payload_sha256"]),
+        created_at=str(row["created_at"]),
+        status=str(row["status"]),
+        revision=int(row["revision"]),
+        attempt_count=int(row["attempt_count"]),
+        available_at=str(row["available_at"] or ""),
+        lease_owner=str(row["lease_owner"] or ""),
+        lease_expires_at=str(row["lease_expires_at"] or ""),
+        last_error_type=str(row["last_error_type"] or ""),
+        updated_at=str(row["updated_at"]),
+        completed_at=str(row["completed_at"] or ""),
+    )
+    if job.delivery_kind not in DELIVERY_KINDS or job.status not in DELIVERY_STATUSES:
+        raise WitnessPipelineConflict(f"WitnessDeliveryStateDrift:{job.job_id}")
+    if _record_hash(job.payload) != job.payload_sha256:
+        raise WitnessPipelineConflict(f"WitnessDeliveryPayloadDrift:{job.job_id}")
+    return job
+
+
+def _mysql_reconciliation_state_from_row(
+    scan_name: str,
+    row: Any | None,
+) -> WitnessReconciliationState:
+    if row is None:
+        return WitnessReconciliationState(scan_name=scan_name)
+    cursor_order = str(row["cursor_order_value"] or "")
+    cursor_identity = str(row["cursor_identity"] or "")
+    frontier_order = str(row["frontier_order_value"] or "")
+    frontier_identity = str(row["frontier_identity"] or "")
+    if bool(cursor_order) != bool(cursor_identity):
+        raise WitnessReconciliationStateCorrupt(
+            "WitnessReconciliationCursorPartial"
+        )
+    if bool(frontier_order) != bool(frontier_identity):
+        raise WitnessReconciliationStateCorrupt(
+            "WitnessReconciliationFrontierPartial"
+        )
+    cursor = (
+        StableLedgerCursor(
+            cursor_order,
+            cursor_identity,
+        )
+        if cursor_order
+        else None
+    )
+    frontier = (
+        StableLedgerCursor(
+            frontier_order,
+            frontier_identity,
+        )
+        if frontier_order
+        else None
+    )
+    return validate_witness_reconciliation_state(
+        WitnessReconciliationState(
+            scan_name=str(row["scan_name"]),
+            cursor=cursor,
+            frontier=frontier,
+            revision=int(row["revision"]),
+            cycle_started_at=str(row["cycle_started_at"] or ""),
+            last_completed_at=str(row["last_completed_at"] or ""),
+            updated_at=str(row["updated_at"] or ""),
+            state_sha256=str(row["state_sha256"] or ""),
+        )
+    )
+
+
 class MySQLWitnessLedgerStore(_MySQLWitnessProjectionStore):
     async def list_pending(self, *, limit: int = 100) -> list[WitnessMemory]:
         assert self.runtime.engine is not None
@@ -5948,6 +6488,7 @@ class MySQLWitnessLedgerStore(_MySQLWitnessProjectionStore):
                         text(
                             "SELECT * FROM memory_witnesses WHERE projection_status "
                             "IN ('pending', 'failed') AND projection_path IS NOT NULL "
+                            "AND projection_path <> '' "
                             "ORDER BY recorded_at, witness_id LIMIT :limit"
                         ),
                         {"limit": _safe_limit(limit)},
@@ -5957,6 +6498,104 @@ class MySQLWitnessLedgerStore(_MySQLWitnessProjectionStore):
                 .all()
             )
             return [await _witness_from_row(connection, row) for row in rows]  # type: ignore[arg-type]
+
+    async def list_pending_page(
+        self,
+        *,
+        after: StableLedgerCursor | None = None,
+        through: StableLedgerCursor | None = None,
+        limit: int = 100,
+    ) -> StableLedgerPage[WitnessMemory]:
+        page_limit = _safe_limit(limit)
+        frontier = through
+        assert self.runtime.engine is not None
+        async with self.runtime.engine.connect() as connection:
+            if frontier is None:
+                row = (
+                    (
+                        await connection.execute(
+                            text(
+                                "SELECT recorded_at, witness_id "
+                                "FROM memory_witnesses WHERE projection_status "
+                                "IN ('pending', 'failed') "
+                                "AND projection_path IS NOT NULL "
+                                "AND projection_path <> '' "
+                                "ORDER BY recorded_at DESC, witness_id DESC LIMIT 1"
+                            )
+                        )
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+                if row is None:
+                    return StableLedgerPage((), None, None, False)
+                frontier = StableLedgerCursor(
+                    order_value=str(row["recorded_at"]),
+                    identity=str(row["witness_id"]),
+                )
+            if after is not None and after > frontier:
+                raise ValueError("StableLedgerCursorBeyondFrontier")
+            clauses = [
+                "projection_status IN ('pending', 'failed')",
+                "projection_path IS NOT NULL",
+                "projection_path <> ''",
+            ]
+            params: dict[str, Any] = {
+                "frontier_order": frontier.order_value,
+                "frontier_identity": frontier.identity,
+                "limit": page_limit + 1,
+            }
+            if after is not None:
+                clauses.append(
+                    "(recorded_at > :after_order OR "
+                    "(recorded_at = :after_order AND witness_id > :after_identity))"
+                )
+                params.update(
+                    {
+                        "after_order": after.order_value,
+                        "after_identity": after.identity,
+                    }
+                )
+            clauses.append(
+                "(recorded_at < :frontier_order OR "
+                "(recorded_at = :frontier_order AND "
+                "witness_id <= :frontier_identity))"
+            )
+            rows = (
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT * FROM memory_witnesses WHERE "
+                            + " AND ".join(clauses)
+                            + " ORDER BY recorded_at, witness_id LIMIT :limit"
+                        ),
+                        params,
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            delivered_rows = rows[:page_limit]
+            items = tuple(
+                [
+                    await _witness_from_row(connection, row)  # type: ignore[arg-type]
+                    for row in delivered_rows
+                ]
+            )
+        next_cursor = (
+            StableLedgerCursor(
+                order_value=str(delivered_rows[-1]["recorded_at"]),
+                identity=str(delivered_rows[-1]["witness_id"]),
+            )
+            if delivered_rows
+            else after
+        )
+        return StableLedgerPage(
+            items=items,
+            next_cursor=next_cursor,
+            frontier=frontier,
+            has_more=len(rows) > page_limit,
+        )
 
     async def get_by_projection_path(
         self,
@@ -6254,6 +6893,896 @@ class MySQLWitnessLedgerStore(_MySQLWitnessProjectionStore):
 
         await self._write(_operation)
 
+    async def append_window(self, window: WitnessWindow) -> WitnessWindow:
+        normalized = normalize_witness_window(window)
+
+        async def _operation(session: AsyncSession) -> WitnessWindow:
+            existing = (
+                (
+                    await session.execute(
+                        text(
+                            "SELECT * FROM memory_witness_windows "
+                            "WHERE window_id = :window_id FOR UPDATE"
+                        ),
+                        {"window_id": normalized.window_id},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if existing is not None:
+                persisted = await _mysql_witness_window_from_row(session, existing)
+                if persisted.payload_sha256 != normalized.payload_sha256:
+                    raise WitnessPipelineConflict(
+                        f"WitnessWindowIdentityConflict:{normalized.window_id}"
+                    )
+                return persisted
+            for occurrence in normalized.occurrences:
+                persisted_occurrence = await _mysql_get_experience_occurrence(
+                    session, occurrence.occurrence_id
+                )
+                if persisted_occurrence is None:
+                    raise ValueError(
+                        f"WitnessWindowOccurrenceMissing:{occurrence.occurrence_id}"
+                    )
+                if occurrence_identity_body(
+                    persisted_occurrence
+                ) != occurrence_identity_body(occurrence):
+                    raise WitnessPipelineConflict(
+                        f"WitnessWindowOccurrenceConflict:{occurrence.occurrence_id}"
+                    )
+            await session.execute(
+                text(
+                    """INSERT INTO memory_witness_windows (
+                        window_id, consciousness_instance_id, stream_scope,
+                        start_position, end_position, occurrence_count,
+                        source_digest, planner_version, created_at,
+                        metadata_json, payload_sha256
+                    ) VALUES (
+                        :window_id, :consciousness_instance_id, :stream_scope,
+                        :start_position, :end_position, :occurrence_count,
+                        :source_digest, :planner_version, :created_at,
+                        :metadata_json, :payload_sha256
+                    )"""
+                ),
+                {
+                    "window_id": normalized.window_id,
+                    "consciousness_instance_id": normalized.consciousness_instance_id,
+                    "stream_scope": normalized.stream_scope,
+                    "start_position": normalized.start_position,
+                    "end_position": normalized.end_position,
+                    "occurrence_count": len(normalized.occurrences),
+                    "source_digest": normalized.source_digest,
+                    "planner_version": normalized.planner_version,
+                    "created_at": normalized.created_at,
+                    "metadata_json": canonical_json(normalized.metadata),
+                    "payload_sha256": normalized.payload_sha256,
+                },
+            )
+            for ordinal, occurrence in enumerate(normalized.occurrences):
+                await session.execute(
+                    text(
+                        """INSERT INTO memory_witness_window_sources (
+                            window_id, ordinal, occurrence_id,
+                            canonical_event_id, source_event_id, ingest_position,
+                            occurrence_recorded_at, canonical_payload_sha256,
+                            is_alias
+                        ) VALUES (
+                            :window_id, :ordinal, :occurrence_id,
+                            :canonical_event_id, :source_event_id,
+                            :ingest_position, :occurrence_recorded_at,
+                            :canonical_payload_sha256, :is_alias
+                        )"""
+                    ),
+                    {
+                        "window_id": normalized.window_id,
+                        "ordinal": ordinal,
+                        "occurrence_id": occurrence.occurrence_id,
+                        "canonical_event_id": occurrence.canonical_event_id,
+                        "source_event_id": occurrence.source_event_id,
+                        "ingest_position": occurrence.ingest_position,
+                        "occurrence_recorded_at": occurrence.recorded_at,
+                        "canonical_payload_sha256": (
+                            occurrence.canonical_payload_sha256
+                        ),
+                        "is_alias": bool(occurrence.is_alias),
+                    },
+                )
+            return normalized
+
+        return await self._write(_operation)
+
+    async def get_window(self, window_id: str) -> WitnessWindow | None:
+        assert self.runtime.engine is not None
+        async with self.runtime.engine.connect() as connection:
+            row = (
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT * FROM memory_witness_windows "
+                            "WHERE window_id = :window_id"
+                        ),
+                        {"window_id": window_id},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            return (
+                await _mysql_witness_window_from_row(connection, row)
+                if row is not None
+                else None
+            )
+
+    async def next_pending_window(
+        self,
+        consciousness_instance_id: str | None = None,
+    ) -> WitnessWindow | None:
+        clause = ""
+        params: dict[str, Any] = {}
+        if consciousness_instance_id is not None:
+            clause = "AND w.consciousness_instance_id = :instance_id"
+            params["instance_id"] = consciousness_instance_id
+        assert self.runtime.engine is not None
+        async with self.runtime.engine.connect() as connection:
+            row = (
+                (
+                    await connection.execute(
+                        text(
+                            """SELECT w.* FROM memory_witness_windows AS w
+                            WHERE NOT EXISTS (
+                                SELECT 1 FROM memory_witness_decisions AS d
+                                WHERE d.window_id = w.window_id
+                            ) """
+                            + clause
+                            + " ORDER BY w.start_position, w.window_id LIMIT 1"
+                        ),
+                        params,
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            return (
+                await _mysql_witness_window_from_row(connection, row)
+                if row is not None
+                else None
+            )
+
+    async def append_decision(
+        self,
+        decision: WitnessDecision,
+        *,
+        delivery_payloads: Mapping[str, Mapping[str, Any]],
+    ) -> WitnessDecision:
+        normalized, payloads = normalize_witness_decision(
+            decision, delivery_payloads
+        )
+        jobs = build_delivery_jobs(normalized, payloads)
+
+        async def _operation(session: AsyncSession) -> WitnessDecision:
+            window = (
+                (
+                    await session.execute(
+                        text(
+                            "SELECT consciousness_instance_id "
+                            "FROM memory_witness_windows "
+                            "WHERE window_id = :window_id FOR UPDATE"
+                        ),
+                        {"window_id": normalized.window_id},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if window is None:
+                raise ValueError(
+                    f"WitnessDecisionWindowMissing:{normalized.window_id}"
+                )
+            if (
+                str(window["consciousness_instance_id"])
+                != normalized.consciousness_instance_id
+            ):
+                raise WitnessPipelineConflict(
+                    "WitnessDecisionConsciousnessConflict"
+                )
+            existing_rows = (
+                (
+                    await session.execute(
+                        text(
+                            "SELECT * FROM memory_witness_decisions "
+                            "WHERE decision_id = :decision_id "
+                            "OR window_id = :window_id FOR UPDATE"
+                        ),
+                        {
+                            "decision_id": normalized.decision_id,
+                            "window_id": normalized.window_id,
+                        },
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            if existing_rows:
+                if len(existing_rows) != 1:
+                    raise WitnessPipelineConflict(
+                        f"WitnessDecisionIdentityConflict:{normalized.decision_id}"
+                    )
+                persisted = _mysql_witness_decision_from_row(existing_rows[0])
+                if (
+                    persisted.decision_id != normalized.decision_id
+                    or persisted.payload_sha256 != normalized.payload_sha256
+                ):
+                    raise WitnessPipelineConflict(
+                        f"WitnessDecisionIdentityConflict:{normalized.decision_id}"
+                    )
+                rows = (
+                    await session.execute(
+                        text(
+                            "SELECT delivery_kind, payload_sha256 "
+                            "FROM memory_witness_delivery_jobs "
+                            "WHERE decision_id = :decision_id "
+                            "ORDER BY delivery_kind"
+                        ),
+                        {"decision_id": normalized.decision_id},
+                    )
+                ).mappings()
+                observed = tuple(
+                    (str(row["delivery_kind"]), str(row["payload_sha256"]))
+                    for row in rows
+                )
+                expected = tuple(
+                    (job.delivery_kind, job.payload_sha256) for job in jobs
+                )
+                if observed != expected:
+                    raise WitnessPipelineConflict(
+                        f"WitnessDecisionOutboxConflict:{normalized.decision_id}"
+                    )
+                return persisted
+            await session.execute(
+                text(
+                    """INSERT INTO memory_witness_decisions (
+                        decision_id, window_id, consciousness_instance_id,
+                        decision_kind, witness_id, model_task_name,
+                        model_request_id, response_sha256,
+                        delivery_manifest_sha256, decided_at, metadata_json,
+                        payload_sha256
+                    ) VALUES (
+                        :decision_id, :window_id, :consciousness_instance_id,
+                        :decision_kind, :witness_id, :model_task_name,
+                        :model_request_id, :response_sha256,
+                        :delivery_manifest_sha256, :decided_at,
+                        :metadata_json, :payload_sha256
+                    )"""
+                ),
+                {
+                    "decision_id": normalized.decision_id,
+                    "window_id": normalized.window_id,
+                    "consciousness_instance_id": normalized.consciousness_instance_id,
+                    "decision_kind": normalized.decision_kind,
+                    "witness_id": normalized.witness_id,
+                    "model_task_name": normalized.model_task_name,
+                    "model_request_id": normalized.model_request_id,
+                    "response_sha256": normalized.response_sha256,
+                    "delivery_manifest_sha256": (
+                        normalized.delivery_manifest_sha256
+                    ),
+                    "decided_at": normalized.decided_at,
+                    "metadata_json": canonical_json(normalized.metadata),
+                    "payload_sha256": normalized.payload_sha256,
+                },
+            )
+            for job in jobs:
+                await session.execute(
+                    text(
+                        """INSERT INTO memory_witness_delivery_jobs (
+                            job_id, decision_id, window_id, delivery_kind,
+                            payload_json, payload_sha256, created_at, status,
+                            revision, attempt_count, available_at, lease_owner,
+                            lease_expires_at, last_error_type, updated_at,
+                            completed_at
+                        ) VALUES (
+                            :job_id, :decision_id, :window_id, :delivery_kind,
+                            :payload_json, :payload_sha256, :created_at, :status,
+                            :revision, :attempt_count, :available_at,
+                            :lease_owner, :lease_expires_at, :last_error_type,
+                            :updated_at, :completed_at
+                        )"""
+                    ),
+                    {
+                        "job_id": job.job_id,
+                        "decision_id": job.decision_id,
+                        "window_id": job.window_id,
+                        "delivery_kind": job.delivery_kind,
+                        "payload_json": canonical_json(job.payload),
+                        "payload_sha256": job.payload_sha256,
+                        "created_at": job.created_at,
+                        "status": job.status,
+                        "revision": job.revision,
+                        "attempt_count": job.attempt_count,
+                        "available_at": job.available_at,
+                        "lease_owner": job.lease_owner,
+                        "lease_expires_at": job.lease_expires_at,
+                        "last_error_type": job.last_error_type,
+                        "updated_at": job.updated_at,
+                        "completed_at": job.completed_at,
+                    },
+                )
+            return normalized
+
+        return await self._write(_operation)
+
+    async def get_decision(self, decision_id: str) -> WitnessDecision | None:
+        assert self.runtime.engine is not None
+        async with self.runtime.engine.connect() as connection:
+            row = (
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT * FROM memory_witness_decisions "
+                            "WHERE decision_id = :decision_id"
+                        ),
+                        {"decision_id": decision_id},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+        return _mysql_witness_decision_from_row(row) if row is not None else None
+
+    async def list_delivery_jobs(
+        self,
+        *,
+        delivery_kind: str | None = None,
+        statuses: Sequence[str] = ("pending", "failed"),
+        limit: int = 100,
+    ) -> list[WitnessDeliveryJob]:
+        normalized_statuses = tuple(dict.fromkeys(str(item) for item in statuses))
+        if any(status not in DELIVERY_STATUSES for status in normalized_statuses):
+            raise ValueError("WitnessDeliveryStatusUnsupported")
+        clauses: list[str] = []
+        params: dict[str, Any] = {"limit": _safe_limit(limit)}
+        if delivery_kind is not None:
+            if delivery_kind not in DELIVERY_KINDS:
+                raise ValueError(f"WitnessDeliveryKindUnsupported:{delivery_kind}")
+            clauses.append("delivery_kind = :delivery_kind")
+            params["delivery_kind"] = delivery_kind
+        if normalized_statuses:
+            marks: list[str] = []
+            for index, item in enumerate(normalized_statuses):
+                key = f"status_{index}"
+                marks.append(f":{key}")
+                params[key] = item
+            clauses.append(f"status IN ({', '.join(marks)})")
+        where = "" if not clauses else "WHERE " + " AND ".join(clauses)
+        assert self.runtime.engine is not None
+        async with self.runtime.engine.connect() as connection:
+            rows = (
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT * FROM memory_witness_delivery_jobs "
+                            + where
+                            + " ORDER BY created_at, job_id LIMIT :limit"
+                        ),
+                        params,
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        return [_mysql_witness_delivery_job_from_row(row) for row in rows]
+
+    async def list_delivery_jobs_page(
+        self,
+        *,
+        delivery_kind: str | None = None,
+        statuses: Sequence[str] = ("pending", "failed"),
+        after: StableLedgerCursor | None = None,
+        through: StableLedgerCursor | None = None,
+        limit: int = 100,
+    ) -> StableLedgerPage[WitnessDeliveryJob]:
+        normalized_statuses = tuple(dict.fromkeys(str(item) for item in statuses))
+        if any(status not in DELIVERY_STATUSES for status in normalized_statuses):
+            raise ValueError("WitnessDeliveryStatusUnsupported")
+        clauses: list[str] = []
+        params: dict[str, Any] = {}
+        if delivery_kind is not None:
+            if delivery_kind not in DELIVERY_KINDS:
+                raise ValueError(f"WitnessDeliveryKindUnsupported:{delivery_kind}")
+            clauses.append("delivery_kind = :delivery_kind")
+            params["delivery_kind"] = delivery_kind
+        if normalized_statuses:
+            marks: list[str] = []
+            for index, item in enumerate(normalized_statuses):
+                key = f"status_{index}"
+                marks.append(f":{key}")
+                params[key] = item
+            clauses.append(f"status IN ({', '.join(marks)})")
+        page_limit = _safe_limit(limit)
+        frontier = through
+        assert self.runtime.engine is not None
+        async with self.runtime.engine.connect() as connection:
+            where = "" if not clauses else " WHERE " + " AND ".join(clauses)
+            if frontier is None:
+                row = (
+                    (
+                        await connection.execute(
+                            text(
+                                "SELECT created_at, job_id "
+                                "FROM memory_witness_delivery_jobs"
+                                + where
+                                + " ORDER BY created_at DESC, job_id DESC LIMIT 1"
+                            ),
+                            params,
+                        )
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+                if row is None:
+                    return StableLedgerPage((), None, None, False)
+                frontier = StableLedgerCursor(
+                    order_value=str(row["created_at"]),
+                    identity=str(row["job_id"]),
+                )
+            if after is not None and after > frontier:
+                raise ValueError("StableLedgerCursorBeyondFrontier")
+            bounded_clauses = list(clauses)
+            bounded_params = {
+                **params,
+                "frontier_order": frontier.order_value,
+                "frontier_identity": frontier.identity,
+                "limit": page_limit + 1,
+            }
+            if after is not None:
+                bounded_clauses.append(
+                    "(created_at > :after_order OR "
+                    "(created_at = :after_order AND job_id > :after_identity))"
+                )
+                bounded_params.update(
+                    {
+                        "after_order": after.order_value,
+                        "after_identity": after.identity,
+                    }
+                )
+            bounded_clauses.append(
+                "(created_at < :frontier_order OR "
+                "(created_at = :frontier_order AND job_id <= :frontier_identity))"
+            )
+            rows = (
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT * FROM memory_witness_delivery_jobs WHERE "
+                            + " AND ".join(bounded_clauses)
+                            + " ORDER BY created_at, job_id LIMIT :limit"
+                        ),
+                        bounded_params,
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        delivered_rows = rows[:page_limit]
+        items = tuple(
+            _mysql_witness_delivery_job_from_row(row) for row in delivered_rows
+        )
+        next_cursor = (
+            StableLedgerCursor(
+                order_value=str(delivered_rows[-1]["created_at"]),
+                identity=str(delivered_rows[-1]["job_id"]),
+            )
+            if delivered_rows
+            else after
+        )
+        return StableLedgerPage(
+            items=items,
+            next_cursor=next_cursor,
+            frontier=frontier,
+            has_more=len(rows) > page_limit,
+        )
+
+    async def mark_delivery_job(
+        self,
+        job_id: str,
+        *,
+        expected_revision: int,
+        status: str,
+        error_type: str = "",
+        available_at: str = "",
+        lease_owner: str = "",
+        lease_expires_at: str = "",
+        completed_at: str = "",
+    ) -> WitnessDeliveryJob:
+        target_status = str(status or "").strip()
+        if target_status not in DELIVERY_STATUSES - {"pending"}:
+            raise ValueError(f"WitnessDeliveryStatusUnsupported:{target_status}")
+
+        async def _operation(session: AsyncSession) -> WitnessDeliveryJob:
+            row = (
+                (
+                    await session.execute(
+                        text(
+                            "SELECT * FROM memory_witness_delivery_jobs "
+                            "WHERE job_id = :job_id FOR UPDATE"
+                        ),
+                        {"job_id": job_id},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if row is None:
+                raise KeyError(f"WitnessDeliveryJobMissing:{job_id}")
+            current = _mysql_witness_delivery_job_from_row(row)
+            if current.revision != int(expected_revision):
+                raise CursorConflict(
+                    "witness delivery revision changed: "
+                    f"expected {expected_revision}, actual {current.revision}"
+                )
+            if current.status == "succeeded":
+                raise WitnessPipelineConflict(
+                    f"WitnessDeliveryAlreadySucceeded:{job_id}"
+                )
+            if target_status == "processing" and current.status not in {
+                "pending",
+                "failed",
+            }:
+                raise WitnessPipelineConflict(
+                    f"WitnessDeliveryTransitionConflict:"
+                    f"{current.status}->{target_status}"
+                )
+            if target_status in {"succeeded", "failed"} and current.status not in {
+                "pending",
+                "processing",
+                "failed",
+            }:
+                raise WitnessPipelineConflict(
+                    f"WitnessDeliveryTransitionConflict:"
+                    f"{current.status}->{target_status}"
+                )
+            if target_status == "failed" and not str(error_type or "").strip():
+                raise ValueError("WitnessDeliveryFailureErrorTypeRequired")
+            now = _now_iso()
+            attempt_count = current.attempt_count + int(
+                target_status == "processing" or current.status != "processing"
+            )
+            values = {
+                "job_id": job_id,
+                "expected_revision": int(expected_revision),
+                "status": target_status,
+                "attempt_count": attempt_count,
+                "available_at": available_at,
+                "lease_owner": lease_owner if target_status == "processing" else "",
+                "lease_expires_at": (
+                    lease_expires_at if target_status == "processing" else ""
+                ),
+                "last_error_type": (
+                    str(error_type or "") if target_status == "failed" else ""
+                ),
+                "updated_at": now,
+                "completed_at": (
+                    completed_at or now if target_status == "succeeded" else ""
+                ),
+            }
+            updated = await session.execute(
+                text(
+                    """UPDATE memory_witness_delivery_jobs SET
+                        status = :status, revision = revision + 1,
+                        attempt_count = :attempt_count,
+                        available_at = :available_at,
+                        lease_owner = :lease_owner,
+                        lease_expires_at = :lease_expires_at,
+                        last_error_type = :last_error_type,
+                        updated_at = :updated_at,
+                        completed_at = :completed_at
+                    WHERE job_id = :job_id AND revision = :expected_revision"""
+                ),
+                values,
+            )
+            if updated.rowcount != 1:
+                raise CursorConflict("witness delivery changed during CAS")
+            persisted = (
+                (
+                    await session.execute(
+                        text(
+                            "SELECT * FROM memory_witness_delivery_jobs "
+                            "WHERE job_id = :job_id"
+                        ),
+                        {"job_id": job_id},
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            return _mysql_witness_delivery_job_from_row(persisted)
+
+        return await self._write(_operation)
+
+    async def list_projection_records(
+        self,
+        *,
+        statuses: Sequence[str] = (),
+        limit: int = 100,
+    ) -> list[WitnessDeliveryJob]:
+        return await self.list_delivery_jobs(
+            delivery_kind="projection",
+            statuses=statuses,
+            limit=limit,
+        )
+
+    async def list_projection_records_page(
+        self,
+        *,
+        statuses: Sequence[str] = (),
+        after: StableLedgerCursor | None = None,
+        through: StableLedgerCursor | None = None,
+        limit: int = 100,
+    ) -> StableLedgerPage[WitnessDeliveryJob]:
+        return await self.list_delivery_jobs_page(
+            delivery_kind="projection",
+            statuses=statuses,
+            after=after,
+            through=through,
+            limit=limit,
+        )
+
+    async def get_reconciliation_state(
+        self,
+        scan_name: str,
+    ) -> WitnessReconciliationState:
+        normalized_name = str(scan_name or "").strip()
+        if not normalized_name:
+            raise ValueError("WitnessReconciliationScanNameRequired")
+        assert self.runtime.engine is not None
+        async with self.runtime.engine.connect() as connection:
+            row = (
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT * FROM memory_witness_reconciliation_state "
+                            "WHERE scan_name = :scan_name"
+                        ),
+                        {"scan_name": normalized_name},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+        return _mysql_reconciliation_state_from_row(normalized_name, row)
+
+    async def compare_and_advance_reconciliation_state(
+        self,
+        scan_name: str,
+        *,
+        expected_revision: int,
+        next_cursor: StableLedgerCursor | None,
+        frontier: StableLedgerCursor | None,
+        completed: bool,
+    ) -> WitnessReconciliationState:
+        normalized_name = str(scan_name or "").strip()
+        if not normalized_name:
+            raise ValueError("WitnessReconciliationScanNameRequired")
+        if next_cursor is not None and frontier is None:
+            raise ValueError("WitnessReconciliationFrontierRequired")
+        if next_cursor is not None and frontier is not None and next_cursor > frontier:
+            raise ValueError("WitnessReconciliationCursorBeyondFrontier")
+        if completed and (next_cursor is not None or frontier is not None):
+            raise ValueError("WitnessReconciliationCompletedStateMustResetCursor")
+
+        async def _operation(session: AsyncSession) -> WitnessReconciliationState:
+            row = (
+                (
+                    await session.execute(
+                        text(
+                            "SELECT * FROM memory_witness_reconciliation_state "
+                            "WHERE scan_name = :scan_name FOR UPDATE"
+                        ),
+                        {"scan_name": normalized_name},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            current = _mysql_reconciliation_state_from_row(normalized_name, row)
+            if current.revision != max(0, int(expected_revision)):
+                raise CursorConflict(
+                    "witness reconciliation revision changed: "
+                    f"expected {expected_revision}, actual {current.revision}"
+                )
+            if current.frontier is not None and not completed:
+                if frontier != current.frontier:
+                    raise CursorConflict(
+                        "witness reconciliation frontier changed mid-cycle"
+                    )
+                if (
+                    current.cursor is not None
+                    and next_cursor is not None
+                    and next_cursor <= current.cursor
+                ):
+                    raise CursorConflict(
+                        "witness reconciliation cursor did not advance"
+                    )
+            now = _now_iso()
+            values = {
+                "scan_name": normalized_name,
+                "cursor_order_value": (
+                    next_cursor.order_value if next_cursor is not None else ""
+                ),
+                "cursor_identity": (
+                    next_cursor.identity if next_cursor is not None else ""
+                ),
+                "frontier_order_value": (
+                    frontier.order_value if frontier is not None else ""
+                ),
+                "frontier_identity": (
+                    frontier.identity if frontier is not None else ""
+                ),
+                "revision": current.revision + 1,
+                "cycle_started_at": (
+                    "" if completed else current.cycle_started_at or now
+                ),
+                "last_completed_at": (
+                    now if completed else current.last_completed_at
+                ),
+                "updated_at": now,
+            }
+            values["state_sha256"] = witness_reconciliation_state_sha256(
+                scan_name=normalized_name,
+                cursor=next_cursor,
+                frontier=frontier,
+                revision=int(values["revision"]),
+                cycle_started_at=str(values["cycle_started_at"]),
+                last_completed_at=str(values["last_completed_at"]),
+                updated_at=now,
+            )
+            if row is None:
+                await session.execute(
+                    text(
+                        """INSERT INTO memory_witness_reconciliation_state (
+                            scan_name, cursor_order_value, cursor_identity,
+                            frontier_order_value, frontier_identity, revision,
+                            cycle_started_at, last_completed_at, updated_at,
+                            state_sha256
+                        ) VALUES (
+                            :scan_name, :cursor_order_value, :cursor_identity,
+                            :frontier_order_value, :frontier_identity, :revision,
+                            :cycle_started_at, :last_completed_at, :updated_at,
+                            :state_sha256
+                        )"""
+                    ),
+                    values,
+                )
+            else:
+                updated = await session.execute(
+                    text(
+                        """UPDATE memory_witness_reconciliation_state SET
+                            cursor_order_value = :cursor_order_value,
+                            cursor_identity = :cursor_identity,
+                            frontier_order_value = :frontier_order_value,
+                            frontier_identity = :frontier_identity,
+                            revision = :revision,
+                            cycle_started_at = :cycle_started_at,
+                            last_completed_at = :last_completed_at,
+                            updated_at = :updated_at,
+                            state_sha256 = :state_sha256
+                        WHERE scan_name = :scan_name
+                          AND revision = :expected_revision"""
+                    ),
+                    {**values, "expected_revision": current.revision},
+                )
+                if updated.rowcount != 1:
+                    raise CursorConflict(
+                        "witness reconciliation state changed during CAS"
+                    )
+            return WitnessReconciliationState(
+                scan_name=normalized_name,
+                cursor=next_cursor,
+                frontier=frontier,
+                revision=int(values["revision"]),
+                cycle_started_at=str(values["cycle_started_at"]),
+                last_completed_at=str(values["last_completed_at"]),
+                updated_at=now,
+                state_sha256=str(values["state_sha256"]),
+            )
+
+        return await self._write(_operation)
+
+    async def delivery_health(self) -> dict[str, Any]:
+        assert self.runtime.engine is not None
+        async with self.runtime.engine.connect() as connection:
+            rows = (
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT delivery_kind, status, COUNT(*) AS count, "
+                            "SUM(CASE "
+                            "WHEN status IN ('pending', 'failed') THEN 1 "
+                            "WHEN status = 'processing' AND "
+                            "(lease_expires_at = '' OR lease_expires_at <= :now) "
+                            "THEN 1 ELSE 0 END) AS actionable "
+                            "FROM memory_witness_delivery_jobs "
+                            "GROUP BY delivery_kind, status"
+                        ),
+                        {"now": _now_iso()},
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        counts: dict[str, dict[str, int]] = {
+            kind: {status: 0 for status in sorted(DELIVERY_STATUSES)}
+            for kind in sorted(DELIVERY_KINDS)
+        }
+        for row in rows:
+            counts.setdefault(str(row["delivery_kind"]), {})[
+                str(row["status"])
+            ] = int(row["count"])
+        actionable = {
+            kind: sum(
+                int(row["actionable"] or 0)
+                for row in rows
+                if str(row["delivery_kind"]) == kind
+            )
+            for kind in counts
+        }
+        return {
+            "status": (
+                "degraded"
+                if any(item.get("failed", 0) for item in counts.values())
+                else "healthy"
+            ),
+            "counts": counts,
+            "actionable": actionable,
+            "total": sum(sum(item.values()) for item in counts.values()),
+            "exact": True,
+        }
+
+    async def projection_health(self) -> dict[str, Any]:
+        assert self.runtime.engine is not None
+        async with self.runtime.engine.connect() as connection:
+            rows = (
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT status, COUNT(*) AS count "
+                            "FROM memory_witness_delivery_jobs "
+                            "WHERE delivery_kind = 'projection' GROUP BY status"
+                        )
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            summary = (
+                (
+                    await connection.execute(
+                        text(
+                            """SELECT
+                            MIN(CASE WHEN status IN ('pending', 'failed')
+                                THEN created_at END) AS oldest_pending_at,
+                            MAX(CASE WHEN status = 'succeeded'
+                                THEN completed_at END) AS latest_completed_at
+                            FROM memory_witness_delivery_jobs
+                            WHERE delivery_kind = 'projection'"""
+                        )
+                    )
+                )
+                .mappings()
+                .one()
+            )
+        counts = {status: 0 for status in sorted(DELIVERY_STATUSES)}
+        counts.update({str(row["status"]): int(row["count"]) for row in rows})
+        return {
+            "status": "degraded" if counts["failed"] else "healthy",
+            "delivery_kind": "projection",
+            "counts": counts,
+            "total": sum(counts.values()),
+            "oldest_pending_at": str(summary["oldest_pending_at"] or ""),
+            "latest_completed_at": str(summary["latest_completed_at"] or ""),
+        }
+
     async def migrate_legacy(self, **kwargs: Any) -> WitnessMemory | None:
         migration_key = str(kwargs.get("migration_key") or "")
         source_path = str(kwargs.get("source_path") or "")
@@ -6267,7 +7796,7 @@ class MySQLWitnessLedgerStore(_MySQLWitnessProjectionStore):
         }
         values = {
             "witness_id": witness_id,
-            "content": str(kwargs.get("content") or "").strip(),
+            "content": str(kwargs.get("content") or ""),
             "consciousness_instance_id": "legacy_diary_plugin",
             "perspective_subject_id": "elysia",
             "epistemic_kind": EpistemicKind.LEGACY_WITNESS.value,

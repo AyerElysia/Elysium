@@ -8,7 +8,7 @@
 | Voice Live `/voice-live/` | 独立原生页面 | Console 原生 Ready + 现有会话桥接 | 全原生旗舰体验 | Stage 2 | 麦克风授权、可打断、Qwen Realtime、Seed-VC、错误恢复、真实通话 |
 | Voice Live OBS overlay | 独立 URL | 保持 link/overlay | 独立只读 overlay | Stage 2 | OBS Browser Source、透明背景、observer token、无 Owner 信息 |
 | Livestream `/livestream/` | 浏览器默认控件为主 | 受控 embedded | 原生直播控制台 | Stage 3 | OBS、弹幕、画面、音频和意识检查统一 |
-| Memory Vis `/memory_vis/` | 独立成熟可视化 | 同源 embedded | 原生 dashboard 或受控子应用 | Stage 3 | 品牌统一、查询隔离、数据权限、深链兼容 |
+| Memory Health `/api/v1/admin/memory` | 正式只读 API | Console 原生状态卡 | 连续性、Witness、Recall 与投影诊断 | Stage 3 | content-free、权限、分页、无旧图写语义 |
 | Message Timeline `/message_timeline/` | 独立时间线 | 同源 embedded | 原生 dashboard | Stage 3 | 生命事件语义、分页、时间轴状态、旧 URL 兼容 |
 | LLM Inspector | 独立诊断工具 | link/diagnostic | 受控 embedded diagnostic | Stage 3 | Owner-only、脱敏、无 prompt/secret 外泄 |
 | Minecraft | Bridge + 多条控制链路 | 原生入口 + readiness；细节页暂保留 | 原生具身体験中心 | Stage 3 | 仿生/Agent 双路径、意图归属、OBS、服务器、安全停机 |

@@ -1,0 +1,23 @@
+{
+  "name": "ayla_adapter",
+  "version": "1.0.0",
+  "description": "Ayla 独立应用聊天通道（SSE 投影唯一交付）",
+  "author": "Elysium",
+  "license": "GPL-3.0",
+  "dependencies": {
+    "plugins": [],
+    "components": []
+  },
+  "include": [
+    {
+      "component_type": "adapter",
+      "component_name": "ayla_adapter",
+      "dependencies": [],
+      "enabled": true
+    }
+  ],
+  "entry_point": "plugin.py",
+  "min_core_version": "1.0.0",
+  "python_dependencies": [],
+  "dependencies_required": true
+}

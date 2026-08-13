@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sqlite3
-import time
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
@@ -11,7 +10,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from plugins.life_engine.memory.edges import EdgeType
-from plugins.life_engine.memory.nodes import generate_legacy_file_node_id
+from plugins.life_engine.memory.nodes import MemoryNode
 from plugins.life_engine.memory.search import SearchResult, search_memory, vector_search
 from plugins.life_engine.memory.service import LifeMemoryService
 
@@ -58,32 +57,113 @@ async def _make_service(tmp_path: Path) -> LifeMemoryService:
     return service
 
 
+async def _seed_legacy_migration_node(
+    service: LifeMemoryService,
+    file_path: str,
+    *,
+    title: str = "",
+    content: str = "",
+) -> MemoryNode:
+    """Seed one historical graph row through the offline-migration adapter."""
+    return await service._require_memory_storage().legacy_graph.get_or_create_file_node(
+        file_path,
+        title,
+        content,
+    )
+
+
+async def _seed_legacy_migration_edge(
+    service: LifeMemoryService,
+    source: MemoryNode,
+    target: MemoryNode,
+    edge_type: EdgeType,
+    *,
+    reason: str,
+    strength: float,
+    bidirectional: bool,
+) -> None:
+    """Seed historical edge evidence without reopening a runtime write path."""
+    await _seed_legacy_migration_edge_ids(
+        service,
+        source.node_id,
+        target.node_id,
+        edge_type,
+        reason=reason,
+        strength=strength,
+        bidirectional=bidirectional,
+    )
+
+
+async def _seed_legacy_migration_edge_ids(
+    service: LifeMemoryService,
+    source_id: str,
+    target_id: str,
+    edge_type: EdgeType,
+    *,
+    reason: str,
+    strength: float,
+    bidirectional: bool,
+) -> None:
+    """Seed an edge when a malformed historical node has no modern DTO."""
+    await service._require_memory_storage().legacy_graph.create_or_update_edge(
+        source_id,
+        target_id,
+        edge_type.value,
+        reason=reason,
+        strength=strength,
+        bidirectional=bidirectional,
+    )
+
+
+def _seed_legacy_migration_unindexable_node(
+    service: LifeMemoryService,
+    *,
+    node_id: str,
+    file_path: str,
+) -> None:
+    """Seed malformed pre-validation evidence that the modern adapter rejects."""
+    service._db.execute(
+        """
+        INSERT INTO memory_nodes (
+            node_id, node_type, file_path, content_hash, title,
+            created_at, updated_at, embedding_synced
+        ) VALUES (?, 'file', ?, '', 'migration-fixture', 1.0, 1.0, 0)
+        """,
+        (node_id, file_path),
+    )
+    service._db.commit()
+
+
 async def test_search_is_read_only_and_does_not_delete_stale_vectors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = await _make_service(tmp_path)
-    node_a = await service.get_or_create_file_node(
+    node_a = await _seed_legacy_migration_node(
+        service,
         "notes/a.md",
         title="A",
         content="alpha memory",
     )
-    node_b = await service.get_or_create_file_node(
+    node_b = await _seed_legacy_migration_node(
+        service,
         "notes/b.md",
         title="B",
         content="beta memory",
     )
-    await service.create_or_update_edge(
-        node_a.node_id,
-        node_b.node_id,
+    await _seed_legacy_migration_edge(
+        service,
+        node_a,
+        node_b,
         EdgeType.RELATES,
         reason="explicit relation",
         strength=0.9,
         bidirectional=True,
     )
-    await service.create_or_update_edge(
-        node_a.node_id,
-        node_b.node_id,
+    await _seed_legacy_migration_edge(
+        service,
+        node_a,
+        node_b,
         EdgeType.ASSOCIATES,
         reason="old learned relation",
         strength=0.9,
@@ -118,20 +198,22 @@ async def test_search_is_read_only_and_does_not_delete_stale_vectors(
 
 async def test_spread_activation_defaults_to_explicit_relations(tmp_path: Path) -> None:
     service = await _make_service(tmp_path)
-    node_a = await service.get_or_create_file_node("notes/a.md", title="A")
-    node_b = await service.get_or_create_file_node("notes/b.md", title="B")
-    node_c = await service.get_or_create_file_node("notes/c.md", title="C")
-    await service.create_or_update_edge(
-        node_a.node_id,
-        node_b.node_id,
+    node_a = await _seed_legacy_migration_node(service, "notes/a.md", title="A")
+    node_b = await _seed_legacy_migration_node(service, "notes/b.md", title="B")
+    node_c = await _seed_legacy_migration_node(service, "notes/c.md", title="C")
+    await _seed_legacy_migration_edge(
+        service,
+        node_a,
+        node_b,
         EdgeType.ASSOCIATES,
         reason="learned",
         strength=1.0,
         bidirectional=False,
     )
-    await service.create_or_update_edge(
-        node_a.node_id,
-        node_c.node_id,
+    await _seed_legacy_migration_edge(
+        service,
+        node_a,
+        node_c,
         EdgeType.RELATES,
         reason="explicit",
         strength=1.0,
@@ -175,11 +257,12 @@ async def test_dream_walk_default_does_not_create_or_update_edges(
     tmp_path: Path,
 ) -> None:
     service = await _make_service(tmp_path)
-    node_a = await service.get_or_create_file_node("notes/a.md", title="A")
-    node_b = await service.get_or_create_file_node("notes/b.md", title="B")
-    await service.create_or_update_edge(
-        node_a.node_id,
-        node_b.node_id,
+    node_a = await _seed_legacy_migration_node(service, "notes/a.md", title="A")
+    node_b = await _seed_legacy_migration_node(service, "notes/b.md", title="B")
+    await _seed_legacy_migration_edge(
+        service,
+        node_a,
+        node_b,
         EdgeType.RELATES,
         reason="walkable",
         strength=1.0,
@@ -198,34 +281,38 @@ async def test_dream_walk_default_does_not_create_or_update_edges(
     assert _snapshot(service._db) == before
 
 
-async def test_dream_walk_can_explicitly_persist_learning(tmp_path: Path) -> None:
+async def test_dream_walk_rejects_legacy_relation_mutation(tmp_path: Path) -> None:
     service = await _make_service(tmp_path)
-    node_a = await service.get_or_create_file_node("notes/a.md", title="A")
-    node_b = await service.get_or_create_file_node("notes/b.md", title="B")
-    await service.create_or_update_edge(
-        node_a.node_id,
-        node_b.node_id,
+    node_a = await _seed_legacy_migration_node(service, "notes/a.md", title="A")
+    node_b = await _seed_legacy_migration_node(service, "notes/b.md", title="B")
+    await _seed_legacy_migration_edge(
+        service,
+        node_a,
+        node_b,
         EdgeType.RELATES,
         reason="walkable",
         strength=1.0,
         bidirectional=False,
     )
 
-    result = await service.dream_walk(
-        num_seeds=1,
-        seed_ids=[node_a.node_id],
-        max_depth=1,
-        decay_factor=1.0,
-        persist_learning=True,
-    )
+    before = _snapshot(service._db)
 
-    assert result["new_edges_created"] >= 1
+    with pytest.raises(RuntimeError, match="LegacyDreamMutationRetired"):
+        await service.dream_walk(
+            num_seeds=1,
+            seed_ids=[node_a.node_id],
+            max_depth=1,
+            decay_factor=1.0,
+            persist_learning=True,
+        )
+
+    assert _snapshot(service._db) == before
     cursor = service._db.cursor()
     cursor.execute(
         "SELECT COUNT(*) AS count FROM memory_edges WHERE edge_type = ?",
         (EdgeType.ASSOCIATES.value,),
     )
-    assert cursor.fetchone()["count"] >= 1
+    assert cursor.fetchone()["count"] == 0
 
 
 async def test_default_canonical_resolver_is_read_only_and_does_not_scan_workspace(
@@ -264,30 +351,26 @@ async def test_default_canonical_resolver_reads_legacy_lineage_without_migration
     current_file.parent.mkdir(parents=True)
     current_file.write_text("current", encoding="utf-8")
 
-    legacy_node_id = generate_legacy_file_node_id(old_path)
-    target = await service.get_or_create_file_node(current_path, title="current")
-    now = time.time()
-    service._db.execute(
-        """
-        INSERT INTO memory_nodes (
-            node_id, node_type, file_path, content_hash, title,
-            activation_strength, access_count, last_accessed_at,
-            emotional_valence, emotional_arousal, importance,
-            created_at, updated_at, embedding_synced
-        ) VALUES (?, 'file', ?, '', 'legacy', 1.0, 0, NULL, 0.0, 0.0, 0.5, ?, ?, 0)
-        """,
-        (legacy_node_id, "notes/legacy.md", now, now),
+    source = await _seed_legacy_migration_node(
+        service,
+        old_path,
+        title="legacy",
     )
-    service._db.execute(
-        """
-        INSERT INTO memory_edges (
-            edge_id, source_id, target_id, edge_type, weight, base_strength,
-            reinforcement, activation_count, last_activated_at, reason, created_at, bidirectional
-        ) VALUES ('legacy-link', ?, ?, ?, 0.8, 0.8, 0.0, 0, NULL, 'legacy lineage', ?, 0)
-        """,
-        (legacy_node_id, target.node_id, EdgeType.RENAMES.value, now),
+    target = await _seed_legacy_migration_node(
+        service,
+        current_path,
+        title="current",
+        content="current",
     )
-    service._db.commit()
+    await _seed_legacy_migration_edge(
+        service,
+        source,
+        target,
+        EdgeType.RENAMES,
+        reason="legacy lineage",
+        strength=0.8,
+        bidirectional=False,
+    )
 
     before = _snapshot(service._db)
     result = await service.resolve_canonical_path(old_path)
@@ -356,38 +439,36 @@ async def test_memory_bundles_exclude_legacy_runtime_lineage_nodes(
     file_path = tmp_path / memory_path
     file_path.parent.mkdir(parents=True)
     file_path.write_text("kept", encoding="utf-8")
-    primary = await service.get_or_create_file_node(
+    primary = await _seed_legacy_migration_node(
+        service,
         memory_path,
         title="Kept",
         content="kept",
     )
-    now = time.time()
-    runtime_node_ids = ("file:legacy-runtime-out", "file:legacy-runtime-in")
-    for node_id, runtime_path in zip(
-        runtime_node_ids,
-        ("runtime/outbound.json", "runtime/inbound.json"),
-        strict=True,
-    ):
-        service._db.execute(
-            """
-            INSERT INTO memory_nodes (
-                node_id, node_type, file_path, content_hash, title,
-                created_at, updated_at, embedding_synced
-            ) VALUES (?, 'file', ?, '', 'runtime', ?, ?, 0)
-            """,
-            (node_id, runtime_path, now, now),
-        )
-    service._db.commit()
-    await service.create_or_update_edge(
+    runtime_out_id = "file:legacy-runtime-out"
+    runtime_in_id = "file:legacy-runtime-in"
+    _seed_legacy_migration_unindexable_node(
+        service,
+        node_id=runtime_out_id,
+        file_path="runtime/outbound.json",
+    )
+    _seed_legacy_migration_unindexable_node(
+        service,
+        node_id=runtime_in_id,
+        file_path="runtime/inbound.json",
+    )
+    await _seed_legacy_migration_edge_ids(
+        service,
         primary.node_id,
-        runtime_node_ids[0],
+        runtime_out_id,
         EdgeType.RENAMES,
         reason="legacy runtime target",
         strength=0.9,
         bidirectional=False,
     )
-    await service.create_or_update_edge(
-        runtime_node_ids[1],
+    await _seed_legacy_migration_edge_ids(
+        service,
+        runtime_in_id,
         primary.node_id,
         EdgeType.REFINES,
         reason="legacy runtime source",
@@ -424,7 +505,12 @@ async def test_build_memory_bundles_does_not_use_filename_heuristic(
     current_path = tmp_path / "notes" / "topic.md"
     current_path.parent.mkdir(parents=True)
     current_path.write_text("current", encoding="utf-8")
-    await service.get_or_create_file_node(old_path, title="topic", content="old")
+    await _seed_legacy_migration_node(
+        service,
+        old_path,
+        title="topic",
+        content="old",
+    )
 
     def _unexpected_scan(_: str) -> str | None:
         raise AssertionError("memory bundles must not use filename heuristics")
@@ -470,7 +556,8 @@ async def test_memory_bundles_batch_lineage_reads_and_path_checks(
     memory_path = "notes/primary.md"
     (tmp_path / "notes").mkdir(parents=True)
     (tmp_path / memory_path).write_text("primary", encoding="utf-8")
-    primary = await service.get_or_create_file_node(
+    primary = await _seed_legacy_migration_node(
+        service,
         memory_path,
         title="Primary",
         content="primary",
@@ -480,7 +567,8 @@ async def test_memory_bundles_batch_lineage_reads_and_path_checks(
     for index in range(edge_count):
         neighbour_path = f"notes/neighbour_{index}.md"
         (tmp_path / neighbour_path).write_text(f"n{index}", encoding="utf-8")
-        neighbour = await service.get_or_create_file_node(
+        neighbour = await _seed_legacy_migration_node(
+            service,
             neighbour_path,
             title=f"Neighbour {index}",
             content=f"n{index}",
@@ -490,10 +578,10 @@ async def test_memory_bundles_batch_lineage_reads_and_path_checks(
             source_id, target_id = primary.node_id, neighbour.node_id
         else:
             source_id, target_id = neighbour.node_id, primary.node_id
-        await service.create_or_update_edge(
+        await service._require_memory_storage().legacy_graph.create_or_update_edge(
             source_id,
             target_id,
-            EdgeType.REFINES,
+            EdgeType.REFINES.value,
             reason=f"lineage {index}",
             strength=0.9,
             bidirectional=False,

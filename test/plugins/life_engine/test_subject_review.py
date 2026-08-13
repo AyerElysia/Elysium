@@ -15,6 +15,7 @@ import pytest
 from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.learning import scheduler as scheduler_module
 from plugins.life_engine.learning import tools as learning_tools
+from plugins.life_engine.learning.decisions import LearningCandidate
 from plugins.life_engine.learning.scheduler import LearningScheduler
 from plugins.life_engine.learning.tools import LifeReviewSubjectDocumentTool
 from plugins.life_engine.memory.continuity_index import (
@@ -72,6 +73,7 @@ def _remote_snapshot(
     contents: dict[str, bytes],
     *,
     head_revisions: dict[str, int] | None = None,
+    revision: str = "a" * 64,
 ) -> SubjectAuthoritySnapshot:
     commits: dict[str, SubjectDocumentCommit] = {}
     for index, (path, content) in enumerate(contents.items(), start=1):
@@ -108,7 +110,7 @@ def _remote_snapshot(
                 revision=head_revision,
             ),
         )
-    return SubjectAuthoritySnapshot(commits=commits, revision="a" * 64)  # type: ignore[arg-type]
+    return SubjectAuthoritySnapshot(commits=commits, revision=revision)  # type: ignore[arg-type]
 
 
 class _Ledger:
@@ -377,7 +379,8 @@ async def test_memory_engineering_pressure_invites_review_without_auto_deletion(
     assert item["pressure_semantics"] == "engineering_review_only"
     prompt = await scheduler.get_subject_review_prompt()
     assert "不授权自动删除" in prompt
-    assert "nucleus_create_memory_boundary" in prompt
+    assert "nucleus_memory_continuity_review" in prompt
+    assert "nucleus_create_memory_boundary" not in prompt
     assert memory.exists()
 
 
@@ -418,7 +421,9 @@ async def test_memory_above_soft_target_without_index_invites_structural_review(
     assert health_item["continuity_index_state"] == "absent"
     prompt = await scheduler.get_subject_review_prompt()
     assert "不判断任何记忆是否重要" in prompt
-    assert "nucleus_create_memory_boundary_from_subject_range" in prompt
+    assert "nucleus_memory_continuity_review" in prompt
+    assert "text_edits" in prompt
+    assert "nucleus_create_memory_boundary_from_subject_range" not in prompt
 
     await scheduler.record_subject_review_outcome(
         target_path="MEMORY.md",
@@ -468,7 +473,7 @@ async def test_explicit_boundary_index_suppresses_absence_review_signal(
     assert item["due"] is False
 
 
-async def test_open_subject_candidate_is_reoffered_only_after_exact_delivery(
+async def test_historical_memory_candidate_is_reoffered_as_audit_only(
     tmp_path: Path,
 ) -> None:
     for path in ("SOUL.md", "USER.md", "MEMORY.md"):
@@ -498,8 +503,12 @@ async def test_open_subject_candidate_is_reoffered_only_after_exact_delivery(
     assert memory["due_reasons"] == ["candidate_decision_pending"]
     prompt = await scheduler.get_subject_review_prompt()
     pending = scheduler.get_pending_subject_review_offer()
-    assert "保持开放、拒绝或接受都有效" in prompt
+    assert "只保留为迁移审计证据" in prompt
+    assert "不能再被决定、接受或自动转换" in prompt
+    assert "nucleus_memory_continuity_review" in prompt
     assert "nucleus_read_subject_candidate" in prompt
+    assert "旧候选读/决定入口完成兼容处理" not in prompt
+    assert "主体候选决定工具接受" not in prompt
     assert pending is not None
 
     identity = str(pending["delivery_id"])
@@ -1002,6 +1011,191 @@ async def test_selected_snooze_appends_exact_immutable_learning_event(
     )
 
 
+async def test_selected_unchanged_appends_exact_immutable_learning_event(
+    tmp_path: Path,
+) -> None:
+    remote = {
+        "SOUL.md": b"remote soul",
+        "USER.md": b"remote user",
+        "MEMORY.md": b"remote memory",
+    }
+
+    async def read_remote() -> SubjectAuthoritySnapshot:
+        return _remote_snapshot(remote)
+
+    event_store = _LearningEventStore()
+    scheduler = LearningScheduler(
+        workspace_path=tmp_path,
+        current_subject_revision=lambda: _revision("a"),
+        read_subject_authority=read_remote,
+        validate_active_consciousness_instance=lambda actor: _is_active(actor),
+        learning_store=event_store,
+        learning_event_store=event_store,
+    )
+    await scheduler.initialize()
+
+    record = await scheduler.record_subject_review_outcome(
+        target_path="MEMORY.md",
+        outcome="unchanged",
+        actor_consciousness_instance_id="consciousness-1",
+        subject_revision="a" * 64,
+        occurrence_id="subject-review:unchanged:1",
+        reason="I reviewed these exact bytes and choose to keep them.",
+    )
+
+    events = [
+        event
+        for event in event_store.records
+        if event.event_kind == "subject_review.unchanged"
+    ]
+    assert len(events) == 1
+    event = events[0]
+    assert event.actor_consciousness_instance_id == "consciousness-1"
+    assert event.subject_revision == "a" * 64
+    assert event.payload["target_path"] == "MEMORY.md"
+    assert event.payload["outcome"] == "unchanged"
+    assert event.payload["current_content_sha256"] == hashlib.sha256(
+        remote["MEMORY.md"]
+    ).hexdigest()
+    assert record["last_occurrence_id"] == "subject-review:unchanged:1"
+
+    replay = await scheduler.record_subject_review_outcome(
+        target_path="MEMORY.md",
+        outcome="unchanged",
+        actor_consciousness_instance_id="consciousness-1",
+        subject_revision="a" * 64,
+        occurrence_id="subject-review:unchanged:1",
+        reason="I reviewed these exact bytes and choose to keep them.",
+    )
+    assert replay["last_evidence_sha256"] == record["last_evidence_sha256"]
+    assert len(events) == 1
+
+    with pytest.raises(
+        LearningOccurrenceConflict,
+        match="SubjectReviewUnchangedOccurrenceConflict",
+    ):
+        await scheduler.record_subject_review_outcome(
+            target_path="MEMORY.md",
+            outcome="unchanged",
+            actor_consciousness_instance_id="consciousness-1",
+            subject_revision="a" * 64,
+            occurrence_id="subject-review:unchanged:1",
+            reason="A different reason cannot reuse the occurrence.",
+        )
+
+
+async def test_committed_review_projection_recovers_after_restart(
+    tmp_path: Path,
+) -> None:
+    remote = {
+        "SOUL.md": b"remote soul",
+        "USER.md": b"remote user",
+        "MEMORY.md": b"accepted remote memory",
+    }
+    new_revision = "b" * 64
+    candidate_hash = hashlib.sha256(remote["MEMORY.md"]).hexdigest()
+    event_store = _LearningEventStore()
+    occurred_at = "2026-08-12T10:00:00+00:00"
+    await event_store.commit(
+        events=[
+            LearningEventDraft(
+                occurrence_id="decision:continuity:1",
+                event_kind="candidate.accept_requested",
+                occurred_at=occurred_at,
+                source="learning.subject_decision",
+                actor_consciousness_instance_id="consciousness-1",
+                subject_revision="a" * 64,
+                provenance={},
+                payload={
+                    "candidate_id": "candidate-continuity-1",
+                    "candidate_revision": 1,
+                    "candidate_sha256": candidate_hash,
+                    "candidate_occurrence_id": "candidate:continuity:1",
+                    "decision_kind": "accept_requested",
+                    "reason": "I accept this exact continuity revision.",
+                    "target_path": "MEMORY.md",
+                    "accepted_content_base64": base64.b64encode(
+                        remote["MEMORY.md"]
+                    ).decode("ascii"),
+                    "accepted_content_sha256": candidate_hash,
+                },
+            ),
+            LearningEventDraft(
+                occurrence_id="learning_authority:authority:continuity:1",
+                event_kind="candidate.committed",
+                occurred_at=occurred_at,
+                source="subject_authority",
+                actor_consciousness_instance_id="consciousness-1",
+                subject_revision=new_revision,
+                provenance={
+                    "authority_occurrence_id": "authority:continuity:1",
+                    "decision_occurrence_id": "decision:continuity:1",
+                },
+                payload={
+                    "candidate_id": "candidate-continuity-1",
+                    "decision_occurrence_id": "decision:continuity:1",
+                    "previous_subject_revision": "a" * 64,
+                    "new_subject_revision": new_revision,
+                    "document_version_id": "memory-version-2",
+                    "document_revision": 2,
+                    "accepted_content_sha256": candidate_hash,
+                    "idempotent_replay": False,
+                },
+            ),
+        ],
+        projections=[],
+    )
+
+    async def read_remote() -> SubjectAuthoritySnapshot:
+        return _remote_snapshot(remote, revision=new_revision)
+
+    restarted = LearningScheduler(
+        workspace_path=tmp_path,
+        current_subject_revision=lambda: _revision("b"),
+        read_subject_authority=read_remote,
+        validate_active_consciousness_instance=lambda actor: _is_active(actor),
+        learning_store=event_store,
+        learning_event_store=event_store,
+    )
+
+    await restarted.initialize()
+
+    state = restarted.store.load_state()["subject_review_v1"]
+    memory = state["documents"]["MEMORY.md"]
+    assert memory["last_outcome"] == "committed"
+    assert memory["last_occurrence_id"] == "decision:continuity:1"
+    assert memory["last_authority_occurrence_id"] == "authority:continuity:1"
+    assert state["outcome_event_cursor"] == 2
+    assert state["outcome_event_frontier"] == 2
+    assert restarted.get_state()["subject_review"]["outcome_reconciliation"] == {
+        "status": "healthy",
+        "cursor": 2,
+        "frontier": 2,
+        "backlog_lower_bound": 0,
+        "last_success_at": state["outcome_reconcile_last_success_at"],
+        "last_failure_at": "",
+        "last_error_type": "",
+        "authority_commit_replay": True,
+    }
+
+    assert await restarted.reconcile_subject_review_outcomes() == 0
+    assert (
+        sum(
+            item.occurrence_id == "decision:continuity:1"
+            for item in event_store.records
+        )
+        == 1
+    )
+    assert (
+        sum(
+            item.occurrence_id
+            == "learning_authority:authority:continuity:1"
+            for item in event_store.records
+        )
+        == 1
+    )
+
+
 async def test_local_snooze_keeps_the_compatible_append_only_journal(
     tmp_path: Path,
 ) -> None:
@@ -1124,7 +1318,7 @@ async def test_review_tool_fails_closed_for_proposal_before_migration(
     )
 
     assert ok is False
-    assert "SubjectAuthorityMigrationRequired" in str(error)
+    assert "MemoryContinuityReviewRequired" in str(error)
     assert (tmp_path / "MEMORY.md").read_bytes() == current
     assert not (tmp_path / ".life_learning" / "subject_reviews.jsonl").exists()
 
@@ -1161,7 +1355,7 @@ async def test_review_tool_records_unchanged_against_exact_hash(
     assert (tmp_path / "USER.md").read_bytes() == current
 
 
-async def test_selected_review_proposes_candidate_without_writing_file(
+async def test_generic_subject_review_rejects_memory_proposal_even_when_selected(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1192,19 +1386,14 @@ async def test_selected_review_proposes_candidate_without_writing_file(
         proposed_content="# MEMORY.md\nproposed interpretation\n",
     )
 
-    assert ok is True
-    assert isinstance(payload, dict)
-    assert payload["status"] == "open"
-    assert len(ledger.candidates) == 1
-    candidate = ledger.candidates[0]
-    assert getattr(candidate, "actor_consciousness_instance_id") == ("consciousness-1")
-    assert getattr(candidate, "subject_revision") == "a" * 64
-    assert getattr(candidate, "target_path") == "MEMORY.md"
+    assert ok is False
+    assert "MemoryContinuityReviewRequired" in str(payload)
+    assert ledger.candidates == []
     assert target.read_bytes() == current
     assert not (tmp_path / ".life_learning" / "subject_reviews.jsonl").exists()
 
 
-async def test_selected_review_reads_remote_memory_and_never_local_shadow(
+async def test_generic_subject_review_never_reads_or_proposes_remote_memory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1239,14 +1428,8 @@ async def test_selected_review_reads_remote_memory_and_never_local_shadow(
 
     ok, status = await tool.execute(action="status", target_path="MEMORY.md")
 
-    assert ok is True
-    assert isinstance(status, dict)
-    assert status["content"] == remote["MEMORY.md"].decode("utf-8")
-    assert (
-        status["documents"][0]["content_sha256"]
-        == hashlib.sha256(remote["MEMORY.md"]).hexdigest()
-    )
-    assert "LOCAL SHADOW" not in status["content"]
+    assert ok is False
+    assert "MemoryContinuityReviewRequired" in str(status)
 
     ok, proposed = await tool.execute(
         action="propose",
@@ -1257,9 +1440,8 @@ async def test_selected_review_reads_remote_memory_and_never_local_shadow(
         proposed_content="# Remote memory\nchosen continuity\nnew memory\n",
     )
 
-    assert ok is True
-    assert isinstance(proposed, dict)
-    assert proposed["status"] == "open"
+    assert ok is False
+    assert "MemoryContinuityReviewRequired" in str(proposed)
     assert (tmp_path / "MEMORY.md").read_text(encoding="utf-8") == "LOCAL SHADOW"
 
 
@@ -1268,6 +1450,249 @@ def test_subject_memory_tools_are_available_to_chat_consciousness() -> None:
     assert "life_chatter" in learning_tools.LifeListSubjectCandidatesTool.chatter_allow
     assert "life_chatter" in learning_tools.LifeReadSubjectCandidateTool.chatter_allow
     assert "life_chatter" in learning_tools.LifeDecideSubjectCandidateTool.chatter_allow
+
+
+@pytest.mark.parametrize(
+    "candidate_kind",
+    (
+        "derived_observation_document",
+        "subject_document_change",
+        "memory_continuity_document_revision",
+        "disguised_generic_candidate",
+    ),
+)
+@pytest.mark.parametrize("decision", ("accepted", "rejected", "kept_open"))
+async def test_generic_candidate_decision_rejects_every_memory_target(
+    candidate_kind: str,
+    decision: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = LearningCandidate.create(
+        candidate_id="continuity-candidate-generic-bypass",
+        candidate_revision=1,
+        candidate_kind=candidate_kind,
+        candidate_occurrence_id=(
+            "continuity-review:" + "a" * 64 + ":prepare:" + "b" * 16 + ":candidate"
+        ),
+        candidate_content_bytes=b"# MEMORY\nexact candidate\n",
+        source_occurrence_id="source-occurrence",
+        source="memory.continuity.active_consciousness",
+        actor_consciousness_instance_id="consciousness-1",
+        subject_revision="c" * 64,
+        target_path="MEMORY.md",
+    )
+
+    class _CandidateLedger:
+        async def read_candidate(self, _candidate_id: str) -> LearningCandidate:
+            return candidate
+
+        async def accept_subject_candidate(self, _decision: object) -> None:
+            raise AssertionError("generic MEMORY acceptance must remain unreachable")
+
+        async def record_decision(self, _decision: object) -> None:
+            raise AssertionError("generic MEMORY decisions must remain unreachable")
+
+    scheduler = SimpleNamespace(decision_ledger=_CandidateLedger())
+    monkeypatch.setattr(learning_tools, "_get_scheduler", lambda _plugin: scheduler)
+    tool = learning_tools.LifeDecideSubjectCandidateTool(plugin=SimpleNamespace())
+    ok, payload = await tool.execute(
+        candidate_id=candidate.candidate_id,
+        candidate_revision=candidate.candidate_revision,
+        candidate_sha256=candidate.candidate_sha256,
+        expected_subject_revision=candidate.subject_revision,
+        decision=decision,
+        reason="I reviewed the historical candidate.",
+        accepted_content=(
+            candidate.candidate_content_bytes.decode("utf-8")
+            if decision == "accepted"
+            else ""
+        ),
+    )
+
+    assert ok is False
+    assert "LegacyMemoryCandidateMigrationRequired" in str(payload)
+
+
+async def test_historical_generic_memory_candidate_is_readable_for_audit_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = LearningCandidate.create(
+        candidate_id="legacy-memory-candidate",
+        candidate_revision=1,
+        candidate_kind="derived_observation_document",
+        candidate_occurrence_id="legacy-memory-candidate:1",
+        candidate_content_bytes=b"# Historical candidate\nread-only evidence\n",
+        source_occurrence_id="knowledge_version:7:legacy",
+        source="learning.knowledge_compression",
+        subject_revision="a" * 64,
+        target_path="MEMORY.md",
+    )
+
+    class _CandidateLedger:
+        async def read_candidate(self, _candidate_id: str) -> LearningCandidate:
+            return candidate
+
+    monkeypatch.setattr(
+        learning_tools,
+        "_get_scheduler",
+        lambda _plugin: SimpleNamespace(decision_ledger=_CandidateLedger()),
+    )
+    tool = learning_tools.LifeReadSubjectCandidateTool(plugin=SimpleNamespace())
+
+    ok, payload = await tool.execute(candidate_id=candidate.candidate_id)
+
+    assert ok is True
+    assert isinstance(payload, dict)
+    assert payload["content"] == "# Historical candidate\nread-only evidence\n"
+    assert payload["audit_only"] is True
+    assert payload["migration_required"] is True
+    assert payload["decision_blocker"] == "LegacyMemoryCandidateMigrationRequired"
+
+
+async def test_continuity_candidate_generic_read_cannot_create_delivery_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = LearningCandidate.create(
+        candidate_id="continuity-memory-candidate",
+        candidate_revision=1,
+        candidate_kind="memory_continuity_document_revision",
+        candidate_occurrence_id="continuity-memory-candidate:1",
+        candidate_content_bytes=b"# Exact continuity candidate\n",
+        source_occurrence_id="continuity-session:1",
+        source="memory.continuity.active_consciousness",
+        subject_revision="a" * 64,
+        target_path="MEMORY.md",
+    )
+
+    class _CandidateLedger:
+        async def read_candidate(self, _candidate_id: str) -> LearningCandidate:
+            return candidate
+
+    monkeypatch.setattr(
+        learning_tools,
+        "_get_scheduler",
+        lambda _plugin: SimpleNamespace(decision_ledger=_CandidateLedger()),
+    )
+    tool = learning_tools.LifeReadSubjectCandidateTool(plugin=SimpleNamespace())
+
+    ok, payload = await tool.execute(candidate_id=candidate.candidate_id)
+
+    assert ok is False
+    assert "MemoryContinuityReviewRequired" in str(payload)
+
+
+@pytest.mark.parametrize("target_path", ("SOUL.md", "USER.md"))
+async def test_generic_candidate_acceptance_remains_available_for_non_memory_subjects(
+    target_path: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = LearningCandidate.create(
+        candidate_id=f"normal-{target_path}",
+        candidate_revision=1,
+        candidate_kind="subject_document_change",
+        candidate_occurrence_id=f"normal-{target_path}:1",
+        candidate_content_bytes=f"# {target_path}\nnew text\n".encode(),
+        source_occurrence_id=f"review:{target_path}",
+        source="subject.review.active_consciousness",
+        actor_consciousness_instance_id="consciousness-1",
+        subject_revision="a" * 64,
+        target_path=target_path,  # type: ignore[arg-type]
+    )
+    accepted: list[object] = []
+    projected: list[dict[str, object]] = []
+
+    class _CandidateLedger:
+        async def read_candidate(self, _candidate_id: str) -> LearningCandidate:
+            return candidate
+
+        async def accept_subject_candidate(self, decision: object) -> SimpleNamespace:
+            accepted.append(decision)
+            return SimpleNamespace(
+                candidate_id=candidate.candidate_id,
+                candidate_revision=candidate.candidate_revision,
+                candidate_sha256=candidate.candidate_sha256,
+                decision_occurrence_id=getattr(decision, "decision_occurrence_id"),
+                authority_occurrence_id="authority:normal:1",
+                status="committed",
+            )
+
+    async def current_subject_revision() -> str:
+        return "b" * 64
+
+    async def record_subject_review_outcome(**kwargs: object) -> None:
+        projected.append(dict(kwargs))
+
+    scheduler = SimpleNamespace(
+        decision_ledger=_CandidateLedger(),
+        current_subject_revision=current_subject_revision,
+        record_subject_review_outcome=record_subject_review_outcome,
+    )
+    monkeypatch.setattr(learning_tools, "_get_scheduler", lambda _plugin: scheduler)
+    monkeypatch.setattr(
+        learning_tools,
+        "_decision_actor",
+        lambda _tool: (None, "consciousness-1"),
+    )
+    tool = learning_tools.LifeDecideSubjectCandidateTool(plugin=SimpleNamespace())
+
+    ok, payload = await tool.execute(
+        candidate_id=candidate.candidate_id,
+        candidate_revision=candidate.candidate_revision,
+        candidate_sha256=candidate.candidate_sha256,
+        expected_subject_revision=candidate.subject_revision,
+        decision="accepted",
+        reason="I explicitly choose these exact bytes.",
+        accepted_content=candidate.candidate_content_bytes.decode(),
+    )
+
+    assert ok is True
+    assert isinstance(payload, dict)
+    assert payload["committed"] is True
+    assert len(accepted) == 1
+    assert projected[0]["target_path"] == target_path
+
+
+async def test_first_maintenance_compression_keeps_knowledge_outside_subject_candidates(
+    tmp_path: Path,
+) -> None:
+    _workspace(tmp_path)
+    scheduler = _scheduler(tmp_path)
+    ledger = _Ledger()
+    scheduler.decision_ledger = ledger  # type: ignore[assignment]
+
+    async def run_compression() -> bool:
+        scheduler.store.write_knowledge_version(
+            content="# Derived knowledge\nrevisable observation\n",
+            version=1,
+            insight_ids=["insight-1"],
+            edit_count=1,
+            promoted=False,
+            reason="independent_gate_recommended",
+        )
+        state = scheduler.store.load_state()
+        state["last_knowledge_candidate_version"] = 1
+        scheduler.store.save_state(state)
+        return True
+
+    scheduler.compressor.should_compress = lambda: True  # type: ignore[method-assign]
+    scheduler.compressor.run_compression = run_compression  # type: ignore[method-assign]
+    scheduler._reflection_work_due = lambda: False  # type: ignore[method-assign]
+    scheduler._epistemic_backfilled = True
+    scheduler._should_audit = lambda: False  # type: ignore[method-assign]
+    scheduler.distiller.should_distill = lambda: False  # type: ignore[method-assign]
+    scheduler._should_snapshot_metrics = lambda: False  # type: ignore[method-assign]
+    scheduler._should_check_staleness = lambda: False  # type: ignore[method-assign]
+
+    await scheduler.initialize()
+    await scheduler.on_heartbeat()
+
+    assert scheduler.store.read_knowledge_version(1).startswith("# Derived knowledge")
+    assert ledger.candidates == []
+    state = scheduler.store.load_state()
+    assert state["last_knowledge_candidate_version"] == 1
+    assert "last_knowledge_candidate_ledgered_version" not in state
+    assert "last_knowledge_candidate_id" not in state
+    assert scheduler._compression_work_due() is True
 
 
 async def test_review_context_rejects_stale_revision_and_inactive_actor(

@@ -1061,12 +1061,24 @@ class LifePassAndWaitAction(BaseAction):
     action_description = (
         "跳过本次动作，不进行任何操作，但保持对话继续，等待用户新消息。"
         "若当前不需要回复，就使用本工具等待用户的下一条消息。"
+        "调用时必须用 reason 参数说明为什么选择沉默等待。"
     )
 
     chatter_allow: list[str] = ["life_chatter"]
 
-    async def execute(self) -> tuple[bool, str]:
-        return True, "已跳过，等待新消息"
+    async def execute(self, reason: str) -> tuple[bool, str]:
+        """跳过本轮动作并等待新消息。
+
+        Args:
+            reason: 本次选择沉默等待的原因。必须如实、具体地说明为什么
+                不回复/不行动（例如"凌晨五点对方可能在睡，不想打扰"、
+                "上一轮已回应完整，没有新的信息差"、"当前情绪状态更想
+                安静陪伴"）。原因会原样记录，作为主体决策的留痕。
+        """
+        logger.info(
+            f"life_pass_and_wait 调用，原因: {reason}"
+        )
+        return True, f"已跳过，等待新消息。原因: {reason}"
 
 
 @dataclass(slots=True)
@@ -3757,17 +3769,22 @@ class LifeChatter(BaseChatter):
 
     @staticmethod
     def _register_pending_memory_recall_deliveries(response: Any) -> tuple[str, ...]:
-        """Bind pending boundary traces to their exact final ``ToolResult``."""
+        """Bind boundary/search recall plans to complete ToolResult bytes."""
 
         from ..memory.boundary_resolver import (
             get_memory_boundary_recall_coordinator,
+        )
+        from ..memory.recall_delivery import (
+            MemorySearchRecallDeliveryError,
+            get_memory_search_recall_delivery_coordinator,
         )
 
         register = getattr(response, "register_context_delivery", None)
         payloads = getattr(response, "payloads", None)
         if not callable(register) or not isinstance(payloads, list):
             return ()
-        coordinator = get_memory_boundary_recall_coordinator()
+        boundary = get_memory_boundary_recall_coordinator()
+        search = get_memory_search_recall_delivery_coordinator()
         deliveries: dict[str, str] = {}
         for payload in payloads:
             if getattr(payload, "role", None) != ROLE.TOOL_RESULT:
@@ -3778,15 +3795,42 @@ class LifeChatter(BaseChatter):
                 delivery_id = str(
                     part.value.get("memory_recall_delivery_id") or ""
                 ).strip()
-                if not delivery_id or not coordinator.has_pending(delivery_id):
-                    continue
                 expected = part.to_text()
-                previous = deliveries.get(delivery_id)
-                if previous is not None and previous != expected:
-                    raise RuntimeError(
-                        f"MemoryBoundaryRecallToolResultConflict:{delivery_id}"
+                if delivery_id and boundary.has_pending(delivery_id):
+                    previous = deliveries.get(delivery_id)
+                    if previous is not None and previous != expected:
+                        raise RuntimeError(
+                            f"MemoryBoundaryRecallToolResultConflict:{delivery_id}"
+                        )
+                    deliveries[delivery_id] = expected
+
+                search_binding = part.value.get("recall_delivery_binding")
+                if not isinstance(search_binding, dict):
+                    continue
+                search_delivery_id = str(
+                    search_binding.get("delivery_id") or ""
+                ).strip()
+                if not search.has_pending(search_delivery_id):
+                    continue
+                try:
+                    expectation = search.register_pending_tool_result(
+                        part.value,
+                        expected,
                     )
-                deliveries[delivery_id] = expected
+                except MemorySearchRecallDeliveryError as error:
+                    logger.warning(
+                        "memory search ToolResult could not be bound for exact "
+                        "delivery; recall trace remains uncommitted: "
+                        f"error_type={type(error).__name__}"
+                    )
+                    continue
+                previous = deliveries.get(expectation.delivery_id)
+                if previous is not None and previous != expectation.expected_text:
+                    raise RuntimeError(
+                        "MemorySearchRecallToolResultConflict:"
+                        f"{expectation.delivery_id}"
+                    )
+                deliveries[expectation.delivery_id] = expectation.expected_text
         for delivery_id, expected in deliveries.items():
             register(
                 delivery_id,
@@ -3808,22 +3852,149 @@ class LifeChatter(BaseChatter):
         from ..memory.boundary_resolver import (
             get_memory_boundary_recall_coordinator,
         )
+        from ..memory.recall_delivery import (
+            get_memory_search_recall_delivery_coordinator,
+        )
 
-        coordinator = get_memory_boundary_recall_coordinator()
+        boundary = get_memory_boundary_recall_coordinator()
+        search = get_memory_search_recall_delivery_coordinator()
         lookup = getattr(response, "effective_context_receipt", None)
         for delivery_id in delivery_ids:
             receipt = lookup(delivery_id) if callable(lookup) else None
             if receipt is None:
-                coordinator.discard(delivery_id)
+                boundary.discard(delivery_id)
+                search.discard(delivery_id)
                 continue
             try:
-                await coordinator.commit_exact(delivery_id, receipt)
+                if search.has_pending(delivery_id):
+                    await search.commit_exact(delivery_id, receipt)
+                else:
+                    await boundary.commit_exact(delivery_id, receipt)
             except asyncio.CancelledError:
                 raise
             except Exception as error:  # noqa: BLE001 - derived trace can retry later
                 logger.warning(
-                    "memory boundary exact-delivery trace commit failed: "
+                    "memory recall exact-delivery trace commit failed: "
                     f"delivery_id={delivery_id}, error_type={type(error).__name__}"
+                )
+
+    @staticmethod
+    def _discard_pending_memory_recall_deliveries(
+        delivery_ids: tuple[str, ...],
+    ) -> None:
+        """Drop search/boundary plans after a failed or cancelled model attempt."""
+
+        if not delivery_ids:
+            return
+        from ..memory.boundary_resolver import (
+            get_memory_boundary_recall_coordinator,
+        )
+        from ..memory.recall_delivery import (
+            get_memory_search_recall_delivery_coordinator,
+        )
+
+        boundary = get_memory_boundary_recall_coordinator()
+        search = get_memory_search_recall_delivery_coordinator()
+        for delivery_id in delivery_ids:
+            boundary.discard(delivery_id)
+            search.discard(delivery_id)
+
+    @staticmethod
+    def _register_pending_continuity_candidate_deliveries(
+        response: Any,
+    ) -> tuple[str, ...]:
+        """Bind candidate pages to exact final ``ToolResult`` bytes."""
+
+        from ..memory.continuity_delivery import (
+            ContinuityCandidateDeliveryError,
+            get_memory_continuity_delivery_coordinator,
+        )
+
+        register = getattr(response, "register_context_delivery", None)
+        payloads = getattr(response, "payloads", None)
+        if not callable(register) or not isinstance(payloads, list):
+            return ()
+        coordinator = get_memory_continuity_delivery_coordinator()
+        deliveries: dict[str, str] = {}
+        for payload in payloads:
+            if getattr(payload, "role", None) != ROLE.TOOL_RESULT:
+                continue
+            for part in getattr(payload, "content", ()):
+                if not isinstance(part, ToolResult) or not isinstance(part.value, dict):
+                    continue
+                if (
+                    part.value.get("action") != "candidate_read"
+                    or not isinstance(part.value.get("delivery_binding"), dict)
+                ):
+                    continue
+                try:
+                    expectation = coordinator.register_pending_tool_result(
+                        part.value,
+                        part.to_text(),
+                    )
+                except ContinuityCandidateDeliveryError as error:
+                    logger.warning(
+                        "continuity candidate ToolResult could not be bound for "
+                        "exact delivery; acceptance remains unavailable: "
+                        f"error_type={type(error).__name__}"
+                    )
+                    continue
+                previous = deliveries.get(expectation.delivery_id)
+                if previous is not None and previous != expectation.expected_text:
+                    raise RuntimeError(
+                        "ContinuityCandidateToolResultConflict:"
+                        f"{expectation.delivery_id}"
+                    )
+                deliveries[expectation.delivery_id] = expectation.expected_text
+        for delivery_id, expected in deliveries.items():
+            register(
+                delivery_id,
+                expected,
+                marker=delivery_id,
+                part_kind="tool_result",
+            )
+        return tuple(deliveries)
+
+    @staticmethod
+    def _discard_pending_continuity_candidate_deliveries(
+        delivery_ids: tuple[str, ...],
+    ) -> None:
+        """Drop unverified in-process pages after a failed model attempt."""
+
+        if not delivery_ids:
+            return
+        from ..memory.continuity_delivery import (
+            get_memory_continuity_delivery_coordinator,
+        )
+
+        coordinator = get_memory_continuity_delivery_coordinator()
+        for delivery_id in delivery_ids:
+            coordinator.discard_pending(delivery_id)
+
+    @staticmethod
+    async def _commit_continuity_candidate_deliveries(
+        response: Any,
+        delivery_ids: tuple[str, ...],
+    ) -> None:
+        """Commit pages only when the successful attempt proves exact bytes."""
+
+        if not delivery_ids:
+            return
+        from ..memory.continuity_delivery import (
+            get_memory_continuity_delivery_coordinator,
+        )
+
+        coordinator = get_memory_continuity_delivery_coordinator()
+        lookup = getattr(response, "effective_context_receipt", None)
+        for delivery_id in delivery_ids:
+            receipt = lookup(delivery_id) if callable(lookup) else None
+            if receipt is None:
+                coordinator.discard_pending(delivery_id)
+                continue
+            if not coordinator.commit_effective_context_receipt(receipt):
+                logger.warning(
+                    "continuity candidate exact-delivery receipt was rejected: "
+                    f"delivery_id={delivery_id}"
                 )
 
     @staticmethod
@@ -5373,6 +5544,11 @@ class LifeChatter(BaseChatter):
                 pending_memory_recall_delivery_ids = (
                     self._register_pending_memory_recall_deliveries(rt.response)
                 )
+                pending_continuity_delivery_ids = (
+                    self._register_pending_continuity_candidate_deliveries(
+                        rt.response
+                    )
+                )
 
                 def requeue_promoted_media() -> None:
                     for promoted in promoted_media_items:
@@ -5417,8 +5593,18 @@ class LifeChatter(BaseChatter):
                         rt.response,
                         pending_memory_recall_delivery_ids,
                     )
+                    await self._commit_continuity_candidate_deliveries(
+                        rt.response,
+                        pending_continuity_delivery_ids,
+                    )
 
                 except asyncio.CancelledError:
+                    self._discard_pending_memory_recall_deliveries(
+                        pending_memory_recall_delivery_ids
+                    )
+                    self._discard_pending_continuity_candidate_deliveries(
+                        pending_continuity_delivery_ids
+                    )
                     requeue_promoted_media()
                     self._recover_failed_model_turn(
                         rt,
@@ -5454,7 +5640,17 @@ class LifeChatter(BaseChatter):
                                 rt.response,
                                 pending_memory_recall_delivery_ids,
                             )
+                            await self._commit_continuity_candidate_deliveries(
+                                rt.response,
+                                pending_continuity_delivery_ids,
+                            )
                         except asyncio.CancelledError:
+                            self._discard_pending_memory_recall_deliveries(
+                                pending_memory_recall_delivery_ids
+                            )
+                            self._discard_pending_continuity_candidate_deliveries(
+                                pending_continuity_delivery_ids
+                            )
                             requeue_promoted_media()
                             self._recover_failed_model_turn(
                                 rt,
@@ -5463,6 +5659,12 @@ class LifeChatter(BaseChatter):
                             )
                             raise
                         except Exception as fallback_error:
+                            self._discard_pending_memory_recall_deliveries(
+                                pending_memory_recall_delivery_ids
+                            )
+                            self._discard_pending_continuity_candidate_deliveries(
+                                pending_continuity_delivery_ids
+                            )
                             requeue_promoted_media()
                             self._recover_failed_model_turn(
                                 rt,
@@ -5480,6 +5682,12 @@ class LifeChatter(BaseChatter):
                                 )
                             return Failure("LLM 请求失败", fallback_error)
                     else:
+                        self._discard_pending_memory_recall_deliveries(
+                            pending_memory_recall_delivery_ids
+                        )
+                        self._discard_pending_continuity_candidate_deliveries(
+                            pending_continuity_delivery_ids
+                        )
                         requeue_promoted_media()
                         self._recover_failed_model_turn(
                             rt,

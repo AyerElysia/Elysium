@@ -6,10 +6,12 @@
 - 删除
 - 查询/列表
 
-仅允许几类安全模板：
+仅允许两类安全模板：
 - heartbeat: 触发一次心跳
-- dream: 触发一次做梦
 - message: 向生命中枢队列注入一条提醒消息
+
+历史 ``dream`` 记录仍可加载和列出，但执行时会明确报告已退役；
+新建和更新不再接受这种会按分数改写关系的旧模板。
 """
 
 from __future__ import annotations
@@ -30,7 +32,7 @@ from ._utils import _get_workspace
 
 logger = log_api.get_logger("life_engine.schedule_tools")
 
-ScheduleKind = Literal["heartbeat", "dream", "message"]
+ScheduleKind = Literal["heartbeat", "message"]
 TriggerMode = Literal["at", "delay", "interval"]
 ScheduleAction = Literal["create", "update", "delete"]
 
@@ -96,7 +98,7 @@ class ScheduleRecord:
 
     record_id: str
     title: str
-    kind: ScheduleKind
+    kind: str
     task_name: str
     trigger_mode: TriggerMode
     trigger_config: dict[str, Any]
@@ -316,7 +318,10 @@ def _build_callback(plugin: Any, record: ScheduleRecord):
             await service.trigger_heartbeat_manually()
             return
         if kind == "dream":
-            await service.trigger_dream_manually()
+            logger.warning(
+                f"定时任务 {record.title} 使用已退役的 dream 模板；"
+                "未执行任何记忆写入: error=LegacyDreamScheduleRetired"
+            )
             return
         if kind == "message":
             message = _normalize_text(record.message)
@@ -429,7 +434,12 @@ async def _resolve_live_task_info(record: ScheduleRecord) -> dict[str, Any] | No
 
 
 async def restore_life_schedules_when_ready(plugin: Any) -> dict[str, str]:
-    """等待调度器就绪后，恢复登记册中的任务。"""
+    """等待调度器就绪后，仅恢复当前受支持的登记任务。
+
+    历史 ``dream`` 或未知 kind 继续留在登记册中供审计，但绝不重新
+    注册 callback。这样旧的关系改写机制不会因为一次进程重启重新
+    进入活跃运行面。
+    """
     if not getattr(getattr(plugin, "config", None), "settings", None):
         return {}
 
@@ -453,6 +463,14 @@ async def restore_life_schedules_when_ready(plugin: Any) -> dict[str, str]:
     async with _get_registry_lock():
         current_records = store.list_records()
         for record in current_records:
+            if record.kind not in {"heartbeat", "message"}:
+                logger.warning(
+                    "跳过已退役或未知的生命定时任务恢复: "
+                    f"task_name={record.task_name} kind={record.kind} "
+                    "error=LegacyScheduleKindNotRestored"
+                )
+                continue
+
             live_info = await _resolve_live_task_info(record)
             if live_info:
                 record.schedule_id = str(live_info.get("schedule_id") or record.schedule_id or "")
@@ -514,7 +532,7 @@ class LifeEngineManageScheduleTool(BaseTool):
     tool_name = "nucleus_manage_schedule"
     tool_description = (
         "管理生命中枢定时任务：创建、修改或删除。"
-        "仅允许安全模板：heartbeat / dream / message。"
+        "仅允许安全模板：heartbeat / message。旧 dream 记录只读保留且不会执行。"
         "\n\n"
         "**action=create** — 创建新的定时任务。"
         "\ntrigger_mode 说明：at（绝对时间）/ delay（相对延迟）/ interval（周期触发）。"
@@ -531,7 +549,7 @@ class LifeEngineManageScheduleTool(BaseTool):
         action: Annotated[ScheduleAction, "操作：create / update / delete"],
         # create & update 共用参数
         title: Annotated[str, "任务标题（create 必填，update 可选）"] = "",
-        kind: Annotated[ScheduleKind, "任务模板：heartbeat / dream / message"] = "message",
+        kind: Annotated[ScheduleKind, "任务模板：heartbeat / message"] = "message",
         trigger_mode: Annotated[TriggerMode, "触发方式：at / delay / interval"] = "delay",
         trigger_at: Annotated[str | None, "绝对时间（ISO 格式）"] = None,
         delay_seconds: Annotated[float | None, "延迟秒数"] = None,
@@ -566,8 +584,8 @@ class LifeEngineManageScheduleTool(BaseTool):
             return False, "title 不能为空"
 
         kind_value = _normalize_text(kind)
-        if kind_value not in {"heartbeat", "dream", "message"}:
-            return False, "kind 只能是 heartbeat / dream / message"
+        if kind_value not in {"heartbeat", "message"}:
+            return False, "kind 只能是 heartbeat / message；dream 已退役"
 
         trigger_mode_value = _normalize_text(trigger_mode)
         if trigger_mode_value not in {"at", "delay", "interval"}:
@@ -653,8 +671,8 @@ class LifeEngineManageScheduleTool(BaseTool):
 
         new_title = _normalize_text(title) or record.title
         new_kind = _normalize_text(kind) or record.kind
-        if new_kind not in {"heartbeat", "dream", "message"}:
-            return False, "kind 只能是 heartbeat / dream / message"
+        if new_kind not in {"heartbeat", "message"}:
+            return False, "kind 只能是 heartbeat / message；dream 已退役"
 
         new_trigger_mode = _normalize_text(trigger_mode) or record.trigger_mode
         if new_trigger_mode not in {"at", "delay", "interval"}:

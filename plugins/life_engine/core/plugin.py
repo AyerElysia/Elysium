@@ -10,6 +10,7 @@ from ..agents.mission_tool import MISSION_TOOLS
 from ..attention_threads.tools import ATTENTION_THREAD_TOOLS
 from ..learning.tools import LEARNING_TOOLS
 from ..memory.boundary_tools import MEMORY_BOUNDARY_TOOLS
+from ..memory.continuity_tools import CONTINUITY_REVIEW_TOOLS
 from ..memory.tools import MEMORY_TOOLS
 from ..service import LifeEngineService
 from ..service.audit import (
@@ -51,7 +52,7 @@ class LifeEnginePlugin(BasePlugin):
     - 文件系统操作：提供限定在 workspace 内的文件操作工具
     - Grep 搜索：在私人文件系统中搜索内容
     - TODO 系统：为数字生命设计的生活愿望系统
-    - 仿生记忆系统：语义检索、联想、遗忘机制
+    - 生命记忆系统：可追溯经历、见证、检索与主体决定的长期记忆治理
     - 子代理系统：启动独立代理处理复杂任务
     - 可配置可见事件数：通过 context_history_max_events 控制
     """
@@ -87,14 +88,12 @@ class LifeEnginePlugin(BasePlugin):
 
     def get_components(self) -> list[type]:
         """返回插件提供的组件。"""
-        from ..memory.router import MemoryRouter
         from ..monitor.router import MessageTimelineRouter
 
         components: list[type] = [
             LifeEngineService,
             LifeEngineMessageCollectorHandler,
             LifeEngineCommandHandler,
-            MemoryRouter,
             MessageTimelineRouter,
             LifeReportStateAction,
             LifeInnerQueryTool,
@@ -102,6 +101,7 @@ class LifeEnginePlugin(BasePlugin):
             *TODO_TOOLS,
             *MEMORY_TOOLS,
             *MEMORY_BOUNDARY_TOOLS,
+            *CONTINUITY_REVIEW_TOOLS,
             *GREP_TOOLS,
             *WEB_TOOLS,
             *SCHEDULE_TOOLS,

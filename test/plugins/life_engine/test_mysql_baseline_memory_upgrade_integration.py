@@ -106,15 +106,32 @@ async def _prepare_v8_database(engine: object) -> None:
             await connection.execute(
                 text("ALTER TABLE memory_index_jobs DROP COLUMN claim_token")
             )
-        await connection.execute(
-            text("DELETE FROM life_memory_schema_migrations WHERE version >= 9")
-        )
-        await connection.execute(
+        schema_migration_table_exists = await connection.scalar(
             text(
-                "DELETE FROM life_memory_immutability_schema_migrations "
-                "WHERE version = 2"
+                "SELECT 1 FROM information_schema.tables "
+                "WHERE table_schema = DATABASE() "
+                "AND table_name = 'life_memory_schema_migrations' LIMIT 1"
             )
         )
+        if schema_migration_table_exists is not None:
+            await connection.execute(
+                text("DELETE FROM life_memory_schema_migrations WHERE version >= 9")
+            )
+        immutability_migration_table_exists = await connection.scalar(
+            text(
+                "SELECT 1 FROM information_schema.tables "
+                "WHERE table_schema = DATABASE() "
+                "AND table_name = 'life_memory_immutability_schema_migrations' "
+                "LIMIT 1"
+            )
+        )
+        if immutability_migration_table_exists is not None:
+            await connection.execute(
+                text(
+                    "DELETE FROM life_memory_immutability_schema_migrations "
+                    "WHERE version >= 2"
+                )
+            )
     await MySQLMigrationRunner(
         engine,  # type: ignore[arg-type]
         table_name="life_memory_schema_migrations",
@@ -166,12 +183,28 @@ async def test_real_mysql_memory_v8_to_current_upgrade_is_additive_and_guarded(
             backend_identity=config.safe_identity,
         )
 
-        assert result["schema_versions"] == list(range(1, 11))
-        assert result["immutability_versions"] == [1, 2]
-        assert result["verified_memory_trigger_count"] == 44
+        assert result["schema_versions"] == [
+            item.version for item in MEMORY_MIGRATIONS
+        ]
+        assert result["immutability_versions"] == [
+            item.version for item in MEMORY_IMMUTABILITY_MIGRATIONS
+        ]
+        assert result["verified_memory_trigger_count"] == len(
+            baseline.MEMORY_IMMUTABILITY_TRIGGER_CONTRACT
+        )
         before = json.loads((args.output / "memory-before.json").read_text())
         after = json.loads((args.output / "memory-after.json").read_text())
-        assert before["existing_memory"] == after["existing_memory"]
+        assert baseline._content_evidence(
+            before["existing_memory"]
+        ) == baseline._content_evidence(after["existing_memory"])
+        after_existing = {
+            item["table_name"]: item
+            for item in after["existing_memory"]["tables"]
+        }
+        assert after_existing["memory_index_jobs"]["primary_key"] == [
+            "job_id",
+            "index_revision",
+        ]
         assert before["authority"] == after["authority"]
         assert before["workspace_projection"]["present_tables"] == []
         assert after["workspace_projection"]["row_count"] == 0

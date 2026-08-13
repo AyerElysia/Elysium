@@ -1,9 +1,11 @@
-"""Bounded, traceable resolution of exact long-memory boundary references.
+"""Bounded, traceable resolution of exact long-memory references.
 
 The resolver never floats a reference to a newer artifact and never turns
 recall frequency into subject truth. It projects only the exact immutable
 manifest selected by a ``memory://boundary`` URI, then records what was
-actually included in the model-visible tool result.
+actually included in the model-visible tool result.  The exact-delivery
+coordinator is shared with ordinary memory search so every formal recall path
+uses the same two-phase accessibility trace.
 """
 
 from __future__ import annotations
@@ -79,10 +81,20 @@ class PendingMemoryBoundaryRecall:
     association_pairs: tuple[tuple[str, str], ...]
     metadata: Mapping[str, object]
     recall: MemoryBoundaryRecallPort
+    policy_version: str = MEMORY_BOUNDARY_RECALL_POLICY
+    event_source: str = "memory_boundary_resolver"
+    corecall_signal: str = "co_recalled_from_exact_memory_boundary_delivery"
+    episode_context: Mapping[str, object] | None = None
 
 
 class MemoryBoundaryRecallCoordinator:
-    """Bounded two-phase coordinator for exact-delivery recall evidence."""
+    """Bounded two-phase coordinator for every exact-delivery recall trace.
+
+    The historical class name remains as a compatibility import.  Its pending
+    ledger is the sole process-local coordinator for boundary and search
+    recall; no accessibility event is durable until the final successful LLM
+    attempt proves the complete ``ToolResult`` bytes were present.
+    """
 
     def __init__(
         self,
@@ -141,6 +153,29 @@ class MemoryBoundaryRecallCoordinator:
 
         with self._lock:
             self._pending.pop(str(delivery_id or "").strip(), None)
+
+    def health_snapshot(self) -> dict[str, object]:
+        """Return content-free process-local exact-delivery pressure."""
+
+        now = time.monotonic()
+        with self._lock:
+            self._prune_locked(now)
+            ages = [max(0.0, now - created_at) for created_at, _ in self._pending.values()]
+            pending_count = len(self._pending)
+        oldest_age = max(ages, default=0.0)
+        degraded = bool(
+            pending_count >= self._max_pending
+            or oldest_age >= self._ttl_seconds * 0.75
+        )
+        return {
+            "status": "degraded" if degraded else "healthy",
+            "component": "memory_recall_exact_delivery",
+            "pending_count": pending_count,
+            "max_pending": self._max_pending,
+            "oldest_pending_age_seconds": round(oldest_age, 3),
+            "ttl_seconds": self._ttl_seconds,
+            "authority": "process_local_delivery_proof_only",
+        }
 
     async def commit_exact(self, delivery_id: str, receipt: Any) -> bool:
         """Persist accessibility evidence only for an exact ToolResult receipt."""
@@ -208,7 +243,7 @@ class MemoryBoundaryRecallCoordinator:
             consciousness_instance_id=plan.consciousness_instance_id,
             stream_scope=plan.stream_scope,
             context_key=context_key,
-            policy_version=MEMORY_BOUNDARY_RECALL_POLICY,
+            policy_version=plan.policy_version,
             random_seed=seed,
             episode_id=episode_id,
             recorded_at=plan.recorded_at,
@@ -217,6 +252,7 @@ class MemoryBoundaryRecallCoordinator:
                 "artifact_id": plan.artifact_id,
                 "root_sha256": plan.root_sha256,
                 "recall_chain_id": plan.recall_chain_id,
+                **dict(plan.episode_context or {}),
             },
         )
         delivery_metadata = {
@@ -239,7 +275,7 @@ class MemoryBoundaryRecallCoordinator:
                 recorded_at=plan.recorded_at,
                 entity_ref=entity_ref,
                 ordinal=ordinal,
-                source="memory_boundary_resolver",
+                source=plan.event_source,
                 reason=plan.retrieval_reason,
                 metadata=delivery_metadata,
             )
@@ -261,7 +297,7 @@ class MemoryBoundaryRecallCoordinator:
                     corecall_id=corecall_id,
                     episode_id=episode.episode_id,
                     context_key=context_key,
-                    signal="co_recalled_from_exact_memory_boundary_delivery",
+                    signal=plan.corecall_signal,
                     entity_refs=pair,
                     actor=plan.consciousness_instance_id,
                     reason=plan.retrieval_reason,
@@ -280,7 +316,13 @@ _RECALL_COORDINATOR = MemoryBoundaryRecallCoordinator()
 
 
 def get_memory_boundary_recall_coordinator() -> MemoryBoundaryRecallCoordinator:
-    """Return the process-local bounded exact-delivery coordinator."""
+    """Return the shared process-local exact-delivery recall coordinator."""
+
+    return _RECALL_COORDINATOR
+
+
+def get_memory_recall_delivery_coordinator() -> MemoryBoundaryRecallCoordinator:
+    """Return the canonical coordinator under its non-legacy semantic name."""
 
     return _RECALL_COORDINATOR
 

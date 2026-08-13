@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from dataclasses import asdict, is_dataclass
 from datetime import UTC, datetime
@@ -29,6 +30,66 @@ def _dict(value: Any) -> dict[str, Any]:
     if callable(to_dict):
         return dict(to_dict())
     return {"value": value}
+
+
+_HEALTH_SENSITIVE_KEYS = frozenset(
+    {
+        "api_key",
+        "content",
+        "credentials",
+        "database",
+        "database_path",
+        "detail",
+        "dsn",
+        "error",
+        "host",
+        "message",
+        "password",
+        "path",
+        "paths",
+        "payload",
+        "query",
+        "secret",
+        "text",
+        "token",
+        "url",
+        "user",
+        "username",
+        "workspace_path",
+    }
+)
+
+
+def _content_free_health(value: Any) -> Any:
+    """Recursively remove content, locations and connection material from health."""
+
+    if isinstance(value, dict):
+        projected: dict[str, Any] = {}
+        for key, item in value.items():
+            name = str(key)
+            normalized = name.lower()
+            if (
+                normalized in _HEALTH_SENSITIVE_KEYS
+                or normalized.endswith("_path")
+                or normalized.endswith("_paths")
+                or any(
+                    marker in normalized
+                    for marker in (
+                        "password",
+                        "credential",
+                        "api_key",
+                        "secret",
+                        "authority_token",
+                        "claim_token",
+                    )
+                )
+            ):
+                continue
+            projected[name] = _content_free_health(item)
+        return projected
+    if isinstance(value, (list, tuple)):
+        return [_content_free_health(item) for item in value]
+    return value
 
 
 def _life_service() -> Any:
@@ -123,7 +184,9 @@ class RuntimeConsciousnessProvider:
         if asyncio.iscoroutine(value):
             value = await value
         if not value:
-            raise ValueError(f"consciousness instance cannot {action} from current status")
+            raise ValueError(
+                f"consciousness instance cannot {action} from current status"
+            )
         save = getattr(_life_service(), "save_consciousness_registry_async", None)
         if callable(save):
             await save()
@@ -167,7 +230,9 @@ class RuntimeWorldProvider:
             result = await result
         return [_dict(item) for item in result]
 
-    async def changes_since(self, after: int, *, session: SessionRecord) -> list[dict[str, Any]]:
+    async def changes_since(
+        self, after: int, *, session: SessionRecord
+    ) -> list[dict[str, Any]]:
         del session
         result = self._projection().changes_since(after)
         if asyncio.iscoroutine(result):
@@ -199,36 +264,91 @@ class RuntimeMemoryProvider:
             raise RuntimeError("memory capability is unavailable")
         return memory
 
-    async def search(self, query: str, *, top_k: int, session: SessionRecord) -> list[dict[str, Any]]:
-        del session
-        values = await self._service().search_memory(
+    async def search(
+        self, query: str, *, top_k: int, session: SessionRecord
+    ) -> list[dict[str, Any]]:
+        service = self._service()
+        direct_results = await service.search_memory(
             query,
             top_k=top_k,
-            enable_association=True,
-            return_bundles=True,
+            # API v1 is a formal consumer.  Legacy weighted-edge activation is
+            # migration-only and must never be selected by an implicit default.
+            enable_association=False,
+            return_bundles=False,
+        )
+        expand = getattr(service, "expand_living_document_associations", None)
+        build_bundles = getattr(service, "build_memory_bundles", None)
+        if not callable(expand) or not callable(build_bundles):
+            raise RuntimeError("canonical memory association facade is unavailable")
+
+        context_key = f"api-v1/admin/memory:{session.actor_id}"
+        random_seed = int.from_bytes(
+            hashlib.sha256(f"{context_key}\0{query}".encode("utf-8")).digest()[:8],
+            "big",
+        )
+        living_results = await expand(
+            direct_results,
+            context_key=context_key,
+            random_seed=random_seed,
+            limit=top_k,
+        )
+        values = await build_bundles(
+            query=query,
+            results=living_results,
+            top_k=top_k,
         )
         return [_dict(item) for item in values]
 
-    async def get_experience(self, experience_id: str, *, session: SessionRecord) -> dict[str, Any]:
+    async def get_experience(
+        self, experience_id: str, *, session: SessionRecord
+    ) -> dict[str, Any]:
         del session
-        # Experience 没有按 id 的独立 port；分页读取时保留权威顺序，不直连 DB。
-        after = 0
+        # Experience has no independent point-lookup port. Scan one immutable
+        # occurrence frontier through the coherent composite cursor instead of
+        # advancing by sequence alone: many occurrences may share one ingest
+        # position, so an integer cursor can silently skip the tail of a page.
+        memory = self._service()
+        after = None
+        frontier = None
         for _ in range(10000):
-            batch = await self._service().list_experiences_after(after, limit=500)
-            if not batch:
-                break
-            for item in batch:
-                raw = _dict(item)
-                if raw.get("experience_id") == experience_id or raw.get("event_id") == experience_id:
+            page = await memory.list_experience_occurrence_page(
+                after=after,
+                through=frontier,
+                limit=500,
+            )
+            if frontier is None:
+                frontier = page.frontier
+            for occurrence in page.items:
+                raw = _dict(occurrence.experience)
+                aliases = {
+                    str(occurrence.occurrence_id),
+                    str(occurrence.source_event_id),
+                    str(occurrence.canonical_event_id),
+                    str(raw.get("experience_id") or ""),
+                    str(raw.get("event_id") or ""),
+                }
+                if experience_id in aliases:
                     return raw
-            after = max(int(getattr(item, "sequence", 0)) for item in batch)
+            if not page.has_more:
+                break
+            next_cursor = page.next_cursor
+            if next_cursor is None or next_cursor == after:
+                raise RuntimeError("ExperienceOccurrencePaginationDidNotAdvance")
+            after = next_cursor
         raise KeyError(experience_id)
 
-    async def artifact_versions(self, artifact_id: str, *, session: SessionRecord) -> list[dict[str, Any]]:
+    async def artifact_versions(
+        self, artifact_id: str, *, session: SessionRecord
+    ) -> list[dict[str, Any]]:
         del session
-        return [_dict(item) for item in await self._service().get_memory_artifact_history(artifact_id)]
+        return [
+            _dict(item)
+            for item in await self._service().get_memory_artifact_history(artifact_id)
+        ]
 
-    async def artifact_version(self, artifact_id: str, version: int, *, session: SessionRecord) -> dict[str, Any]:
+    async def artifact_version(
+        self, artifact_id: str, version: int, *, session: SessionRecord
+    ) -> dict[str, Any]:
         values = await self.artifact_versions(artifact_id, session=session)
         if version < 1 or version > len(values):
             raise KeyError(f"{artifact_id}:{version}")
@@ -245,11 +365,14 @@ class RuntimeMemoryProvider:
 
     async def health(self, *, session: SessionRecord) -> dict[str, Any]:
         del session
-        result = dict(await self._service().health_snapshot())
-        result.pop("database_path", None)
+        result = _content_free_health(dict(await self._service().health_snapshot()))
+        if not isinstance(result, dict):
+            raise RuntimeError("memory health projection is invalid")
         return result
 
-    async def rebuild_projection(self, projection: str, *, session: SessionRecord) -> dict[str, Any]:
+    async def rebuild_projection(
+        self, projection: str, *, session: SessionRecord
+    ) -> dict[str, Any]:
         del session
         if projection != "associations":
             raise ValueError("only the associations memory projection is rebuildable")
@@ -270,7 +393,9 @@ class RuntimeCommitmentsProvider:
 
     async def list_todos(self, *, session: SessionRecord) -> list[dict[str, Any]]:
         del session
-        return [item.to_dict() for item in await asyncio.to_thread(self._todo_store().load)]
+        return [
+            item.to_dict() for item in await asyncio.to_thread(self._todo_store().load)
+        ]
 
     async def get_todo(self, todo_id: str, *, session: SessionRecord) -> dict[str, Any]:
         del session
@@ -279,7 +404,9 @@ class RuntimeCommitmentsProvider:
             raise KeyError(todo_id)
         return item.to_dict()
 
-    async def todo_events(self, todo_id: str, *, session: SessionRecord) -> list[dict[str, Any]]:
+    async def todo_events(
+        self, todo_id: str, *, session: SessionRecord
+    ) -> list[dict[str, Any]]:
         todo = await self.get_todo(todo_id, session=session)
         events = [dict(item) for item in todo.get("progress_log", [])]
         events.extend(dict(item) for item in todo.get("completion_log", []))
@@ -298,9 +425,13 @@ class RuntimeCommitmentsProvider:
         records = await asyncio.to_thread(self._schedule_store().list_records)
         return [await self._schedule_summary(item) for item in records]
 
-    async def get_schedule(self, record_id: str, *, session: SessionRecord) -> dict[str, Any]:
+    async def get_schedule(
+        self, record_id: str, *, session: SessionRecord
+    ) -> dict[str, Any]:
         del session
-        matches = await asyncio.to_thread(self._schedule_store().find_matches, record_id)
+        matches = await asyncio.to_thread(
+            self._schedule_store().find_matches, record_id
+        )
         if len(matches) != 1:
             raise KeyError(record_id)
         return await self._schedule_summary(matches[0])
@@ -362,11 +493,17 @@ class RuntimeCommitmentsProvider:
         reason: str,
     ) -> dict[str, Any]:
         del reason
-        matches = await asyncio.to_thread(self._schedule_store().find_matches, record_id)
+        matches = await asyncio.to_thread(
+            self._schedule_store().find_matches, record_id
+        )
         if len(matches) != 1:
             raise KeyError(record_id)
         record = matches[0]
-        revision = int(datetime.fromisoformat(record.updated_at).timestamp()) if record.updated_at else 0
+        revision = (
+            int(datetime.fromisoformat(record.updated_at).timestamp())
+            if record.updated_at
+            else 0
+        )
         if expected_revision is not None and expected_revision != revision:
             raise ValueError("schedule revision conflict")
         if not record.schedule_id:
@@ -400,29 +537,37 @@ class RuntimeAutonomyProvider:
         del session
         return [item.to_dict() for item in await self._store().load()]
 
-    async def get_intent(self, intent_id: str, *, session: SessionRecord) -> dict[str, Any]:
+    async def get_intent(
+        self, intent_id: str, *, session: SessionRecord
+    ) -> dict[str, Any]:
         del session
         item = await self._store().get(intent_id)
         if item is None:
             raise KeyError(intent_id)
         return item.to_dict()
 
-    async def occurrences(self, intent_id: str, *, session: SessionRecord) -> list[dict[str, Any]]:
+    async def occurrences(
+        self, intent_id: str, *, session: SessionRecord
+    ) -> list[dict[str, Any]]:
         intent = await self.get_intent(intent_id, session=session)
         result: list[dict[str, Any]] = []
         if intent.get("last_occurrence_id"):
-            result.append({
-                "occurrence_id": intent["last_occurrence_id"],
-                "status": intent.get("last_outcome") or "completed",
-                "active": False,
-            })
+            result.append(
+                {
+                    "occurrence_id": intent["last_occurrence_id"],
+                    "status": intent.get("last_outcome") or "completed",
+                    "active": False,
+                }
+            )
         if intent.get("active_occurrence_id"):
-            result.append({
-                "occurrence_id": intent["active_occurrence_id"],
-                "status": intent.get("active_occurrence_status") or "in_flight",
-                "started_at": intent.get("active_occurrence_started_at") or "",
-                "active": True,
-            })
+            result.append(
+                {
+                    "occurrence_id": intent["active_occurrence_id"],
+                    "status": intent.get("active_occurrence_status") or "in_flight",
+                    "started_at": intent.get("active_occurrence_started_at") or "",
+                    "active": True,
+                }
+            )
         return result
 
     async def cancel_occurrence(
@@ -486,13 +631,19 @@ class RuntimeAbilitiesProvider:
         result: list[dict[str, Any]] = []
         for item in self._ABILITIES:
             required = tuple(item["required_scopes"])
-            result.append({
-                **item,
-                "state": "available" if set(required) & set(session.scopes) else "unauthorized",
-            })
+            result.append(
+                {
+                    **item,
+                    "state": "available"
+                    if set(required) & set(session.scopes)
+                    else "unauthorized",
+                }
+            )
         return result
 
-    async def get_ability(self, ability_id: str, *, session: SessionRecord) -> dict[str, Any]:
+    async def get_ability(
+        self, ability_id: str, *, session: SessionRecord
+    ) -> dict[str, Any]:
         for item in await self.list_abilities(session=session):
             if item["ability_id"] == ability_id:
                 return item
@@ -511,23 +662,38 @@ class RuntimeSurfaceProvider:
     async def list_surfaces(self, *, session: SessionRecord) -> list[dict[str, Any]]:
         del session
         snapshot = await self._gateway().snapshot()
-        surface_ids = sorted({str(item.get("surface_id") or "") for item in snapshot.get("clients", []) if item.get("surface_id")})
+        surface_ids = sorted(
+            {
+                str(item.get("surface_id") or "")
+                for item in snapshot.get("clients", [])
+                if item.get("surface_id")
+            }
+        )
         if not surface_ids:
             surface_ids = ["neko-default"]
         return [
             {
                 "surface_id": surface_id,
                 "protocol": "elysia.surface.v1",
-                "connected": any(item.get("surface_id") == surface_id for item in snapshot.get("clients", [])),
+                "connected": any(
+                    item.get("surface_id") == surface_id
+                    for item in snapshot.get("clients", [])
+                ),
                 "owns_identity": False,
             }
             for surface_id in surface_ids
         ]
 
-    async def status(self, surface_id: str, *, session: SessionRecord) -> dict[str, Any]:
+    async def status(
+        self, surface_id: str, *, session: SessionRecord
+    ) -> dict[str, Any]:
         del session
         snapshot = await self._gateway().snapshot()
-        clients = [item for item in snapshot.get("clients", []) if item.get("surface_id") == surface_id]
+        clients = [
+            item
+            for item in snapshot.get("clients", [])
+            if item.get("surface_id") == surface_id
+        ]
         return {
             "surface_id": surface_id,
             "protocol": "elysia.surface.v1",
@@ -545,7 +711,9 @@ class RuntimeSurfaceProvider:
             actor_id=grant.actor_id,
         )
 
-    async def connections(self, surface_id: str, *, session: SessionRecord) -> list[dict[str, Any]]:
+    async def connections(
+        self, surface_id: str, *, session: SessionRecord
+    ) -> list[dict[str, Any]]:
         del session
         return await self._gateway().connection_summaries(surface_id)
 

@@ -19,8 +19,8 @@ from src.kernel.storage.migration_runner import MySQLMigrationRunner, SchemaMigr
 from ..contracts import StorageBackendRuntime, StorageWriterRole
 from ..models import BackendKind
 
-MEMORY_SCHEMA_VERSION = 11
-MEMORY_IMMUTABILITY_SCHEMA_VERSION = 2
+MEMORY_SCHEMA_VERSION = 14
+MEMORY_IMMUTABILITY_SCHEMA_VERSION = 3
 
 # Database immutability follows the Memory Port contract, not a blanket
 # "nothing may change" rule.  These tables contain authoritative occurrences
@@ -51,6 +51,9 @@ _MEMORY_IMMUTABLE_TABLES_V1 = (
 MEMORY_IMMUTABLE_TABLES = (
     *_MEMORY_IMMUTABLE_TABLES_V1,
     "memory_workspace_projection_events",
+    "memory_witness_windows",
+    "memory_witness_window_sources",
+    "memory_witness_decisions",
 )
 
 # A witness row mixes immutable first-person testimony with mutable delivery
@@ -82,6 +85,32 @@ MEMORY_WITNESS_MUTABLE_PROJECTION_COLUMNS = (
     "projection_error",
 )
 
+MEMORY_WITNESS_DELIVERY_IMMUTABLE_COLUMNS = (
+    "job_id",
+    "decision_id",
+    "window_id",
+    "delivery_kind",
+    "payload_json",
+    "payload_sha256",
+    "created_at",
+)
+MEMORY_WITNESS_DELIVERY_MUTABLE_COLUMNS = (
+    "status",
+    "revision",
+    "attempt_count",
+    "available_at",
+    "lease_owner",
+    "lease_expires_at",
+    "last_error_type",
+    "updated_at",
+    "completed_at",
+)
+
+MEMORY_MIXED_TABLES = (
+    "memory_witnesses",
+    "memory_witness_delivery_jobs",
+)
+
 MEMORY_MUTABLE_TABLES = (
     "memory_schema",
     "memory_nodes",
@@ -90,6 +119,7 @@ MEMORY_MUTABLE_TABLES = (
     "memory_index_state",
     "memory_vector_tombstones",
     "memory_witness_state",
+    "memory_witness_reconciliation_state",
     "memory_artifact_heads",
     "memory_association_projection",
     "memory_edges",
@@ -794,6 +824,151 @@ _VECTOR_TOMBSTONE_FORCE_DELETE = SchemaMigration(
     ),
 )
 
+_WITNESS_PIPELINE = SchemaMigration(
+    version=12,
+    name="life_memory_witness_pipeline_v1",
+    statements=(
+        """CREATE TABLE IF NOT EXISTS memory_witness_windows (
+            window_id VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+            consciousness_instance_id VARCHAR(255)
+                CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+            stream_scope VARCHAR(512)
+                CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+            start_position BIGINT UNSIGNED NOT NULL,
+            end_position BIGINT UNSIGNED NOT NULL,
+            occurrence_count BIGINT UNSIGNED NOT NULL,
+            source_digest CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            planner_version VARCHAR(255)
+                CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+            created_at VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            metadata_json LONGTEXT NOT NULL,
+            payload_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            KEY idx_memory_witness_windows_pending
+                (consciousness_instance_id, start_position, window_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci""",
+        """CREATE TABLE IF NOT EXISTS memory_witness_window_sources (
+            window_id VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            ordinal BIGINT UNSIGNED NOT NULL,
+            occurrence_id VARCHAR(255)
+                CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+            canonical_event_id VARCHAR(255)
+                CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+            source_event_id VARCHAR(255)
+                CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+            ingest_position BIGINT UNSIGNED NOT NULL,
+            occurrence_recorded_at VARCHAR(64)
+                CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            canonical_payload_sha256 CHAR(64)
+                CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            is_alias BOOLEAN NOT NULL,
+            PRIMARY KEY (window_id, ordinal),
+            UNIQUE KEY uq_memory_witness_window_occurrence
+                (window_id, occurrence_id),
+            KEY idx_memory_witness_window_source_occurrence
+                (occurrence_id, window_id),
+            CONSTRAINT fk_memory_witness_window_source_window
+                FOREIGN KEY (window_id)
+                REFERENCES memory_witness_windows(window_id) ON DELETE RESTRICT,
+            CONSTRAINT fk_memory_witness_window_source_event
+                FOREIGN KEY (canonical_event_id)
+                REFERENCES memory_experiences(event_id) ON DELETE RESTRICT
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci""",
+        """CREATE TABLE IF NOT EXISTS memory_witness_decisions (
+            decision_id VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+            window_id VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            consciousness_instance_id VARCHAR(255)
+                CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+            decision_kind VARCHAR(255)
+                CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+            witness_id VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            model_task_name VARCHAR(255)
+                CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+            model_request_id VARCHAR(255)
+                CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+            response_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            delivery_manifest_sha256 CHAR(64)
+                CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            decided_at VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            metadata_json LONGTEXT NOT NULL,
+            payload_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            UNIQUE KEY uq_memory_witness_decision_window (window_id),
+            KEY idx_memory_witness_decision_instance
+                (consciousness_instance_id, decided_at),
+            CONSTRAINT fk_memory_witness_decision_window FOREIGN KEY (window_id)
+                REFERENCES memory_witness_windows(window_id) ON DELETE RESTRICT
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci""",
+        """CREATE TABLE IF NOT EXISTS memory_witness_delivery_jobs (
+            job_id VARCHAR(80) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+            decision_id VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            window_id VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            delivery_kind VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            payload_json LONGTEXT NOT NULL,
+            payload_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            created_at VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            status VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            revision BIGINT UNSIGNED NOT NULL,
+            attempt_count BIGINT UNSIGNED NOT NULL,
+            available_at VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            lease_owner VARCHAR(255)
+                CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+            lease_expires_at VARCHAR(64)
+                CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            last_error_type VARCHAR(255)
+                CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            updated_at VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            completed_at VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            UNIQUE KEY uq_memory_witness_delivery_kind
+                (decision_id, delivery_kind),
+            KEY idx_memory_witness_delivery_pending
+                (delivery_kind, status, available_at, created_at, job_id),
+            CONSTRAINT chk_memory_witness_delivery_kind
+                CHECK (delivery_kind IN ('world', 'projection')),
+            CONSTRAINT chk_memory_witness_delivery_status
+                CHECK (status IN ('pending', 'processing', 'succeeded', 'failed')),
+            CONSTRAINT fk_memory_witness_delivery_decision
+                FOREIGN KEY (decision_id)
+                REFERENCES memory_witness_decisions(decision_id) ON DELETE RESTRICT,
+            CONSTRAINT fk_memory_witness_delivery_window FOREIGN KEY (window_id)
+                REFERENCES memory_witness_windows(window_id) ON DELETE RESTRICT
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci""",
+    ),
+)
+
+_WITNESS_RECONCILIATION_CURSOR = SchemaMigration(
+    version=13,
+    name="life_memory_witness_reconciliation_cursor_v1",
+    statements=(
+        """CREATE TABLE IF NOT EXISTS memory_witness_reconciliation_state (
+            scan_name VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin PRIMARY KEY,
+            cursor_order_value VARCHAR(64)
+                CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            cursor_identity VARCHAR(255)
+                CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+            frontier_order_value VARCHAR(64)
+                CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            frontier_identity VARCHAR(255)
+                CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+            revision BIGINT UNSIGNED NOT NULL,
+            cycle_started_at VARCHAR(64)
+                CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            last_completed_at VARCHAR(64)
+                CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+            updated_at VARCHAR(64)
+                CHARACTER SET ascii COLLATE ascii_bin NOT NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci""",
+    ),
+)
+
+_WITNESS_RECONCILIATION_CHECKSUM = SchemaMigration(
+    version=14,
+    name="life_memory_witness_reconciliation_checksum_v1",
+    statements=(
+        """ALTER TABLE memory_witness_reconciliation_state
+        ADD COLUMN state_sha256 CHAR(64)
+            CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT ''""",
+    ),
+)
+
 MEMORY_MIGRATIONS = (
     _DOCUMENT_INDEX,
     _EXPERIENCE,
@@ -806,6 +981,9 @@ MEMORY_MIGRATIONS = (
     _WORKSPACE_PROJECTION_IDENTITY,
     _INDEX_JOB_LEASE,
     _VECTOR_TOMBSTONE_FORCE_DELETE,
+    _WITNESS_PIPELINE,
+    _WITNESS_RECONCILIATION_CURSOR,
+    _WITNESS_RECONCILIATION_CHECKSUM,
 )
 
 
@@ -869,6 +1047,16 @@ def _memory_immutability_trigger_contract() -> tuple[tuple[str, str, str], ...]:
                 "memory_witnesses_immutable_delete",
                 "DELETE",
                 "memory_witnesses",
+            ),
+            (
+                "memory_witness_delivery_authority_immutable_update",
+                "UPDATE",
+                "memory_witness_delivery_jobs",
+            ),
+            (
+                "memory_witness_delivery_immutable_delete",
+                "DELETE",
+                "memory_witness_delivery_jobs",
             ),
         )
     )
@@ -960,6 +1148,30 @@ def _memory_immutability_extension_statements(
     return tuple(statements)
 
 
+def _memory_witness_delivery_immutability_statements() -> tuple[str, ...]:
+    predicate = "\n                AND ".join(
+        f"OLD.{column} <=> NEW.{column}"
+        for column in MEMORY_WITNESS_DELIVERY_IMMUTABLE_COLUMNS
+    )
+    return (
+        f"""CREATE TRIGGER IF NOT EXISTS
+            memory_witness_delivery_authority_immutable_update
+        BEFORE UPDATE ON memory_witness_delivery_jobs FOR EACH ROW
+        BEGIN
+            IF NOT (
+                {predicate}
+            ) THEN
+                SIGNAL SQLSTATE '45000'
+                    SET MESSAGE_TEXT = 'MemoryWitnessDeliveryAuthorityImmutable';
+            END IF;
+        END""",
+        """CREATE TRIGGER IF NOT EXISTS memory_witness_delivery_immutable_delete
+        BEFORE DELETE ON memory_witness_delivery_jobs FOR EACH ROW
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'MemoryWitnessDeliveryAuthorityImmutable'""",
+    )
+
+
 _MEMORY_IMMUTABILITY_V1 = SchemaMigration(
     version=1,
     name="life_memory_authority_immutability_v1",
@@ -972,10 +1184,25 @@ _MEMORY_IMMUTABILITY_V2 = SchemaMigration(
         ("memory_workspace_projection_events",)
     ),
 )
+_MEMORY_IMMUTABILITY_V3 = SchemaMigration(
+    version=3,
+    name="life_memory_witness_pipeline_immutability_v1",
+    statements=(
+        *_memory_immutability_extension_statements(
+            (
+                "memory_witness_windows",
+                "memory_witness_window_sources",
+                "memory_witness_decisions",
+            )
+        ),
+        *_memory_witness_delivery_immutability_statements(),
+    ),
+)
 
 MEMORY_IMMUTABILITY_MIGRATIONS = (
     _MEMORY_IMMUTABILITY_V1,
     _MEMORY_IMMUTABILITY_V2,
+    _MEMORY_IMMUTABILITY_V3,
 )
 
 
@@ -1071,21 +1298,23 @@ async def _verify_memory_database_immutability(
             missing_or_drifted.append(name)
             continue
         action = actual[3]
-        marker = (
-            "memorywitnessauthorityimmutable"
-            if table == "memory_witnesses"
-            else "memoryauthorityrecordimmutable"
-        )
+        if table == "memory_witnesses":
+            marker = "memorywitnessauthorityimmutable"
+        elif table == "memory_witness_delivery_jobs":
+            marker = "memorywitnessdeliveryauthorityimmutable"
+        else:
+            marker = "memoryauthorityrecordimmutable"
         if marker not in action:
             missing_or_drifted.append(name)
             continue
         if event != "UPDATE":
             continue
-        protected_columns = (
-            MEMORY_WITNESS_IMMUTABLE_COLUMNS
-            if table == "memory_witnesses"
-            else MEMORY_IMMUTABLE_TABLE_COLUMNS[table]
-        )
+        if table == "memory_witnesses":
+            protected_columns = MEMORY_WITNESS_IMMUTABLE_COLUMNS
+        elif table == "memory_witness_delivery_jobs":
+            protected_columns = MEMORY_WITNESS_DELIVERY_IMMUTABLE_COLUMNS
+        else:
+            protected_columns = MEMORY_IMMUTABLE_TABLE_COLUMNS[table]
         if any(
             f"old.{column}" not in action or f"new.{column}" not in action
             for column in protected_columns
@@ -1159,8 +1388,11 @@ __all__ = [
     "MEMORY_IMMUTABLE_TABLES",
     "MEMORY_IMMUTABLE_TABLE_COLUMNS",
     "MEMORY_MIGRATIONS",
+    "MEMORY_MIXED_TABLES",
     "MEMORY_MUTABLE_TABLES",
     "MEMORY_SCHEMA_VERSION",
+    "MEMORY_WITNESS_DELIVERY_IMMUTABLE_COLUMNS",
+    "MEMORY_WITNESS_DELIVERY_MUTABLE_COLUMNS",
     "MEMORY_WITNESS_IMMUTABLE_COLUMNS",
     "MEMORY_WITNESS_MUTABLE_PROJECTION_COLUMNS",
     "MemoryDatabaseImmutabilityError",

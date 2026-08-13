@@ -406,7 +406,7 @@ def _build_mysql_config(
         "pool_size": pool_size,
         "max_overflow": pool_size * 2,
         "pool_timeout": connection_timeout,
-        "pool_recycle": 900,
+        "pool_recycle": 120,  # frp 隧道下避免闲置死连接（须小于服务端 wait_timeout）
         "pool_pre_ping": True,
         "pool_reset_on_return": "rollback",
         "connect_args": connect_args,
