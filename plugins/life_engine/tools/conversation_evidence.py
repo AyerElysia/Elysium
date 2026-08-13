@@ -224,8 +224,18 @@ class LifeEngineConversationEvidenceTool(BaseTool):
         """把「你可以触达的人和地方」里的 target_key（如 p-20403fdb）解析回完整 stream_id。
 
         非 target_key 格式（完整 stream_id 等）原样返回；解析失败返回 None。
+        兼容模型脑补出的 UUID 形式（如 20403fdb-6f1a-441c-9596-4d7e4f85e3c8）：
+        去掉连字符后按 hex 前缀做模糊匹配，避免 stream_not_found。
         """
-        if not ref or not _TARGET_KEY_RE.match(ref):
+        if not ref:
+            return ref
+        if not _TARGET_KEY_RE.match(ref):
+            # 可能是模型脑补的 UUID 形式流 ID：去连字符后按前缀匹配真实流。
+            compact = re.sub(r"[-]", "", ref)
+            if re.fullmatch(r"[0-9a-fA-F]{6,64}", compact):
+                resolved = await self._resolve_stream_prefix(compact)
+                if resolved is not None:
+                    return resolved
             return ref
         try:
             from ..core.send_targets import resolve_send_target_key
@@ -237,6 +247,13 @@ class LifeEngineConversationEvidenceTool(BaseTool):
             self._log_resolution_failure(ref, exc)
         # 兜底：按 stream_id 前缀匹配 chat_streams，优先 platform 非空的真实流。
         prefix = ref.split("-", 1)[1]
+        resolved = await self._resolve_stream_prefix(prefix)
+        if resolved is not None:
+            return resolved
+        return None
+
+    async def _resolve_stream_prefix(self, prefix: str) -> str | None:
+        """按 stream_id hex 前缀匹配 ChatStreams；仅一个唯一真实流时返回完整 stream_id。"""
         try:
             async with get_db_session() as session:
                 result = await session.execute(
@@ -262,10 +279,15 @@ class LifeEngineConversationEvidenceTool(BaseTool):
                 return matches[0][0]
             return None
         except Exception as exc:  # noqa: BLE001 - best-effort fallback
-            self._log_resolution_failure(ref, exc)
+            self._log_resolution_failure(prefix, exc)
             return None
 
-    async def _resolve_streams(self, requested: list[str] | None) -> tuple[str, ...]:
+    async def _resolve_streams(
+        self,
+        requested: list[str] | None,
+        *,
+        operation: str = "page",
+    ) -> tuple[str, ...]:
         raw = tuple(
             dict.fromkeys(
                 str(item or "").strip()
@@ -283,6 +305,28 @@ class LifeEngineConversationEvidenceTool(BaseTool):
         explicit = tuple(dict.fromkeys(explicit))
         current = self.get_current_stream_id()
         if not explicit:
+            if operation == "search":
+                # search 是全库有界检索：心跳态没有当前流时不应报错，
+                # 降级为扫描全部真实流（排除 chat_global 占位符）。
+                async with get_db_session() as session:
+                    result = await session.execute(
+                        select(ChatStreams.stream_id).where(
+                            ChatStreams.platform.is_not(None),
+                            ChatStreams.platform != "",
+                            ChatStreams.stream_id != "chat_global",
+                        )
+                    )
+                    all_streams = tuple(
+                        str(item)
+                        for item in result.scalars().all()
+                        if str(item) != "chat_global"
+                    )
+                if not all_streams:
+                    raise ConversationEvidenceError(
+                        "stream_required",
+                        "no real conversation streams are available for search",
+                    )
+                return all_streams
             if not current or current == "chat_global":
                 raise ConversationEvidenceError(
                     "stream_required",
@@ -681,7 +725,7 @@ class LifeEngineConversationEvidenceTool(BaseTool):
                 }
             )
         try:
-            streams = await self._resolve_streams(stream_ids)
+            streams = await self._resolve_streams(stream_ids, operation=operation)
             if operation == "read":
                 if not message_ref:
                     raise ConversationEvidenceError(

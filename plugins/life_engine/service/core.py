@@ -7906,7 +7906,7 @@ class LifeEngineService(BaseService):
             "可用 kind：`speak`（到点交给 life_chatter 重新判断）、`reflect`（到点回到中枢继续想）、`silence`（到点记录选择沉默）。",
             "`speak` 只能写动机、目标提示和约束；不要写最终回复话术，不要教表达层具体怎么说。",
             "`speak` 的目标可以填「你可以触达的人和地方」里列出的 `target_key`，或精确 `target_stream_id`。",
-            "都留空时，意向到点只会以事件浮现给心跳、不会唤醒表达层；不要猜测列表之外的目标。",
+            "如果本轮心跳没有渲染「你可以触达的人和地方」列表（近 24 小时无消息会话），把 `target_key` 和 `target_stream_id` 留空就是正确选择——到点意向会浮现给你，由你重新判断是否开口。",
             "保持沉默也是主体选择：如果你想确认自己不会打扰，可以登记 `kind=silence`。",
             "",
             "### `nucleus_skill` — 管理自己的做事方式",
