@@ -133,6 +133,10 @@ def _snapshot(tmp_path: Path) -> tuple[Path, dict[str, bytes]]:
         "diaries/2026-08/04.md": b"external diary\r\nexact\r\n",
         "life_engine_workspace/SOUL.md": b"\xef\xbb\xbf# Elysia\r\nSoul\r\n",
         "life_engine_workspace/diaries/private.md": b"private diary\nexact\n",
+        "life_engine_workspace/notes/relationships/xiaoxi.md": (
+            "# 汐汐关系档案\r\n".encode("utf-8")
+        ),
+        "life_engine_workspace/notes/draft.md": b"# draft\n",
         "media_cache/ignored.bin": b"not a declared subject document",
     }
     entries: list[dict[str, Any]] = []
@@ -189,10 +193,10 @@ async def test_subject_snapshot_copy_and_reverse_export_are_exact(
             progress_interval=2,
         )
         assert report.verified is True
-        assert report.document_count == 3
-        assert report.copied_count == 3
+        assert report.document_count == 5
+        assert report.copied_count == 5
         assert report.source_root_sha256 == report.target_root_sha256
-        assert registry.progress == [2, 3]
+        assert registry.progress == [2, 4, 5]
         assert registry.conflicts == []
 
         soul = await store.get_head("life_engine_workspace/SOUL.md")
@@ -215,7 +219,7 @@ async def test_subject_snapshot_copy_and_reverse_export_are_exact(
         export_root = tmp_path / "reverse-export"
         exported = await export_subject_documents(store, export_root)
         assert exported.verified is True
-        assert exported.document_count == 3
+        assert exported.document_count == 5
         assert exported.root_sha256 == report.target_root_sha256
         assert not (export_root / "EXPORT_INCOMPLETE").exists()
         assert (
@@ -224,9 +228,14 @@ async def test_subject_snapshot_copy_and_reverse_export_are_exact(
         assert (
             export_root / "workspace/diaries/2026-08/04.md"
         ).read_bytes() == contents["diaries/2026-08/04.md"]
+        assert (
+            export_root / "workspace/life_engine_workspace/notes/relationships/xiaoxi.md"
+        ).read_bytes() == contents[
+            "life_engine_workspace/notes/relationships/xiaoxi.md"
+        ]
         manifest = json.loads((export_root / "manifest.json").read_text())
-        assert manifest["document_count"] == 3
-        assert len(manifest["documents"]) == 3
+        assert manifest["document_count"] == 5
+        assert len(manifest["documents"]) == 5
 
 
 async def test_subject_snapshot_copy_fails_closed_on_changed_bytes(
