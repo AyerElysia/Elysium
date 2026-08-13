@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import threading
 import tomllib
 from collections.abc import Mapping
@@ -19,6 +20,7 @@ from types import MappingProxyType
 from typing import Any
 from urllib.parse import urlparse
 
+from src.kernel.config.env import interpolate_env
 from src.kernel.logger import get_logger
 
 logger = get_logger("models_loader", display="Models", enable_event_broadcast=False)
@@ -122,16 +124,19 @@ _TASK_FIELDS = frozenset(
 )
 _READY_CLIENT_TYPES = frozenset({"openai", "anthropic"})
 _NON_GENERATIVE_TASKS = frozenset({"voice", "embedding"})
+_UNRESOLVED_ENV_PATTERN = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")
+_KNOWN_API_KEY_PLACEHOLDER_PREFIXES = ("replace-with",)
 
 
 class ModelsConfig:
-    """Validated, immutable routing snapshot loaded from ``models.toml``."""
+    """Structurally validated immutable snapshot loaded from ``models.toml``."""
 
     def __init__(self, path: str | Path = "config/models.toml") -> None:
         self._path = Path(path)
         self._providers: Mapping[str, Mapping[str, Any]] = MappingProxyType({})
         self._models: Mapping[str, Mapping[str, Any]] = MappingProxyType({})
         self._tasks: Mapping[str, Mapping[str, Any]] = MappingProxyType({})
+        self._runtime_ready = False
         self._snapshot = ModelRoutingSnapshot(
             source_path=str(self._path),
             digest="",
@@ -147,7 +152,7 @@ class ModelsConfig:
             raise ModelRegistryError(f"模型配置不存在: {self._path}")
         try:
             with self._path.open("rb") as file:
-                data = tomllib.load(file)
+                data = interpolate_env(tomllib.load(file))
         except (OSError, tomllib.TOMLDecodeError) as exc:
             raise ModelRegistryError(f"模型配置无法读取: {self._path}: {exc}") from exc
 
@@ -574,6 +579,85 @@ class ModelsConfig:
                 f"生产生成任务缺少任务级 context_tokens: {missing_context_budgets}"
             )
 
+    @classmethod
+    def _find_unresolved_env_paths(
+        cls,
+        value: Any,
+        *,
+        location: str,
+    ) -> list[str]:
+        if isinstance(value, str):
+            return [location] if _UNRESOLVED_ENV_PATTERN.search(value) else []
+        if isinstance(value, Mapping):
+            paths: list[str] = []
+            for key, item in value.items():
+                child = f"{location}.{key}" if location else str(key)
+                paths.extend(cls._find_unresolved_env_paths(item, location=child))
+            return paths
+        if isinstance(value, (list, tuple)):
+            paths = []
+            for index, item in enumerate(value):
+                paths.extend(
+                    cls._find_unresolved_env_paths(
+                        item,
+                        location=f"{location}[{index}]",
+                    )
+                )
+            return paths
+        return []
+
+    def require_runtime_readiness(self) -> None:
+        """Reject unresolved or placeholder credentials before publication.
+
+        Direct construction remains useful for validating the committed example
+        without requiring local secrets.  Production access through
+        :func:`init_models_config` or :func:`get_models_config` calls this
+        stricter boundary before exposing a registry generation.
+        """
+
+        if self._runtime_ready:
+            return
+
+        unresolved_paths: list[str] = []
+        for section_name, section in (
+            ("providers", self._providers),
+            ("models", self._models),
+            ("tasks", self._tasks),
+        ):
+            unresolved_paths.extend(
+                self._find_unresolved_env_paths(
+                    section,
+                    location=section_name,
+                )
+            )
+        if unresolved_paths:
+            raise ModelRegistryError(
+                "模型配置包含未解析的环境变量占位符，涉及字段: "
+                f"{sorted(unresolved_paths)}"
+            )
+
+        empty_api_keys: list[str] = []
+        placeholder_api_keys: list[str] = []
+        for provider_name, provider in self._providers.items():
+            location = f"providers.{provider_name}.api_key"
+            api_key = str(provider.get("api_key", ""))
+            normalized = api_key.strip().casefold()
+            if not normalized:
+                empty_api_keys.append(location)
+            elif normalized.startswith(_KNOWN_API_KEY_PLACEHOLDER_PREFIXES):
+                placeholder_api_keys.append(location)
+        if empty_api_keys:
+            raise ModelRegistryError(
+                "生产模型 provider 的 api_key 不能为空，涉及字段: "
+                f"{sorted(empty_api_keys)}"
+            )
+        if placeholder_api_keys:
+            raise ModelRegistryError(
+                "生产模型 provider 的 api_key 仍为示例占位符，涉及字段: "
+                f"{sorted(placeholder_api_keys)}"
+            )
+        self._runtime_ready = True
+
     def log_snapshot(self) -> None:
         """Log a complete secret-free task priority manifest once at startup."""
 
@@ -758,6 +842,7 @@ def init_models_config(
     with _models_config_lock:
         candidate = ModelsConfig(path)
         candidate.require_tasks(required_tasks)
+        candidate.require_runtime_readiness()
         _models_config = candidate
     candidate.log_snapshot()
     return candidate
@@ -769,6 +854,7 @@ def get_models_config() -> ModelsConfig:
     global _models_config
     existing = _models_config
     if existing is not None:
+        existing.require_runtime_readiness()
         return existing
 
     with _models_config_lock:
@@ -776,6 +862,7 @@ def get_models_config() -> ModelsConfig:
         if existing is None:
             existing = ModelsConfig()
             existing.require_tasks(PRODUCTION_MODEL_TASKS)
+            existing.require_runtime_readiness()
             _models_config = existing
     existing.log_snapshot()
     return existing

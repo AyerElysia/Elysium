@@ -12,12 +12,13 @@ from src.kernel.config import ConfigBase, Field, SectionBase, config_section
 
 CORE_VERSION = "1.1.0-alpha"
 
+
 class CoreConfig(ConfigBase):
     """Core 层配置类
 
     定义 Core 层的所有配置节。Core 层包含对话管理、用户管理、消息处理等业务逻辑。
     """
-    
+
     @config_section("bot")
     class BotSection(SectionBase):
         """Bot 配置节
@@ -337,7 +338,7 @@ class CoreConfig(ConfigBase):
         # ========== PostgreSQL SSL 配置 ==========
         postgresql_ssl_mode: str = Field(
             default="prefer",
-            description='SSL 模式: disable, allow, prefer, require, verify-ca, verify-full',
+            description="SSL 模式: disable, allow, prefer, require, verify-ca, verify-full",
         )
         postgresql_ssl_ca: str = Field(
             default="",
@@ -377,11 +378,11 @@ class CoreConfig(ConfigBase):
             default="utf8mb4",
             description="MySQL 字符集；Elysium 固定使用 utf8mb4 保留完整 Unicode",
         )
-        mysql_ssl_mode: Literal[
-            "disabled", "required", "verify-ca", "verify-full"
-        ] = Field(
-            default="disabled",
-            description="MySQL TLS 模式: disabled, required, verify-ca, verify-full",
+        mysql_ssl_mode: Literal["disabled", "required", "verify-ca", "verify-full"] = (
+            Field(
+                default="disabled",
+                description="MySQL TLS 模式: disabled, required, verify-ca, verify-full",
+            )
         )
         mysql_ssl_ca: str = Field(
             default="",
@@ -414,10 +415,13 @@ class CoreConfig(ConfigBase):
             description="Life Engine MySQL 连接池允许的额外连接数。",
         )
         mysql_pool_recycle_seconds: int = Field(
-            default=1800,
+            default=120,
             ge=30,
             le=86400,
-            description="Life Engine MySQL 连接回收间隔（秒）。",
+            description=(
+                "Life Engine MySQL 连接回收间隔（秒）；必须小于 "
+                "mysql_idle_session_timeout_seconds。"
+            ),
         )
         mysql_idle_session_timeout_seconds: int = Field(
             default=180,
@@ -452,6 +456,20 @@ class CoreConfig(ConfigBase):
             default=False,
             description="是否打印 SQL 语句（用于调试）",
         )
+
+        @model_validator(mode="after")
+        def validate_mysql_recycle_window(self) -> "CoreConfig.DatabaseSection":
+            """Recycle pooled connections before MySQL can expire them."""
+
+            if (
+                self.mysql_pool_recycle_seconds
+                >= self.mysql_idle_session_timeout_seconds
+            ):
+                raise ValueError(
+                    "database.mysql_pool_recycle_seconds must be shorter than "
+                    "database.mysql_idle_session_timeout_seconds"
+                )
+            return self
 
     database: DatabaseSection = Field(default_factory=DatabaseSection)
 
@@ -593,6 +611,7 @@ class CoreConfig(ConfigBase):
             le=1_000_000,
             description="阶段三命令 ledger 允许等待调度的最大 accepted 数",
         )
+
     http_router: HttpRouterSection = Field(default_factory=HttpRouterSection)
 
     @config_section("advanced")
@@ -630,7 +649,7 @@ class CoreConfig(ConfigBase):
         )
         install_command: str = Field(
             default="uv pip install",
-            description="安装依赖时使用的命令前缀，支持 \"uv pip install\"、\"pip install\" 等",
+            description='安装依赖时使用的命令前缀，支持 "uv pip install"、"pip install" 等',
         )
         skip_if_satisfied: bool = Field(
             default=True,
@@ -638,6 +657,7 @@ class CoreConfig(ConfigBase):
         )
 
     plugin_deps: PluginDepsSection = Field(default_factory=PluginDepsSection)
+
 
 # 全局配置实例（延迟初始化）
 _global_config: CoreConfig | None = None
@@ -738,8 +758,7 @@ def get_core_config() -> CoreConfig:
     global _global_config
     if _global_config is None:
         raise RuntimeError(
-            "Core config not initialized. "
-            "Call init_core_config() first."
+            "Core config not initialized. Call init_core_config() first."
         )
     return _global_config
 
@@ -781,6 +800,7 @@ def init_core_config(config_path: str) -> CoreConfig:
 
         # 保存默认配置到文件
         from src.kernel.config.core import _render_toml_with_signature
+
         toml_content = _render_toml_with_signature(CoreConfig, default_config)
         path.write_text(toml_content, encoding="utf-8")
 
