@@ -179,17 +179,20 @@ def test_text_values_are_encoded_without_raw_sql_interpolation() -> None:
     assert literal.endswith("' USING utf8mb4)")
 
 
-def test_sync_entrypoints_cannot_restore_implicit_remote_actions() -> None:
+def test_legacy_entrypoints_cannot_restore_implicit_remote_actions() -> None:
+    start_entrypoint = (PROJECT_ROOT / "start.bat").read_text(encoding="utf-8")
     cleanup_entrypoint = (PROJECT_ROOT / "scripts/cleanup_leases.sh").read_text(
         encoding="utf-8"
     )
     sync_entrypoint = (PROJECT_ROOT / "scripts/sync_job.sh").read_text(encoding="utf-8")
 
+    assert "cleanup_leases" not in start_entrypoint
+    assert 'deploy.ps1" run' in start_entrypoint
     assert "asyncmy" not in cleanup_entrypoint
     assert "exit 78" in cleanup_entrypoint
     assert "crontab" not in sync_entrypoint
     assert "--confirm-explicit-run" in sync_entrypoint
 
-    combined = f"{cleanup_entrypoint}\n{sync_entrypoint}"
+    combined = f"{start_entrypoint}\n{cleanup_entrypoint}\n{sync_entrypoint}"
     assert "/root/" not in combined
     assert "export ELYSIUM_MYSQL_PASSWORD=" not in combined
