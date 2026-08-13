@@ -70,6 +70,39 @@ from .perception_gateway import (
 from .presence_store import PresenceRevisionConflict
 from .world_state import PerceptionFilter
 
+# 双路径加载身份兼容。plugin_manager 以顶层包身份（life_engine.*）加载插件，
+# 而 main.py/src 可能先以 plugins 前缀导入同一子模块 → 同一源码出现两份类
+# （__module__ 不同）。捕获方必须同时匹配两个身份，否则 except/isinstance
+# 漏捕并把常态并发竞争刷成 ERROR（2026-08-13 线上两次：ClaimConflict 漏捕、
+# PresenceRevisionConflict 漏捕均为此因）。
+try:
+    from plugins.life_engine.service.presence_store import (  # type: ignore[import-not-found]
+        PresenceRevisionConflict as _PluginsPresenceRevisionConflict,
+    )
+except ImportError:  # pragma: no cover - 单一路径环境不会触发
+    _PluginsPresenceRevisionConflict = PresenceRevisionConflict
+try:
+    from plugins.life_engine.storage import (  # type: ignore[import-not-found]
+        SingletonWriterClaimConflict as _PluginsWriterClaimConflict,
+    )
+    from plugins.life_engine.storage import (
+        SingletonWriterClaimLost as _PluginsWriterClaimLost,
+    )
+except ImportError:  # pragma: no cover
+    _PluginsWriterClaimConflict = SingletonWriterClaimConflict
+    _PluginsWriterClaimLost = SingletonWriterClaimLost
+
+_PRESENCE_CONFLICT_TYPES = (
+    PresenceRevisionConflict,
+    _PluginsPresenceRevisionConflict,
+)
+_WRITER_CLAIM_TYPES = (
+    SingletonWriterClaimConflict,
+    _PluginsWriterClaimConflict,
+    SingletonWriterClaimLost,
+    _PluginsWriterClaimLost,
+)
+
 if TYPE_CHECKING:
     from .core import LifeEngineService
 
@@ -478,17 +511,16 @@ class MemoryWitnessCoordinator:
                 if isinstance(
                     exc,
                     (
-                        PresenceRevisionConflict,
+                        *_PRESENCE_CONFLICT_TYPES,
                         CursorConflict,
                         MemoryWitnessProjectionFilesystemChanged,
-                        SingletonWriterClaimConflict,
-                        SingletonWriterClaimLost,
+                        *_WRITER_CLAIM_TYPES,
                     ),
                 ):
                     transient_failures = 0
                     concurrency_failures += 1
                     next_delay = retry_delay
-                    if isinstance(exc, PresenceRevisionConflict):
+                    if isinstance(exc, _PRESENCE_CONFLICT_TYPES):
                         await self._refresh_presence_snapshot_safely()
                     elif isinstance(exc, SingletonWriterClaimLost):
                         self._author_claim = None
@@ -637,10 +669,7 @@ class MemoryWitnessCoordinator:
                                 last_error="",
                             )
                         )
-                except (
-                    SingletonWriterClaimConflict,
-                    SingletonWriterClaimLost,
-                ) as claim_issue:
+                except _WRITER_CLAIM_TYPES as claim_issue:
                     # Another live instance (the resident writer) holds the
                     # durable author claim.  This is the expected multi-writer
                     # guest role, not a failure: ingest/delivery/reconciliation
@@ -815,6 +844,12 @@ class MemoryWitnessCoordinator:
             # Drop the stale local claim so the next attempt re-acquires
             # instead of renewing a dead lease forever; the caller decides
             # whether to skip authoring (guest) or retry (writer).
+            self._author_claim = None
+            self._author_claim_mode = "selected_runtime_claim_failed"
+            raise
+        except _PluginsWriterClaimLost:
+            # plugins 前缀身份的 SingletonWriterClaimLost（双路径加载的另一份
+            # 类）；与同身份分支完全同语义，仅类身份不同。
             self._author_claim = None
             self._author_claim_mode = "selected_runtime_claim_failed"
             raise

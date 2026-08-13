@@ -1720,3 +1720,39 @@ async def test_author_claim_capture_identity_holds_under_dual_import(
         assert isinstance(exc, CapturedConflict)
     finally:
         sys.path[:] = saved
+
+
+@pytest.mark.asyncio
+async def test_presence_conflict_capture_covers_plugins_identity() -> None:
+    """防回归：presence 链路可能以 plugins 前缀身份加载（与 memory_witness 的
+    life_engine 身份不同），抛出的 PresenceRevisionConflict 是另一份类。捕获
+    元组必须覆盖两个身份，否则常态 presence 竞争被刷成 fatal ERROR。"""
+
+    import sys
+
+    plugins_dir = str(Path(__file__).resolve().parents[3] / "plugins")
+    saved = list(sys.path)
+    modules_before = set(sys.modules)
+    sys.path.insert(0, plugins_dir)
+    try:
+        from life_engine.service.memory_witness import (
+            _PRESENCE_CONFLICT_TYPES as LifePresenceTypes,
+        )
+        from plugins.life_engine.service.presence_store import (
+            PresenceRevisionConflict as PluginsPresenceConflict,
+        )
+
+        # 两个身份的 presence 冲突类必须都在捕获元组里
+        assert PluginsPresenceConflict in LifePresenceTypes
+        # 真实抛出（plugins 身份）必须被捕获元组 isinstance 命中
+        exc = PluginsPresenceConflict(
+            "presence revision conflict for 'memory_witness': "
+            "expected 1, actual 2"
+        )
+        assert isinstance(exc, LifePresenceTypes)
+    finally:
+        sys.path[:] = saved
+        # 清理本次新加载的 life_engine 身份模块，避免污染后续测试
+        for mod in list(sys.modules):
+            if mod.startswith("life_engine.") and mod not in modules_before:
+                del sys.modules[mod]
