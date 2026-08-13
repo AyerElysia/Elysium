@@ -39,6 +39,11 @@ from src.kernel.scheduler import get_unified_scheduler, TriggerType
 
 _STORAGE_RENEWAL_BACKOFF_BASE_SECONDS = 1.0
 _STORAGE_RENEWAL_BACKOFF_MAX_SECONDS = 30.0
+# 心跳模型失败若为瞬时 MySQL 断连（2013），前 8 次只记 debug/warning，
+# 第 9 次才升级 ERROR 刷 traceback，避免 FRP 隧道抖动反复刷屏。
+# 语义对齐 memory_witness._CONCURRENCY_ERROR_ESCALATION_COUNT。
+_HEARTBEAT_TRANSIENT_ERROR_ESCALATION_COUNT = 9
+_MYSQL_LOST_CONNECTION_ERROR_CODE = 2013
 
 
 def _storage_renewal_backoff_seconds(
@@ -77,6 +82,47 @@ def _is_storage_renewal_connectivity_unknown(exc: BaseException) -> bool:
     ):
         return True
     return isinstance(exc, DBAPIError) and bool(exc.connection_invalidated)
+
+
+def _dbapi_error_code(exc: DBAPIError) -> int | None:
+    """Return a numeric DBAPI error code without copying SQL or server text."""
+
+    for value in getattr(exc.orig, "args", ()):
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isdecimal():
+            return int(value)
+    return None
+
+
+def _is_transient_mysql_disconnect(exc: BaseException) -> bool:
+    """Recognize MySQL 2013 lost-connection as a transient, self-healing failure.
+
+    FRP 内网穿透隧道（frp-one.com:65429）抖动时，客户端查询中途连接被
+    隧道切断，asyncmy 报 2013。服务器端 wait_timeout=28800 且连接级
+    wait_timeout=180 已排除服务端空闲杀连接；此判定仅用于日志降级
+    （前 8 次 warning/debug，第 9 次才 ERROR），不改变失败语义——
+    心跳模型失败不推进游标，事件已在 publish_legacy_events 时写入账本。
+    """
+
+    return isinstance(exc, DBAPIError) and (
+        _dbapi_error_code(exc) == _MYSQL_LOST_CONNECTION_ERROR_CODE
+    )
+
+
+def _transient_error_summary(exc: BaseException) -> str:
+    """Describe a transient failure without dumping response bodies or traces."""
+
+    details = [type(exc).__name__]
+    if isinstance(exc, DBAPIError):
+        code = _dbapi_error_code(exc)
+        if code is not None:
+            details.append(f"code={code}")
+    if len(details) == 1:
+        return details[0]
+    return f"{details[0]}({', '.join(details[1:])})"
 
 if TYPE_CHECKING:
     from ..attention_threads import (
@@ -10156,6 +10202,7 @@ class LifeEngineService(BaseService):
         """心跳循环。"""
         interval = self._effective_heartbeat_interval()
         should_log_heartbeat = bool(self._cfg().settings.log_heartbeat)
+        transient_model_failures = 0
 
         try:
             while self._state.running:
@@ -10255,19 +10302,50 @@ class LifeEngineService(BaseService):
                         collect_background_agents=True,
                     )
                     injected_content = prepared.content
+                    transient_model_failures = 0
 
                 except Exception as exc:  # noqa: BLE001
                     self._state.last_model_error = str(exc)
-                    log_error(
-                        "heartbeat_model_failed",
-                        str(exc),
-                        heartbeat_count=self._state.heartbeat_count,
-                        heartbeat_at=self._state.last_heartbeat_at,
-                        model_task_name=self._cfg().model.task_name,
-                    )
-                    logger.error(
-                        f"life_engine 心跳模型异常: {exc}\n{traceback.format_exc()}"
-                    )
+                    if _is_transient_mysql_disconnect(exc):
+                        # FRP 隧道抖动导致 MySQL 2013：事件已在 publish_legacy_events
+                        # 写入账本，心跳不推进游标下轮自愈。前 8 次降级为
+                        # warning/debug（不刷 traceback），第 9 次才 ERROR。
+                        transient_model_failures += 1
+                        summary = _transient_error_summary(exc)
+                        message = (
+                            "life_engine 心跳模型瞬时数据库断连（待处理工作已保留，"
+                            f"下轮重试）: failure_count={transient_model_failures}, "
+                            f"error={summary}"
+                        )
+                        if (
+                            transient_model_failures
+                            == _HEARTBEAT_TRANSIENT_ERROR_ESCALATION_COUNT
+                        ):
+                            log_error(
+                                "heartbeat_model_failed",
+                                str(exc),
+                                heartbeat_count=self._state.heartbeat_count,
+                                heartbeat_at=self._state.last_heartbeat_at,
+                                model_task_name=self._cfg().model.task_name,
+                            )
+                            logger.error(
+                                f"{message}\n{traceback.format_exc()}"
+                            )
+                        elif transient_model_failures == 1:
+                            logger.warning(message)
+                        else:
+                            logger.debug(message)
+                    else:
+                        log_error(
+                            "heartbeat_model_failed",
+                            str(exc),
+                            heartbeat_count=self._state.heartbeat_count,
+                            heartbeat_at=self._state.last_heartbeat_at,
+                            model_task_name=self._cfg().model.task_name,
+                        )
+                        logger.error(
+                            f"life_engine 心跳模型异常: {exc}\n{traceback.format_exc()}"
+                        )
 
                 if should_log_heartbeat:
                     if injected_content:

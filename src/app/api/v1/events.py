@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol, runtime_checkable
 
+from sqlalchemy.exc import DBAPIError
+
 from plugins.life_engine.service.event_bus import (
     LifeEvent,
     RawEventGapError,
@@ -33,8 +35,34 @@ from .tokens import SignedValueCodec, SignedValueError
 EVENT_CURSOR_LEDGER = "life-events-v1"
 _MAX_SCAN_PER_PAGE = 10_000
 _SCAN_BATCH = 500
+# SSE 订阅流对瞬时 MySQL 断连（2013，FRP 隧道抖动常见）做有界重试，
+# 重试成功则流继续，不把瞬时故障抛成 ASGI traceback 刷屏。
+_STREAM_DB_RETRY_ATTEMPTS = 3
+_STREAM_DB_RETRY_BACKOFF_SECONDS = (0.5, 1.0, 2.0)
+_MYSQL_LOST_CONNECTION_ERROR_CODE = 2013
 
 logger = logging.getLogger(__name__)
+
+
+def _dbapi_error_code(exc: DBAPIError) -> int | None:
+    """Return a numeric DBAPI error code without copying SQL or server text."""
+
+    for value in getattr(exc.orig, "args", ()):
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isdecimal():
+            return int(value)
+    return None
+
+
+def _is_transient_mysql_disconnect(exc: BaseException) -> bool:
+    """Recognize MySQL 2013 lost-connection as a transient, self-healing failure."""
+
+    return isinstance(exc, DBAPIError) and (
+        _dbapi_error_code(exc) == _MYSQL_LOST_CONNECTION_ERROR_CODE
+    )
 
 
 @runtime_checkable
@@ -204,6 +232,7 @@ class EventQueryService:
         self.validate_subscription(event_filter, session)
         position = self._decode_cursor(cursor)
         last_emission = asyncio.get_running_loop().time()
+        db_retry = 0
         while True:
             try:
                 page = await self.query(
@@ -212,6 +241,7 @@ class EventQueryService:
                     event_filter=event_filter,
                     session=session,
                 )
+                db_retry = 0
             except StorageRuntimeClosed:
                 # 进程关闭窗口的正常竞态：存储引擎已关闭，订阅流不再有可读数据。
                 # 优雅结束流（生成器 return），而不是把 StorageRuntimeClosed
@@ -231,6 +261,23 @@ class EventQueryService:
                         "storage runtime closed during stream, ending gracefully"
                     )
                     return
+                if _is_transient_mysql_disconnect(exc) and db_retry < (
+                    _STREAM_DB_RETRY_ATTEMPTS
+                ):
+                    # FRP 隧道抖动导致 MySQL 2013：只读幂等查询，重试安全。
+                    # 重试成功则流继续；重试耗尽仍失败才上抛（一次性，
+                    # 不会每轮循环刷屏）。query 是只读操作，position 未推进，
+                    # 重试不会重复投递事件。
+                    db_retry += 1
+                    delay = _STREAM_DB_RETRY_BACKOFF_SECONDS[db_retry - 1]
+                    logger.warning(
+                        "life event stream 瞬时 MySQL 断连，"
+                        f"{delay:.1f}s 后重试 "
+                        f"({db_retry}/{_STREAM_DB_RETRY_ATTEMPTS}): "
+                        f"{type(exc).__name__}"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
                 raise
             next_position = self._decode_cursor(page.next_cursor)
             for visible_index, event in enumerate(page.events, start=1):

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy.exc import OperationalError
 
 from plugins.life_engine.constants import LIFE_CHATTER_GLOBAL_CURSOR_KEY
 from plugins.life_engine.core.config import LifeEngineConfig
@@ -1721,3 +1723,141 @@ async def test_advance_memory_projection_skips_when_bridge_disabled(
     report = SimpleNamespace(claimed=0, completed=(), failed=(), stale=())
     await service._advance_memory_projection(report)
     service._multi_writer_bridge.advance_projection.assert_not_awaited()  # type: ignore[attr-defined]
+
+
+def _mysql_2013() -> OperationalError:
+    """构造与线上一致的 MySQL 2013 瞬时断连（FRP 隧道抖动）。"""
+
+    return OperationalError(
+        "SELECT meta_value FROM raw_event_ledger_meta WHERE meta_key = %s",
+        {},
+        Exception(
+            2013,
+            "Lost connection to MySQL server during query ([WinError 121])",
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_loop_degrades_transient_mysql_disconnect_before_escalation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """心跳模型瞬时 MySQL 2013 断连：阈值内降级，不刷 ERROR traceback。
+
+    回归线上缺陷（2026-08-13）：FRP 隧道抖动时每轮心跳失败都打完整
+    traceback 刷屏。修复后前 8 次瞬时失败只记 debug/warning，第 9 次
+    才升级 ERROR（对齐 memory_witness 的竞争降级先例）。
+    """
+
+    from plugins.life_engine.service import core as core_module
+    from plugins.life_engine.service.core import (
+        _HEARTBEAT_TRANSIENT_ERROR_ESCALATION_COUNT,
+    )
+
+    service = _make_service(tmp_path)
+    service._state.running = True
+    service._stop_event = asyncio.Event()
+    calls = {"n": 0}
+
+    async def fake_round(**_: object) -> tuple[str, SimpleNamespace]:
+        calls["n"] += 1
+        if calls["n"] <= _HEARTBEAT_TRANSIENT_ERROR_ESCALATION_COUNT:
+            raise _mysql_2013()
+        service._state.running = False
+        return "reply", SimpleNamespace(content="ok")
+
+    records = {"error": [], "warning": [], "debug": []}
+
+    class _FakeLogger:
+        def error(self, message: object) -> None:
+            records["error"].append(str(message))
+
+        def warning(self, message: object) -> None:
+            records["warning"].append(str(message))
+
+        def debug(self, message: object) -> None:
+            records["debug"].append(str(message))
+
+        def info(self, message: object) -> None:
+            del message
+
+    monkeypatch.setattr(core_module, "logger", _FakeLogger())
+    monkeypatch.setattr(
+        core_module,
+        "log_error",
+        lambda event, error, **kw: records["error"].append(str(error)),
+    )
+    monkeypatch.setattr(service, "_run_heartbeat_round", fake_round)
+    monkeypatch.setattr(service, "_effective_heartbeat_interval", lambda: 0)
+    monkeypatch.setattr(service, "_in_sleep_window_now", lambda: (False, "test"))
+    monkeypatch.setattr(
+        service, "_self_pause_status", lambda: (False, None, None, None)
+    )
+
+    await asyncio.wait_for(service._heartbeat_loop(), timeout=3)
+
+    # 阈值内（1..N-1 次）失败后第 N 次成功退出。
+    assert calls["n"] == _HEARTBEAT_TRANSIENT_ERROR_ESCALATION_COUNT + 1
+    assert records["error"], "第 9 次瞬时失败应升级 ERROR"
+    # logger.error 的完整消息带"瞬时数据库断连"前缀（log_error 的是裸异常串）。
+    assert any(
+        "瞬时数据库断连" in message for message in records["error"]
+    ), "ERROR 必须包含瞬时断连降级路径的输出（不能是普通异常路径）"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_loop_transient_mysql_disconnect_recovers_without_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """瞬时 MySQL 断连在阈值内恢复：全程无 ERROR，成功清零计数。"""
+
+    from plugins.life_engine.service import core as core_module
+
+    service = _make_service(tmp_path)
+    service._state.running = True
+    service._stop_event = asyncio.Event()
+    calls = {"n": 0}
+
+    async def fake_round(**_: object) -> tuple[str, SimpleNamespace]:
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise _mysql_2013()
+        service._state.running = False
+        return "reply", SimpleNamespace(content="ok")
+
+    records = {"error": [], "warning": [], "debug": []}
+
+    class _FakeLogger:
+        def error(self, message: object) -> None:
+            records["error"].append(str(message))
+
+        def warning(self, message: object) -> None:
+            records["warning"].append(str(message))
+
+        def debug(self, message: object) -> None:
+            records["debug"].append(str(message))
+
+        def info(self, message: object) -> None:
+            del message
+
+    monkeypatch.setattr(core_module, "logger", _FakeLogger())
+    monkeypatch.setattr(
+        core_module,
+        "log_error",
+        lambda event, error, **kw: records["error"].append(str(error)),
+    )
+    monkeypatch.setattr(service, "_run_heartbeat_round", fake_round)
+    monkeypatch.setattr(service, "_effective_heartbeat_interval", lambda: 0)
+    monkeypatch.setattr(service, "_in_sleep_window_now", lambda: (False, "test"))
+    monkeypatch.setattr(
+        service, "_self_pause_status", lambda: (False, None, None, None)
+    )
+
+    await asyncio.wait_for(service._heartbeat_loop(), timeout=3)
+
+    assert calls["n"] == 3
+    assert not records["error"], "阈值内恢复的瞬时断连不应产生 ERROR"
+    assert records["warning"], "首次瞬时断连应留下 warning"
+    assert all("瞬时数据库断连" in message for message in records["warning"])

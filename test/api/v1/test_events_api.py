@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import OperationalError
 
 from plugins.life_engine.service.event_bus import (
     LifeEvent,
@@ -21,6 +22,20 @@ from src.app.api.v1.schemas.events import EventFilter
 from src.app.api.v1.tokens import SignedValueCodec
 
 
+def _mysql_2013() -> OperationalError:
+    """构造与线上一致的 MySQL 2013 瞬时断连（FRP 隧道抖动）。"""
+
+    return OperationalError(
+        "SELECT meta_value FROM raw_event_ledger_meta WHERE meta_key = %s",
+        {},
+        Exception(
+            2013,
+            "Lost connection to MySQL server during query ([WinError 121])",
+        ),
+    )
+
+
+
 def _life_event(
     event_id: str,
     *,
@@ -29,11 +44,12 @@ def _life_event(
     actor_id: str = "actor-owner",
     stream_id: str = "stream-1",
     content: str = "private content",
+    sequence: int = 0,
 ) -> LifeEvent:
     now = datetime.now(UTC).isoformat()
     return LifeEvent(
         event_id=event_id,
-        sequence=0,
+        sequence=sequence,
         timestamp=now,
         source="test_adapter",
         channel="chat",
@@ -479,4 +495,117 @@ def test_event_http_query_validate_and_route_order(tmp_path: Path) -> None:
         assert schema["paths"]["/events/{event_id}"]["get"]["operationId"] == "getEvent"
         assert "/events/ws" not in schema["paths"]
     finally:
+        auth.close()
+
+
+@pytest.mark.asyncio
+async def test_stream_recovers_from_transient_mysql_disconnect(tmp_path: Path) -> None:
+    """SSE 订阅流在瞬时 MySQL 2013 断连（FRP 隧道抖动）后应重试并继续投递。
+
+    回归线上缺陷：2026-08-13 隧道抖动时 stream 直接把 2013 抛成 ASGI
+    traceback 刷屏。修复后重试成功则流继续，不刷 traceback。
+    """
+
+    read_calls = {"n": 0}
+
+    class FlakyThenHealthyStore:
+        async def read_since(
+            self, sequence: int, *, limit: int | None = None
+        ) -> list[LifeEvent]:
+            read_calls["n"] += 1
+            # 第 1 次抛瞬时断连；第 2 次返回事件（重试成功）；
+            # 之后（probe/后续轮询）返回空，避免重复投递。
+            if read_calls["n"] == 1:
+                raise _mysql_2013()
+            if read_calls["n"] == 2:
+                return [
+                    _life_event(
+                        "evt-after-retry",
+                        visibility={"scope": "public", "audience": []},
+                        sequence=1,
+                    )
+                ]
+            return []
+
+        async def read_tail(self, limit: int = 100) -> list[LifeEvent]:
+            del limit
+            return []
+
+    context, auth, _ = _context(tmp_path, RawEventStore(tmp_path / "unused"))
+    service = EventQueryService(
+        node_id="node-events",
+        codec=context.codec,
+        store_provider=lambda: FlakyThenHealthyStore(),  # type: ignore[return-value]
+        poll_interval=0.01,
+        heartbeat_interval=0.02,
+    )
+    secret = _register_service(auth, actor_id="actor-retry")
+    session, _, _ = auth.issue_session_from_credential(
+        credential=secret,
+        audience=PLATFORM_SERVICE_AUDIENCE,
+        codec=context.codec,
+        access_ttl=timedelta(minutes=5),
+        refresh_ttl=timedelta(hours=1),
+    )
+    stream = service.stream(
+        cursor=None,
+        event_filter=EventFilter(),
+        session=session,
+    )
+    try:
+        frame = await asyncio.wait_for(anext(stream), timeout=3)
+        assert "evt-after-retry" in frame
+    finally:
+        await stream.aclose()
+        auth.close()
+
+
+@pytest.mark.asyncio
+async def test_stream_raises_after_mysql_retry_exhausted(tmp_path: Path) -> None:
+    """SSE 订阅流重试耗尽（3 次）后仍失败时才上抛一次，不无限重试。
+
+    回归：瞬时抖动应重试；持续故障应一次性暴露给调用方（runtime 层
+    转 SSE error 帧），而不是每轮循环反复刷 traceback。
+    """
+
+    class AlwaysDownStore:
+        def __init__(self) -> None:
+            self.read_calls = 0
+
+        async def read_since(
+            self, sequence: int, *, limit: int | None = None
+        ) -> list[LifeEvent]:
+            self.read_calls += 1
+            raise _mysql_2013()
+
+        async def read_tail(self, limit: int = 100) -> list[LifeEvent]:
+            del limit
+            return []
+
+    context, auth, _ = _context(tmp_path, RawEventStore(tmp_path / "unused"))
+    service = EventQueryService(
+        node_id="node-events",
+        codec=context.codec,
+        store_provider=lambda: AlwaysDownStore(),  # type: ignore[return-value]
+        poll_interval=0.01,
+        heartbeat_interval=0.02,
+    )
+    secret = _register_service(auth, actor_id="actor-exhaust")
+    session, _, _ = auth.issue_session_from_credential(
+        credential=secret,
+        audience=PLATFORM_SERVICE_AUDIENCE,
+        codec=context.codec,
+        access_ttl=timedelta(minutes=5),
+        refresh_ttl=timedelta(hours=1),
+    )
+    stream = service.stream(
+        cursor=None,
+        event_filter=EventFilter(),
+        session=session,
+    )
+    try:
+        with pytest.raises(OperationalError):
+            await asyncio.wait_for(anext(stream), timeout=10)
+    finally:
+        await stream.aclose()
         auth.close()
