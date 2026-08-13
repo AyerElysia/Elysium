@@ -11,6 +11,7 @@ from src.app.plugin_system.base import BaseTool
 
 from .contracts import (
     AttentionThreadCommand,
+    AttentionThreadConflict,
     AttentionThreadPageQuery,
 )
 
@@ -88,7 +89,8 @@ class LifeEngineManageAttentionThreadTool(BaseTool):
         ],
         thread_id: Annotated[
             str,
-            "线索 ID；除 open/list 外必填。open 留空时由系统生成稳定 ID",
+            "线索 ID；除 open/list 外必填。必须使用 list 返回的完整 thread_ref 原值"
+            "（含前缀），不要手工去掉或改写前缀。open 留空时由系统生成稳定 ID",
         ] = "",
         expected_revision: Annotated[
             int,
@@ -164,6 +166,33 @@ class LifeEngineManageAttentionThreadTool(BaseTool):
                 "status": commit.status,
                 "event_id": commit.event_id,
                 "idempotent_replay": commit.idempotent_replay,
+            }
+        except AttentionThreadConflict as exc:
+            current = exc.current_revision
+            exists = exc.thread_exists
+            if exists:
+                detail = (
+                    f"线索当前 revision 已是 {current}，"
+                    "请用该值作为 expected_revision 重新提交"
+                )
+            elif exists is False:
+                detail = (
+                    "线索不存在，thread_id 必须使用 list 返回的完整 thread_ref 原值"
+                )
+            else:
+                detail = "线索状态未知，请重新调用 list 确认 thread_ref 与 revision"
+            return False, {
+                "error": "AttentionThreadConflict",
+                "detail": detail,
+                "thread_id": exc.thread_id,
+                "current_revision": current,
+                "thread_exists": exists,
+                "recoverable": True,
+                "hint": (
+                    "重新调用 list 获取最新 thread_ref 与 revision；"
+                    "thread_id 使用返回的完整 thread_ref 原值，"
+                    "expected_revision 使用 current_revision"
+                ),
             }
         except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
             return False, f"持续关注线索操作失败: {type(exc).__name__}"

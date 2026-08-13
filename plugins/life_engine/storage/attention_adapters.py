@@ -394,7 +394,14 @@ class SQLAttentionThreadStore:
             parameters,
         )
         if result.rowcount != 1:
-            raise AttentionThreadConflict(current.thread_id)
+            raise AttentionThreadConflict(
+                current.thread_id,
+                thread_id=current.thread_id,
+                current_revision=(
+                    previous.revision if previous is not None else 0
+                ),
+                thread_exists=previous is not None,
+            )
 
     async def decide(
         self,
@@ -439,7 +446,14 @@ class SQLAttentionThreadStore:
                 previous is not None
                 and previous.revision != command.expected_revision
             ):
-                raise AttentionThreadConflict(command.thread_id)
+                raise AttentionThreadConflict(
+                    command.thread_id,
+                    thread_id=command.thread_id,
+                    current_revision=(
+                        previous.revision if previous is not None else 0
+                    ),
+                    thread_exists=previous is not None,
+                )
             event = await self._insert_event(
                 session,
                 command,

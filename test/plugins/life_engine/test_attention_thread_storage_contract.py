@@ -396,3 +396,54 @@ async def test_attention_event_rows_are_database_immutable_and_health_is_content
             "schema_version": 1,
         }
         assert "statement" not in str(health).lower()
+
+
+async def test_attention_conflict_carries_current_revision_and_thread_exists(
+    tmp_path: Path,
+) -> None:
+    """Stale revision / missing thread conflicts must expose recoverable hints."""
+    async with _local_stores(tmp_path) as (_, stores, presence):
+        await _register_actor(presence)
+        opened = await stores.authority.decide(_command("open"))
+        assert opened.revision == 1
+
+        # 1) stale revision on an existing thread -> thread_exists + current revision
+        with pytest.raises(AttentionThreadConflict) as caught:
+            await stores.authority.decide(
+                _command(
+                    "stale-note",
+                    action="note",
+                    thread_id="attention:thread:continuity",
+                    expected_revision=9,
+                    statement="基于过期版本的决定不得自动合并。",
+                )
+            )
+        exc = caught.value
+        assert exc.thread_id == "attention:thread:continuity"
+        assert exc.current_revision == 1
+        assert exc.thread_exists is True
+
+        # 2) missing thread with expected_revision != 0 -> not exists, current 0
+        with pytest.raises(AttentionThreadConflict) as caught:
+            await stores.authority.decide(
+                _command(
+                    "missing-thread-note",
+                    action="note",
+                    thread_id="attention:thread:does-not-exist",
+                    expected_revision=3,
+                    statement="指向不存在线索的提交应携带 not-exists 提示。",
+                )
+            )
+        exc = caught.value
+        assert exc.thread_id == "attention:thread:does-not-exist"
+        assert exc.current_revision == 0
+        assert exc.thread_exists is False
+
+        # 3) opening an already-open thread with expected_revision=0 -> conflict
+        with pytest.raises(AttentionThreadConflict) as caught:
+            await stores.authority.decide(
+                _command("reopen-existing", thread_id="attention:thread:continuity")
+            )
+        exc = caught.value
+        assert exc.current_revision == 1
+        assert exc.thread_exists is True
