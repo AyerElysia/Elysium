@@ -168,4 +168,7 @@ class KookAdapterPlugin(BasePlugin):
 
     def get_components(self) -> list[type]:
         """获取插件内所有组件类。"""
+        config = cast(KookAdapterConfig | None, self.config)
+        if config is None or not config.plugin.enabled:
+            return []
         return [KookAdapter]

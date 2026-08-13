@@ -28,7 +28,7 @@ class LivestreamConfig(BaseConfig):
     @config_section("plugin", title="插件设置", tag="plugin", order=0)
     class PluginSection(SectionBase):
         enabled: bool = Field(
-            default=True,
+            default=False,
             description="是否启用 AI 直播插件",
             label="启用插件",
             tag="plugin",

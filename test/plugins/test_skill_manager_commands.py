@@ -7,19 +7,23 @@ from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 
-import pytest
-
 from plugins.skill_manager.commands import SkillManagerCommand
 from plugins.skill_manager.config import SkillManagerConfig
 from plugins.skill_manager.models import SkillEntry
 from plugins.skill_manager.plugin import SkillManagerPlugin
+from plugins.skill_manager.tools import SkillGetScriptTool
 from src.core.prompt import get_system_reminder_store, reset_system_reminder_store
 
 
 def _build_plugin() -> SkillManagerPlugin:
     """创建测试用插件实例。"""
 
-    return SkillManagerPlugin(config=SkillManagerConfig())
+    return SkillManagerPlugin(
+        config=SkillManagerConfig(
+            plugin={"enabled": True},
+            manager={"enabled": True},
+        )
+    )
 
 
 def _register_skill(plugin: SkillManagerPlugin, root_dir: Path, name: str) -> SkillEntry:
@@ -103,6 +107,16 @@ def test_skill_manager_plugin_exposes_command_component() -> None:
     plugin = _build_plugin()
 
     assert SkillManagerCommand in plugin.get_components()
+
+
+def test_new_skill_manager_install_and_missing_config_register_nothing() -> None:
+    config = SkillManagerConfig()
+
+    assert config.plugin.enabled is False
+    assert config.manager.allow_script_execution is False
+    assert SkillManagerPlugin(config=config).get_components() == []
+    assert SkillManagerPlugin(config=None).get_components() == []
+    assert SkillGetScriptTool not in _build_plugin().get_components()
 
 
 async def test_skill_command_direct_invocation_injects_skill(

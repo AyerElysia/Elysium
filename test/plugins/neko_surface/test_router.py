@@ -4,9 +4,43 @@ from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
+from plugins.neko_surface.config import NekoSurfaceConfig
+from plugins.neko_surface.plugin import NekoSurfacePlugin
 from plugins.neko_surface.protocol import SurfaceEvent
 from plugins.neko_surface.router import NekoSurfaceRouter
 from plugins.neko_surface.service import NekoSurfaceGateway, SurfaceGatewayConfig
+
+
+async def test_new_neko_install_registers_no_surface_or_gateway() -> None:
+    config = NekoSurfaceConfig()
+    plugin = NekoSurfacePlugin(config)
+    missing_config_plugin = NekoSurfacePlugin(config=None)
+
+    assert config.plugin.enabled is False
+    assert plugin.gateway is None
+    assert plugin.get_components() == []
+    assert missing_config_plugin.get_components() == []
+
+    await plugin.on_plugin_loaded()
+    await missing_config_plugin.on_plugin_loaded()
+    assert plugin.gateway is None
+    assert missing_config_plugin.gateway is None
+
+
+async def test_explicitly_enabled_neko_keeps_surface_components() -> None:
+    plugin = NekoSurfacePlugin(NekoSurfaceConfig(plugin={"enabled": True}))
+
+    assert [component.__name__ for component in plugin.get_components()] == [
+        "NekoSurfaceService",
+        "NekoSurfaceRouter",
+        "NekoSurfaceAdapter",
+        "NekoSurfaceDeliveredMirror",
+    ]
+    assert plugin.gateway is not None
+    await plugin.on_plugin_loaded()
+
+    await plugin.on_plugin_unloaded()
+    assert plugin.gateway is None
 
 
 def _hello() -> dict:

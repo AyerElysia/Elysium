@@ -22,6 +22,15 @@ class EmojiConfig(BaseConfig):
     config_name: ClassVar[str] = "config"
     config_description: ClassVar[str] = "表情包插件配置（收藏发送 + 现场生成）"
 
+    @config_section("plugin", title="插件设置", tag="plugin", order=0)
+    class PluginSection(SectionBase):
+        """Top-level activation boundary for every emoji capability."""
+
+        enabled: bool = Field(
+            default=False,
+            description="是否启用表情包收藏、检索、发送与现场生成能力",
+        )
+
     # ── sender：表情包收藏与发送（原 emoji_sender）──────────────
 
     @config_section("sender")
@@ -273,5 +282,6 @@ class EmojiConfig(BaseConfig):
         identity: IdentitySection = Field(default_factory=IdentitySection)
         caption: CaptionSection = Field(default_factory=CaptionSection)
 
+    plugin: PluginSection = Field(default_factory=PluginSection)
     sender: SenderSection = Field(default_factory=SenderSection)
     generated: GeneratedSection = Field(default_factory=GeneratedSection)

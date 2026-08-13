@@ -93,20 +93,23 @@ class SkillManagerPlugin(BasePlugin):
     def get_components(self) -> list[type]:
         """返回插件组件列表。"""
 
-        if (
-            isinstance(self.config, SkillManagerConfig)
-            and not self.config.manager.enabled
+        if not isinstance(self.config, SkillManagerConfig) or not (
+            self.config.plugin.enabled and self.config.manager.enabled
         ):
             logger.info("skill_manager 已在配置中禁用")
+            if getattr(SkillManagerCommand, "_plugin_instance", None) is self:
+                SkillManagerCommand._plugin_instance = None
             return []
         SkillManagerCommand._plugin_instance = self
-        return [
+        components: list[type] = [
             SkillManagerLoadHandler,
             SkillManagerCommand,
             SkillGetTool,
             SkillGetReferenceTool,
-            SkillGetScriptTool,
         ]
+        if self.config.manager.allow_script_execution:
+            components.append(SkillGetScriptTool)
+        return components
 
     async def on_plugin_unloaded(self) -> None:
         """插件卸载时清理 system reminder。"""
@@ -116,6 +119,8 @@ class SkillManagerPlugin(BasePlugin):
         store = get_system_reminder_store()
         store.delete("actor", "skill_manager_catalog")
         store.delete("sub_actor", "skill_manager_catalog")
+        if getattr(SkillManagerCommand, "_plugin_instance", None) is self:
+            SkillManagerCommand._plugin_instance = None
 
     async def refresh_skill_catalog(self) -> None:
         """扫描配置路径并刷新 skill 索引。"""

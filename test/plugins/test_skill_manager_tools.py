@@ -7,8 +7,6 @@ from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 
-import pytest
-
 from plugins.skill_manager.config import SkillManagerConfig
 from plugins.skill_manager.models import SkillEntry
 from plugins.skill_manager.plugin import SkillManagerPlugin
@@ -18,7 +16,12 @@ from plugins.skill_manager.tools import SkillGetScriptTool, SkillGetTool
 def _build_plugin() -> SkillManagerPlugin:
     """创建测试用插件实例。"""
 
-    return SkillManagerPlugin(config=SkillManagerConfig())
+    return SkillManagerPlugin(
+        config=SkillManagerConfig(
+            plugin={"enabled": True},
+            manager={"enabled": True, "allow_script_execution": True},
+        )
+    )
 
 
 def _register_skill(plugin: SkillManagerPlugin, root_dir: Path, name: str = "demo") -> SkillEntry:
