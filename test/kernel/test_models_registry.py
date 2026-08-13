@@ -102,13 +102,25 @@ def test_task_routes_preserve_toml_order() -> None:
         )
 
 
-def test_expression_uses_only_vision_capable_models() -> None:
+def test_expression_keeps_vision_capable_fallback() -> None:
+    """表达层文本优先 DeepSeek，但列表必须保留至少一个 vision 模型兜底识图。
+
+    media-aware routing (LLMRequest.filter_model_set_for_media) 会在 payload
+    含图片/表情时把 model_set 过滤到支持 image 的成员，因此文本优先 + 视觉
+    兜底的结构不会丢失原生识图能力。
+    """
     registry_path = Path(__file__).parents[2] / "config" / "models.toml.example"
     config = ModelsConfig(registry_path)
 
     expression_models = config.tasks["expression"]["models"]
 
-    assert all(config.models[name].get("vision", False) for name in expression_models)
+    # 首选模型可文本优先；列表内必须至少有一个 vision-capable 模型承接识图。
+    assert any(config.models[name].get("vision", False) for name in expression_models)
+    assert all(
+        config.models[name].get("vision", False)
+        or config.models[name].get("ctx", 0) >= config.tasks["expression"]["context_tokens"]
+        for name in expression_models
+    )
 
 
 def test_task_routes_only_reference_unique_registered_models() -> None:

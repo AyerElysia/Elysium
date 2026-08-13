@@ -113,10 +113,14 @@ extra = { enable_thinking = false }
 
 # Generative budgets include hidden reasoning and final output. Qualified
 # non-multimodal tasks temporarily prefer the formal DeepSeek V4 Flash route;
-# GPT priority then remains Luna -> Terra -> Sol. Expression requires vision
-# capability and therefore excludes text-only models. Remove an unhealthy
-# ability from automatic tasks only after an end-to-end probe confirms the
-# fault. qwen3.7-plus remains registered for explicit recovery probes only.
+# GPT priority then remains Luna -> Terra -> Sol. Expression now prefers the
+# text-first DeepSeek V4 Flash route while keeping at least one vision-capable
+# model in the list: media-aware routing filters the model set by payload
+# modalities, so image/emoji messages automatically fall to the vision-capable
+# members (MiMo-V2.5 / Gemini / Claude) without losing native image input.
+# Remove an unhealthy ability from automatic tasks only after an end-to-end
+# probe confirms the fault. qwen3.7-plus remains registered for explicit
+# recovery probes only.
 [tasks.core]
 models = ["deepseek-v4-flash", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "MiMo-V2.5-Pro", "gemini-3.5-flash", "MiMo-V2.5", "claude-sonnet-5"]
 tokens = 32000
@@ -134,12 +138,12 @@ attempt_timeout_seconds = 300
 model_extra = { "deepseek-v4-flash" = { thinking = { type = "enabled" } }, "gpt-5.6-luna" = { reasoning_effort = "high" }, "gpt-5.6-terra" = { reasoning_effort = "high" }, "gpt-5.6-sol" = { reasoning_effort = "high" }, "MiMo-V2.5-Pro" = { enable_thinking = true }, "MiMo-V2.5" = { enable_thinking = true }, "claude-sonnet-5" = { thinking = { budget_tokens = 16000, type = "enabled" } } }
 
 [tasks.expression]
-models = ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gemini-3.5-flash", "MiMo-V2.5", "claude-sonnet-5"]
+models = ["deepseek-v4-flash", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gemini-3.5-flash", "MiMo-V2.5", "claude-sonnet-5"]
 tokens = 32000
 temp = 0.8
 context_tokens = 200000
 extra = { parallel_tool_calls = true }
-model_extra = { "gpt-5.6-luna" = { reasoning_effort = "low" }, "gpt-5.6-terra" = { reasoning_effort = "low" }, "gpt-5.6-sol" = { reasoning_effort = "low" }, "MiMo-V2.5" = { enable_thinking = false }, "claude-sonnet-5" = { thinking = { budget_tokens = 2048, type = "enabled" } } }
+model_extra = { "deepseek-v4-flash" = { thinking = { type = "disabled" } }, "gpt-5.6-luna" = { reasoning_effort = "low" }, "gpt-5.6-terra" = { reasoning_effort = "low" }, "gpt-5.6-sol" = { reasoning_effort = "low" }, "MiMo-V2.5" = { enable_thinking = false }, "claude-sonnet-5" = { thinking = { budget_tokens = 2048, type = "enabled" } } }
 
 [tasks.witness]
 models = ["deepseek-v4-flash", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "MiMo-V2.5", "gemini-3.5-flash"]

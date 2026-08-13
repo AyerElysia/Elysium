@@ -560,7 +560,7 @@ temp = 0.7
 现阶段的路由目标是：
 
 - `tasks.core`：Life Engine 潜意识/心跳模型。
-- `tasks.expression`：Life Chatter 对话表达模型；聊天请求可能直接携带图片，因此当前路由中的每个模型都必须声明并真实支持 `vision = true`，不能换成纯文本模型。
+- `tasks.expression`：Life Chatter 对话表达模型。文本请求优先使用任务列表首个模型（当前生产为 DeepSeek-V4-Flash 正式版 `ark-code-latest` 路由）；聊天请求可能直接携带图片/表情，`LLMRequest` 会在发送前按 payload 媒体模态把 `models` 列表过滤到支持对应模态的成员，因此列表内**必须至少保留一个声明并真实支持 `vision = true` 的模型**（生产为 `xiaomi-mimo-v2.5`）承接识图，不能换成纯文本单模型。
 - `witness`、`agent`、`utility`、`router`、`router_context_projection` 等任务：根据能力和成本选择纯文本模型。
 - `vision`：显式图片/视频观察任务，只能绑定经过媒体协议验收的多模态模型。
 - `live`：场景任务可能携带多模态感知；没有完成场景级媒体路由核对前，按多模态任务管理，不随纯文本模型批量切换。
