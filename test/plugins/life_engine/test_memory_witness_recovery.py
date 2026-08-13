@@ -41,6 +41,10 @@ from plugins.life_engine.service.perception_gateway import (
 from plugins.life_engine.storage.memory.local import (
     create_local_memory_storage_bundle,
 )
+from plugins.life_engine.storage.writer_claims import (
+    SingletonWriterClaimConflict,
+    SingletonWriterClaimLost,
+)
 from src.kernel.llm.exceptions import LLMAPIError
 from src.kernel.storage import CursorConflict, canonical_json
 
@@ -1378,10 +1382,16 @@ async def test_filesystem_projection_scan_source_change_fails_closed(
         "rewritten private projection body",
         encoding="utf-8",
     )
-    with pytest.raises(MemoryWitnessProjectionFilesystemChanged):
-        await MemoryWitnessCoordinator(service)._reconcile_projections(store)
+    # A mid-scan source rewrite must fail closed: the scan cursor is not
+    # advanced and the whole reconciliation is not aborted.  It is surfaced as
+    # a bounded filesystem-scan blocker and retried next cycle, without
+    # spamming a fatal ERROR/traceback through the managed worker loop.
+    report = await MemoryWitnessCoordinator(service)._reconcile_projections(store)
     after = await store.get_reconciliation_state("projection_filesystem:v1")
-    assert after == before
+    assert report.filesystem_scan_blocker == (
+        "WitnessProjectionFilesystemSourceChangedRetryNextCycle"
+    )
+    assert after == before  # cursor never advanced over an unstable scan
 
 
 @pytest.mark.asyncio
@@ -1503,3 +1513,173 @@ async def test_presence_failure_does_not_reverse_committed_decision(
     )
     assert report.decisions_committed == 1
     assert state["last_sequence"] == 1
+
+
+@pytest.mark.asyncio
+async def test_author_claim_conflict_returns_skip_report_not_failure(
+    tmp_path: Path,
+) -> None:
+    """Another live instance (resident writer) holding the author claim is the
+    expected multi-writer guest role. run_once must finish ingest/delivery/
+    reconciliation, skip authoring, and report a bounded skip -- not raise."""
+
+    coordinator, service = _coordinator(tmp_path, [_event(1)])
+
+    class _ClaimingRuntime:
+        enabled = True
+        authority_token = SimpleNamespace(owner_id="elysium-linux-primary")
+
+        async def validate_writer(self) -> None:
+            return None
+
+        async def acquire_singleton_writer(self, **_kwargs: Any) -> Any:
+            raise SingletonWriterClaimConflict(
+                "SingletonWriterAlreadyClaimed:life_engine.memory_witness:"
+                "memory_witness:owner=elysium-linux-primary:memory_witness:"
+                "pid-60412:epoch=3"
+            )
+
+        async def renew_singleton_writer(
+            self,
+            current: Any,
+            **_kwargs: Any,
+        ) -> Any:
+            raise AssertionError("renew must not run on the non-authoring path")
+
+    service.storage_runtime = _ClaimingRuntime()
+    report = await coordinator.run_once()
+
+    assert report.author_claim_conflict is True
+    assert report.decisions_committed == 0
+    assert report.synced_experiences >= 1  # Stage A still ingested
+    assert coordinator._author_claim_mode == "not_authoring_writer"
+    # cursor must not advance: this node is not the writer
+    state = await service.memory_service.bundle.witnesses.get_state(
+        MEMORY_WITNESS_INSTANCE_ID
+    )
+    assert state["last_sequence"] == 0
+
+
+@pytest.mark.asyncio
+async def test_author_claim_conflict_keeps_ingest_and_reconciliation(
+    tmp_path: Path,
+) -> None:
+    """The non-authoring skip must not lose the already-completed ingest /
+    delivery / reconciliation work, and must never trigger a fatal ERROR."""
+
+    coordinator, service = _coordinator(tmp_path, [_event(1)])
+
+    class _ClaimingRuntime:
+        enabled = True
+        authority_token = SimpleNamespace(owner_id="elysium-linux-primary")
+
+        async def validate_writer(self) -> None:
+            return None
+
+        async def acquire_singleton_writer(self, **_kwargs: Any) -> Any:
+            raise SingletonWriterClaimConflict(
+                "SingletonWriterAlreadyClaimed:life_engine.memory_witness:"
+                "memory_witness:owner=elysium-linux-primary:pid-60412:epoch=3"
+            )
+
+        async def renew_singleton_writer(
+            self,
+            current: Any,
+            **_kwargs: Any,
+        ) -> Any:
+            raise AssertionError("renew must not run on the non-authoring path")
+
+    service.storage_runtime = _ClaimingRuntime()
+    reports = [await coordinator.run_once() for _ in range(2)]
+
+    assert all(report.author_claim_conflict for report in reports)
+    # repeated non-authoring skips are normal and stay quiet
+    assert all(report.decisions_committed == 0 for report in reports)
+    assert coordinator._author_claim_mode == "not_authoring_writer"
+
+
+@pytest.mark.asyncio
+async def test_author_claim_lost_skips_and_drops_stale_claim(
+    tmp_path: Path,
+) -> None:
+    """Losing the author lease (takeover/expiry) must not spam ERROR forever:
+    run_once surfaces a bounded skip and the stale claim is dropped so the
+    next cycle re-acquires instead of renewing a dead lease."""
+
+    coordinator, service = _coordinator(tmp_path, [_event(1)])
+
+    class _LosingRuntime:
+        enabled = True
+        authority_token = SimpleNamespace(owner_id="elysium-linux-primary")
+
+        async def validate_writer(self) -> None:
+            return None
+
+        async def acquire_singleton_writer(self, **_kwargs: Any) -> Any:
+            raise AssertionError("acquire must not run while a claim is held")
+
+        async def renew_singleton_writer(
+            self,
+            current: Any,
+            **_kwargs: Any,
+        ) -> Any:
+            raise SingletonWriterClaimLost("SingletonWriterRenewalLost")
+
+    # Simulate this node previously held the durable author claim.
+    coordinator._author_claim = SimpleNamespace(owner_id="stale")
+    service.storage_runtime = _LosingRuntime()
+    report = await coordinator.run_once()
+
+    assert report.author_claim_conflict is True
+    assert report.decisions_committed == 0
+    assert coordinator._author_claim is None  # stale claim dropped
+    assert coordinator._author_claim_mode == "not_authoring_writer"
+    # Stage A still ingested; this node keeps doing shared work
+    assert report.synced_experiences >= 1
+
+
+@pytest.mark.asyncio
+async def test_author_claim_lost_then_reacquires_on_next_cycle(
+    tmp_path: Path,
+) -> None:
+    """After the lease is lost, the next cycle re-acquires cleanly instead of
+    being stuck renewing a dead lease forever."""
+
+    coordinator, service = _coordinator(tmp_path, [])
+
+    class _Runtime:
+        enabled = True
+        authority_token = SimpleNamespace(owner_id="elysium-linux-primary")
+
+        async def validate_writer(self) -> None:
+            return None
+
+        async def acquire_singleton_writer(self, **_kwargs: Any) -> Any:
+            return SimpleNamespace(
+                generation_id="g",
+                namespace="life_engine.memory_witness",
+                state_key="memory_witness",
+                owner_instance_id="elysium-linux-primary:memory_witness:pid-x",
+                lease_epoch=1,
+                lease_until="2099-01-01T00:00:00+00:00",
+                fencing_token="tok",
+            )
+
+        async def renew_singleton_writer(
+            self,
+            current: Any,
+            **_kwargs: Any,
+        ) -> Any:
+            raise SingletonWriterClaimLost("SingletonWriterRenewalLost")
+
+    service.storage_runtime = _Runtime()
+    coordinator._author_claim = SimpleNamespace(owner_id="stale")
+    with pytest.raises(SingletonWriterClaimLost):
+        await coordinator._ensure_authoring_claim()
+    assert coordinator._author_claim is None
+    assert coordinator._author_claim_mode == "selected_runtime_claim_failed"
+
+    # next cycle re-acquires cleanly and becomes the durable writer again
+    await coordinator._ensure_authoring_claim()
+    assert coordinator._author_claim_mode == "durable_singleton_claim"
+    assert coordinator._author_claim is not None
