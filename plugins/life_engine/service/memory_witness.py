@@ -30,11 +30,6 @@ from typing import TYPE_CHECKING, Any
 
 from sqlalchemy.exc import DBAPIError
 
-from plugins.life_engine.service.presence_store import PresenceRevisionConflict
-from plugins.life_engine.storage import (
-    SingletonWriterClaimConflict,
-    SingletonWriterClaimLost,
-)
 from src.app.plugin_system.api.llm_api import get_model_set_by_task
 from src.app.plugin_system.api.log_api import get_logger
 from src.kernel.llm import ROLE, LLMPayload, LLMRequest, Text
@@ -57,6 +52,10 @@ from ..memory.witness_pipeline import (
     WitnessWindow,
     witness_window_source_digest,
 )
+from ..storage import (
+    SingletonWriterClaimConflict,
+    SingletonWriterClaimLost,
+)
 from ..storage.memory.contracts import (
     StableLedgerCursor,
     StableLedgerPage,
@@ -68,6 +67,7 @@ from .perception_gateway import (
     PerceptionCommitCheckpoint,
     PerceptionDeliveryReceipt,
 )
+from .presence_store import PresenceRevisionConflict
 from .world_state import PerceptionFilter
 
 if TYPE_CHECKING:

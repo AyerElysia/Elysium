@@ -1683,3 +1683,40 @@ async def test_author_claim_lost_then_reacquires_on_next_cycle(
     await coordinator._ensure_authoring_claim()
     assert coordinator._author_claim_mode == "durable_singleton_claim"
     assert coordinator._author_claim is not None
+
+
+@pytest.mark.asyncio
+async def test_author_claim_capture_identity_holds_under_dual_import(
+    tmp_path: Path,
+) -> None:
+    """plugin_manager 加载插件时把 plugins 目录插入 sys.path，life_engine
+    插件会以顶层包身份（life_engine.*）加载，writer_claims 随之出现第二份
+    模块实例与第二份异常类。memory_witness 捕获的异常类必须与抛出方同身份
+    （相对导入保证），否则 except 漏捕并把正常 guest 竞争刷成 ERROR。
+    回归锚点：2026-08-13 双路径下 SingletonWriterClaimConflict 双类漏捕。"""
+
+    import sys
+
+    plugins_dir = str(Path(__file__).resolve().parents[3] / "plugins")
+    saved = list(sys.path)
+    sys.path.insert(0, plugins_dir)
+    try:
+        from life_engine.service.memory_witness import (
+            SingletonWriterClaimConflict as CapturedConflict,
+            SingletonWriterClaimLost as CapturedLost,
+        )
+        from life_engine.storage.writer_claims import (
+            SingletonWriterClaimConflict as AltConflict,
+            SingletonWriterClaimLost as AltLost,
+        )
+
+        assert CapturedConflict is AltConflict
+        assert CapturedLost is AltLost
+        # 真实抛出的异常必须被捕获方 isinstance 命中
+        exc = AltConflict(
+            "SingletonWriterAlreadyClaimed:life_engine.memory_witness:"
+            "memory_witness:owner=remote:pid-1:epoch=3"
+        )
+        assert isinstance(exc, CapturedConflict)
+    finally:
+        sys.path[:] = saved
