@@ -1967,7 +1967,22 @@ class LifeEngineService(BaseService):
         if runtime is None:
             return False
         claim = exc.claim
-        removed = runtime.invalidate_managed_singleton_writer(claim)
+        # invalidate 只清本地管理表；DB 租约行仍是自己的且可能未过期，
+        # 会阻塞后续 re-acquire（AlreadyClaimed）。先按正常路径 release
+        # （DB 释放 + 本地弹出），release 失败再退回 invalidate。
+        release = getattr(runtime, "release_singleton_writer", None)
+        released = False
+        if callable(release):
+            try:
+                released = bool(await release(claim))
+            except Exception as release_exc:  # noqa: BLE001 - best effort
+                logger.warning(
+                    "managed singleton loss: DB release failed before "
+                    f"local invalidation: {type(release_exc).__name__}"
+                )
+        removed = bool(runtime.invalidate_managed_singleton_writer(claim))
+        if released:
+            removed = True
         key = (str(exc.namespace), str(exc.state_key))
         domain_status = "degraded" if key == (
             LEARNING_WRITER_CLAIM_NAMESPACE,
