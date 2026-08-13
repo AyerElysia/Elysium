@@ -13,7 +13,7 @@ Elysium 由用户手工启动，不得为它新建或恢复 systemd service、Wi
 
 1. 确认自动启动的本地 New API 已监听并可访问；
 2. 需要 QQ 时手工启动 NapCat；
-3. 在 `/root/Elysia/Elysium` 前台手工执行 `uv run main.py`；
+3. 在实际仓库根目录执行 `deploy.sh doctor`，通过后由用户前台执行 `deploy.sh run`（Windows 使用 `deploy.ps1`）；
 4. 从启动日志确认 raw ledger、memory schema、index recovery 和 memory witness 完成初始化。
 
 ## 2. 首次升级会发生什么

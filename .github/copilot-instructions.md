@@ -14,12 +14,12 @@
 - 插件相关实现位于 `src/core/components/` 与 `src/core/managers/plugin_manager.py`。
 
 ## Build and Test
-- 安装依赖：`uv sync`
-- 启动应用：`uv run main.py`
-- 运行测试：`pytest`
-- 针对单文件测试：`pytest test/path/to/test_file.py`
-- 覆盖率检查：`pytest --cov=src`
-- 代码检查：`ruff check src/`（自动修复：`ruff check --fix src/`）
+- 部署依赖与缺失配置：`./deploy.sh bootstrap`（PowerShell 使用 `./deploy.ps1 bootstrap`）。
+- 只读启动前检查：`./deploy.sh doctor`。
+- 启动应用：只能由用户在可观察终端主动执行 `./deploy.sh run`；禁止 systemd、cron、登录项或 restart loop。
+- 运行测试：`uv run --group dev python -m pytest test -q --no-cov -n 0`。
+- 针对单文件测试：`uv run --group dev python -m pytest test/path/to/test_file.py -q --no-cov -n 0`。
+- 代码检查：`uv run --group dev ruff check src plugins test`（自动修复前先核对文件 owner 与 diff）。
 
 ## Project Conventions
 - 禁止滥用 fallback 机制，优先修复根因（见 `代码规范.md`）。
@@ -31,12 +31,12 @@
 
 ## Integration Points
 - 外部核心依赖：`openai`, `chromadb`, `fastapi`, `mcp`, `mofox-wire`, `sqlalchemy`（见 `pyproject.toml`）。
-- 模型与平台配置主要来自 `config/model.toml`、`config/core.toml`。
+- 模型与平台配置主要来自 `config/models.toml`、`config/core.toml`。
 - 传输链路围绕 Adapter/Sink/Receiver 组织（见 `src/core/transport/` 与 `src/core/components/base/adapter.py`）。
 - 插件支持目录、zip、`.mfp` 形式加载（见 `src/core/components/loader.py`、`src/core/managers/plugin_manager.py`）。
 
 ## Security
-- 不要在提交中包含明文密钥、令牌、数据库密码（重点检查 `config/model.toml`、`config/core.toml`）。
+- 不要在提交中包含明文密钥、令牌、数据库密码（重点检查 `config/models.toml`、`config/core.toml`）。
 - 涉及外部 API（LLM/平台）调用时，最小化日志中的敏感字段输出。
 - 处理插件包（zip/`.mfp`）时保持来源可信，避免引入未审查代码。
 - 持久化数据默认位于 `data/`（如 `data/chroma_db`, `data/json_storage`）；变更存储行为时评估隐私与路径安全。

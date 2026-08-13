@@ -309,7 +309,7 @@ _heartbeat_loop
 
 ### 7.1 背景
 
-Elysium 以 **multi-writer 双实例**（`elysium-windows-primary` 与 `elysium-linux-primary`）共享同一个远端 MySQL（frp 隧道 `frp-one.com:65429`，库 `elysium`）。这是有意的架构（`core.toml` 中 `multi_writer_enabled = true`），heartbeat/presence/rolling_context 均需在数据库内做写入仲裁。
+Elysium 当时以 **multi-writer 双实例**（Windows 节点与 Linux 节点）共享同一个受控远端 MySQL。具体实例名、隧道端点、端口和库名属于本机运维配置，不写入仓库事故记录。该架构通过 `core.toml` 中的 `multi_writer_enabled = true` 启用，heartbeat/presence/rolling_context 均需在数据库内做写入仲裁。
 
 ### 7.2 问题一：`2013 Lost connection during query`（根因：Clash 代理劫持）
 
@@ -318,16 +318,14 @@ Elysium 以 **multi-writer 双实例**（`elysium-windows-primary` 与 `elysium-
 根因：
 
 - 本机 Clash Verge 开启 **TUN 模式**（`Meta` 网卡持有 `198.18.0.1/16`）与 **fake-ip DNS 劫持**；
-- WSL2 NAT 网络下，`frp-one.com` 被解析为 fake-ip `198.18.0.238`，MySQL 长连接被强制走代理；
+- WSL2 NAT 网络下，受控数据库域名被解析到 fake-ip 网段，MySQL 长连接被强制走代理；
 - 代理切换节点/抖动时 TCP 长连接被掐断，客户端读到 0 字节 → `IncompleteReadError` → 2013。
 
 修复（Clash 侧，无需改代码）：
 
-- 当前订阅 `R7k9CaxLtblM`（赔钱机场）的 rules 扩展 `r5yXhN2t3jTK.yaml`：
-  `prepend: - DOMAIN-SUFFIX,frp-one.com,DIRECT`
-- merge 扩展 `mgKpMFTxdNnf.yaml`：
-  `dns.fake-ip-filter: ["+.frp-one.com"]`
-- 重启 Clash Verge 使配置合并生效；验证 `getent hosts frp-one.com` 返回真实 IP `117.162.35.233`，连接直连 65429。
+- 在本机 Clash rules 扩展中为受控数据库域名增加 `DOMAIN-SUFFIX,<DATABASE_DOMAIN>,DIRECT`；
+- 在本机 merge 扩展中将 `+.<DATABASE_DOMAIN>` 加入 `dns.fake-ip-filter`；
+- 重启 Clash Verge 使配置合并生效；验证 `getent hosts <DATABASE_DOMAIN>` 返回非 fake-ip 地址，并按受控配置核对数据库端口直连。
 
 ### 7.3 问题二：`RuntimeStateRevisionConflict` / `PresenceRevisionConflict`（根因：双实例 CAS 竞争）
 
@@ -359,8 +357,8 @@ Elysium 以 **multi-writer 双实例**（`elysium-windows-primary` 与 `elysium-
 ### 7.4 遗留观察
 
 - `memory_witness` 的 `PresenceRevisionConflict` / `PerceptionCursorConflict` 已有 try/except 容错与 refresh 重试，属可恢复路径；若旧进程未加载新代码会以 ERROR 形式逃逸到 loop，**重启 main.py 即可**（当前进程 2168584 为 11:22 启动，早于 10:43 的 rebase 后编译，需重启加载当前磁盘代码）。
-- 12:12:22 仍有一次性 `2013 Lost connection`（frp 隧道瞬断，非 Clash——规则仍生效、DNS 仍直连）；SQLAlchemy 池会自动重连。若高频复发需检查 frp 服务端。
-- 启动等待：旧进程强杀后新进程需等 `selected_persistence` 租约过期接管（最长 120s，`authority_lease_seconds`）。优雅停止（Ctrl+C）可避免；强杀后可手动清理 `runtime_singleton_writer_claims` 中 `released_at IS NULL` 且确认旧实例已死的行。
+- 仍观察到一次性 `2013 Lost connection`（隧道瞬断，非 Clash——规则仍生效、DNS 仍直连）；SQLAlchemy 池会自动重连。若高频复发需检查隧道服务端。
+- 启动等待：旧进程异常退出后，新进程必须等待 `selected_persistence` 租约按数据库时间自然过期并通过正式 acquire 事务接管；优雅停止（Ctrl+C）可避免长时间等待。禁止仅凭 PID 或主机名手动修改 `runtime_singleton_writer_claims`。
 
 ### 7.5 数据迁移核对（协作者提法）
 
@@ -377,7 +375,7 @@ Elysium 以 **multi-writer 双实例**（`elysium-windows-primary` 与 `elysium-
 
 ### 8.1 数据回迁（远端 MySQL → 本地 SQLite）
 
-远端库（frp-one.com:65429/elysium）在 8/9 起积累的全部生命域数据回迁到本地：
+受控远端库在事故窗口内积累的全部生命域数据回迁到本地；具体端点、库名和账号不进入仓库文档：
 
 | 域 | 数据量 | 方式 | 验证 |
 |---|---|---|---|
@@ -417,10 +415,10 @@ sqlite3.IntegrityError: NOT NULL constraint failed: raw_event_consumer_offsets.r
 ### 8.4 双向同步（本地 ⇄ 远端）
 
 1. **shared_sync（事件级双向）**：`config/plugins/life_engine/config.toml [shared_sync]`：
-   - `enabled = true`、`remote_host = "frp-one.com"`、`remote_port = 65429`、`remote_user = "elysia"`、`pull_enabled = true`；
-   - 密码走 `ELYSIUM_SYNC_MYSQL_PASSWORD` 环境变量（.bashrc 已加）；
+   - `enabled = true`，并由受控本机配置提供 `remote_host`、`remote_port`、`remote_user`，同时设置 `pull_enabled = true`；历史现场的具体端点和账号不再写入仓库文档；
+   - 密码走 `ELYSIUM_SYNC_MYSQL_PASSWORD` 环境变量；历史现场曾写入 `.bashrc` 的做法已经退役，轮换旧凭据后应移除持久明文，并由当前终端或受控 secret manager 注入；
    - 仅 local 模式可用（`_selectable_storage_enabled` 必须 False），绑定 life_events.sqlite3，visibility=shared 的事件 push/pull 双向。
-2. **sync_local_to_mysql.py（Core 表增量）**：`scripts/sync_job.sh` + crontab 每 10 分钟；按自然键只 INSERT 远端缺失行，不覆盖。dry-run 验证通过。
+2. **历史 Core 表增量同步**：自动 crontab 方案已经退役。`scripts/sync_job.sh` 只允许操作者显式执行一次，并由 `scripts/sync_local_to_mysql.py` 通过环境变量和 owner-only 临时 defaults 文件取得凭据；部署脚本不会安装、调度或调用它。任何同步前仍须单独确认源、目标、writer 与备份边界。
 3. 仿真验证：SharedSyncBridge 初始化 OK（push+pull=True），17 项数据完整性检查全部 PASS，修复后 0 ERROR、heartbeat 正常。
 
 ### 8.5 遗留
@@ -434,23 +432,23 @@ Clash Verge TUN 模式会劫持 WSL 全部流量并返回 fake-ip。**凡是 Ely
 
 | 域名 | 用途 | 登记时间 |
 |---|---|---|
-| `frp-one.com` | 远端 MySQL（frp 隧道） | 2026-08-12 上午 |
+| `<DATABASE_DOMAIN>` | 受控远端 MySQL 隧道 | 按本机变更记录 |
 | `kookapp.cn` / `kookapp.com` | KOOK API + WebSocket Gateway | 2026-08-12 晚 |
 
-登记位置（当前订阅 `R7k9CaxLtblM`）：
+登记位置（具体订阅与本机扩展文件名不写入仓库）：
 
-1. **rules 扩展** `r5yXhN2t3jTK.yaml` 的 `prepend`：
+1. **rules 扩展**的 `prepend`：
    ```yaml
    prepend:
-     - DOMAIN-SUFFIX,frp-one.com,DIRECT
+     - DOMAIN-SUFFIX,<DATABASE_DOMAIN>,DIRECT
      - DOMAIN-SUFFIX,kookapp.cn,DIRECT
      - DOMAIN-SUFFIX,kookapp.com,DIRECT
    ```
-2. **merge 扩展** `mgKpMFTxdNnf.yaml` 的 `dns.fake-ip-filter`：
+2. **merge 扩展**的 `dns.fake-ip-filter`：
    ```yaml
    dns:
      fake-ip-filter:
-       - "+.frp-one.com"
+       - "+.<DATABASE_DOMAIN>"
        - "+.kookapp.cn"
        - "+.kookapp.com"
    ```

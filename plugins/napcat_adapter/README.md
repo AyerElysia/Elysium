@@ -1,6 +1,6 @@
-# NEW_napcat_adapter
+# napcat_adapter
 
-基于 mofox-wire v2.x 的 Napcat 适配器（使用 BaseAdapter 架构）
+基于 mofox-wire v2.x 的 Elysium NapCat 适配器（使用 BaseAdapter 架构）。
 
 ## 🏗️ 架构设计
 
@@ -15,7 +15,7 @@
 ## 📁 项目结构
 
 ```
-NEW_napcat_adapter/
+napcat_adapter/
 ├── plugin.py                      # ✅ 主插件文件（BaseAdapter实现）
 ├── _manifest.json                 # 插件清单
 │
@@ -50,9 +50,10 @@ NEW_napcat_adapter/
 
 ### 使用方式
 
-1. **配置文件**: 在 `config/plugins/NEW_napcat_adapter.toml` 中配置 WebSocket URL 和其他参数
-2. **启动插件**: 插件自动在系统启动时加载
-3. **WebSocket连接**: 自动连接到 Napcat OneBot 11 服务器
+1. **配置文件**: 在 `config/plugins/napcat_adapter/config.toml` 中配置 WebSocket URL 和其他参数。
+2. **显式启用**: 把 `[plugin].enabled` 改为 `true`；部署默认值为 `false`。
+3. **启动前检查**: 执行 `./deploy.sh doctor`，再由用户在可观察终端执行 `./deploy.sh run`。
+4. **WebSocket连接**: 显式启用后连接到 NapCat OneBot 11 服务器。
 
 ### 黑白名单过滤系统
 
@@ -129,8 +130,8 @@ ban_user_id = ["333333333", "444444444"]
 
 #### 🔧 配置文件位置
 
-- **示例配置**: `src/plugins/built_in/napcat_adapter/config.example.toml`
-- **实际配置**: `config/plugins/NEW_napcat_adapter.toml`
+- **配置 schema**: `plugins/napcat_adapter/config.py`
+- **实际配置**: `config/plugins/napcat_adapter/config.toml`
 
 #### 📊 日志信息
 

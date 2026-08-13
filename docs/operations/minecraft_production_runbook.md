@@ -162,7 +162,7 @@ Perception cursor 只在最终成功模型请求证明完整正文实际送达�
 该测试不会启动或停止 Elysium；若游戏未运行会按托管脚本启动，结束时只释放控制并断开桥接，游戏保持运行：
 
 ```bash
-PYTHONPATH=. .venv/bin/python \
+PYTHONPATH=. uv run --frozen --no-sync python \
   integrations/minecraft_bridge/agent_live_smoke.py
 ```
 
