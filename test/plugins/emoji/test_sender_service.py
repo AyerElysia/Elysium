@@ -9,7 +9,63 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from plugins.emoji.config import EmojiConfig
+from plugins.emoji.plugin import EmojiPlugin, build_emoji_sender_actor_reminder
+from plugins.emoji.sender.action import (
+    RecallEmojiAction,
+    SendEmojiByIdAction,
+    SendEmojiMemeAction,
+)
 from plugins.emoji.sender.service import EmojiSenderService, MemeCandidate
+
+
+async def test_new_emoji_install_has_no_components_or_lifecycle_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = EmojiConfig()
+    plugin = EmojiPlugin(config)
+    missing_config_plugin = EmojiPlugin(config=None)
+    task_manager = MagicMock(side_effect=AssertionError("must not schedule"))
+    reminder = MagicMock(side_effect=AssertionError("must not inject reminder"))
+    vector_service = MagicMock(side_effect=AssertionError("must not open vector DB"))
+
+    monkeypatch.setattr("plugins.emoji.plugin.get_task_manager", task_manager)
+    monkeypatch.setattr(
+        "plugins.emoji.plugin.sync_emoji_sender_actor_reminder",
+        reminder,
+    )
+    monkeypatch.setattr(
+        "plugins.emoji.sender.service.get_vector_db_service",
+        vector_service,
+    )
+
+    assert config.plugin.enabled is False
+    assert plugin.get_components() == []
+    assert missing_config_plugin.get_components() == []
+    assert build_emoji_sender_actor_reminder(plugin) == ""
+    assert build_emoji_sender_actor_reminder(missing_config_plugin) == ""
+
+    await plugin.on_plugin_loaded()
+    await plugin.on_plugin_unloaded()
+    await missing_config_plugin.on_plugin_loaded()
+    await missing_config_plugin.on_plugin_unloaded()
+
+    task_manager.assert_not_called()
+    reminder.assert_not_called()
+    vector_service.assert_not_called()
+    assert plugin._register_task_id is None
+    assert plugin._schedule_ids == []
+    assert plugin.emoji_service is None
+
+
+def test_explicitly_enabled_emoji_keeps_sender_components() -> None:
+    config = EmojiConfig(plugin={"enabled": True})
+
+    assert EmojiPlugin(config).get_components() == [
+        EmojiSenderService,
+        SendEmojiMemeAction,
+        RecallEmojiAction,
+        SendEmojiByIdAction,
+    ]
 
 
 def _make_service(*, temperature: float = 0.12, visual_enabled: bool = False) -> EmojiSenderService:

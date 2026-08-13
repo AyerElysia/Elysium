@@ -61,13 +61,14 @@ main.py
 
 `src/app/` 负责进程生命周期。`main.py` 只创建 `Bot` 并启动；`Bot` 依次初始化 Kernel、Core、插件依赖和插件实例，进入运行循环，退出时按生命周期关闭调度器、插件、任务、数据库、向量库和日志。
 
-无人值守运行支持：
+进程生命周期合同：
 
+- Elysium 只能由用户在可观察终端中手工前台启动；仓库不提供 systemd、cron、登录项或 restart loop；
+- `deploy.sh run` / `deploy.ps1 run` 只在只读 doctor 通过后以前台 `exec` 进入 `main.py`；
 - 无 TTY 时 stdin EOF 只关闭命令输入，Bot 继续运行；
-- 交互终端中的 Ctrl+D 仍结束交互主循环；
-- SIGTERM 请求优雅关闭；
-- SIGHUP 不结束进程；
-- 根目录 `elysium.service` 提供经过语法验证的 systemd unit。
+- 交互终端中的 Ctrl+D 结束交互主循环；
+- SIGTERM 请求优雅关闭，SIGHUP 不结束进程；
+- 进程、端口与后台任务必须保留唯一 owner，启动脚本不清 lease、不杀未知进程。
 
 ---
 

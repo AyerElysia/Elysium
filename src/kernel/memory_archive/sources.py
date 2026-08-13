@@ -46,7 +46,7 @@ class SQLiteTableArchiveContract:
 
 
 DEFAULT_SQLITE_SOURCES = (
-    SQLiteSource("core", Path("Elysium.db")),
+    SQLiteSource("core", Path("MoFox.db")),
     SQLiteSource("life_events", Path("life_engine_workspace/life_events.sqlite3")),
     SQLiteSource("life_memory", Path("life_engine_workspace/.memory/memory.db")),
     SQLiteSource(

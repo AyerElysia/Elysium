@@ -100,6 +100,6 @@ class AylaAdapterPlugin(BasePlugin):
 
     def get_components(self) -> list[type]:
         config = cast(AylaAdapterConfig | None, self.config)
-        if config is not None and not config.plugin.enabled:
+        if config is None or not config.plugin.enabled:
             return []
         return [AylaAdapter]

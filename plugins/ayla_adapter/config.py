@@ -27,7 +27,7 @@ class AylaAdapterConfig(BaseConfig):
     @config_section("plugin", title="插件设置", tag="plugin", order=0)
     class PluginSection(SectionBase):
         enabled: bool = Field(
-            default=True,
+            default=False,
             description="是否注册 Ayla 应用通道适配器",
             label="启用适配器",
             tag="plugin",

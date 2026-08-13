@@ -40,7 +40,11 @@ def build_emoji_sender_actor_reminder(plugin: Any) -> str:
     """构建 sender 的 actor reminder。"""
 
     config = getattr(plugin, "config", None)
-    if isinstance(config, EmojiConfig) and not config.sender.plugin.inject_system_prompt:
+    if (
+        not isinstance(config, EmojiConfig)
+        or not config.plugin.enabled
+        or not config.sender.plugin.inject_system_prompt
+    ):
         return ""
     return _EMOJI_USAGE_REMINDER
 
@@ -86,19 +90,26 @@ class EmojiPlugin(BasePlugin):
 
     def get_components(self) -> list[type]:
         """返回本插件提供的组件类。"""
+        cfg = self.config
+        if not isinstance(cfg, EmojiConfig) or not cfg.plugin.enabled:
+            return []
         components: list[type] = [
             EmojiSenderService,
             SendEmojiMemeAction,
             RecallEmojiAction,
             SendEmojiByIdAction,
         ]
-        cfg = self.config
-        if isinstance(cfg, EmojiConfig) and cfg.generated.plugin.enabled:
+        if cfg.generated.plugin.enabled:
             components.extend([ElysiaGeneratedEmojiService, GenerateEmojiMemeAction])
         return components
 
     async def on_plugin_loaded(self) -> None:
         """插件加载完成后：初始化 sender 调度与 generated 服务。"""
+        cfg = self.config
+        if not isinstance(cfg, EmojiConfig) or not cfg.plugin.enabled:
+            logger.info("emoji 已禁用，不初始化 reminder、schedule 或生成服务")
+            return
+
         # ── sender：reminder + 自定义指令 + 周期入库任务 ──
         sync_emoji_sender_actor_reminder(self)
 
@@ -119,8 +130,7 @@ class EmojiPlugin(BasePlugin):
         self._register_task_id = task.task_id
 
         # ── generated：按需初始化生成服务 ──
-        cfg = self.config
-        if isinstance(cfg, EmojiConfig) and cfg.generated.plugin.enabled:
+        if cfg.generated.plugin.enabled:
             self.emoji_service = ElysiaGeneratedEmojiService(self)
             await self.emoji_service.initialize()
         else:
@@ -128,6 +138,10 @@ class EmojiPlugin(BasePlugin):
 
     async def on_plugin_unloaded(self) -> None:
         """插件卸载前：移除 schedule、取消后台任务、清理 reminder 与生成服务。"""
+        cfg = self.config
+        if not isinstance(cfg, EmojiConfig) or not cfg.plugin.enabled:
+            return
+
         from src.kernel.scheduler import get_unified_scheduler
         from src.core.prompt import get_system_reminder_store
 
@@ -158,7 +172,10 @@ class EmojiPlugin(BasePlugin):
         """
         from src.kernel.scheduler import get_unified_scheduler, TriggerType
 
-        if not isinstance(self.config, EmojiConfig):
+        if (
+            not isinstance(self.config, EmojiConfig)
+            or not self.config.plugin.enabled
+        ):
             logger.warning("emoji config 未加载，无法注册 schedule")
             return
 

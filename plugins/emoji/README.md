@@ -79,7 +79,7 @@ python smoke_test.py --image <图> --match "俏皮卖萌" --mismatch "商务报�
 把旧的已收藏表情包视觉化入库：
 
 ```bash
-.venv/bin/python scripts/migrate_emoji_to_visual.py
+uv run --frozen --no-sync python scripts/migrate_emoji_to_visual.py
 ```
 
 ## 配置

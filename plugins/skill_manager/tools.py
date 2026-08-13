@@ -129,7 +129,14 @@ class SkillGetScriptTool(BaseTool):
         if resolved_name not in plugin.injected_skills:
             return False, f"skill '{resolved_name}' 尚未注入，请先调用 get_skill"
 
-        if not bool(manager_config_value(plugin, "allow_script_execution", True)):
+        config = getattr(plugin, "config", None)
+        plugin_config = getattr(config, "plugin", None)
+        manager_config = getattr(config, "manager", None)
+        if not (
+            bool(getattr(plugin_config, "enabled", False))
+            and bool(getattr(manager_config, "enabled", False))
+            and bool(manager_config_value(plugin, "allow_script_execution", False))
+        ):
             return False, "get_script 已被配置关闭。可改用 get_reference 读取脚本文档或说明。"
 
         entry = plugin.skills.get(resolved_name)

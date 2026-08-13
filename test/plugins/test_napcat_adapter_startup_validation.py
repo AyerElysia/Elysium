@@ -36,6 +36,11 @@ def test_disabled_napcat_plugin_registers_no_adapter_component() -> None:
     assert NapcatAdapterPlugin(config=config).get_components() == []
 
 
+def test_new_napcat_install_defaults_disabled_and_missing_config_fails_closed() -> None:
+    assert NapcatAdapterConfig.PluginSection().enabled is False
+    assert NapcatAdapterPlugin(config=None).get_components() == []
+
+
 def test_enabled_napcat_plugin_still_registers_adapter_component() -> None:
     """修复停用开关不能破坏 enabled=true 的正常注册。"""
     plugin = _build_napcat_plugin()

@@ -17,7 +17,7 @@ class NapcatAdapterConfig(BaseConfig):
         """插件基本配置"""
 
         enabled: bool = Field(
-            default=True,
+            default=False,
             description="是否启用 Napcat 适配器",
             label="启用适配器",
             tag="plugin",

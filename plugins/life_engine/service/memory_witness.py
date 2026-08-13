@@ -53,6 +53,7 @@ from ..memory.witness_pipeline import (
     WitnessWindow,
     witness_window_source_digest,
 )
+from ..storage.contracts import StorageRuntimeError
 from ..storage.memory.contracts import (
     StableLedgerCursor,
     StableLedgerPage,
@@ -85,6 +86,9 @@ _FILESYSTEM_RECONCILIATION_MAX_FILES = 100_000
 _FILESYSTEM_RECONCILIATION_MAX_BYTES = 1024 * 1024 * 1024
 _FILESYSTEM_HASH_CHUNK_BYTES = 64 * 1024
 _AUTHOR_CLAIM_NAMESPACE = "life_engine.memory_witness"
+_UNMANAGED_SINGLETON_WRITER_PREFIX = (
+    "singleton writer is not managed locally:"
+)
 _TRANSIENT_ERROR_ESCALATION_COUNT = 3
 # 双实例共享同一 witness presence 行时，PresenceRevisionConflict 是常态合法竞争；
 # 前 8 次只记 debug/warning，第 9 次才升级 ERROR，避免常态竞争刷 ERROR。
@@ -190,6 +194,19 @@ def _dbapi_error_code(exc: DBAPIError) -> int | None:
         if isinstance(value, str) and value.isdecimal():
             return int(value)
     return None
+
+
+def _is_unmanaged_author_claim_error(exc: BaseException) -> bool:
+    """Return whether the runtime explicitly rejected a detached local claim.
+
+    A renewal can fail for many reasons while the runtime still manages the
+    exact claim.  Only the runtime's structured error for a missing managed
+    claim permits this coordinator to forget its snapshot and acquire again.
+    """
+
+    return isinstance(exc, StorageRuntimeError) and str(exc).startswith(
+        _UNMANAGED_SINGLETON_WRITER_PREFIX
+    )
 
 
 def _is_transient_mysql_disconnect(exc: BaseException) -> bool:
@@ -766,7 +783,15 @@ class MemoryWitnessCoordinator:
                         self._author_claim,
                         lease_seconds=lease_seconds,
                     )
+                except asyncio.CancelledError:
+                    raise
                 except Exception as renew_exc:
+                    if not _is_unmanaged_author_claim_error(renew_exc):
+                        # A DB/network failure or any other unclassified renewal
+                        # error does not prove lease loss.  Keep the exact local
+                        # snapshot so the managed loop can retry it without
+                        # colliding with the runtime's still-owned claim entry.
+                        raise
                     # 续租线程可能在 2013/claim lost 后 invalidate 了本地管理表
                     # （_handle_managed_singleton_loss），本协程仍持有旧 claim
                     # 引用，renew 会报 "not managed locally"。此时丢弃旧 claim

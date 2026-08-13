@@ -23,7 +23,7 @@ class FeishuAdapterConfig(BaseConfig):
         """Plugin switches."""
 
         enabled: bool = Field(
-            default=True,
+            default=False,
             description="是否启用 Feishu 适配器",
             label="启用适配器",
             tag="plugin",

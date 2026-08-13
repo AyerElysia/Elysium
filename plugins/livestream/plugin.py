@@ -28,6 +28,8 @@ class LivestreamPlugin(BasePlugin):
         logger.info("直播插件已装载；等待操作者手动开始")
 
     def get_components(self) -> list[type]:
+        if not self.config.plugin.enabled:
+            return []
         from .router import LivestreamRouter
 
         return [LivestreamRouter]

@@ -78,6 +78,17 @@ def test_models_example_is_complete_and_budgeted() -> None:
         assert all(entry["timeout"] == expected_timeout for entry in entries)
 
 
+def test_models_example_uses_environment_credentials_but_remains_structural(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry_path = Path(__file__).parents[2] / "config" / "models.toml.example"
+    monkeypatch.delenv("ELYSIUM_NEXUS_API_KEY", raising=False)
+
+    config = ModelsConfig(registry_path)
+
+    assert config.providers["NexusAI"]["api_key"] == "${ELYSIUM_NEXUS_API_KEY}"
+
+
 def test_example_defines_background_attempt_timeout_policy() -> None:
     # 仅依赖入库的 models.toml.example（CI 自包含、不含真实密钥）；
     # 生产 config/models.toml 被 .gitignore 忽略，绝不能作为 CI 测试输入。
@@ -212,6 +223,150 @@ context_tokens = 16000
 """.lstrip(),
         encoding="utf-8",
     )
+
+
+def test_registry_recursively_expands_environment_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry_path = tmp_path / "models.toml"
+    secret = "runtime-secret-must-not-appear-in-errors"
+    monkeypatch.setenv("ELYSIUM_TEST_MODEL_API_KEY", secret)
+    monkeypatch.setenv(
+        "ELYSIUM_TEST_MODEL_BASE_URL",
+        "https://gateway.example/v1",
+    )
+    monkeypatch.setenv("ELYSIUM_TEST_MODEL_ID", "expanded-primary-id")
+    monkeypatch.setattr(models_loader, "_models_config", None)
+    _write_minimal_registry(
+        registry_path,
+        api_key="${ELYSIUM_TEST_MODEL_API_KEY}",
+    )
+    registry_path.write_text(
+        registry_path.read_text(encoding="utf-8")
+        .replace(
+            'base_url = "http://127.0.0.1:3000/v1"',
+            'base_url = "${ELYSIUM_TEST_MODEL_BASE_URL}"',
+        )
+        .replace('id = "primary-id"', 'id = "${ELYSIUM_TEST_MODEL_ID}"'),
+        encoding="utf-8",
+    )
+
+    config = models_loader.init_models_config(
+        registry_path,
+        required_tasks=frozenset({"expression"}),
+    )
+
+    assert config.providers["gateway"]["api_key"] == secret
+    assert config.providers["gateway"]["base_url"] == "https://gateway.example/v1"
+    assert config.get_task("expression")[0]["api_key"] == secret
+    assert config.get_task("expression")[0]["model_identifier"] == (
+        "expanded-primary-id"
+    )
+    assert models_loader.get_models_config() is config
+
+
+def test_unresolved_environment_credential_is_structurally_inspectable_but_not_ready(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry_path = tmp_path / "models.toml"
+    placeholder = "${ELYSIUM_TEST_UNSET_MODEL_API_KEY}"
+    monkeypatch.delenv("ELYSIUM_TEST_UNSET_MODEL_API_KEY", raising=False)
+    monkeypatch.setattr(models_loader, "_models_config", None)
+    _write_minimal_registry(registry_path, api_key=placeholder)
+
+    direct = ModelsConfig(registry_path)
+    assert direct.providers["gateway"]["api_key"] == placeholder
+
+    with pytest.raises(ModelRegistryError, match="未解析") as caught:
+        models_loader.init_models_config(
+            registry_path,
+            required_tasks=frozenset({"expression"}),
+        )
+
+    message = str(caught.value)
+    assert "providers.gateway.api_key" in message
+    assert placeholder not in message
+    assert models_loader._models_config is None
+
+    monkeypatch.setattr(models_loader, "_models_config", direct)
+    with pytest.raises(ModelRegistryError, match="未解析") as get_caught:
+        models_loader.get_models_config()
+    assert "providers.gateway.api_key" in str(get_caught.value)
+    assert placeholder not in str(get_caught.value)
+
+
+def test_runtime_rejects_unresolved_nested_placeholder_without_value_leak(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry_path = tmp_path / "models.toml"
+    placeholder = "${ELYSIUM_TEST_UNSET_TASK_VALUE}"
+    monkeypatch.delenv("ELYSIUM_TEST_UNSET_TASK_VALUE", raising=False)
+    monkeypatch.setattr(models_loader, "_models_config", None)
+    _write_minimal_registry(registry_path)
+    registry_path.write_text(
+        registry_path.read_text(encoding="utf-8").replace(
+            "context_tokens = 16000",
+            f'context_tokens = 16000\nextra = {{ marker = "{placeholder}" }}',
+        ),
+        encoding="utf-8",
+    )
+
+    direct = ModelsConfig(registry_path)
+    assert direct.tasks["expression"]["extra"]["marker"] == placeholder
+
+    with pytest.raises(ModelRegistryError, match="未解析") as caught:
+        models_loader.init_models_config(
+            registry_path,
+            required_tasks=frozenset({"expression"}),
+        )
+
+    message = str(caught.value)
+    assert "tasks.expression.extra.marker" in message
+    assert placeholder not in message
+
+
+@pytest.mark.parametrize(
+    ("api_key", "message"),
+    [
+        ("", "不能为空"),
+        ("   ", "不能为空"),
+        ("replace-with-never-print-this-token", "示例占位符"),
+        ("RePlAcE-WiTh-Never-Print-This-Token", "示例占位符"),
+    ],
+)
+@pytest.mark.parametrize("access_path", ["init", "get"])
+def test_runtime_paths_reject_empty_and_known_placeholders_without_leak(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    api_key: str,
+    message: str,
+    access_path: str,
+) -> None:
+    registry_path = tmp_path / "models.toml"
+    _write_minimal_registry(registry_path, api_key=api_key)
+    direct = ModelsConfig(registry_path)
+    monkeypatch.setattr(
+        models_loader,
+        "_models_config",
+        None if access_path == "init" else direct,
+    )
+
+    with pytest.raises(ModelRegistryError, match=message) as caught:
+        if access_path == "init":
+            models_loader.init_models_config(
+                registry_path,
+                required_tasks=frozenset({"expression"}),
+            )
+        else:
+            models_loader.get_models_config()
+
+    error = str(caught.value)
+    assert "providers.gateway.api_key" in error
+    if api_key.strip():
+        assert api_key not in error
 
 
 def test_registry_preserves_priority_and_attaches_snapshot_identity(

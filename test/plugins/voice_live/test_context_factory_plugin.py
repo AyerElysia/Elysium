@@ -377,8 +377,13 @@ def test_factory_reads_owner_only_api_key_file(
     assert isinstance(create_provider(config), QwenRealtimeProvider)
 
 
-def test_plugin_declares_only_its_router_and_event_handler() -> None:
-    plugin = VoiceLivePlugin(VoiceLiveConfig())
+def test_new_voice_live_install_registers_components_only_when_enabled() -> None:
+    config = VoiceLiveConfig()
+    assert config.plugin.enabled is False
+    assert VoiceLivePlugin(config).get_components() == []
+
+    enabled_config = VoiceLiveConfig(plugin={"enabled": True})
+    plugin = VoiceLivePlugin(enabled_config)
     components = plugin.get_components()
     assert [component.__name__ for component in components] == [
         "VoiceLiveRouter",

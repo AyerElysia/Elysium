@@ -14,6 +14,15 @@ class SkillManagerConfig(BaseConfig):
     config_name: ClassVar[str] = "config"
     config_description: ClassVar[str] = "SkillManager 配置"
 
+    @config_section("plugin", title="插件设置", tag="plugin")
+    class PluginSection(SectionBase):
+        """Top-level activation boundary for all SkillManager components."""
+
+        enabled: bool = Field(
+            default=False,
+            description="是否注册 SkillManager 索引、命令与工具",
+        )
+
     @config_section("manager", title="技能管理", tag="plugin")
     class ManagerSection(SectionBase):
         """技能管理主配置。"""
@@ -52,8 +61,9 @@ class SkillManagerConfig(BaseConfig):
             description="get_reference 返回引用文档的最大字符数",
         )
         allow_script_execution: bool = Field(
-            default=True,
+            default=False,
             description="是否允许 get_script 执行 skill 目录内脚本。关闭后仍可读取 skill 和引用文档。",
         )
 
+    plugin: PluginSection = Field(default_factory=PluginSection)
     manager: ManagerSection = Field(default_factory=ManagerSection)

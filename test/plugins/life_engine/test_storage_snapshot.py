@@ -45,7 +45,9 @@ def _fixture_data(data_root: Path) -> LifeStorageLayout:
     )
 
 
-def test_frozen_snapshot_verifies_and_builds_verified_generation(tmp_path: Path) -> None:
+def test_frozen_snapshot_verifies_and_builds_verified_generation(
+    tmp_path: Path,
+) -> None:
     data_root = tmp_path / "data"
     layout = _fixture_data(data_root)
     source_hash_before = hashlib.sha256(
@@ -71,9 +73,9 @@ def test_frozen_snapshot_verifies_and_builds_verified_generation(tmp_path: Path)
     assert generation.status == GenerationStatus.VERIFIED
     assert generation.frontiers["ledger.sqlite3:events.sequence"] == 2
     assert (data_root / "documents/SOUL.md").read_bytes().startswith(b"\xef\xbb\xbf")
-    assert hashlib.sha256((data_root / "documents/SOUL.md").read_bytes()).hexdigest() == (
-        source_hash_before
-    )
+    assert hashlib.sha256(
+        (data_root / "documents/SOUL.md").read_bytes()
+    ).hexdigest() == (source_hash_before)
 
 
 def test_live_snapshot_stays_candidate_even_when_copy_verifies(tmp_path: Path) -> None:
@@ -142,6 +144,65 @@ def test_sqlite_backup_is_complete_without_sidecar_files(tmp_path: Path) -> None
     with sqlite3.connect(backup) as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone() == ("delete",)
     assert verify_local_snapshot(output)["verified"] is True
+
+
+def test_snapshot_secures_empty_output_before_copying_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root = tmp_path / "data"
+    layout = _fixture_data(data_root)
+    inspected: list[Path] = []
+
+    def inspect_empty_output(path: Path) -> None:
+        assert path.is_dir()
+        assert not any(path.iterdir())
+        inspected.append(path)
+
+    monkeypatch.setattr(
+        "plugins.life_engine.storage.migration.snapshot._restrict_windows_output_acl",
+        inspect_empty_output,
+    )
+    output = tmp_path / "snapshot"
+
+    create_local_snapshot(data_root, output, layout=layout)
+
+    assert inspected == [output]
+    assert (output / "manifest.json").is_file()
+
+
+@pytest.mark.parametrize("link_kind", ["file", "directory"])
+def test_snapshot_rejects_symlinks_inside_exact_roots(
+    tmp_path: Path,
+    link_kind: str,
+) -> None:
+    data_root = tmp_path / "data"
+    layout = _fixture_data(data_root)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    if link_kind == "file":
+        outside_target = outside / "private.txt"
+        outside_target.write_text("must not enter backup", encoding="utf-8")
+        link = data_root / "documents/linked.txt"
+    else:
+        outside_target = outside
+        (outside / "private.txt").write_text(
+            "must not enter backup",
+            encoding="utf-8",
+        )
+        link = data_root / "documents/linked-directory"
+    try:
+        link.symlink_to(outside_target, target_is_directory=link_kind == "directory")
+    except OSError as error:
+        pytest.skip(f"symlink creation unavailable: {error}")
+
+    with pytest.raises(LifeSnapshotError, match="contains a symlink"):
+        create_local_snapshot(data_root, tmp_path / "snapshot", layout=layout)
+
+    assert outside_target.exists()
+    snapshot = tmp_path / "snapshot"
+    copied_files = list(snapshot.rglob("private.txt")) if snapshot.exists() else []
+    assert not copied_files
 
 
 def test_backup_wrapper_persists_independent_verification_failure(

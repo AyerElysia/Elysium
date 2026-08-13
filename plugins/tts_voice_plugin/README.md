@@ -18,11 +18,13 @@
 
 ## 🛠️ 安装依赖
 
-本插件需要以下 Python 库：
+本插件需要 `aiohttp`、`soundfile` 和 `pedalboard`。启用前必须由开发者将它们加入 `pyproject.toml` 并更新 `uv.lock`，随后由部署入口安装锁定依赖：
 
 ```bash
-pip install aiohttp soundfile pedalboard
+./deploy.sh bootstrap
 ```
+
+禁止在生产启动时临时 `pip install` 或 `uv pip install`。未入锁的依赖表示该可选插件尚未具备可复现部署条件，应保持关闭。
 
 > **注意**：使用 `gpt_sovits` 引擎时需要一个运行中的 [GPT-SoVITS API 服务](https://github.com/RVC-Boss/GPT-SoVITS/blob/main/docs/cn/API.md)。使用 `higgs_cloud` 引擎时需要配置 Boson API Key。
 

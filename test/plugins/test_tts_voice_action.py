@@ -17,6 +17,7 @@ def test_disabled_tts_voice_plugin_registers_no_components() -> None:
     cfg.plugin.enable = False
 
     assert TTSVoicePlugin(config=cfg).get_components() == []
+    assert TTSVoicePlugin(config=None).get_components() == []
 
 
 def _build_action(*, always_available: bool, platform: str = "") -> TTSVoiceAction:
@@ -32,7 +33,9 @@ def _build_action(*, always_available: bool, platform: str = "") -> TTSVoiceActi
     return TTSVoiceAction(chat_stream=chat_stream, plugin=plugin)
 
 
-async def test_go_activate_returns_true_when_always_available_enabled(monkeypatch) -> None:
+async def test_go_activate_returns_true_when_always_available_enabled(
+    monkeypatch,
+) -> None:
     """常驻可用开关开启时应直接激活，不走随机/关键词/LLM 判定。"""
     action = _build_action(always_available=True)
 
@@ -46,7 +49,9 @@ async def test_go_activate_returns_true_when_always_available_enabled(monkeypatc
     assert await action.go_activate() is True
 
 
-async def test_go_activate_uses_keyword_when_always_available_disabled(monkeypatch) -> None:
+async def test_go_activate_uses_keyword_when_always_available_disabled(
+    monkeypatch,
+) -> None:
     """关闭常驻可用后，命中关键词应激活。"""
     action = _build_action(always_available=False)
     action._last_message = "我想听你用语音说一句晚安"
@@ -85,7 +90,9 @@ async def test_execute_persists_tts_text_as_voice_plain_text(monkeypatch) -> Non
     action = _build_action(always_available=True)
 
     class FakeTTSService:
-        async def generate_voice(self, *, text: str, style_hint: str, language_hint: str | None) -> str:
+        async def generate_voice(
+            self, *, text: str, style_hint: str, language_hint: str | None
+        ) -> str:
             assert text == "今晚我想认真说一会儿。"
             assert style_hint == "gentle"
             assert language_hint == "zh"
@@ -98,7 +105,9 @@ async def test_execute_persists_tts_text_as_voice_plain_text(monkeypatch) -> Non
         return True
 
     action.tts_service = FakeTTSService()  # type: ignore[assignment]
-    monkeypatch.setattr("plugins.tts_voice_plugin.actions.tts_action.send_voice", fake_send_voice)
+    monkeypatch.setattr(
+        "plugins.tts_voice_plugin.actions.tts_action.send_voice", fake_send_voice
+    )
 
     success, message = await action.execute(
         tts_voice_text="  今晚我想认真说一会儿。  ",

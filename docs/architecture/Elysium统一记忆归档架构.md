@@ -17,7 +17,7 @@ Elysium 的“记忆”并不是单一数据库：聊天与应用记录、原始
 
 | 归档域 | 本地来源 | 归档解释 |
 |---|---|---|
-| `core` | `data/Elysium.db` | 聊天与应用存储快照，不代表主体记忆判断 |
+| `core` | `data/MoFox.db` | 聊天与应用存储快照，不代表主体记忆判断 |
 | `life_events` | `life_events.sqlite3` | 原始生命事件、导入证据与工程游标 |
 | `life_memory` | `.memory/memory.db` | 同时包含不可变历史、版本状态与可重建投影，必须逐表区分 |
 | `consciousness_presence` | `runtime/consciousness_presence.sqlite3` | 意识在场技术记录，不是人格或主观状态 |

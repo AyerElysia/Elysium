@@ -6,6 +6,38 @@ from pydantic import ValidationError
 from src.core.config.core_config import CoreConfig
 
 
+def test_default_local_profile_has_safe_mysql_recycle_window() -> None:
+    """Local 配置也携带 MySQL 默认字段，默认组合必须始终可构造。"""
+    config = CoreConfig()
+
+    assert config.storage.backend == "local"
+    assert config.database.mysql_pool_recycle_seconds == 120
+    assert config.database.mysql_idle_session_timeout_seconds == 180
+    assert (
+        config.database.mysql_pool_recycle_seconds
+        < config.database.mysql_idle_session_timeout_seconds
+    )
+
+
+def test_mysql_recycle_must_be_shorter_than_idle_session_timeout() -> None:
+    """连接池不能晚于服务端 idle timeout 才回收失效连接。"""
+    with pytest.raises(
+        ValidationError,
+        match=(
+            r"database\.mysql_pool_recycle_seconds must be shorter than "
+            r"database\.mysql_idle_session_timeout_seconds"
+        ),
+    ):
+        CoreConfig.model_validate(
+            {
+                "database": {
+                    "mysql_pool_recycle_seconds": 1800,
+                    "mysql_idle_session_timeout_seconds": 180,
+                }
+            }
+        )
+
+
 def test_mysql_connection_parameters_remain_in_database_section() -> None:
     """全局选择后，数据库节仍只负责 MySQL 连接参数。"""
     config = CoreConfig(

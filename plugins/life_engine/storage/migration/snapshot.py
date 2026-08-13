@@ -9,6 +9,8 @@ import math
 import os
 import shutil
 import sqlite3
+import stat
+import subprocess
 import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -51,7 +53,7 @@ class LifeStorageLayout:
     """Explicit inventory of authoritative/operational files to preserve."""
 
     sqlite_sources: tuple[Path, ...] = (
-        Path("Elysium.db"),
+        Path("MoFox.db"),
         Path("life_engine_workspace/.memory/memory.db"),
         Path("life_engine_workspace/life_events.sqlite3"),
         Path("life_engine_workspace/runtime/consciousness_presence.sqlite3"),
@@ -195,11 +197,16 @@ def _stat_identity(path: Path) -> dict[str, int]:
     }
 
 
-def _sqlite_source_evidence(source: Path, *, include_hash: bool) -> list[dict[str, Any]]:
+def _sqlite_source_evidence(
+    source: Path, *, include_hash: bool
+) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for candidate in (source, Path(f"{source}-wal"), Path(f"{source}-shm")):
-        if not candidate.exists():
+        if not os.path.lexists(candidate):
             continue
+        metadata = candidate.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise LifeSnapshotError(f"SQLite source is not a regular file: {candidate}")
         record: dict[str, Any] = {
             "name": candidate.name,
             "stat": _stat_identity(candidate),
@@ -217,6 +224,11 @@ def _backup_sqlite(
     *,
     writer_frozen: bool,
 ) -> dict[str, Any]:
+    source_metadata = source.lstat()
+    if stat.S_ISLNK(source_metadata.st_mode) or not stat.S_ISREG(
+        source_metadata.st_mode
+    ):
+        raise LifeSnapshotError(f"SQLite source is not a regular file: {source}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="elysium-life-snapshot-") as temporary:
         staged = Path(temporary) / source.name
@@ -276,6 +288,158 @@ def _is_excluded(relative: Path, layout: LifeStorageLayout) -> bool:
     return any(relative == root or root in relative.parents for root in excluded)
 
 
+def _safe_layout_path(data_root: Path, relative: Path) -> Path | None:
+    """Resolve a layout entry without following source-side symlinks."""
+
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        raise LifeSnapshotError(f"unsafe snapshot layout path: {relative}")
+    current = data_root
+    for index, part in enumerate(relative.parts):
+        current = current / part
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            return None
+        if stat.S_ISLNK(metadata.st_mode):
+            raise LifeSnapshotError(
+                f"snapshot source contains a symlink: {relative.as_posix()}"
+            )
+        if index < len(relative.parts) - 1 and not stat.S_ISDIR(metadata.st_mode):
+            raise LifeSnapshotError(
+                f"snapshot source ancestor is not a directory: {relative.as_posix()}"
+            )
+    try:
+        current.resolve(strict=True).relative_to(data_root)
+    except (OSError, ValueError) as error:
+        raise LifeSnapshotError(
+            f"snapshot source escapes data root: {relative.as_posix()}"
+        ) from error
+    return current
+
+
+def _restrict_windows_output_acl(path: Path) -> None:
+    """Protect an empty snapshot directory before authoritative bytes are copied."""
+
+    if os.name != "nt":
+        return
+    whoami = shutil.which("whoami")
+    icacls = shutil.which("icacls")
+    if whoami is None or icacls is None:
+        raise LifeSnapshotError(
+            "cannot protect snapshot output: Windows ACL tools are unavailable"
+        )
+    try:
+        identity_result = subprocess.run(
+            [whoami],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise LifeSnapshotError(
+            "cannot determine the current Windows identity"
+        ) from error
+    identity = identity_result.stdout.strip()
+    if identity_result.returncode != 0 or not identity:
+        raise LifeSnapshotError("cannot determine the current Windows identity")
+    try:
+        for command in (
+            [icacls, str(path), "/setowner", identity],
+            [
+                icacls,
+                str(path),
+                "/inheritance:r",
+                "/grant:r",
+                f"{identity}:(OI)(CI)(F)",
+            ],
+        ):
+            result = subprocess.run(
+                command,
+                check=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=20,
+            )
+            if result.returncode != 0:
+                raise LifeSnapshotError(
+                    "cannot restrict snapshot output to the current Windows user"
+                )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise LifeSnapshotError(
+            "cannot restrict snapshot output to the current Windows user"
+        ) from error
+
+
+def _iter_exact_regular_files(data_root: Path, relative_root: Path) -> list[Path]:
+    source_root = _safe_layout_path(data_root, relative_root)
+    if source_root is None:
+        return []
+    metadata = source_root.lstat()
+    if stat.S_ISREG(metadata.st_mode):
+        return [source_root]
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise LifeSnapshotError(
+            f"snapshot exact root is not a regular file or directory: {relative_root}"
+        )
+
+    files: list[Path] = []
+    for current_raw, directory_names, file_names in os.walk(
+        source_root,
+        followlinks=False,
+    ):
+        current = Path(current_raw)
+        for directory_name in list(directory_names):
+            directory = current / directory_name
+            relative = directory.relative_to(data_root)
+            try:
+                directory_metadata = directory.lstat()
+            except OSError as error:
+                raise LifeSnapshotError(
+                    f"snapshot directory cannot be inspected: {relative.as_posix()}"
+                ) from error
+            if stat.S_ISLNK(directory_metadata.st_mode):
+                raise LifeSnapshotError(
+                    f"snapshot source contains a symlink: {relative.as_posix()}"
+                )
+            if not stat.S_ISDIR(directory_metadata.st_mode):
+                raise LifeSnapshotError(
+                    f"snapshot source contains a non-directory entry: {relative.as_posix()}"
+                )
+        for file_name in file_names:
+            source = current / file_name
+            relative = source.relative_to(data_root)
+            try:
+                file_metadata = source.lstat()
+            except OSError as error:
+                raise LifeSnapshotError(
+                    f"snapshot file cannot be inspected: {relative.as_posix()}"
+                ) from error
+            if stat.S_ISLNK(file_metadata.st_mode):
+                raise LifeSnapshotError(
+                    f"snapshot source contains a symlink: {relative.as_posix()}"
+                )
+            if not stat.S_ISREG(file_metadata.st_mode):
+                raise LifeSnapshotError(
+                    f"snapshot source contains a non-regular file: {relative.as_posix()}"
+                )
+            try:
+                source.resolve(strict=True).relative_to(data_root)
+            except (OSError, ValueError) as error:
+                raise LifeSnapshotError(
+                    f"snapshot source escapes data root: {relative.as_posix()}"
+                ) from error
+            files.append(source)
+    return files
+
+
 def _copy_exact_files(
     data_root: Path,
     output: Path,
@@ -285,13 +449,13 @@ def _copy_exact_files(
     records: list[dict[str, Any]] = []
     seen: set[Path] = set()
     for root in layout.exact_roots:
-        source_root = data_root / root
-        if not source_root.exists():
-            continue
-        candidates = [source_root] if source_root.is_file() else source_root.rglob("*")
-        for source in sorted(path for path in candidates if path.is_file()):
+        for source in sorted(_iter_exact_regular_files(data_root, root)):
             relative = source.relative_to(data_root)
-            if relative in seen or relative in sqlite_sources or _is_excluded(relative, layout):
+            if (
+                relative in seen
+                or relative in sqlite_sources
+                or _is_excluded(relative, layout)
+            ):
                 continue
             if source.name.endswith(_SQLITE_SUFFIXES):
                 continue
@@ -335,6 +499,7 @@ def create_local_snapshot(
     *,
     layout: LifeStorageLayout | None = None,
     writer_frozen: bool = False,
+    precreated_output: bool = False,
 ) -> dict[str, Any]:
     """Copy local sources into a new directory and write cryptographic evidence.
 
@@ -343,20 +508,50 @@ def create_local_snapshot(
     can later become a verified writable generation.
     """
 
-    data_root = Path(data_root).resolve()
-    output = Path(output).resolve()
+    raw_data_root = Path(data_root).absolute()
+    try:
+        root_metadata = raw_data_root.lstat()
+    except OSError as error:
+        raise LifeSnapshotError(f"data root does not exist: {raw_data_root}") from error
+    if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
+        raise LifeSnapshotError("data root must be a real directory, not a symlink")
+    data_root = raw_data_root.resolve(strict=True)
+    raw_output = Path(output).absolute()
+    if os.path.lexists(raw_output):
+        output_metadata = raw_output.lstat()
+        if stat.S_ISLNK(output_metadata.st_mode) or not stat.S_ISDIR(
+            output_metadata.st_mode
+        ):
+            raise LifeSnapshotError("snapshot output must be an ordinary directory")
+        if not precreated_output:
+            raise LifeSnapshotError(
+                "snapshot output already exists; refusing overwrite"
+            )
+        if any(raw_output.iterdir()):
+            raise LifeSnapshotError("precreated snapshot output must be empty")
+    output = raw_output.resolve()
     layout = LifeStorageLayout() if layout is None else layout
     if not data_root.is_dir():
         raise LifeSnapshotError(f"data root does not exist: {data_root}")
-    if output.exists():
-        raise LifeSnapshotError("snapshot output already exists; refusing overwrite")
     try:
         output.relative_to(data_root)
     except ValueError:
         pass
     else:
         raise LifeSnapshotError("snapshot output must be outside the source data root")
-    output.mkdir(parents=True)
+    if not output.exists():
+        output.mkdir(mode=0o700, parents=True)
+    elif os.name != "nt":
+        os.chmod(output, stat.S_IRWXU)
+    try:
+        _restrict_windows_output_acl(output)
+    except LifeSnapshotError:
+        if not any(output.iterdir()):
+            try:
+                output.rmdir()
+            except OSError:
+                pass
+        raise
     incomplete_marker = output / "SNAPSHOT_INCOMPLETE"
     with incomplete_marker.open("xb") as handle:
         handle.write(b"snapshot creation did not complete\n")
@@ -366,8 +561,8 @@ def create_local_snapshot(
     sqlite_records: list[dict[str, Any]] = []
     frontiers: dict[str, int] = {}
     for relative in layout.sqlite_sources:
-        source = data_root / relative
-        if not source.is_file():
+        source = _safe_layout_path(data_root, relative)
+        if source is None or not stat.S_ISREG(source.lstat().st_mode):
             raise LifeSnapshotError(f"required SQLite source is missing: {relative}")
         backup_relative = Path("sqlite") / relative
         record = _backup_sqlite(
@@ -393,7 +588,11 @@ def create_local_snapshot(
     file_records = _copy_exact_files(data_root, output, layout)
     files_root = canonical_json_sha256(
         [
-            {"path": item["source_relative"], "bytes": item["bytes"], "sha256": item["sha256"]}
+            {
+                "path": item["source_relative"],
+                "bytes": item["bytes"],
+                "sha256": item["sha256"],
+            }
             for item in file_records
         ]
     )
@@ -444,9 +643,9 @@ def create_local_snapshot(
     }
     manifest["manifest_sha256"] = snapshot_manifest_sha256(manifest)
     manifest_path = output / "manifest.json"
-    encoded = (json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode(
-        "utf-8"
-    )
+    encoded = (
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
     with manifest_path.open("xb") as handle:
         handle.write(encoded)
         handle.flush()

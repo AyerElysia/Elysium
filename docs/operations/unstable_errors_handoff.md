@@ -418,9 +418,9 @@ sqlite3.IntegrityError: NOT NULL constraint failed: raw_event_consumer_offsets.r
 
 1. **shared_sync（事件级双向）**：`config/plugins/life_engine/config.toml [shared_sync]`：
    - `enabled = true`、`remote_host = "frp-one.com"`、`remote_port = 65429`、`remote_user = "elysia"`、`pull_enabled = true`；
-   - 密码走 `ELYSIUM_SYNC_MYSQL_PASSWORD` 环境变量（.bashrc 已加）；
+   - 密码走 `ELYSIUM_SYNC_MYSQL_PASSWORD` 环境变量；历史现场曾写入 `.bashrc` 的做法已经退役，轮换旧凭据后应移除持久明文，并由当前终端或受控 secret manager 注入；
    - 仅 local 模式可用（`_selectable_storage_enabled` 必须 False），绑定 life_events.sqlite3，visibility=shared 的事件 push/pull 双向。
-2. **sync_local_to_mysql.py（Core 表增量）**：`scripts/sync_job.sh` + crontab 每 10 分钟；按自然键只 INSERT 远端缺失行，不覆盖。dry-run 验证通过。
+2. **历史 Core 表增量同步**：自动 crontab 方案已经退役。`scripts/sync_job.sh` 只允许操作者显式执行一次，并由 `scripts/sync_local_to_mysql.py` 通过环境变量和 owner-only 临时 defaults 文件取得凭据；部署脚本不会安装、调度或调用它。任何同步前仍须单独确认源、目标、writer 与备份边界。
 3. 仿真验证：SharedSyncBridge 初始化 OK（push+pull=True），17 项数据完整性检查全部 PASS，修复后 0 ERROR、heartbeat 正常。
 
 ### 8.5 遗留
