@@ -621,6 +621,47 @@ async def test_managed_claim_renewal_propagates_cancellation(
 
 
 @pytest.mark.asyncio
+async def test_managed_claim_renewal_accepts_same_epoch_after_registry_roll(
+    tmp_path: Path,
+) -> None:
+    """后台续期循环(_renew_managed_singleton_writers)每次 renew 会把注册表
+    对象替换为新 lease_until 的副本（frozen dataclass 字段比较不相等）。持有
+    方持有的同 epoch/token 旧引用再 renew 必须成功（fencing 校验保证安全），
+    而不是误判 "not managed locally" 后 re-acquire 又撞 "already managed"。
+    回归锚点：2026-08-13 14:31 线上 renew not-managed + acquire already-managed
+    连环报错。"""
+
+    async with _local_store(tmp_path) as (runtime, _store):
+        original = await runtime.acquire_singleton_writer(
+            namespace="life_engine.learning",
+            state_key="selected_persistence",
+            owner_instance_id="host-a:pid-100:boot-a",
+            lease_seconds=30,
+        )
+        # 模拟后台续期循环把注册表对象替换为新 lease_until 副本
+        await runtime._renew_managed_singleton_writers()
+        registry_claim = runtime._managed_singleton_claims[
+            (original.namespace, original.state_key)
+        ][0]
+        assert registry_claim != original  # frozen dataclass 字段比较不相等
+
+        # 持有方用旧引用 renew：必须成功（修复前抛 not managed locally）
+        renewed = await runtime.renew_singleton_writer(
+            original,
+            lease_seconds=30,
+        )
+        assert renewed is not None
+        assert renewed.lease_epoch == original.lease_epoch
+        # 注册表已滚动到 renewed
+        assert (
+            runtime._managed_singleton_claims[
+                (original.namespace, original.state_key)
+            ][0]
+            == renewed
+        )
+
+
+@pytest.mark.asyncio
 async def test_runtime_exposes_trigger_binding_without_claim_store_access(
     tmp_path: Path,
 ) -> None:
