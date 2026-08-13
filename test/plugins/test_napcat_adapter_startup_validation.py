@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+from mofox_wire import WebSocketAdapterOptions
 
 from plugins.napcat_adapter.config import NapcatAdapterConfig
 from plugins.napcat_adapter.events.meta import MetaEventHandler
@@ -48,7 +50,7 @@ def test_enabled_napcat_plugin_still_registers_adapter_component() -> None:
     assert plugin.get_components() == [NapcatAdapter]
 
 
-def _build_napcat_plugin() -> NapcatAdapterPlugin:
+def _build_napcat_plugin(*, access_token: str = "") -> NapcatAdapterPlugin:
     """构造测试用 Napcat 插件实例。"""
     config = NapcatAdapterConfig.from_dict(
         {
@@ -58,7 +60,7 @@ def _build_napcat_plugin() -> NapcatAdapterPlugin:
                 "mode": "reverse",
                 "host": "localhost",
                 "port": 8095,
-                "access_token": "",
+                "access_token": access_token,
             },
             "features": {
                 "group_list_type": "blacklist",
@@ -79,6 +81,28 @@ def _build_napcat_plugin() -> NapcatAdapterPlugin:
         }
     )
     return NapcatAdapterPlugin(config=config)
+
+
+async def _capture_reverse_ws_handler(
+    adapter: NapcatAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Any, dict[str, Any]]:
+    """Capture the legacy-server handler without opening a real socket."""
+    captured: dict[str, Any] = {}
+
+    async def fake_serve(handler: Any, host: str, port: int, **kwargs: Any) -> Any:
+        captured.update(handler=handler, host=host, port=port, kwargs=kwargs)
+        return SimpleNamespace(is_serving=lambda: True)
+
+    monkeypatch.setattr("websockets.legacy.server.serve", fake_serve)
+    options = cast(WebSocketAdapterOptions, adapter._transport_config)
+    await adapter._start_ws_server(options)
+    return captured["handler"], captured
+
+
+def _fake_reverse_ws(authorization: str | None = None) -> Any:
+    headers = {} if authorization is None else {"Authorization": authorization}
+    return SimpleNamespace(path="/", request_headers=headers, close=AsyncMock())
 
 
 class _FakeCoreSink:
@@ -683,6 +707,114 @@ async def test_reverse_mode_health_fails_when_listener_is_missing() -> None:
     adapter._ws_server = None
 
     assert await adapter.health_check() is False
+
+
+async def test_reverse_ws_accepts_matching_bearer_without_response_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "test-reverse-token"
+    adapter = NapcatAdapter(
+        core_sink=cast(Any, _FakeCoreSink()),
+        plugin=_build_napcat_plugin(access_token=secret),
+    )
+    connected = AsyncMock()
+    disconnected = AsyncMock()
+    listen = AsyncMock()
+    monkeypatch.setattr(adapter, "on_ws_connected", connected)
+    monkeypatch.setattr(adapter, "on_ws_disconnected", disconnected)
+    monkeypatch.setattr(adapter, "_ws_listen_loop", listen)
+
+    handler, captured = await _capture_reverse_ws_handler(adapter, monkeypatch)
+    ws = _fake_reverse_ws(f"Bearer {secret}")
+    with patch(
+        "plugins.napcat_adapter.plugin.hmac.compare_digest",
+        wraps=hmac.compare_digest,
+    ) as compare_digest:
+        await handler(ws)
+
+    options = cast(WebSocketAdapterOptions, adapter._transport_config)
+    assert options.headers is None
+    assert "extra_headers" not in captured["kwargs"]
+    compare_digest.assert_called_once()
+    ws.close.assert_not_awaited()
+    connected.assert_awaited_once_with(ws)
+    listen.assert_awaited_once_with(options)
+    disconnected.assert_awaited_once_with()
+
+
+async def test_reverse_ws_rejects_wrong_bearer_without_leaking_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "test-reverse-token"
+    adapter = NapcatAdapter(
+        core_sink=cast(Any, _FakeCoreSink()),
+        plugin=_build_napcat_plugin(access_token=secret),
+    )
+    connected = AsyncMock()
+    listen = AsyncMock()
+    warning = Mock()
+    monkeypatch.setattr(adapter, "on_ws_connected", connected)
+    monkeypatch.setattr(adapter, "_ws_listen_loop", listen)
+    monkeypatch.setattr("plugins.napcat_adapter.plugin.logger.warning", warning)
+
+    handler, _captured = await _capture_reverse_ws_handler(adapter, monkeypatch)
+    ws = _fake_reverse_ws("Bearer wrong-token")
+    await handler(ws)
+
+    ws.close.assert_awaited_once_with(code=4401, reason="Unauthorized")
+    connected.assert_not_awaited()
+    listen.assert_not_awaited()
+    assert adapter._ws is None
+    assert secret not in repr(warning.call_args_list)
+    assert secret not in repr(ws.close.await_args_list)
+
+
+async def test_reverse_ws_rejects_missing_bearer_without_taking_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = NapcatAdapter(
+        core_sink=cast(Any, _FakeCoreSink()),
+        plugin=_build_napcat_plugin(access_token="test-reverse-token"),
+    )
+    connected = AsyncMock()
+    listen = AsyncMock()
+    monkeypatch.setattr(adapter, "on_ws_connected", connected)
+    monkeypatch.setattr(adapter, "_ws_listen_loop", listen)
+
+    handler, _captured = await _capture_reverse_ws_handler(adapter, monkeypatch)
+    ws = _fake_reverse_ws()
+    await handler(ws)
+
+    ws.close.assert_awaited_once_with(code=4401, reason="Unauthorized")
+    connected.assert_not_awaited()
+    listen.assert_not_awaited()
+    assert adapter._ws is None
+
+
+async def test_reverse_ws_empty_token_preserves_unauthenticated_compatibility(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = NapcatAdapter(
+        core_sink=cast(Any, _FakeCoreSink()),
+        plugin=_build_napcat_plugin(access_token=""),
+    )
+    connected = AsyncMock()
+    disconnected = AsyncMock()
+    listen = AsyncMock()
+    monkeypatch.setattr(adapter, "on_ws_connected", connected)
+    monkeypatch.setattr(adapter, "on_ws_disconnected", disconnected)
+    monkeypatch.setattr(adapter, "_ws_listen_loop", listen)
+
+    handler, _captured = await _capture_reverse_ws_handler(adapter, monkeypatch)
+    ws = _fake_reverse_ws()
+    with patch("plugins.napcat_adapter.plugin.hmac.compare_digest") as compare_digest:
+        await handler(ws)
+
+    compare_digest.assert_not_called()
+    ws.close.assert_not_awaited()
+    connected.assert_awaited_once_with(ws)
+    listen.assert_awaited_once()
+    disconnected.assert_awaited_once_with()
 
 
 async def test_qq_explicit_identity_mapping_reaches_envelope() -> None:

@@ -33,6 +33,7 @@
 - Life Engine 删除主体模板自动生成路径，校验前不取得会写盘的运行资源。
 - 历史危险同步/清理入口改为退役或 owner-only 凭据文件传递；Windows 入口只转发到新 run。
 - 可选插件新安装默认关闭，禁用时不注册其外部副作用组件。
+- NapCat reverse WebSocket 不再把 Bearer token 放入服务端响应头；非空 token 会在接管连接前以常量时间校验，失败日志与关闭原因均不含凭据。
 - 上下文清理/权限命令也改为显式 opt-in；未完成的 AstrBot sister bridge 保持 manifest 级禁用，在导入前排除。
 - Core 示例配置改为当前 schema、默认本地存储、8000 loopback 和禁止运行时装包。
 - MySQL 连接池基准修正为 `120 < 180`，doctor 同步验证该不变量；配置树和主体工作区父路径中任何符号链接均 fail-closed。
@@ -58,11 +59,12 @@
 - writer 未冻结时拒绝 `--writer-frozen` 备份声明；
 - 备份父目录权限、预创建输出目录、目录身份复核、Windows 写前 ACL、MySQL 临时凭据/partial/manifest 写前保护、描述符异常关闭及 secret 脱敏；
 - Life Engine 定向生命周期测试和可选插件禁用测试；
+- NapCat reverse WebSocket 的正确、错误、缺失与空 token 四类鉴权合同；
 - `ruff`、`compileall`、`git diff --check` 及风险范围 pytest。
 
-任务执行记录中的两批风险范围 pytest 分别为 `98 passed` 与 `62 passed`。拉取并整合远端 `bf6d50c2` 后，最终完整离线回归命令 `uv run --group dev python -m pytest test -q --no-cov -n 0` 得到 `4677 passed, 21 skipped, 2 warnings`；两条 warning 均来自第三方 `websockets` 弃用提示。`uv lock --check`、ShellCheck、Bash 语法、`compileall`、全范围确定性 Ruff `E9/F63/F7/F82`、部署风险文件完整 Ruff 与 `git diff --check` 均通过。当前 Linux 环境没有 `pwsh`，因此 `deploy.ps1` 由共享 Python 合同测试与静态审查覆盖，尚未在真实 PowerShell 解释器执行。
+任务执行记录中的两批风险范围 pytest 分别为 `98 passed` 与 `62 passed`。拉取并整合远端 `bf6d50c2`、补齐 NapCat reverse WebSocket 鉴权合同后，最终完整离线回归命令 `uv run --group dev python -m pytest test -q --no-cov -n 0` 得到 `4681 passed, 21 skipped, 2 warnings`；两条 warning 均来自第三方 `websockets` 弃用提示。`uv lock --check`、ShellCheck、Bash 语法、`compileall`、全范围确定性 Ruff `E9/F63/F7/F82`、部署风险文件完整 Ruff 与 `git diff --check` 均通过。当前 Linux 环境没有 `pwsh`，因此 `deploy.ps1` 由共享 Python 合同测试与静态审查覆盖，尚未在真实 PowerShell 解释器执行。
 
-拉取远端变更后的当前 checkout 执行 `./deploy.sh doctor --json` 保持完全只读，返回 `13 passed, 5 failed, 1 disabled` 和退出码 2。现有 Core 与模型配置的访问边界通过；失败项是 NexusAI provider 环境密钥尚未解析、本机配置未全部通过综合 schema，以及 `SOUL.md`、`USER.md`、`MEMORY.md` 尚未从可信历史恢复。检查没有创建或改写配置、主体文件或运行数据。该结果证明当前 checkout 会 fail-closed，不是生产就绪声明。
+在 owner-only 本机 secret 注入下，当前 checkout 执行 `doctor --json` 保持完全只读，返回 `15 passed, 3 failed, 1 disabled` 和退出码 2。依赖锁、Core、模型密钥引用、配置权限与综合 schema 均通过；仅 `SOUL.md`、`USER.md`、`MEMORY.md` 尚未从同一份可信历史恢复。检查没有创建或改写主体文件。该结果证明当前 checkout 会在主体权威不完整时 fail-closed，不是生产就绪声明。
 
 用户尚未在本次变更后手工启动 Elysium，因此即使后续离线检查全部通过，状态也只能是 `offline_validated`；`runtime_accepted` 仍须由用户手工前台启动并以关键链路日志证明。
 

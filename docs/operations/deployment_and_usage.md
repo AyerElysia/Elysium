@@ -900,9 +900,9 @@ qq_nickname = "<机器人昵称>"
 
 [napcat_server]
 mode = "reverse"
-host = "localhost"
+host = "127.0.0.1"
 port = 0  # 替换为部署环境选择的未占用端口
-access_token = ""
+access_token = "<仅写入本机忽略配置的强随机令牌>"
 ```
 
 字段说明：
@@ -913,9 +913,9 @@ access_token = ""
 | `bot.qq_id` | 独立机器人 QQ 号，必须与 NapCat 实际登录账号一致 |
 | `bot.qq_nickname` | Elysium 内部使用的机器人昵称 |
 | `napcat_server.mode` | 当前固定为 `reverse`，表示 Elysium 监听、NapCat 主动连接 |
-| `napcat_server.host` | 本机部署使用 `localhost` |
+| `napcat_server.host` | 同一网络命名空间使用 `127.0.0.1`；NapCat 位于 Docker bridge 时，只绑定宿主的精确 bridge 地址，不绑定所有网卡 |
 | `napcat_server.port` | 当前约定为 `<OneBot端口>` |
-| `napcat_server.access_token` | 可选；若启用，NapCat 与 Elysium 两端必须填写相同值，且不得提交真实令牌 |
+| `napcat_server.access_token` | NapCat 与 Elysium 两端填写相同值，且不得提交真实令牌；reverse 服务端会在接管连接前校验 `Authorization: Bearer <token>` |
 
 ### 10.3 配置 NapCat OneBot 11 客户端
 
@@ -932,7 +932,9 @@ access_token = ""
 4. 如果设置 Access Token，必须与 Elysium `access_token` 完全一致；真实令牌不得写入文档或提交。
 5. 保存配置后确认 NapCat 使用的是独立机器人 QQ，而不是个人 QQ。
 
-这里不需要额外配置正向 WebSocket 服务端，也不需要为本机连接开放公网端口。`<OneBot端口>` 只用于本机 NapCat 与 Elysium 之间的 OneBot 连接。
+这里不需要额外配置正向 WebSocket 服务端，也不需要为本机连接开放公网端口。`<OneBot端口>` 只用于本机 NapCat 与 Elysium 之间的 OneBot 连接。若 NapCat 运行在 Docker bridge 中，容器内的 `127.0.0.1` 只指向容器自身；此时应让 Elysium 只监听宿主 bridge 地址，并让 WebSocket Client 连接同一地址。不得为了省事把监听暴露到公网网卡。
+
+配置非空 token 后，Elysium reverse 服务端会在设置连接 owner、绑定 NapCat client 或进入监听循环之前，以常量时间比较 Bearer token。缺失或错误 token 会以通用 `Unauthorized` 拒绝，真实 token 不进入响应头、关闭原因或日志。空 token 仅保留旧部署兼容，不是新部署建议。
 
 ### 10.4 恢复启用后的正式启动顺序
 

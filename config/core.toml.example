@@ -78,7 +78,7 @@ mysql_query_timeout_seconds = 10
 mysql_lock_wait_timeout_seconds = 5
 
 [permissions]
-# Add only explicit platform identities, for example "napcat:123456".
+# Add only explicit platform identities, for example "qq:123456".
 owner_list = []
 default_permission_level = "user"
 strict_mode = true

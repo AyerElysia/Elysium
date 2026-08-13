@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import re
 import time
 from typing import Any, cast
@@ -74,7 +75,7 @@ class NapcatAdapter(BaseAdapter):
 
             ws_url = f"ws://{host}:{port}"
             headers = {}
-            if access_token:
+            if access_token and ws_mode == "client":
                 headers["Authorization"] = f"Bearer {access_token}"
         else:
             ws_url = "ws://127.0.0.1:8095"
@@ -184,6 +185,10 @@ class NapcatAdapter(BaseAdapter):
         host = parsed.hostname or "0.0.0.0"
         port = parsed.port or (443 if parsed.scheme == "wss" else 80)
         path = parsed.path or "/"
+        config = self._get_config()
+        access_token = (
+            str(config.napcat_server.access_token or "") if config is not None else ""
+        )
 
         async def handler(ws: Any) -> None:
             # path guard（与 mofox_wire 保持一致）
@@ -192,6 +197,11 @@ class NapcatAdapter(BaseAdapter):
                 return
             if ws.path != path:
                 await ws.close(code=4000, reason="Path mismatch")
+                return
+
+            if not self._is_reverse_ws_authorized(ws, access_token):
+                logger.warning("NapCat 反向 WebSocket 鉴权失败，拒绝连接")
+                await ws.close(code=4401, reason="Unauthorized")
                 return
 
             self._ws = ws
@@ -205,12 +215,33 @@ class NapcatAdapter(BaseAdapter):
             handler,
             host,
             port,
-            extra_headers=options.headers,
             max_size=options.max_message_size,
             ping_interval=20,
             ping_timeout=20,
         )
         logger.info(f"NapCat WebSocket 服务器已在 {host}:{port} 启动，等待连接...")
+
+    @staticmethod
+    def _is_reverse_ws_authorized(ws: Any, access_token: str) -> bool:
+        """Validate an inbound reverse-WebSocket bearer token without logging it."""
+        if not access_token:
+            return True
+
+        request_headers = getattr(ws, "request_headers", None)
+        authorization = ""
+        if request_headers is not None:
+            try:
+                candidate = request_headers.get("Authorization", "")
+            except (LookupError, TypeError, ValueError):
+                candidate = ""
+            if isinstance(candidate, str):
+                authorization = candidate
+
+        expected = f"Bearer {access_token}"
+        return hmac.compare_digest(
+            authorization.encode("utf-8"),
+            expected.encode("utf-8"),
+        )
 
     async def on_ws_connected(self, ws: Any) -> None:
         """WebSocket 连接建立时调用。"""
