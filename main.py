@@ -88,6 +88,16 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    # Inject git-ignored local secrets (e.g. runtime/app_api_v1_env.local)
+    # before anything reads os.environ, so IDE/terminal launches behave
+    # exactly like the desktop start script. Values are never printed.
+    from src.app.runtime.env_local import load_local_env
+
+    _loaded_local_env = load_local_env(
+        Path(__file__).resolve().parent / "runtime" / "app_api_v1_env.local"
+    )
+    if _loaded_local_env:
+        print(f"[env] loaded local secrets: {', '.join(_loaded_local_env)}")
     try:
         # SQLite remains process-local; MySQL coordinates concurrent writers.
         with runtime_startup_guard("config/core.toml"):

@@ -427,6 +427,12 @@ app_api_v1_max_command_backlog = 1000
 - `ELYSIUM_APP_API_V1_SIGNING_SECRET`：至少 32 字节的稳定随机密钥；重启时必须保持一致，不得写入 TOML、日志或 Git；
 - `ELYSIUM_INSTALLATION_ID`：该部署实例的稳定非空 ID，用于绑定本机 bootstrap challenge。
 
+注入方式：启动链（`main.py`）在最前面自动读取 git-ignored 的
+`runtime/app_api_v1_env.local`（`KEY=VALUE` 逐行格式，支持 `#` 注释与 CRLF），
+把其中未在进程环境中设置的变量注入 `os.environ`；已存在的环境变量优先。
+桌面 `start_elysium.bat` 的注入逻辑保留为兼容冗余。因此 IDE/终端直接运行
+`main.py` 与通过启动脚本运行行为一致，不会因缺少签名密钥导致挂载失败。
+
 安全与恢复边界：
 
 - `api_keys` 是旧 WebUI 合同，不会替代 `/api/v1` 的短时 session、refresh、撤销和单次 WebSocket ticket；
