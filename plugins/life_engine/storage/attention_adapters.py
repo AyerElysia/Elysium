@@ -15,7 +15,9 @@ from sqlalchemy import bindparam, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from plugins.life_engine.attention_threads.contracts import (
+from src.kernel.storage import canonical_json
+
+from ..attention_threads.contracts import (
     AttentionThreadActorInactive,
     AttentionThreadCommand,
     AttentionThreadCommit,
@@ -29,14 +31,12 @@ from plugins.life_engine.attention_threads.contracts import (
     AttentionThreadView,
     InstanceFocus,
 )
-from plugins.life_engine.attention_threads.models import (
+from ..attention_threads.models import (
     apply_attention_thread_event,
 )
-from plugins.life_engine.attention_threads.projection import (
+from ..attention_threads.projection import (
     build_attention_thread_projection,
 )
-from src.kernel.storage import canonical_json
-
 from .contracts import StorageBackendRuntime
 from .models import BackendKind
 

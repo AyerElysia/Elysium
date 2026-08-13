@@ -14,14 +14,14 @@ from sqlalchemy import bindparam, text
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from plugins.life_engine.service.event_bus import (
+from src.kernel.storage import canonical_json
+
+from ..service.event_bus import (
     LifeEvent,
     RawEventGapError,
     life_event_from_dict,
     life_event_to_dict,
 )
-from src.kernel.storage import canonical_json
-
 from .contracts import StorageBackendRuntime, StorageWriterRole
 from .event_contracts import (
     LifeEventConsumerConflict,

@@ -9,8 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from plugins.life_engine.service.event_bus import life_event_from_dict
-
+from ...service.event_bus import life_event_from_dict
 from ..event_contracts import (
     LifeEventSnapshotCursor,
     LifeEventSnapshotImportPort,

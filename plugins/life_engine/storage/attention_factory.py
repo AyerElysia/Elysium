@@ -4,11 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from plugins.life_engine.attention_threads.contracts import (
+from ..attention_threads.contracts import (
     AttentionThreadAuthorityPort,
     InstanceFocusPort,
 )
-
 from .attention_adapters import (
     LocalAttentionThreadStore,
     MySQLAttentionThreadStore,
