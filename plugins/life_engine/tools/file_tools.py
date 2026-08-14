@@ -1279,6 +1279,7 @@ class LifeEngineListFilesTool(BaseTool):
                 items=source_items,
                 item_refs=item_refs,
                 continuation=continuation,
+                compact=True,
             )
             if len(str(result).encode("utf-8")) > result["budget_bytes"]:
                 return False, "list files projection exceeded its byte budget"

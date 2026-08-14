@@ -256,6 +256,73 @@ async def test_autonomy_list_is_bounded_but_mutations_are_unchanged() -> None:
     assert calls[-1]["action"] == "pause"
 
 
+def test_bounded_items_compact_mode_delivers_full_listing() -> None:
+    """Compact listings must fit the whole item set in one model-visible page.
+
+    Regression: directory listings with 30+ entries carried per-item
+    ``_projection`` metadata (ref + sha256 + original_bytes) that consumed the
+    entire 8 KiB core budget after a handful of items, so the model only saw
+    the first few entries and concluded recent diaries were missing.
+    ``compact=True`` drops only that per-item enrichment while preserving the
+    pagination/frontier contract, so the full listing fits one page.
+    """
+    items = [
+        {
+            "name": f"2026-08-{index:02d}_morning.md",
+            "path": f"diaries/2026-08-{index:02d}_morning.md",
+            "type": "file",
+            "size": 1234,
+            "size_human": "1.2KB",
+            "modified_at": "2026-08-14T09:18:00.000000+08:00",
+        }
+        for index in range(29)
+    ]
+    refs = [f"workspace-entry:{item['path']}:sha256:ref{index}" for index, item in enumerate(items)]
+    base_payload = {
+        "action": "list_files",
+        "path": "diaries",
+        "normalized_root": "diaries",
+        "total_items": len(items),
+    }
+
+    compact_payload = project_bounded_items(
+        projection_name="workspace-file-list",
+        task_name="core",
+        requested_max_bytes=None,
+        binding={"root": "diaries", "recursive": False},
+        frontier={"directories": [], "items_sha256": sha256_json(items)},
+        base_payload=base_payload,
+        items_key="items",
+        items=items,
+        item_refs=refs,
+        compact=True,
+    )
+    _assert_exact_budget(compact_payload, CORE_TOOL_RESULT_MAX_BYTES)
+    assert compact_payload["delivered_items"] == len(items)
+    assert compact_payload["truncated"] is False
+    assert compact_payload["continuation"] == ""
+    # Compact pages omit the per-item _projection enrichment entirely.
+    for item in compact_payload["items"]:
+        assert "_projection" not in item
+
+    # Non-compact default still enriches items and may truncate large listings.
+    full_payload = project_bounded_items(
+        projection_name="workspace-file-list",
+        task_name="core",
+        requested_max_bytes=None,
+        binding={"root": "diaries", "recursive": False},
+        frontier={"directories": [], "items_sha256": sha256_json(items)},
+        base_payload=base_payload,
+        items_key="items",
+        items=items,
+        item_refs=refs,
+    )
+    _assert_exact_budget(full_payload, CORE_TOOL_RESULT_MAX_BYTES)
+    assert full_payload["items"][0]["_projection"]["ref"].startswith(
+        "workspace-entry:"
+    )
+
+
 @pytest.mark.asyncio
 async def test_event_grep_projection_tolerates_source_frontier_change(
     monkeypatch: pytest.MonkeyPatch,

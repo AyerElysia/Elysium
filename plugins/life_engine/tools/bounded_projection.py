@@ -277,6 +277,7 @@ def project_bounded_items(
     item_refs: Sequence[str],
     continuation: str = "",
     tolerate_frontier_change: bool = False,
+    compact: bool = False,
 ) -> dict[str, Any]:
     """Project stable source items into one exact UTF-8-bounded model page.
 
@@ -284,6 +285,13 @@ def project_bounded_items(
     appended by multiple writers: the frontier advances between pages, which is
     freshness, not tampering. File/content snapshots must keep strict frontier
     binding (the source changed means the page is no longer meaningful).
+
+    ``compact`` skips the per-item ``_projection`` metadata block (ref, sha256,
+    original_bytes) that can dominate the byte budget for many-item listings
+    (e.g. directory listings with 30+ entries).  Compact pages still carry the
+    same pagination/frontier contract; only the per-item ref enrichment is
+    omitted so a full listing fits one model-visible page instead of being
+    truncated after the first few entries.
     """
 
     name = str(projection_name or "").strip()
@@ -396,12 +404,13 @@ def project_bounded_items(
 
     while offset < original_items:
         full_item = dict(source_items[offset])
-        full_item["_projection"] = {
-            "delivery": "full",
-            "ref": refs[offset],
-            "sha256": source_hashes[offset],
-            "original_bytes": source_sizes[offset],
-        }
+        if not compact:
+            full_item["_projection"] = {
+                "delivery": "full",
+                "ref": refs[offset],
+                "sha256": source_hashes[offset],
+                "original_bytes": source_sizes[offset],
+            }
         candidate = build_payload(
             [*delivered, full_item],
             next_offset=offset + 1,
@@ -428,14 +437,15 @@ def project_bounded_items(
             excerpt = utf8_prefix(source_value, excerpt_bytes)
             entry = {
                 "excerpt": excerpt,
-                "_projection": {
+            }
+            if not compact:
+                entry["_projection"] = {
                     "delivery": "excerpt",
                     "ref": refs[item_offset],
                     "sha256": source_hashes[item_offset],
                     "original_bytes": source_sizes[item_offset],
                     "excerpt_bytes": len(excerpt.encode("utf-8")),
-                },
-            }
+                }
             return build_payload(
                 [entry],
                 next_offset=item_offset + 1,
