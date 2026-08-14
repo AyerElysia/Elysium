@@ -1,7 +1,7 @@
 {
   "name": "neko_surface",
   "version": "1.0.0",
-  "description": "Connect N.E.K.O as an authenticated presentation surface for Neo-MoFox",
+  "description": "Connect N.E.K.O as an authenticated presentation surface for Elysium",
   "author": "Elysium",
   "license": "GPL-3.0",
   "dependencies": {

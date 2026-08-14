@@ -17,15 +17,15 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import re
 import time
 from typing import Any, cast
 
-from mofox_wire import CoreSink, MessageEnvelope, WebSocketAdapterOptions
-
 from src.app.plugin_system.api.log_api import get_logger
 from src.core.components.base import BaseAdapter, BasePlugin
 from src.core.components.loader import register_plugin
+from src.core.transport.wire import CoreSink, MessageEnvelope, WebSocketAdapterOptions
 from src.kernel.concurrency import TaskInfo, get_task_manager
 
 from .client import NapCatClient
@@ -74,7 +74,7 @@ class NapcatAdapter(BaseAdapter):
 
             ws_url = f"ws://{host}:{port}"
             headers = {}
-            if access_token:
+            if access_token and ws_mode == "client":
                 headers["Authorization"] = f"Bearer {access_token}"
         else:
             ws_url = "ws://127.0.0.1:8095"
@@ -175,7 +175,7 @@ class NapcatAdapter(BaseAdapter):
     # ------------------------------------------------------------------
 
     async def _start_ws_server(self, options: WebSocketAdapterOptions) -> None:
-        """Override mofox_wire default: call on_ws_connected/on_ws_disconnected hooks."""
+        """Extend the Elysium wire server with NapCat connection hooks."""
         from urllib.parse import urlparse
 
         from websockets.legacy import server as ws_server_lib
@@ -184,14 +184,23 @@ class NapcatAdapter(BaseAdapter):
         host = parsed.hostname or "0.0.0.0"
         port = parsed.port or (443 if parsed.scheme == "wss" else 80)
         path = parsed.path or "/"
+        config = self._get_config()
+        access_token = (
+            str(config.napcat_server.access_token or "") if config is not None else ""
+        )
 
         async def handler(ws: Any) -> None:
-            # path guard（与 mofox_wire 保持一致）
+            # Keep the common Elysium wire path guard.
             if options.allowed_paths and ws.path not in options.allowed_paths:
                 await ws.close(code=4000, reason="Path not allowed")
                 return
             if ws.path != path:
                 await ws.close(code=4000, reason="Path mismatch")
+                return
+
+            if not self._is_reverse_ws_authorized(ws, access_token):
+                logger.warning("NapCat 反向 WebSocket 鉴权失败，拒绝连接")
+                await ws.close(code=4401, reason="Unauthorized")
                 return
 
             self._ws = ws
@@ -205,12 +214,33 @@ class NapcatAdapter(BaseAdapter):
             handler,
             host,
             port,
-            extra_headers=options.headers,
             max_size=options.max_message_size,
             ping_interval=20,
             ping_timeout=20,
         )
         logger.info(f"NapCat WebSocket 服务器已在 {host}:{port} 启动，等待连接...")
+
+    @staticmethod
+    def _is_reverse_ws_authorized(ws: Any, access_token: str) -> bool:
+        """Validate an inbound reverse-WebSocket bearer token without logging it."""
+        if not access_token:
+            return True
+
+        request_headers = getattr(ws, "request_headers", None)
+        authorization = ""
+        if request_headers is not None:
+            try:
+                candidate = request_headers.get("Authorization", "")
+            except (LookupError, TypeError, ValueError):
+                candidate = ""
+            if isinstance(candidate, str):
+                authorization = candidate
+
+        expected = f"Bearer {access_token}"
+        return hmac.compare_digest(
+            authorization.encode("utf-8"),
+            expected.encode("utf-8"),
+        )
 
     async def on_ws_connected(self, ws: Any) -> None:
         """WebSocket 连接建立时调用。"""
@@ -231,7 +261,7 @@ class NapcatAdapter(BaseAdapter):
     async def from_platform_message(self, raw: dict[str, Any]) -> MessageEnvelope | None:  # type: ignore[override]
         """将 OneBot 原始消息转换为 MessageEnvelope。
 
-        这是核心入站方法，由 mofox-wire 的传输层调用。
+        这是核心入站方法，由 Elysium wire 传输层调用。
         所有事件（message/notice/request/meta_event/API响应）都经过这里。
         """
         # 收到真实 QQ 消息（非心跳/元事件）时更新时间戳，供 watchdog 判断是否卡死
@@ -247,7 +277,7 @@ class NapcatAdapter(BaseAdapter):
     ) -> dict[str, Any] | None:
         """将 MessageEnvelope 发送到 NapCat。
 
-        这是核心出站方法，由 mofox-wire 的核心推送调用。
+        这是核心出站方法，由 Elysium wire 的核心推送调用。
         根据消息段类型分发到 sender 或 command_handler。
         """
         # 检查是否是命令类消息
@@ -673,7 +703,7 @@ class NapcatAdapterPlugin(BasePlugin):
     def get_components(self) -> list[type]:
         """获取插件组件；本机配置停用时不注册适配器。"""
         config = cast(NapcatAdapterConfig | None, self.config)
-        if config is not None and not config.plugin.enabled:
+        if config is None or not config.plugin.enabled:
             logger.info("NapCat 适配器已在配置中停用，不注册 Adapter 组件")
             return []
         return [NapcatAdapter]

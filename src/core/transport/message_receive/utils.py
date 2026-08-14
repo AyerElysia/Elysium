@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from mofox_wire import MessageInfoPayload
+from src.core.transport.wire import MessageInfoPayload
 
 
 def extract_stream_id(message_info: MessageInfoPayload) -> str:

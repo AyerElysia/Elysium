@@ -21,7 +21,12 @@ _DECLARED_ROOTS = {
     "life_engine_workspace/SOUL.md",
     "life_engine_workspace/USER.md",
 }
-_DECLARED_PREFIXES = ("diaries/", "life_engine_workspace/diaries/")
+_DECLARED_PREFIXES = (
+    "diaries/",
+    "life_engine_workspace/diaries/",
+    "notes/",
+    "life_engine_workspace/notes/",
+)
 
 
 class RootSubjectAuthorityRequired(RuntimeError):
@@ -44,7 +49,7 @@ def subject_path_from_workspace_relative(value: str) -> str | None:
     if normalized.startswith("life_engine_workspace/"):
         normalized = normalized.removeprefix("life_engine_workspace/")
     if normalized in {"SOUL.md", "USER.md", "MEMORY.md"} or normalized.startswith(
-        "diaries/"
+        ("diaries/", "notes/")
     ):
         return f"life_engine_workspace/{normalized}"
     return None
@@ -338,7 +343,11 @@ class SubjectWorkspaceObserver:
             path = workspace / name
             if path.is_file() and not path.is_symlink():
                 paths.add(path.relative_to(self.data_root).as_posix())
-        for root in (self.data_root / "diaries", workspace / "diaries"):
+        for root in (
+            self.data_root / "diaries",
+            workspace / "diaries",
+            workspace / "notes",
+        ):
             if not root.is_dir() or root.is_symlink():
                 continue
             for path in root.rglob("*"):

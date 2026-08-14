@@ -1,7 +1,7 @@
 """扁平化消息 API。
 
 为插件提供消息查询、计数与可读格式化接口。
-接口能力参考旧版设计，但数据结构完全采用 Neo-MoFox 最新模型语义。
+接口能力参考既有设计，但数据结构采用 Elysium 当前模型语义。
 """
 
 from __future__ import annotations
@@ -892,4 +892,3 @@ async def filter_bot_messages(messages: list[dict[str, Any]]) -> list[dict[str, 
 		过滤后的消息字典列表
 	"""
 	return await _apply_filter_bot(messages)
-

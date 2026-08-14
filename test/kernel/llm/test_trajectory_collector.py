@@ -141,16 +141,19 @@ class TestPersistence:
             bounded.shutdown()
 
     def test_old_raw_partition_is_atomically_archived(self, tmp_path) -> None:
+        base_path = tmp_path / "archive_lake"
+        raw_path = base_path / "raw"
+        raw_path.mkdir(parents=True)
+        raw_file = raw_path / "2000-01-01.jsonl"
+        raw_file.write_text('{"request_name":"old"}\n', encoding="utf-8")
+
         collector = TrajectoryCollector(
-            base_path=tmp_path / "archive_lake",
+            base_path=base_path,
             flush_interval=60.0,
             raw_retention_days=3,
             archive_retention_days=0,
         )
         try:
-            raw_file = collector.raw_path / "2000-01-01.jsonl"
-            raw_file.write_text('{"request_name":"old"}\n', encoding="utf-8")
-
             collector._run_partition_maintenance()
 
             archive_file = collector.archive_path / "2000-01-01.jsonl.gz"
@@ -160,6 +163,57 @@ class TestPersistence:
                 assert json.loads(file.readline())["request_name"] == "old"
             assert collector.stats()["archived_partition_count"] == 1
         finally:
+            collector.shutdown()
+
+    def test_partition_maintenance_waits_for_inflight_flush(
+        self,
+        tmp_path,
+        monkeypatch,
+    ) -> None:
+        collector = TrajectoryCollector(
+            base_path=tmp_path / "archive_flush_lake",
+            flush_interval=60.0,
+            raw_retention_days=3,
+            archive_retention_days=0,
+        )
+        raw_file = collector.raw_path / "2000-01-01.jsonl"
+        fsync_started = threading.Event()
+        allow_fsync = threading.Event()
+
+        def _slow_fsync(_fd: int) -> None:
+            fsync_started.set()
+            allow_fsync.wait(timeout=3.0)
+
+        monkeypatch.setattr(collector, "_path_for_date", lambda *_args: raw_file)
+        monkeypatch.setattr(collector_mod.os, "fsync", _slow_fsync)
+        collector.record({"request_name": "old", "messages": []})
+        flush_thread = threading.Thread(target=collector.flush)
+        maintenance_thread = threading.Thread(
+            target=collector._run_partition_maintenance
+        )
+        try:
+            flush_thread.start()
+            assert fsync_started.wait(timeout=2.0)
+            maintenance_thread.start()
+            maintenance_thread.join(timeout=0.1)
+
+            assert maintenance_thread.is_alive()
+            assert not (collector.archive_path / "2000-01-01.jsonl.gz").exists()
+
+            allow_fsync.set()
+            flush_thread.join(timeout=3.0)
+            maintenance_thread.join(timeout=3.0)
+
+            archive_file = collector.archive_path / "2000-01-01.jsonl.gz"
+            assert not flush_thread.is_alive()
+            assert not maintenance_thread.is_alive()
+            assert archive_file.exists()
+            with gzip.open(archive_file, "rt", encoding="utf-8") as file:
+                assert json.loads(file.readline())["request_name"] == "old"
+        finally:
+            allow_fsync.set()
+            flush_thread.join(timeout=3.0)
+            maintenance_thread.join(timeout=3.0)
             collector.shutdown()
 
     def test_slow_fsync_does_not_block_producers(

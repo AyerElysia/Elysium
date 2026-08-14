@@ -47,7 +47,7 @@ class HTTPServer:
         self,
         host: str = "127.0.0.1",
         port: int = 8000,
-        title: str = "MoFox HTTP API",
+        title: str = "Elysium HTTP API",
         description: str = "Elysium HTTP API Server",
     ) -> None:
         """初始化 HTTP 服务器。

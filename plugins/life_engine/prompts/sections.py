@@ -340,7 +340,14 @@ class SendTargetsSection(HeartbeatSectionProvider):
             ),
         )
         if not targets:
-            return None
+            return (
+                "### 你可以触达的人和地方\n"
+                "\n"
+                "当前没有近 24 小时内有消息的会话（列表为空是正常状态，"
+                "不是记忆缺失）。如果想主动开口，可以把 "
+                "`nucleus_schedule_autonomy_intent` 的 target_key / "
+                "target_stream_id 留空；到点后意向会浮现给你，由你重新判断。"
+            )
         lines = ["### 你可以触达的人和地方", ""]
         for target in targets:
             chat_label = "群聊" if target.chat_type == "group" else "私聊"

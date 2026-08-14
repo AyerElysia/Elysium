@@ -24,7 +24,9 @@ from ..constants import (
 )
 
 # 默认工作空间路径
-_DEFAULT_WORKSPACE = str(Path(__file__).parent.parent.parent.parent / "data" / "life_engine_workspace")
+_DEFAULT_WORKSPACE = str(
+    Path(__file__).parent.parent.parent.parent / "data" / "life_engine_workspace"
+)
 
 
 class LifeEngineConfig(BaseConfig):
@@ -306,7 +308,10 @@ class LifeEngineConfig(BaseConfig):
 
         task_name: str = Field(
             default="core",
-            description="潜意识（心跳）使用的模型任务名称，对应 config/model.toml 中的 [model_tasks.core]。",
+            description=(
+                "潜意识（心跳）使用的模型任务名称，对应 "
+                "config/models.toml 中的 [tasks.core]。"
+            ),
         )
         chatter_task_name: str = Field(
             default="",
@@ -449,8 +454,12 @@ class LifeEngineConfig(BaseConfig):
             description="是否启动共享事件同步 worker。默认关闭。",
         )
         remote_host: str = Field(default="", description="远端 MySQL 主机。")
-        remote_port: int = Field(default=3306, ge=1, le=65535, description="远端 MySQL 端口。")
-        remote_database: str = Field(default="elysium", description="共享账本数据库名。")
+        remote_port: int = Field(
+            default=3306, ge=1, le=65535, description="远端 MySQL 端口。"
+        )
+        remote_database: str = Field(
+            default="elysium", description="共享账本数据库名。"
+        )
         remote_user: str = Field(default="", description="共享账本数据库用户。")
         remote_password_env: str = Field(
             default="ELYSIUM_SYNC_MYSQL_PASSWORD",
@@ -499,7 +508,9 @@ class LifeEngineConfig(BaseConfig):
             le=3600.0,
             description="重试退避上限秒数。",
         )
-        push_enabled: bool = Field(default=True, description="是否推送明确授权共享的本地事件。")
+        push_enabled: bool = Field(
+            default=True, description="是否推送明确授权共享的本地事件。"
+        )
         pull_enabled: bool = Field(
             default=False,
             description="是否拉取远端事件；应用投影器完成前保持关闭。",
@@ -699,8 +710,7 @@ class LifeEngineConfig(BaseConfig):
             default="learning",
             min_length=1,
             description=(
-                "后台学习认知链使用的专用模型任务名；与前台表达和心跳 core "
-                "路由分离。"
+                "后台学习认知链使用的专用模型任务名；与前台表达和心跳 core 路由分离。"
             ),
         )
 
@@ -1087,8 +1097,7 @@ class LifeEngineConfig(BaseConfig):
             ge=0.0,
             le=1.0,
             description=(
-                "历史兼容字段，仅用于旧图读取诊断；"
-                "当前系统不按时间或分数自动削弱记忆。"
+                "历史兼容字段，仅用于旧图读取诊断；当前系统不按时间或分数自动削弱记忆。"
             ),
         )
 
@@ -1097,8 +1106,7 @@ class LifeEngineConfig(BaseConfig):
             ge=0.0,
             le=1.0,
             description=(
-                "历史兼容字段；旧 memory_edges 自动剪枝已退役，"
-                "不再作为正式记忆写路径。"
+                "历史兼容字段；旧 memory_edges 自动剪枝已退役，不再作为正式记忆写路径。"
             ),
         )
 
@@ -1258,7 +1266,8 @@ class LifeEngineConfig(BaseConfig):
         sub_agent_task_name: str = Field(
             default="agent",
             description=(
-                "子代理创建 LLM request 时使用的模型任务名，对应 config/model.toml 中的 task key。"
+                "子代理创建 LLM request 时使用的模型任务名，对应 "
+                "config/models.toml 中的 tasks key。"
                 "留空时回退为 agent。"
             ),
         )
@@ -1919,7 +1928,7 @@ class LifeEngineConfig(BaseConfig):
             default="auto",
             min_length=1,
             description=(
-                "Minecraft server or LAN host the bot body joins; \"auto\" "
+                'Minecraft server or LAN host the bot body joins; "auto" '
                 "resolves the WSL default gateway at launch time."
             ),
         )
@@ -2065,10 +2074,14 @@ class LifeEngineConfig(BaseConfig):
         default_factory=MemoryArchiveSyncSection
     )
     curiosity: CuriositySection = Field(default_factory=CuriositySection)
-    history_retrieval: HistoryRetrievalSection = Field(default_factory=HistoryRetrievalSection)
+    history_retrieval: HistoryRetrievalSection = Field(
+        default_factory=HistoryRetrievalSection
+    )
     web: WebSection = Field(default_factory=WebSection)
     thresholds: ThresholdsSection = Field(default_factory=ThresholdsSection)
-    memory_algorithm: MemoryAlgorithmSection = Field(default_factory=MemoryAlgorithmSection)
+    memory_algorithm: MemoryAlgorithmSection = Field(
+        default_factory=MemoryAlgorithmSection
+    )
     chatter: ChatterSection = Field(default_factory=ChatterSection)
     multimodal: MultimodalSection = Field(default_factory=MultimodalSection)
     media_observer: MediaObserverSection = Field(default_factory=MediaObserverSection)
@@ -2106,7 +2119,7 @@ class LifeEngineConfig(BaseConfig):
         wake_time = getattr(v, "wake_time", "") or ""
 
         # 检查时间格式
-        time_pattern = re.compile(r'^([01]\d|2[0-3]):([0-5]\d)$')
+        time_pattern = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 
         if sleep_time and not time_pattern.match(sleep_time):
             raise ValueError(
@@ -2123,9 +2136,7 @@ class LifeEngineConfig(BaseConfig):
         wake_set = bool(wake_time.strip())
 
         if sleep_set != wake_set:
-            raise ValueError(
-                "sleep_time 和 wake_time 必须同时设置或同时留空"
-            )
+            raise ValueError("sleep_time 和 wake_time 必须同时设置或同时留空")
 
         if sleep_set and wake_set and sleep_time == wake_time:
             raise ValueError("sleep_time 和 wake_time 不能相同")

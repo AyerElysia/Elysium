@@ -2,16 +2,14 @@
 
 本模块提供 BaseAdapter 类，定义适配器组件的基本行为。
 Adapter 负责与外部平台通信，实现消息的接收和发送。
-继承自 mofox_wire.AdapterBase，添加插件生命周期、自动重连等特性。
+继承自 Elysium 自有 AdapterBase，添加插件生命周期、自动重连等特性。
 """
 
 import asyncio
 from abc import abstractmethod
 from typing import TYPE_CHECKING, Any
 
-from mofox_wire import AdapterBase
-from mofox_wire import CoreSink, MessageEnvelope
-
+from src.core.transport.wire import AdapterBase, CoreSink, MessageEnvelope
 from src.kernel.concurrency import get_task_manager
 
 if TYPE_CHECKING:
@@ -22,7 +20,7 @@ class BaseAdapter(AdapterBase):
     """适配器组件基类。
 
     Adapter 负责与外部平台通信，是 Bot 与平台之间的桥梁。
-    相比 mofox_wire.AdapterBase，增加了以下特性：
+    相比基础传输 AdapterBase，增加了以下特性：
     1. 插件生命周期管理 (on_adapter_loaded, on_adapter_unloaded)
     2. 自动重连与健康检查
     3. （已移除）子进程启动支持
@@ -238,17 +236,17 @@ class BaseAdapter(AdapterBase):
     async def from_platform_message(self, raw: Any) -> MessageEnvelope:
         """将平台原始消息转换为 MessageEnvelope。
 
-        此方法由 mofox_wire.AdapterBase 定义，必须实现。
+        此方法由 Elysium AdapterBase 定义，必须实现。
 
         Args:
             raw: 平台原始消息对象
 
         Returns:
-            MessageEnvelope: 符合 mofox_wire 标准的消息信封
+            MessageEnvelope: 符合 Elysium wire contract 的消息信封
 
         Examples:
             >>> async def from_platform_message(self, raw: Any):
-            ...     from mofox_wire import MessageEnvelope, MessageDirection
+            ...     from src.core.transport.wire import MessageEnvelope, MessageDirection
             ...
             ...     # 解析平台消息
             ...     message_id = raw.get("message_id")

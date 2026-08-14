@@ -620,7 +620,7 @@ class PluginManager:
         """
         try:
             # 创建持久化临时目录（不使用 with 块，避免提前删除）
-            tmpdir = tempfile.mkdtemp(prefix=f"mofox_plugin_{manifest.name}_")
+            tmpdir = tempfile.mkdtemp(prefix=f"elysium_plugin_{manifest.name}_")
             self._archive_tmpdirs[manifest.name] = tmpdir
 
             with zipfile.ZipFile(archive_path, "r") as zf:

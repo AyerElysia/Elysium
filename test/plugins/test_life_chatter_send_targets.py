@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import time
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -200,6 +201,142 @@ async def test_send_target_prompt_lists_recent_current_group_and_private(monkeyp
     assert "始源之地 | 当前聊天" in prompt
     assert "AyerElysia" in prompt
     assert "旧群" not in prompt
+
+
+async def test_send_targets_include_stream_table_persisted_targets(monkeypatch) -> None:
+    """chat_streams 持久化表里的真实流（ayla/飞书，即使今天无新消息）必须进入可触达列表。
+
+    真实缺陷（2026-08-13）：ayla 私聊「汐汐的私聊」当天有消息、飞书「赩汐的私聊」
+    都在 chat_streams 表里，但内存 stream_manager 未重建导致心跳列表为空。
+    """
+    rows = [
+        SimpleNamespace(
+            stream_id="20403fdb0e6df94137c9071e62c44c09eb8090b534279ef5695c4b4aa5fae7bc",
+            platform="ayla",
+            chat_type="private",
+            person_id="person_xixi",
+            group_id=None,
+            group_name="汐汐的私聊",
+            last_active_time=time.time(),
+        ),
+        SimpleNamespace(
+            stream_id="644b65d976c9db473e181e9abc6735da3728afb929f86737eff1ffe4396460ac",
+            platform="feishu",
+            chat_type="private",
+            person_id="person_xixi",
+            group_id=None,
+            group_name="赩汐的私聊",
+            last_active_time=time.time() - 7200,
+        ),
+    ]
+
+    class _Result:
+        def __init__(self, rows: list[object]) -> None:
+            self._rows = rows
+
+        def all(self) -> list[object]:
+            return self._rows
+
+    class _Session:
+        def __init__(self, rows: list[object]) -> None:
+            self._rows = rows
+
+        async def execute(self, _statement: object) -> _Result:
+            return _Result(self._rows)
+
+    @asynccontextmanager
+    async def _session() -> object:
+        yield _Session(rows)
+
+    monkeypatch.setattr(
+        "src.kernel.db.get_db_session", _session
+    )
+    monkeypatch.setattr(
+        "src.core.managers.stream_manager.get_stream_manager",
+        lambda: _FakeStreamManager([], {}),
+    )
+    monkeypatch.setattr(
+        "src.core.utils.user_query_helper.get_user_query_helper",
+        lambda: _FakeUserQueryHelper(),
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.service.registry.get_life_engine_service",
+        lambda: _FakeLifeService([]),
+    )
+
+    targets = await list_recent_send_targets(limit=8, active_window_hours=24.0)
+    stream_ids = {target.stream_id for target in targets}
+    assert "20403fdb0e6df94137c9071e62c44c09eb8090b534279ef5695c4b4aa5fae7bc" in stream_ids
+    assert "644b65d976c9db473e181e9abc6735da3728afb929f86737eff1ffe4396460ac" in stream_ids
+    by_stream = {target.stream_id: target for target in targets}
+    ayla = by_stream["20403fdb0e6df94137c9071e62c44c09eb8090b534279ef5695c4b4aa5fae7bc"]
+    assert ayla.platform == "ayla"
+    assert ayla.display_name == "汐汐的私聊"
+
+
+async def test_send_targets_stream_table_dedupes_memory_streams(monkeypatch) -> None:
+    """表源与内存源同一流只出现一次。"""
+    now = time.time()
+    rows = [
+        SimpleNamespace(
+            stream_id="b" * 64,
+            platform="qq",
+            chat_type="private",
+            person_id="person_ayer",
+            group_id=None,
+            group_name="AyerElysia",
+            last_active_time=now,
+        )
+    ]
+
+    class _Result:
+        def __init__(self, rows: list[object]) -> None:
+            self._rows = rows
+
+        def all(self) -> list[object]:
+            return self._rows
+
+    class _Session:
+        def __init__(self, rows: list[object]) -> None:
+            self._rows = rows
+
+        async def execute(self, _statement: object) -> _Result:
+            return _Result(self._rows)
+
+    @asynccontextmanager
+    async def _session() -> object:
+        yield _Session(rows)
+
+    monkeypatch.setattr(
+        "src.kernel.db.get_db_session", _session
+    )
+    # 内存里也有同一流
+    monkeypatch.setattr(
+        "src.core.managers.stream_manager.get_stream_manager",
+        lambda: _FakeStreamManager(
+            [
+                SimpleNamespace(
+                    stream_id="b" * 64,
+                    platform="qq",
+                    chat_type="private",
+                    stream_name="AyerElysia",
+                    last_active_time=now,
+                )
+            ],
+            {"b" * 64: {"person_id": "person_ayer"}},
+        ),
+    )
+    monkeypatch.setattr(
+        "src.core.utils.user_query_helper.get_user_query_helper",
+        lambda: _FakeUserQueryHelper(),
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.service.registry.get_life_engine_service",
+        lambda: _FakeLifeService([]),
+    )
+
+    targets = await list_recent_send_targets()
+    assert len([t for t in targets if t.stream_id == "b" * 64]) == 1
 
 
 async def test_life_send_text_can_send_to_target_key(monkeypatch) -> None:

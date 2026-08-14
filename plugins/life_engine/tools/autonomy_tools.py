@@ -28,7 +28,9 @@ class LifeEngineScheduleAutonomyIntentTool(BaseTool):
         "周期意向也只是反复浮现，不代表必须行动或必须开口。"
         "speak 只能写 motivation、target_hint 和 constraints，不能写最终回复话术。"
         "speak 的目标可填心跳里看到的 target_key，或精确 target_stream_id；"
-        "都留空时意向到点只会以事件浮现给心跳、不会唤醒表达层，不要猜测列表之外的目标。"
+        "如果当前心跳没有渲染「你可以触达的人和地方」列表（近 24 小时无消息会话），"
+        "把 target_key 和 target_stream_id 留空就是正确选择——"
+        "到点意向会浮现给你，由你重新判断是否开口；不要猜测列表之外的目标。"
     )
     chatter_allow: list[str] = ["life_engine_internal"]
 

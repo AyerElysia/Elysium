@@ -10,12 +10,10 @@
 from __future__ import annotations
 
 import json
-
 from typing import Any, Callable
 
-from mofox_wire import MessageEnvelope
-
 from src.app.plugin_system.api.log_api import get_logger
+from src.core.transport.wire import MessageEnvelope
 
 from .client import KookAPIClient
 from .config import KookAdapterConfig

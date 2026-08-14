@@ -54,6 +54,8 @@ _AUXILIARY_SUBJECT_PREFIXES = (
     "diaries/witness/",
     "life_engine_workspace/diaries/",
     "diaries/",
+    "life_engine_workspace/notes/",
+    "notes/",
 )
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -894,11 +896,11 @@ def _auxiliary_subject_path(value: object) -> str:
 
 def _auxiliary_source_kind(logical_path: str) -> str:
     relative = logical_path.removeprefix("life_engine_workspace/")
-    return (
-        "witness_projection"
-        if relative.startswith("diaries/witness/")
-        else "diary_document"
-    )
+    if relative.startswith("diaries/witness/"):
+        return "witness_projection"
+    if relative.startswith("notes/"):
+        return "note_document"
+    return "diary_document"
 
 
 def _prose(value: object, field: str) -> str:

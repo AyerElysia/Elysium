@@ -1803,3 +1803,38 @@ async def test_multi_writer_gate_keeps_learning_projector_singleton(
     assert _mw_hooks._inbound_fact_hook is None
     assert _mw_hooks._outbox_intent_hook is None
     assert _mw_hooks._outbox_settle_hook is None
+
+
+async def test_async_registry_get_for_stream_falls_back_to_chat_global() -> None:
+    """未绑定实例的流必须回退到 chat_global，与同步 registry 契约一致。
+
+    心跳工具以 stream_id="chat_global" 为身份调用 conversation_evidence；
+    若 get_for_stream 对未绑定流返回 None，会触发 instance_unverified /
+    cross_instance_denied，即使流和消息都存在。回退到 chat_global 使
+    未绑定流归属默认全局聊天窗口，读取证据不再误判。
+    """
+    stores = build_fake_stores()
+    registry = await AsyncConsciousnessRegistry.load(stores.presence)
+    await registry._ensure_chat_global()
+
+    # 绑定实例显式占有的流 → 返回该实例
+    await registry.register(
+        ConsciousnessInstance(
+            instance_id="instance:voice",
+            kind="voice",
+            stream_ids=["stream:voice-owned"],
+        )
+    )
+    owner = registry.get_for_stream("stream:voice-owned")
+    assert owner is not None
+    assert owner.instance_id == "instance:voice"
+
+    # 未绑定流 → 回退 chat_global（而非 None）
+    fallback = registry.get_for_stream("20403fdb0e6df94137c9071e62c44c09eb8090b534279ef5695c4b4aa5fae7bc")
+    assert fallback is not None
+    assert fallback.instance_id == CHAT_GLOBAL_INSTANCE_ID
+
+    # 心跳占位身份 chat_global 同样解析到 chat_global 实例
+    heartbeat = registry.get_for_stream(CHAT_GLOBAL_INSTANCE_ID)
+    assert heartbeat is not None
+    assert heartbeat.instance_id == CHAT_GLOBAL_INSTANCE_ID

@@ -32,6 +32,8 @@ class VoiceLivePlugin(BasePlugin):
         logger.info("Voice Live 插件初始化完成")
 
     def get_components(self) -> list[type]:
+        if not self.config.plugin.enabled:
+            return []
         from .event_handler import VoiceLiveEventHandler
         from .router import VoiceLiveRouter
 

@@ -256,11 +256,11 @@ def example_complex_scenario() -> None:
 
     # 场景 1: 有上下文和历史
     result1 = (
-        tmpl.set("query", "什么是 Neo-MoFox？")
+        tmpl.set("query", "什么是 Elysium？")
         .set(
             "context_list",
             [
-                "Neo-MoFox 是一个聊天机器人框架",
+                "Elysium 是一个数字生命系统",
                 "它采用三层架构设计",
                 "core 层包含 prompt 模块",
             ],

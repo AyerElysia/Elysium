@@ -80,8 +80,8 @@ def main():
     )
     parser.add_argument(
         "--db-path",
-        default="data/MoFox.db",
-        help="数据库路径（默认: data/MoFox.db）",
+        default="data/Elysium.db",
+        help="数据库路径（默认: data/Elysium.db）",
     )
     args = parser.parse_args()
 

@@ -164,13 +164,21 @@ def test_send_targets_section_renders_map_without_command(
     assert "没有想说的话也很好" in text
 
 
-def test_send_targets_section_none_when_no_targets(
+def test_send_targets_section_renders_fallback_when_no_targets(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """近 24h 无活跃会话时，段落仍渲染——明确告知留空是正确选择，不静默消失。"""
     service = _make_service(tmp_path)
     _patch_targets(monkeypatch, [])
 
-    assert asyncio.run(SendTargetsSection().render(_ctx(service))) is None
+    text = asyncio.run(SendTargetsSection().render(_ctx(service)))
+
+    assert text is not None
+    assert "### 你可以触达的人和地方" in text
+    assert "列表为空是正常状态" in text
+    assert "不是记忆缺失" in text
+    assert "留空" in text
+    assert "由你重新判断" in text
 
 
 def test_send_targets_section_respects_config_switch(tmp_path: Path) -> None:

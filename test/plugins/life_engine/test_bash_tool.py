@@ -6,6 +6,7 @@ import asyncio
 import os
 import shlex
 import shutil
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -70,12 +71,15 @@ def test_bash_tool_mounts_workspace_read_only_even_for_python(tmp_path: Path) ->
     target = tmp_path / "MEMORY.md"
     target.write_text("original\n", encoding="utf-8")
     tool = _make_tool(tmp_path)
-    python3 = exec_tools.shutil.which("python3")
-    assert python3 is not None
+    # Bubblewrap overlays /tmp with an isolated tmpfs.  Resolve the test
+    # interpreter so a venv symlink under /tmp remains executable inside the
+    # sandbox while the write still targets the read-only workspace mount.
+    python3 = Path(sys.executable).resolve()
+    assert python3.is_file()
 
     ok, payload = asyncio.run(
         tool.execute(
-            f"{shlex.quote(python3)} -c \"from pathlib import Path; "
+            f"{shlex.quote(str(python3))} -c \"from pathlib import Path; "
             "Path('MEMORY.md').write_text('bypass')\""
         )
     )

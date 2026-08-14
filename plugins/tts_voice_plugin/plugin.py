@@ -26,7 +26,9 @@ class TTSVoicePlugin(BasePlugin):
     """GPT-SoVITS 语音合成插件。"""
 
     plugin_name: str = "tts_voice_plugin"
-    plugin_description: str = "基于GPT-SoVITS的文本转语音插件，支持多种语言和多风格语音合成"
+    plugin_description: str = (
+        "基于GPT-SoVITS的文本转语音插件，支持多种语言和多风格语音合成"
+    )
     plugin_version: str = "3.1.2"
 
     configs = [TTSVoiceConfig]
@@ -42,7 +44,7 @@ class TTSVoicePlugin(BasePlugin):
 
     async def on_plugin_loaded(self) -> None:
         """插件加载后回调，初始化 TTS 服务。"""
-        if isinstance(self.config, TTSVoiceConfig) and not self.config.plugin.enable:
+        if not isinstance(self.config, TTSVoiceConfig) or not self.config.plugin.enable:
             logger.info("TTSVoicePlugin 已在本机配置中停用，跳过服务初始化")
             return
         logger.info("初始化 TTSVoicePlugin...")
@@ -55,7 +57,9 @@ class TTSVoicePlugin(BasePlugin):
         if isinstance(self.config, TTSVoiceConfig):
             custom = self.config.prompt.custom_instructions.strip()
             if custom:
-                base_description = TTSVoiceAction.action_description.split("\n\n自定义指令：", 1)[0].rstrip()
+                base_description = TTSVoiceAction.action_description.split(
+                    "\n\n自定义指令：", 1
+                )[0].rstrip()
                 TTSVoiceAction.action_description = (
                     base_description + "\n\n自定义指令：\n" + custom
                 )
@@ -76,18 +80,15 @@ class TTSVoicePlugin(BasePlugin):
             组件类列表
         """
         cfg: TTSVoiceConfig | None = self.config  # type: ignore[assignment]
-        if cfg is not None and not cfg.plugin.enable:
+        if not isinstance(cfg, TTSVoiceConfig) or not cfg.plugin.enable:
             logger.info("TTSVoicePlugin 已在本机配置中停用，不注册组件")
             return []
 
         from .services.tts_service import TTSService
 
         components: list[type] = [TTSService]
-        action_enabled = True
-        command_enabled = True
-        if cfg is not None:
-            action_enabled = cfg.components.action_enabled
-            command_enabled = cfg.components.command_enabled
+        action_enabled = cfg.components.action_enabled
+        command_enabled = cfg.components.command_enabled
 
         if action_enabled:
             components.append(TTSVoiceAction)

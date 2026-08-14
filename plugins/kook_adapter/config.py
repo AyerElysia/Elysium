@@ -17,7 +17,7 @@ class KookAdapterConfig(BaseConfig):
         """插件基本配置"""
 
         enabled: bool = Field(
-            default=True,
+            default=False,
             description="是否启用 KOOK 适配器",
             label="启用适配器",
             tag="plugin",

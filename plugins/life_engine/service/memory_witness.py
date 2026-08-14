@@ -52,6 +52,7 @@ from ..memory.witness_pipeline import (
     WitnessWindow,
     witness_window_source_digest,
 )
+from ..storage.contracts import StorageRuntimeError
 from ..storage import (
     SingletonWriterClaimConflict,
     SingletonWriterClaimLost,
@@ -122,6 +123,9 @@ _FILESYSTEM_RECONCILIATION_MAX_FILES = 100_000
 _FILESYSTEM_RECONCILIATION_MAX_BYTES = 1024 * 1024 * 1024
 _FILESYSTEM_HASH_CHUNK_BYTES = 64 * 1024
 _AUTHOR_CLAIM_NAMESPACE = "life_engine.memory_witness"
+_UNMANAGED_SINGLETON_WRITER_PREFIX = (
+    "singleton writer is not managed locally:"
+)
 _TRANSIENT_ERROR_ESCALATION_COUNT = 3
 # 双实例共享同一 witness presence 行时，PresenceRevisionConflict 是常态合法竞争；
 # 前 8 次只记 debug/warning，第 9 次才升级 ERROR，避免常态竞争刷 ERROR。
@@ -233,6 +237,19 @@ def _dbapi_error_code(exc: DBAPIError) -> int | None:
         if isinstance(value, str) and value.isdecimal():
             return int(value)
     return None
+
+
+def _is_unmanaged_author_claim_error(exc: BaseException) -> bool:
+    """Return whether the runtime explicitly rejected a detached local claim.
+
+    A renewal can fail for many reasons while the runtime still manages the
+    exact claim.  Only the runtime's structured error for a missing managed
+    claim permits this coordinator to forget its snapshot and acquire again.
+    """
+
+    return isinstance(exc, StorageRuntimeError) and str(exc).startswith(
+        _UNMANAGED_SINGLETON_WRITER_PREFIX
+    )
 
 
 def _is_transient_mysql_disconnect(exc: BaseException) -> bool:
@@ -866,13 +883,23 @@ class MemoryWitnessCoordinator:
                     )
                 except asyncio.CancelledError:
                     raise
-                except Exception:
-                    # The claim we held was retired by the runtime's own
-                    # renewal loop (managed-singleton loss invalidated the
-                    # local registry) or taken over by another instance.
-                    # The stale reference is no longer trusted: drop it and
-                    # re-acquire.  A re-acquire conflict simply returns the
-                    # caller to the guest role; success restores the writer.
+                except Exception as renew_exc:
+                    claim_was_lost = isinstance(
+                        renew_exc,
+                        (SingletonWriterClaimLost, _PluginsWriterClaimLost),
+                    )
+                    if not claim_was_lost and not _is_unmanaged_author_claim_error(
+                        renew_exc
+                    ):
+                        # A DB/network failure or any other unclassified renewal
+                        # error does not prove lease loss.  Keep the exact local
+                        # snapshot so the managed loop can retry it without
+                        # colliding with the runtime's still-owned claim entry.
+                        raise
+                    # An explicit claim-loss or runtime detachment proves this
+                    # snapshot is stale. Re-acquire in the same authoring round;
+                    # a competing live writer will surface the normal conflict
+                    # path and no witness cursor will advance.
                     self._author_claim = None
                     self._author_claim_mode = "selected_runtime_claim_failed"
                     self._author_claim = await acquire(

@@ -195,7 +195,7 @@ def main():
     parser = argparse.ArgumentParser(description="清理 messages 表二进制/base64 数据")
     parser.add_argument("--dry-run", action="store_true", help="仅统计，不修改")
     parser.add_argument("--vacuum", action="store_true", help="清理后 VACUUM 回收磁盘")
-    parser.add_argument("--db-path", default="data/MoFox.db")
+    parser.add_argument("--db-path", default="data/Elysium.db")
     args = parser.parse_args()
 
     db_path = Path(args.db_path)

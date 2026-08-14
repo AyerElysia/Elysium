@@ -11,14 +11,19 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import orjson
-from mofox_wire import MessageBuilder, SegPayload
-from mofox_wire.types import UserRole
 
 from src.app.plugin_system.api.log_api import get_logger
+from src.core.transport.wire import MessageBuilder, SegPayload, UserRole
 from src.core.utils.base64_helper import base64_encode_bytes
 from src.kernel.concurrency import get_task_manager
 
-from ..utils.cache import GROUP_INFO_TTL, MEMBER_INFO_TTL, SELF_INFO_TTL, get_cached, set_cached
+from ..utils.cache import (
+    GROUP_INFO_TTL,
+    MEMBER_INFO_TTL,
+    SELF_INFO_TTL,
+    get_cached,
+    set_cached,
+)
 from ..utils.constants import ACCEPT_FORMAT, QQ_FACE, RealMessageType
 from ..utils.media import download_image_base64
 

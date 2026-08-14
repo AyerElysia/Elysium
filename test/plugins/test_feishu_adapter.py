@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 from plugins.feishu_adapter import adapter as feishu_adapter_module
 from plugins.feishu_adapter.adapter import FeishuAdapter, set_feishu_adapter
 from plugins.feishu_adapter.config import FeishuAdapterConfig
+from plugins.feishu_adapter.plugin import FeishuAdapterPlugin
 from plugins.feishu_adapter.router import FeishuRouter
 from src.core.models.message import MessageType
 from src.core.transport.message_receive.converter import MessageConverter
@@ -33,7 +34,22 @@ class DummyPlugin:
 
 
 def make_adapter(config: FeishuAdapterConfig | None = None) -> FeishuAdapter:
-    return FeishuAdapter(DummySink(), plugin=DummyPlugin(config or FeishuAdapterConfig()))
+    config = config or FeishuAdapterConfig()
+    config.plugin.enabled = True
+    return FeishuAdapter(DummySink(), plugin=DummyPlugin(config))
+
+
+def test_new_feishu_install_defaults_disabled_but_explicit_enable_is_kept() -> None:
+    config = FeishuAdapterConfig()
+    assert config.plugin.enabled is False
+    assert FeishuAdapterPlugin(config=config).get_components() == []
+    assert FeishuAdapterPlugin(config=None).get_components() == []
+
+    enabled_config = FeishuAdapterConfig.from_dict({"plugin": {"enabled": True}})
+    assert FeishuAdapterPlugin(config=enabled_config).get_components() == [
+        FeishuRouter,
+        FeishuAdapter,
+    ]
 
 
 def test_feishu_config_defaults_to_long_connection() -> None:

@@ -16,7 +16,7 @@ class WerewolfConfig(BaseConfig):
     @config_section("plugin", title="插件设置", tag="plugin", order=0)
     class PluginSection(SectionBase):
         enabled: bool = Field(
-            default=True,
+            default=False,
             description="是否启用狼人杀插件",
             label="启用插件",
             tag="plugin",
@@ -94,3 +94,8 @@ class WerewolfConfig(BaseConfig):
             tag="narration",
             order=0,
         )
+
+    plugin: PluginSection = Field(default_factory=PluginSection)
+    game: GameSection = Field(default_factory=GameSection)
+    ai: AISection = Field(default_factory=AISection)
+    narration: NarrationSection = Field(default_factory=NarrationSection)

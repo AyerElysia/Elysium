@@ -25,7 +25,7 @@ class VoiceLiveConfig(BaseConfig):
     @config_section("plugin", title="插件设置", tag="plugin", order=0)
     class PluginSection(SectionBase):
         enabled: bool = Field(
-            default=True, description="是否启用 Voice Live", label="启用插件"
+            default=False, description="是否启用 Voice Live", label="启用插件"
         )
 
     @config_section("server", title="接入与会话安全", tag="network", order=10)

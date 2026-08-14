@@ -289,8 +289,13 @@ class TrajectoryCollector:
 
     def _run_partition_maintenance(self) -> None:
         """Compress old raw partitions and prune expired compressed archives."""
-        with self._maintenance_lock:
-            self._run_partition_maintenance_locked()
+        # Archiving and flushing touch the same raw partitions.  A maintenance
+        # pass must never copy/unlink a file while an append is still being
+        # flushed, otherwise the gzip can become a valid but incomplete
+        # snapshot of the partition.
+        with self._flush_lock:
+            with self._maintenance_lock:
+                self._run_partition_maintenance_locked()
 
     def _run_partition_maintenance_locked(self) -> None:
         """Run partition maintenance while the maintenance lock is held."""

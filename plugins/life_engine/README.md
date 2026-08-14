@@ -287,22 +287,14 @@ client/    API 调用与响应关联
 
 ## 12. 配置与运行
 
-常用启动方式：
+部署前检查与手工启动：
 
 ```bash
-.venv/bin/python main.py
+./deploy.sh doctor
+./deploy.sh run
 ```
 
-无人值守部署：
-
-```bash
-sudo install -m 0644 elysium.service /etc/systemd/system/elysium.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now elysium
-journalctl -u elysium -f
-```
-
-详细操作见仓库根目录 [`SERVICE_COMMANDS.md`](../../SERVICE_COMMANDS.md)。
+Elysium 只允许用户在可观察终端中手工前台启动。禁止 systemd、cron、登录项、Windows 服务和自动重启；详细操作见[安全部署脚本](../../docs/operations/deployment_scripts.md)。
 
 配置文件包含私人身份、平台凭据和模型路径，不应提交真实值。实际字段以 `core/config.py` 与 Kernel config schema 为准。
 
@@ -313,16 +305,16 @@ journalctl -u elysium -f
 定向测试示例：
 
 ```bash
-.venv/bin/python -m pytest -o addopts="" \
+uv run --group dev python -m pytest -o addopts="" \
   test/plugins/life_engine \
   -q --import-mode=importlib
 ```
 
-静态检查使用仓库固定 Ruff：
+静态检查与编译检查同样由 `uv` 进入锁定环境：
 
 ```bash
-/usr/local/bin/ruff check plugins/life_engine
-.venv/bin/python -m compileall -q plugins/life_engine
+uv run --group dev ruff check plugins/life_engine
+uv run python -m compileall -q plugins/life_engine
 ```
 
 不要把旧文档中的测试数量或覆盖率当作当前事实；每次重大改造都应报告当次实际验收结果。

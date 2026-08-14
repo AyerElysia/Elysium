@@ -1,6 +1,6 @@
-"""Neo-MoFox 主入口
+"""Elysium 主入口
 
-启动 Neo-MoFox Bot 应用。
+启动 Elysium 数字生命系统。
 """
 
 import asyncio

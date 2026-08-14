@@ -689,3 +689,91 @@ async def test_mysql_subject_remote_head_self_heals_legacy_failed_projection(
     assert result["status"] == "remote_current_head"
     assert result["projection_self_healed"] is True
     assert healed_calls == ["projection-self-heal"]
+
+
+async def test_notes_prefix_maps_into_subject_document_namespace() -> None:
+    from plugins.life_engine.storage.subject_workspace import (
+        auxiliary_subject_path_from_workspace_relative,
+        subject_path_from_workspace_relative,
+    )
+
+    for candidate, expected in (
+        (
+            "notes/relationships/xiaoxi.md",
+            "life_engine_workspace/notes/relationships/xiaoxi.md",
+        ),
+        (
+            "life_engine_workspace/notes/relationships/xiaoxi.md",
+            "life_engine_workspace/notes/relationships/xiaoxi.md",
+        ),
+        ("notes/2026-08/todo.md", "life_engine_workspace/notes/2026-08/todo.md"),
+    ):
+        assert subject_path_from_workspace_relative(candidate) == expected
+        assert auxiliary_subject_path_from_workspace_relative(candidate) == expected
+
+
+async def test_notes_prefix_is_not_a_root_authority_document() -> None:
+    from plugins.life_engine.storage.subject_workspace import (
+        auxiliary_subject_path_from_workspace_relative,
+        subject_path_from_workspace_relative,
+    )
+
+    candidate = "notes/relationships/xiaoxi.md"
+    assert subject_path_from_workspace_relative(candidate) is not None
+    assert (
+        auxiliary_subject_path_from_workspace_relative(candidate)
+        == "life_engine_workspace/notes/relationships/xiaoxi.md"
+    )
+
+
+async def test_subject_workspace_observer_declared_paths_include_notes(
+    tmp_path: Path,
+) -> None:
+    async with _local_store(tmp_path) as (_, store, _):
+        data_root = tmp_path / "data"
+        workspace = data_root / "life_engine_workspace"
+        notes_dir = workspace / "notes" / "relationships"
+        notes_dir.mkdir(parents=True)
+        (notes_dir / "xiaoxi.md").write_bytes(b"# xiaoxi relationship\r\n")
+        (workspace / "notes" / "draft.md").write_bytes(b"# draft\n")
+        observer = SubjectWorkspaceObserver(
+            store,
+            data_root=data_root,
+            recorded_source="workspace:test",
+        )
+        declared = observer.declared_paths()
+        assert (
+            "life_engine_workspace/notes/relationships/xiaoxi.md" in declared
+        )
+        assert "life_engine_workspace/notes/draft.md" in declared
+
+
+async def test_subject_workspace_observer_observes_notes_file(
+    tmp_path: Path,
+) -> None:
+    async with _local_store(tmp_path) as (_, store, _):
+        data_root = tmp_path / "data"
+        workspace = data_root / "life_engine_workspace"
+        notes_dir = workspace / "notes" / "relationships"
+        notes_dir.mkdir(parents=True)
+        target = notes_dir / "xixi.md"
+        target.write_bytes(b"# xixi relationship\r\n")
+        observer = SubjectWorkspaceObserver(
+            store,
+            data_root=data_root,
+            recorded_source="workspace:test",
+        )
+        observed = await observer.observe_file(
+            "life_engine_workspace/notes/relationships/xixi.md"
+        )
+        assert observed.status == "appended"
+        assert observed.commit is not None
+        version = observed.commit.version
+        assert version.logical_path == (
+            "life_engine_workspace/notes/relationships/xixi.md"
+        )
+        assert version.content_bytes == b"# xixi relationship\r\n"
+        assert version.byte_fidelity == "exact_bytes"
+        assert (await observer.observe_file(
+            "life_engine_workspace/notes/relationships/xixi.md"
+        )).status == "unchanged"
