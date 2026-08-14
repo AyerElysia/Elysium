@@ -42,10 +42,10 @@ def test_mysql_backup_url_must_come_from_a_mysql_environment(
 
 
 def test_core_sqlite_default_is_consistent_across_backup_archive_and_restore() -> None:
-    assert SQLITE_SOURCES[0] == Path("MoFox.db")
+    assert SQLITE_SOURCES[0] == Path("Elysium.db")
     assert DEFAULT_SQLITE_SOURCES[0].domain == "core"
-    assert DEFAULT_SQLITE_SOURCES[0].relative_path == Path("MoFox.db")
-    assert RESTORE_SQLITE_TARGETS["core"] == Path("MoFox.db")
+    assert DEFAULT_SQLITE_SOURCES[0].relative_path == Path("Elysium.db")
+    assert RESTORE_SQLITE_TARGETS["core"] == Path("Elysium.db")
 
 
 def test_mysql_backup_verify_checks_sha_and_gzip_crc(tmp_path: Path) -> None:

@@ -79,11 +79,11 @@ async def test_get_script_executes_python_script(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    success, result = await tool.execute("demo", "scripts/echo.py", ["Neo-MoFox"])
+    success, result = await tool.execute("demo", "scripts/echo.py", ["Elysium"])
 
     assert success is True
     assert "脚本已执行: echo.py" in cast(str, result)
-    assert "[stdout]\nNeo-MoFox" in cast(str, result)
+    assert "[stdout]\nElysium" in cast(str, result)
 
 
 async def test_get_script_executes_powershell_script_via_subprocess(tmp_path: Path) -> None:

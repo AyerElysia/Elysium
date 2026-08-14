@@ -3,15 +3,14 @@
 根据 Adapter 配置创建合适的 CoreSink 实例。
 
 注意：AdapterBase 运行时会调用 core_sink.send/push_outgoing/close 等方法，
-因此 factory 返回的实例必须实现 mofox_wire.CoreSink 协议。
+因此 factory 返回的实例必须实现 Elysium CoreSink 协议。
 """
 
 from typing import TYPE_CHECKING, Any, Callable, Coroutine
 
-from mofox_wire import CoreSink, MessageEnvelope
-
-from src.kernel.logger import get_logger
 from src.core.transport.sink.core_sink_impl import InProcessCoreSinkImpl
+from src.core.transport.wire import CoreSink, MessageEnvelope
+from src.kernel.logger import get_logger
 
 if TYPE_CHECKING:
     from src.core.components.base.adapter import BaseAdapter

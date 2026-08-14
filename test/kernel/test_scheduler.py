@@ -327,8 +327,15 @@ class TestSchedulerTimeUtils:
 
     async def test_task_timeout(self):
         """测试任务超时"""
+        callback_started = asyncio.Event()
+        callback_cancelled = asyncio.Event()
+
         async def timeout_task():
-            await asyncio.sleep(5)  # 超过默认超时时间
+            callback_started.set()
+            try:
+                await asyncio.sleep(5)  # 超过默认超时时间
+            finally:
+                callback_cancelled.set()
 
         # 创建带超时的任务
         schedule_id = await get_unified_scheduler().create_schedule(
@@ -339,8 +346,15 @@ class TestSchedulerTimeUtils:
             task_name="test_timeout",
         )
 
-        # 等待任务执行和超时
-        await asyncio.sleep(3)
+        # 以真实生命周期事件为准，不用全仓负载下不稳定的固定 sleep 猜测。
+        await asyncio.wait_for(callback_started.wait(), timeout=5.0)
+        await asyncio.wait_for(callback_cancelled.wait(), timeout=3.0)
+
+        async def _wait_until_removed() -> None:
+            while await get_unified_scheduler().get_task_info(schedule_id) is not None:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(_wait_until_removed(), timeout=2.0)
 
         # 验证任务已移除（超时失败）
         task_info = await get_unified_scheduler().get_task_info(schedule_id)

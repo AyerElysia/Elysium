@@ -22,7 +22,7 @@ export ELYSIUM_MYSQL_URL='mysql+asyncmy://<user>:<password>@<host>:<port>/<datab
 
 ```bash
 uv run python scripts/migrate_core_to_mysql.py audit \
-  --source data/MoFox.db
+  --source data/Elysium.db
 ```
 
 审计检查：SQLite 完整性、缺表/多列、可空新列兼容、全部有界字符串真实长度和逐表内容指纹。
@@ -31,8 +31,8 @@ uv run python scripts/migrate_core_to_mysql.py audit \
 
 ```bash
 uv run python scripts/migrate_core_to_mysql.py snapshot \
-  --source data/MoFox.db \
-  --output /absolute/backup/path/MoFox.db
+  --source data/Elysium.db \
+  --output /absolute/backup/path/Elysium.db
 ```
 
 输出旁会生成 `.manifest.json`。目标存在时命令拒绝覆盖。
@@ -43,10 +43,10 @@ uv run python scripts/migrate_core_to_mysql.py snapshot \
 
 ```bash
 uv run python scripts/migrate_core_to_mysql.py migrate \
-  --source /absolute/backup/path/MoFox.db
+  --source /absolute/backup/path/Elysium.db
 
 uv run python scripts/migrate_core_to_mysql.py verify \
-  --source /absolute/backup/path/MoFox.db
+  --source /absolute/backup/path/Elysium.db
 ```
 
 重复执行同一逻辑数据会返回 `already_applied: true`，不会重复插入；SQLite 因 WAL/checkpoint 导致物理文件 SHA 改变时也不会误判。目标含未知表、未审计数据或指纹不一致时会拒绝继续。
@@ -82,7 +82,7 @@ gzip -dc /absolute/backup.sql.gz | mysql <isolated_restore_database>
 ```bash
 uv run python scripts/backup_life_data.py \
   --data-root /absolute/Elysium/data \
-  --core-sqlite-relative MoFox.db \
+  --core-sqlite-relative Elysium.db \
   --output /absolute/backup/life-domain-<timestamp>
 ```
 
@@ -90,15 +90,15 @@ uv run python scripts/backup_life_data.py \
 
 脚本使用 SQLite Online Backup API 备份并生成逐表逻辑根、逐文件 SHA-256、frontier 与来源证据：
 
-- `core.toml` 指向的 Core SQLite（新部署默认 `MoFox.db`）；
+- `core.toml` 指向的 Core SQLite（新部署默认 `Elysium.db`）；
 - `.memory/memory.db`；
 - `life_events.sqlite3`；
 - `consciousness_presence.sqlite3`；
 - `world_projection.sqlite3`。
 - `.memory/archive_sync_state.sqlite3`。
 
-旧安装若在 `config/core.toml` 中明确使用 `data/Elysium.db`，备份时传入
-`--core-sqlite-relative Elysium.db`；不得根据文件存在性自动猜测权威库。规范部署入口
+非默认数据库文件名必须从 `config/core.toml` 显式传给
+`--core-sqlite-relative`；不得根据文件存在性自动猜测权威库，也不得自动移动或改名既有数据库。规范部署入口
 `deploy.sh backup` / `deploy.ps1 backup` 会从已校验的 `database.sqlite_path`
 派生该参数。
 

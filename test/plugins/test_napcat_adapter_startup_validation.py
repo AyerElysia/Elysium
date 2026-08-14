@@ -9,7 +9,6 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
-from mofox_wire import WebSocketAdapterOptions
 
 from plugins.napcat_adapter.config import NapcatAdapterConfig
 from plugins.napcat_adapter.events.meta import MetaEventHandler
@@ -18,6 +17,7 @@ from plugins.napcat_adapter.plugin import (
     NapcatAdapterPlugin,
     _validate_bot_identity,
 )
+from src.core.transport.wire import WebSocketAdapterOptions
 
 
 def test_disabled_napcat_plugin_registers_no_adapter_component() -> None:
@@ -25,7 +25,7 @@ def test_disabled_napcat_plugin_registers_no_adapter_component() -> None:
     config = NapcatAdapterConfig.from_dict(
         {
             "plugin": {"enabled": False, "config_version": "2.0.0"},
-            "bot": {"qq_id": "123456789", "qq_nickname": "MoFoxBot"},
+            "bot": {"qq_id": "123456789", "qq_nickname": "Elysia"},
             "napcat_server": {
                 "mode": "reverse",
                 "host": "localhost",
@@ -55,7 +55,7 @@ def _build_napcat_plugin(*, access_token: str = "") -> NapcatAdapterPlugin:
     config = NapcatAdapterConfig.from_dict(
         {
             "plugin": {"enabled": True, "config_version": "2.0.0"},
-            "bot": {"qq_id": "123456789", "qq_nickname": "MoFoxBot"},
+            "bot": {"qq_id": "123456789", "qq_nickname": "Elysia"},
             "napcat_server": {
                 "mode": "reverse",
                 "host": "localhost",
@@ -135,7 +135,7 @@ class TestNapcatAdapterStartupValidation:
         config = NapcatAdapterConfig.from_dict(
             {
                 "plugin": {"enabled": True, "config_version": "2.0.0"},
-                "bot": {"qq_id": "123456789", "qq_nickname": "MoFoxBot"},
+                "bot": {"qq_id": "123456789", "qq_nickname": "Elysia"},
                 "napcat_server": {
                     "mode": "reverse",
                     "host": "localhost",
@@ -168,7 +168,7 @@ class TestNapcatAdapterStartupValidation:
         config = NapcatAdapterConfig.from_dict(
             {
                 "plugin": {"enabled": True, "config_version": "2.0.0"},
-                "bot": {"qq_id": "", "qq_nickname": "MoFoxBot"},
+                "bot": {"qq_id": "", "qq_nickname": "Elysia"},
                 "napcat_server": {
                     "mode": "reverse",
                     "host": "localhost",
@@ -202,7 +202,7 @@ class TestNapcatAdapterStartupValidation:
         config = NapcatAdapterConfig.from_dict(
             {
                 "plugin": {"enabled": True, "config_version": "2.0.0"},
-                "bot": {"qq_id": "abc123", "qq_nickname": "MoFoxBot"},
+                "bot": {"qq_id": "abc123", "qq_nickname": "Elysia"},
                 "napcat_server": {
                     "mode": "reverse",
                     "host": "localhost",
@@ -271,7 +271,7 @@ def test_get_bot_info_returns_standard_bot_name_field() -> None:
     config = NapcatAdapterConfig.from_dict(
         {
             "plugin": {"enabled": True, "config_version": "2.0.0"},
-            "bot": {"qq_id": "123456789", "qq_nickname": "MoFoxBot"},
+            "bot": {"qq_id": "123456789", "qq_nickname": "Elysia"},
             "napcat_server": {
                 "mode": "reverse",
                 "host": "localhost",
@@ -303,7 +303,7 @@ def test_get_bot_info_returns_standard_bot_name_field() -> None:
 
     assert bot_info == {
         "bot_id": "123456789",
-        "bot_name": "MoFoxBot",
+        "bot_name": "Elysia",
         "platform": "qq",
     }
 
@@ -439,7 +439,7 @@ def test_handle_raw_message_ignores_bot_self_echo() -> None:
     config = NapcatAdapterConfig.from_dict(
         {
             "plugin": {"enabled": True, "config_version": "2.0.0"},
-            "bot": {"qq_id": "123456789", "qq_nickname": "MoFoxBot"},
+            "bot": {"qq_id": "123456789", "qq_nickname": "Elysia"},
             "napcat_server": {
                 "mode": "reverse",
                 "host": "localhost",
@@ -476,7 +476,7 @@ def test_handle_raw_message_ignores_bot_self_echo() -> None:
                 "message_type": "private",
                 "sender": {
                     "user_id": "123456789",
-                    "nickname": "MoFoxBot",
+                    "nickname": "Elysia",
                 },
                 "message": [{"type": "text", "data": {"text": "hello"}}],
             }
@@ -491,7 +491,7 @@ def test_handle_raw_message_keeps_normal_private_message() -> None:
     config = NapcatAdapterConfig.from_dict(
         {
             "plugin": {"enabled": True, "config_version": "2.0.0"},
-            "bot": {"qq_id": "123456789", "qq_nickname": "MoFoxBot"},
+            "bot": {"qq_id": "123456789", "qq_nickname": "Elysia"},
             "napcat_server": {
                 "mode": "reverse",
                 "host": "localhost",

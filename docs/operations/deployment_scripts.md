@@ -146,7 +146,7 @@ PowerShell：
 ./deploy.sh backup --output /absolute/path/to/new-snapshot
 ```
 
-目标必须不存在，其父目录必须已由操作者建立且为 owner-only（POSIX `0700`；Windows 通过 owner/ACL 证明）。入口会先原子创建 owner-only 目标目录，记录其设备与 inode 身份，再让备份子进程写入；子进程返回后若目录变成符号链接、非目录或身份发生替换，整次操作显式失败。因此即使中途失败，不完整候选也不会在 Windows 上短暂继承宽 ACL。本地 Core SQLite 路径从 `core.toml` 的 `database.sqlite_path` 派生，且必须指向 `data/` 内的已存在普通文件；新部署默认为 `data/MoFox.db`。
+目标必须不存在，其父目录必须已由操作者建立且为 owner-only（POSIX `0700`；Windows 通过 owner/ACL 证明）。入口会先原子创建 owner-only 目标目录，记录其设备与 inode 身份，再让备份子进程写入；子进程返回后若目录变成符号链接、非目录或身份发生替换，整次操作显式失败。因此即使中途失败，不完整候选也不会在 Windows 上短暂继承宽 ACL。本地 Core SQLite 路径从 `core.toml` 的 `database.sqlite_path` 派生，且必须指向 `data/` 内的已存在普通文件；新部署默认为 `data/Elysium.db`。
 
 在线备份是可验证候选，不自动取得可激活 generation 身份。只有操作者已经确认所有 writer 停止时才使用：
 

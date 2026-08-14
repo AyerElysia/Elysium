@@ -11,9 +11,14 @@ from __future__ import annotations
 import random
 from typing import TYPE_CHECKING, Any
 
-from mofox_wire import GroupInfoPayload, MessageEnvelope, MessageInfoPayload, SegPayload, UserInfoPayload
-
 from src.app.plugin_system.api.log_api import get_logger
+from src.core.transport.wire import (
+    GroupInfoPayload,
+    MessageEnvelope,
+    MessageInfoPayload,
+    SegPayload,
+    UserInfoPayload,
+)
 
 from ..utils.media import convert_image_to_gif, get_image_format
 

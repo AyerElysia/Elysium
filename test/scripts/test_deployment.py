@@ -34,7 +34,7 @@ def _core_template() -> str:
         "[storage]\n"
         'backend = "local"\n\n'
         "[database]\n"
-        'sqlite_path = "data/MoFox.db"\n\n'
+        'sqlite_path = "data/Elysium.db"\n\n'
         "[http_router]\n"
         "enable_http_router = false\n"
         'http_router_host = "127.0.0.1"\n'
@@ -591,7 +591,7 @@ def test_local_backup_uses_validated_core_sqlite_and_private_precreated_output(
 ) -> None:
     root = _repository(tmp_path / "repo")
     deployment.initialize_configuration(root)
-    (root / "data/MoFox.db").touch()
+    (root / "data/Elysium.db").touch()
     commands: list[list[str]] = []
     monkeypatch.setattr(deployment, "_venv_python", lambda root: Path("/fake/python"))
 
@@ -622,7 +622,7 @@ def test_local_backup_uses_validated_core_sqlite_and_private_precreated_output(
     assert len(commands) == 1
     command = commands[0]
     core_path_index = command.index("--core-sqlite-relative") + 1
-    assert command[core_path_index] == "MoFox.db"
+    assert command[core_path_index] == "Elysium.db"
     assert "--precreated-output" in command
 
 
@@ -634,7 +634,7 @@ def test_local_backup_rejects_core_sqlite_leaf_symlink(
     deployment.initialize_configuration(root)
     real_database = root / "data/real.db"
     real_database.touch()
-    linked_database = root / "data/MoFox.db"
+    linked_database = root / "data/Elysium.db"
     try:
         linked_database.symlink_to(real_database)
     except OSError as error:

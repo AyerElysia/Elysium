@@ -1342,7 +1342,7 @@ def create_backup(
     if backend == "local":
         database = core.get("database", {})
         sqlite_value = (
-            database.get("sqlite_path", "data/MoFox.db")
+            database.get("sqlite_path", "data/Elysium.db")
             if isinstance(database, dict)
             else None
         )

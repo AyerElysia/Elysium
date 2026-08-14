@@ -17,10 +17,10 @@ from pathlib import Path
 from typing import Any, cast
 
 import httpx
-from mofox_wire import CoreSink, MessageEnvelope
 from PIL import Image as PILImage
 
 from src.core.components.base.adapter import BaseAdapter
+from src.core.transport.wire import CoreSink, MessageEnvelope
 from src.core.utils.audio_transcode import (
     probe_audio_duration_ms,
     transcode_audio_to_opus,
@@ -531,7 +531,7 @@ class FeishuAdapter(BaseAdapter):
                     event_handler=event_handler,
                     domain=config.app.api_base_url,
                     auto_reconnect=True,
-                    source="neo-mofox-feishu-adapter",
+                    source="elysium-feishu-adapter",
                 )
                 self._long_connection_client = client
                 self._set_long_connection_state("connecting")

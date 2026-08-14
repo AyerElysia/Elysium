@@ -41,7 +41,7 @@ class ArchiveCLIError(RuntimeError):
 
 
 RESTORE_SQLITE_TARGETS = {
-    "core": Path("MoFox.db"),
+    "core": Path("Elysium.db"),
     "life_events": Path("life_engine_workspace/life_events.sqlite3"),
     "life_memory": Path("life_engine_workspace/.memory/memory.db"),
     "consciousness_presence": Path(

@@ -347,7 +347,7 @@ class TestBaseAction:
 
         mock_adapter_manager = MagicMock()
         mock_adapter_manager.get_bot_info_by_platform = AsyncMock(
-            return_value={"bot_id": "987654321", "bot_name": "MoFoxBot"}
+            return_value={"bot_id": "987654321", "bot_name": "Elysia"}
         )
         mock_get_adapter_manager.return_value = mock_adapter_manager
 

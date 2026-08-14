@@ -7,9 +7,9 @@
 from __future__ import annotations
 
 import inspect
-from typing import TYPE_CHECKING, Dict, Any
-from mofox_wire import MessageEnvelope
+from typing import TYPE_CHECKING, Any, Dict
 
+from src.core.transport.wire import MessageEnvelope
 from src.kernel.logger import get_logger
 
 if TYPE_CHECKING:

@@ -40,7 +40,7 @@ from src.kernel.llm.trajectory_types import (  # noqa: E402
 )
 
 DEFAULT_LAKE = PROJECT_ROOT / "data/training_data_lake"
-DEFAULT_DB = PROJECT_ROOT / "data/MoFox.db"
+DEFAULT_DB = PROJECT_ROOT / "data/Elysium.db"
 DEFAULT_LIFE_EVENTS = PROJECT_ROOT / "data/life_engine_workspace/life_events.jsonl"
 DEFAULT_METRICS = PROJECT_ROOT / "data/json_storage/llm_metrics.json"
 
@@ -573,7 +573,7 @@ def main() -> None:
     parser.add_argument("--metrics", action="store_true", help="迁移 llm_metrics.json")
     parser.add_argument("--limit", type=int, default=None, help="每个来源最多输出 N 条")
     parser.add_argument("--lake", default=str(DEFAULT_LAKE), help="数据湖根目录")
-    parser.add_argument("--db", default=str(DEFAULT_DB), help="MoFox.db 路径")
+    parser.add_argument("--db", default=str(DEFAULT_DB), help="Elysium.db 路径")
     parser.add_argument(
         "--life-events-file", default=str(DEFAULT_LIFE_EVENTS), help="life_events.jsonl 路径"
     )

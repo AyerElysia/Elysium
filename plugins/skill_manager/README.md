@@ -1,6 +1,6 @@
 # Skill Manager
 
-SkillManager 是 Neo-MoFox 的技能索引与按需加载插件。
+SkillManager 是 Elysium 的技能索引与按需加载插件。
 
 它会在插件加载完成后扫描本地 skill 目录，建立技能清单，并提供 3 个工具给 LLM 按需调用：
 

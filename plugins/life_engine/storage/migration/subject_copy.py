@@ -23,7 +23,12 @@ _SUBJECT_ROOT_DOCUMENTS = {
     "life_engine_workspace/SOUL.md",
     "life_engine_workspace/USER.md",
 }
-_SUBJECT_PREFIXES = ("diaries/", "life_engine_workspace/diaries/")
+_SUBJECT_PREFIXES = (
+    "diaries/",
+    "life_engine_workspace/diaries/",
+    "notes/",
+    "life_engine_workspace/notes/",
+)
 
 
 class SubjectDocumentCopyError(RuntimeError):

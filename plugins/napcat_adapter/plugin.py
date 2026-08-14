@@ -22,11 +22,10 @@ import re
 import time
 from typing import Any, cast
 
-from mofox_wire import CoreSink, MessageEnvelope, WebSocketAdapterOptions
-
 from src.app.plugin_system.api.log_api import get_logger
 from src.core.components.base import BaseAdapter, BasePlugin
 from src.core.components.loader import register_plugin
+from src.core.transport.wire import CoreSink, MessageEnvelope, WebSocketAdapterOptions
 from src.kernel.concurrency import TaskInfo, get_task_manager
 
 from .client import NapCatClient
@@ -176,7 +175,7 @@ class NapcatAdapter(BaseAdapter):
     # ------------------------------------------------------------------
 
     async def _start_ws_server(self, options: WebSocketAdapterOptions) -> None:
-        """Override mofox_wire default: call on_ws_connected/on_ws_disconnected hooks."""
+        """Extend the Elysium wire server with NapCat connection hooks."""
         from urllib.parse import urlparse
 
         from websockets.legacy import server as ws_server_lib
@@ -191,7 +190,7 @@ class NapcatAdapter(BaseAdapter):
         )
 
         async def handler(ws: Any) -> None:
-            # path guard（与 mofox_wire 保持一致）
+            # Keep the common Elysium wire path guard.
             if options.allowed_paths and ws.path not in options.allowed_paths:
                 await ws.close(code=4000, reason="Path not allowed")
                 return
@@ -262,7 +261,7 @@ class NapcatAdapter(BaseAdapter):
     async def from_platform_message(self, raw: dict[str, Any]) -> MessageEnvelope | None:  # type: ignore[override]
         """将 OneBot 原始消息转换为 MessageEnvelope。
 
-        这是核心入站方法，由 mofox-wire 的传输层调用。
+        这是核心入站方法，由 Elysium wire 传输层调用。
         所有事件（message/notice/request/meta_event/API响应）都经过这里。
         """
         # 收到真实 QQ 消息（非心跳/元事件）时更新时间戳，供 watchdog 判断是否卡死
@@ -278,7 +277,7 @@ class NapcatAdapter(BaseAdapter):
     ) -> dict[str, Any] | None:
         """将 MessageEnvelope 发送到 NapCat。
 
-        这是核心出站方法，由 mofox-wire 的核心推送调用。
+        这是核心出站方法，由 Elysium wire 的核心推送调用。
         根据消息段类型分发到 sender 或 command_handler。
         """
         # 检查是否是命令类消息

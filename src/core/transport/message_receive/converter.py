@@ -20,8 +20,6 @@ import hashlib
 import time
 from typing import Any
 
-from mofox_wire import MessageEnvelope, MessageInfoPayload, SegPayload
-
 from src.core.models.media import MediaAttachment, MediaSegmentType
 from src.core.models.message import Message, MessageType
 from src.core.transport.message_receive.utils import (
@@ -30,6 +28,7 @@ from src.core.transport.message_receive.utils import (
     normalize_base64,
     safe_json_loads,
 )
+from src.core.transport.wire import MessageEnvelope, MessageInfoPayload, SegPayload
 from src.kernel.logger import get_logger
 
 logger = get_logger("message_converter")
@@ -211,7 +210,7 @@ class MessageConverter:
         """将 MessageEnvelope 转换为 Message。
 
         Args:
-            envelope: mofox-wire 消息信封
+            envelope: Elysium 消息信封
 
         Returns:
             Message: 核心业务消息对象
@@ -234,7 +233,7 @@ class MessageConverter:
             raise ValueError("MessageEnvelope 缺少 message_segment/message_chain 字段")
 
         # 规范化输入，适配单个段或段列表两种情况
-        # mofox-wire 有时会直接用 dict 表示一个段，这里统一转为 list
+        # Elysium wire contract 允许单段直接使用 dict，这里统一转为 list
         segments: list[SegPayload]
         if isinstance(raw_segments, dict):
             segments = [raw_segments]  # type: ignore[list-item]
@@ -342,7 +341,7 @@ class MessageConverter:
             message: 核心业务消息对象
 
         Returns:
-            MessageEnvelope: mofox-wire 消息信封
+            MessageEnvelope: Elysium 消息信封
         """
         seg_list: list[SegPayload] = []
 

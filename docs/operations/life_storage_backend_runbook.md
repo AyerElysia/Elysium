@@ -295,8 +295,9 @@ uv run python scripts/migrate_life_subject_documents.py \
 
 连接信息只能通过 `ELYSIUM_LIFE_STORAGE_MYSQL_HOST/PORT/DATABASE/USER/PASSWORD`
 环境变量提供。命令只选择明确声明的 SOUL、USER、MEMORY 与两个 diary
-命名空间，逐文件保存 `LONGBLOB` 原始字节、hash、字节长度、换行/编码诊断与
-“语义来源未知”状态。反向导出同样只允许写入此前不存在的新目录。
+命名空间以及 `notes/` 笔记命名空间，逐文件保存 `LONGBLOB` 原始字节、
+hash、字节长度、换行/编码诊断与“语义来源未知”状态。反向导出同样只允许
+写入此前不存在的新目录。
 
 只读独立复核使用：
 

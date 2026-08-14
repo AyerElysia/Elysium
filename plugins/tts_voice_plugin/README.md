@@ -2,7 +2,7 @@
 
 > **遗留兼容组件：** 当前爱莉的本地 TTS 主路径是 `tasks.tts → IndexTTS2`，不经过本插件。本 README 只说明仍保留的 GPT-SoVITS/Higgs 协议实现；不得据此把 GPT-SoVITS 写成项目当前 TTS 模型。
 
-文本转语音插件，为 Neo-MoFox 提供高质量、多语言、多风格的语音合成能力。支持本地 GPT-SoVITS、MiMo 云端 VoiceClone 和 Boson Higgs Audio 云端 TTS。
+文本转语音插件，为 Elysium 提供高质量、多语言、多风格的语音合成能力。当前本地音色基线为 IndexTTS2，并可接入已配置的云端语音服务。
 
 ## 🌟 功能特性
 

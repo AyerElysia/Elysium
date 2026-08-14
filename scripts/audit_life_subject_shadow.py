@@ -31,7 +31,12 @@ _ROOTS = {
     "life_engine_workspace/SOUL.md",
     "life_engine_workspace/USER.md",
 }
-_PREFIXES = ("diaries/", "life_engine_workspace/diaries/")
+_PREFIXES = (
+    "diaries/",
+    "life_engine_workspace/diaries/",
+    "notes/",
+    "life_engine_workspace/notes/",
+)
 
 
 def _required_environment(name: str) -> str:

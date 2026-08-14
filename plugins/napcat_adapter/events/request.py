@@ -14,9 +14,8 @@ import hashlib
 import time
 from typing import TYPE_CHECKING, Any
 
-from mofox_wire import MessageBuilder, SegPayload, UserInfoPayload
-
 from src.app.plugin_system.api.log_api import get_logger
+from src.core.transport.wire import MessageBuilder, SegPayload, UserInfoPayload
 
 from ..utils.cache import GROUP_INFO_TTL, STRANGER_INFO_TTL, get_cached, set_cached
 from ..utils.constants import ACCEPT_FORMAT, RequestType

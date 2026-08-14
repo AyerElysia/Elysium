@@ -198,7 +198,7 @@ async def test_db_message_to_runtime_uses_bot_name_for_bot_message(monkeypatch) 
 
     adapter_manager = SimpleNamespace(
         get_bot_info_by_platform=AsyncMock(
-            return_value={"bot_id": "10001", "bot_name": "MoFox"}
+            return_value={"bot_id": "10001", "bot_name": "Elysia"}
         )
     )
     monkeypatch.setattr(
@@ -221,8 +221,8 @@ async def test_db_message_to_runtime_uses_bot_name_for_bot_message(monkeypatch) 
     runtime_msg = await manager._db_message_to_runtime(db_message)
 
     assert runtime_msg.sender_id == "10001"
-    assert runtime_msg.sender_name == "MoFox"
-    assert runtime_msg.sender_cardname == "MoFox"
+    assert runtime_msg.sender_name == "Elysia"
+    assert runtime_msg.sender_cardname == "Elysia"
 
 
 async def test_get_stream_info_normalizes_raw_person_id(monkeypatch) -> None:

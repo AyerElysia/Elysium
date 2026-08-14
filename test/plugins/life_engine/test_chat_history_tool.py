@@ -58,7 +58,9 @@ def _tool() -> LifeEngineConversationEvidenceTool:
 def _stub_scope(
     monkeypatch: pytest.MonkeyPatch, tool: LifeEngineConversationEvidenceTool
 ) -> None:
-    async def _resolve(_requested: list[str] | None) -> tuple[str, ...]:
+    async def _resolve(
+        _requested: list[str] | None, *, operation: str = "page"
+    ) -> tuple[str, ...]:
         return ("s1",)
 
     async def _frontier(_streams: tuple[str, ...]) -> int:
@@ -218,9 +220,318 @@ async def test_invalid_cursor_fails_explicitly(monkeypatch: pytest.MonkeyPatch) 
 async def test_internal_call_never_falls_back_to_latest_stream() -> None:
     tool = _tool()
     with pytest.raises(
-        ConversationEvidenceError, match="must provide stream_ids explicitly"
+        ConversationEvidenceError, match="must provide stream_ids"
     ):
         await tool._resolve_streams(None)
+
+
+async def test_heartbeat_placeholder_requires_explicit_streams() -> None:
+    """心跳绑定 stream_id=chat_global 占位符时不得误当真实流读取。"""
+    tool = _tool()
+    tool._bind_runtime_context(stream_id="chat_global")
+    with pytest.raises(
+        ConversationEvidenceError, match="must provide stream_ids"
+    ):
+        await tool._resolve_streams(None)
+
+
+async def test_target_key_resolves_to_full_stream(monkeypatch: pytest.MonkeyPatch) -> None:
+    """「你可以触达的人和地方」的 target_key（p-20403fdb）应解析为完整 stream_id。"""
+    tool = _tool()
+
+    resolved = {"p-20403fdb": "20403fdb0e6df94137c9071e62c44c09eb8090b534279ef5695c4b4aa5fae7bc"}
+
+    async def _resolve_key(ref: str) -> str | None:
+        return resolved.get(ref)
+
+    monkeypatch.setattr(tool, "_resolve_target_key", _resolve_key)
+
+    class _Result:
+        def __init__(self, rows: list[str]) -> None:
+            self._rows = rows
+
+        def scalars(self) -> _Result:
+            return self
+
+        def all(self) -> list[str]:
+            return self._rows
+
+    class _Session:
+        def __init__(self, rows: list[str]) -> None:
+            self._rows = rows
+
+        async def execute(self, _statement: Any) -> _Result:
+            return _Result(self._rows)
+
+    @asynccontextmanager
+    async def _session() -> Any:
+        yield _Session(["20403fdb0e6df94137c9071e62c44c09eb8090b534279ef5695c4b4aa5fae7bc"])
+
+    registry = SimpleNamespace(
+        get_for_stream=lambda _stream_id: SimpleNamespace(instance_id="chat_global")
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.tools.conversation_evidence.get_db_session", _session
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.tools.conversation_evidence.LifeEngineService.get_instance",
+        lambda: SimpleNamespace(consciousness_registry=registry),
+    )
+
+    streams = await tool._resolve_streams(["p-20403fdb"])
+    assert streams == (
+        "20403fdb0e6df94137c9071e62c44c09eb8090b534279ef5695c4b4aa5fae7bc",
+    )
+
+
+async def test_resolve_target_key_accepts_uuid_hallucination(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """模型脑补的 UUID 形式流 ID（20403fdb-6f1a-...）应去连字符按前缀解析为完整流。"""
+    tool = _tool()
+    full = "20403fdb0e6df94137c9071e62c44c09eb8090b534279ef5695c4b4aa5fae7bc"
+    uuid_form = "20403fdb-6f1a-441c-9596-4d7e4f85e3c8"
+
+    class _Result:
+        def __init__(self, rows: list[tuple[str, str]]) -> None:
+            self._rows = rows
+
+        def all(self) -> list[tuple[str, str]]:
+            return self._rows
+
+    class _Session:
+        def __init__(self, rows: list[tuple[str, str]]) -> None:
+            self._rows = rows
+
+        async def execute(self, _statement: Any) -> _Result:
+            return _Result(self._rows)
+
+    @asynccontextmanager
+    async def _session() -> Any:
+        yield _Session([(full, "feishu")])
+
+    monkeypatch.setattr(
+        "plugins.life_engine.tools.conversation_evidence.get_db_session", _session
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.core.send_targets.resolve_send_target_key",
+        lambda _ref: None,
+    )
+
+    resolved = await tool._resolve_target_key(uuid_form)
+    assert resolved == full
+
+
+async def test_resolve_target_key_uuid_hallucination_returns_original_when_ambiguous(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """UUID 形式解析不到唯一真实流时原样返回（后续精确匹配会显式报错，不伪造）。"""
+    tool = _tool()
+    uuid_form = "deadbeef-6f1a-441c-9596-4d7e4f85e3c8"
+
+    class _Result:
+        def __init__(self, rows: list[tuple[str, str]]) -> None:
+            self._rows = rows
+
+        def all(self) -> list[tuple[str, str]]:
+            return self._rows
+
+    class _Session:
+        def __init__(self, rows: list[tuple[str, str]]) -> None:
+            self._rows = rows
+
+        async def execute(self, _statement: Any) -> _Result:
+            return _Result(self._rows)
+
+    @asynccontextmanager
+    async def _session() -> Any:
+        yield _Session([])
+
+    monkeypatch.setattr(
+        "plugins.life_engine.tools.conversation_evidence.get_db_session", _session
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.core.send_targets.resolve_send_target_key",
+        lambda _ref: None,
+    )
+
+    assert await tool._resolve_target_key(uuid_form) == uuid_form
+
+
+async def test_search_without_streams_scans_all_real_streams(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """search 在心跳态无当前流时不抛 stream_required，降级扫描全部真实流。"""
+    tool = _tool()
+
+    class _Result:
+        def __init__(self, rows: list[str]) -> None:
+            self._rows = rows
+
+        def scalars(self) -> _Result:
+            return self
+
+        def all(self) -> list[str]:
+            return self._rows
+
+    class _Session:
+        def __init__(self, rows: list[str]) -> None:
+            self._rows = rows
+
+        async def execute(self, _statement: Any) -> _Result:
+            return _Result(self._rows)
+
+    @asynccontextmanager
+    async def _session() -> Any:
+        yield _Session(
+            [
+                "20403fdb0e6df94137c9071e62c44c09eb8090b534279ef5695c4b4aa5fae7bc",
+                "aaabbbcccddd000111222333444555666777888999aaabbbcccddd000111222",
+                "chat_global",
+            ]
+        )
+
+    monkeypatch.setattr(
+        "plugins.life_engine.tools.conversation_evidence.get_db_session", _session
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.tools.conversation_evidence.LifeEngineService.get_instance",
+        lambda: None,
+    )
+
+    streams = await tool._resolve_streams(None, operation="search")
+    assert "chat_global" not in streams
+    assert len(streams) == 2
+
+
+async def test_search_without_streams_fails_when_no_real_streams(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """全库没有真实流时 search 才报 stream_required，消息说明"no real conversation streams"。"""
+    tool = _tool()
+
+    class _Result:
+        def __init__(self, rows: list[str]) -> None:
+            self._rows = rows
+
+        def scalars(self) -> _Result:
+            return self
+
+        def all(self) -> list[str]:
+            return self._rows
+
+    class _Session:
+        def __init__(self, rows: list[str]) -> None:
+            self._rows = rows
+
+        async def execute(self, _statement: Any) -> _Result:
+            return _Result(self._rows)
+
+    @asynccontextmanager
+    async def _session() -> Any:
+        yield _Session(["chat_global"])
+
+    monkeypatch.setattr(
+        "plugins.life_engine.tools.conversation_evidence.get_db_session", _session
+    )
+
+    with pytest.raises(ConversationEvidenceError, match="no real conversation streams"):
+        await tool._resolve_streams(None, operation="search")
+
+
+async def test_target_key_unresolvable_keeps_original_and_fails_explicitly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """target_key 解析失败时保留原值；精确匹配不到即显式 stream_not_found，不伪造结果。"""
+    tool = _tool()
+
+    async def _resolve_key(_ref: str) -> str | None:
+        return None  # 活跃列表与前缀兜底都解析不到
+
+    monkeypatch.setattr(tool, "_resolve_target_key", _resolve_key)
+
+    class _Result:
+        def scalars(self) -> _Result:
+            return self
+
+        def all(self) -> list[str]:
+            return []
+
+    class _Session:
+        async def execute(self, _statement: Any) -> _Result:
+            return _Result()
+
+    @asynccontextmanager
+    async def _session() -> Any:
+        yield _Session()
+
+    registry = SimpleNamespace(
+        get_for_stream=lambda _stream_id: SimpleNamespace(instance_id="chat_global")
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.tools.conversation_evidence.get_db_session", _session
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.tools.conversation_evidence.LifeEngineService.get_instance",
+        lambda: SimpleNamespace(consciousness_registry=registry),
+    )
+
+    with pytest.raises(ConversationEvidenceError) as error:
+        await tool._resolve_streams(["p-20403fdb"])
+    assert error.value.code == "stream_not_found"
+
+
+async def test_resolve_target_key_prefix_scan_prefers_real_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_resolve_target_key 前缀扫描：排除空 platform 占位，返回唯一真实流。"""
+    tool = _tool()
+
+    # send_targets 活跃列表解析失败
+    async def _no_target(_key: str) -> Any:
+        return None
+
+    monkeypatch.setattr(
+        "plugins.life_engine.core.send_targets.resolve_send_target_key", _no_target
+    )
+
+    class _Rows:
+        def __init__(self, rows: list[tuple[str, str]]) -> None:
+            self._rows = rows
+
+        def all(self) -> list[tuple[str, str]]:
+            return self._rows
+
+    class _Session:
+        def __init__(self, rows: list[tuple[str, str]]) -> None:
+            self._rows = rows
+
+        async def execute(self, _statement: Any) -> _Rows:
+            return _Rows(self._rows)
+
+    rows = [
+        ("20403fdb", ""),
+        ("20403fdb0e6df94137c9071e62c44c09eb8090b534279ef5695c4b4aa5fae7bc", "ayla"),
+    ]
+
+    @asynccontextmanager
+    async def _session() -> Any:
+        yield _Session(rows)
+
+    monkeypatch.setattr(
+        "plugins.life_engine.tools.conversation_evidence.get_db_session", _session
+    )
+
+    full = await tool._resolve_target_key("p-20403fdb")
+    assert full == "20403fdb0e6df94137c9071e62c44c09eb8090b534279ef5695c4b4aa5fae7bc"
+
+
+async def test_resolve_target_key_passthrough_for_full_stream_id() -> None:
+    """完整 stream_id 不是 target_key 格式，应原样返回。"""
+    tool = _tool()
+    full = "20403fdb0e6df94137c9071e62c44c09eb8090b534279ef5695c4b4aa5fae7bc"
+    assert await tool._resolve_target_key(full) == full
+    assert await tool._resolve_target_key("") == ""
 
 
 async def test_cross_instance_stream_read_is_denied(

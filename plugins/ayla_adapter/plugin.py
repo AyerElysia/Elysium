@@ -9,11 +9,10 @@ from __future__ import annotations
 
 from typing import Any, cast
 
-from mofox_wire import CoreSink, MessageEnvelope
-
 from src.app.plugin_system.api.log_api import get_logger
 from src.core.components.base import BaseAdapter, BasePlugin
 from src.core.components.loader import register_plugin
+from src.core.transport.wire import CoreSink, MessageEnvelope
 
 from .config import AylaAdapterConfig
 from .sender import AylaSender

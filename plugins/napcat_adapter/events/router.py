@@ -12,9 +12,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, cast
 
-from mofox_wire import MessageEnvelope
-
 from src.app.plugin_system.api.log_api import get_logger
+from src.core.transport.wire import MessageEnvelope
 
 if TYPE_CHECKING:
     from ..client import NapCatClient

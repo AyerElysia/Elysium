@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-清理 MoFox.db 中 images 表的重复 image_id 记录
+清理 Elysium.db 中 images 表的重复 image_id 记录
 规则：当 image_id 重复时，保留 path 包含 'data\media_cache\images' 的记录，删除其他 
 """
 
@@ -150,7 +150,7 @@ def clean_duplicate_images(db_path: str, dry_run: bool = True) -> dict:
 
 def main():
     # 默认数据库路径
-    db_path = Path("data/MoFox.db")
+    db_path = Path("data/Elysium.db")
 
     # 检查命令行参数
     dry_run = True

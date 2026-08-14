@@ -1,6 +1,6 @@
 # N.E.K.O Surface Gateway
 
-Neo-MoFox owns identity, memory, LifeChatter, autonomy, and permissions. N.E.K.O
+Elysium owns identity, memory, LifeChatter, autonomy, and permissions. N.E.K.O
 owns avatar rendering, local TTS/audio playback, and user interaction. The gateway
 only transports versioned events between those boundaries.
 
@@ -11,7 +11,7 @@ only transports versioned events between those boundaries.
 The client must authenticate with `Authorization: Bearer <token>` (or the
 `X-NEKO-Surface-Token` header) and send an `elysia.surface.v1` `hello` event first.
 
-## Neo-MoFox environment
+## Elysium environment
 
 ```bash
 NEKO_SURFACE_TOKEN=replace-with-a-long-random-token

@@ -19,7 +19,6 @@ import time
 from collections import OrderedDict
 from typing import Any
 
-from mofox_wire import MessageEnvelope
 from rich.markup import escape
 
 from src.core.components.types import EventType
@@ -29,6 +28,7 @@ from src.core.transport.message_receive.utils import (
     extract_stream_id,
     infer_chat_type,
 )
+from src.core.transport.wire import MessageEnvelope
 from src.kernel.logger import COLOR, get_logger
 
 logger = get_logger("message_receiver", display="消息接收器", color=COLOR.CYAN)
@@ -244,7 +244,7 @@ class MessageReceiver:
         这是与 ``SinkManager`` 集成的唯一入口。
 
         Args:
-            envelope: mofox-wire 消息信封
+            envelope: Elysium 消息信封
             adapter_signature: 发送方适配器签名（如 ``"my_plugin:adapter:qq"``）
         """
         # 方向校验

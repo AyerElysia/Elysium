@@ -305,7 +305,7 @@ class CoreConfig(ConfigBase):
 
         # ========== SQLite 配置（当 storage.backend = "local" 时使用）==========
         sqlite_path: str = Field(
-            default="data/MoFox.db",
+            default="data/Elysium.db",
             description="SQLite 数据库文件路径",
         )
 
@@ -319,7 +319,7 @@ class CoreConfig(ConfigBase):
             description="PostgreSQL 服务器端口",
         )
         postgresql_database: str = Field(
-            default="mofox",
+            default="elysium",
             description="PostgreSQL 数据库名",
         )
         postgresql_user: str = Field(

@@ -104,7 +104,7 @@ class TestDatabaseSection:
         """数据库节只保存连接参数，不选择后端。"""
         config = CoreConfig.DatabaseSection()
 
-        assert config.sqlite_path == "data/MoFox.db"
+        assert config.sqlite_path == "data/Elysium.db"
         assert not hasattr(config, "database_type")
 
     def test_global_storage_config(self):

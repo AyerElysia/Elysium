@@ -1374,7 +1374,7 @@ chatter_task_name = "expression"
 至少关注：
 
 ```text
-data/MoFox.db
+data/Elysium.db
 data/life_engine_workspace/
 data/training_data_lake/
 logs/

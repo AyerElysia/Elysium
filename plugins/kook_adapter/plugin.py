@@ -15,11 +15,10 @@ from __future__ import annotations
 
 from typing import Any, cast
 
-from mofox_wire import CoreSink, MessageEnvelope
-
 from src.app.plugin_system.api.log_api import get_logger
 from src.core.components.base import BaseAdapter, BasePlugin
 from src.core.components.loader import register_plugin
+from src.core.transport.wire import CoreSink, MessageEnvelope
 
 from .client import KookAPIClient
 from .config import KookAdapterConfig
@@ -112,7 +111,7 @@ class KookAdapter(BaseAdapter):
     async def from_platform_message(self, raw: dict[str, Any]) -> MessageEnvelope | None:
         """入站：KOOK 事件 → MessageEnvelope。
 
-        由 Gateway 事件回调触发，而非 mofox-wire 传输层。
+        由 Gateway 事件回调触发，而非 Elysium 通用传输层。
         此方法保留用于接口兼容。
         """
         if self._event_handler:
@@ -136,7 +135,7 @@ class KookAdapter(BaseAdapter):
     async def health_check(self) -> bool:
         """健康检查：返回 KOOK Gateway 的真实连接状态。
 
-        本适配器未使用 mofox_wire 内置传输层，基类默认的 is_connected()
+        本适配器未使用 Elysium wire 内置传输层，基类默认的 is_connected()
         恒为 False，会导致框架每 30 秒误判"不健康"并触发 reconnect，
         进而把适配器停掉。此处以 Gateway 实际连接状态为准。
         """

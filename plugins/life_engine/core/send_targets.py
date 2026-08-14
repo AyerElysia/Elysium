@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -208,12 +209,106 @@ async def _recover_targets_from_event_ledger(
     return targets[: max(1, int(limit or 8))]
 
 
+async def _targets_from_stream_table(
+) -> list[SendTarget]:
+    """从 chat_streams 持久化表读取真实可触达流（platform 非空、真实流 ID）。
+
+    权威数据源：chat_streams 表是"她注册过的所有真实会话"的持久化注册表，
+    内存 stream_manager 重启后可能只重建部分流且 platform 为空，导致
+    心跳「你可以触达的人和地方」漏掉真实可触达的流（2026-08-13：ayla/飞书
+    汐汐流明明在表里且当天有消息，心跳却看不到）。
+    """
+    try:
+        from sqlalchemy import select
+
+        from src.core.models.sql_alchemy import ChatStreams
+        from src.kernel.db import get_db_session
+
+        async with get_db_session() as session:
+            result = await session.execute(
+                select(
+                    ChatStreams.stream_id,
+                    ChatStreams.platform,
+                    ChatStreams.chat_type,
+                    ChatStreams.person_id,
+                    ChatStreams.group_id,
+                    ChatStreams.group_name,
+                    ChatStreams.last_active_time,
+                ).where(
+                    ChatStreams.platform.is_not(None),
+                    ChatStreams.platform != "",
+                    ChatStreams.chat_type.in_(["private", "group"]),
+                )
+            )
+            rows = result.all()
+    except Exception:
+        return []
+
+    targets: list[SendTarget] = []
+    for row in rows:
+        if hasattr(row, "_mapping"):
+            mapping = row._mapping
+        else:
+            mapping = row
+        _get = (
+            (lambda key: mapping[key])
+            if isinstance(mapping, Mapping)
+            else (lambda key: getattr(mapping, key, None))
+        )
+        stream_id = str(_get("stream_id") or "").strip()
+        platform = str(_get("platform") or "").strip()
+        chat_type = str(_get("chat_type") or "").strip().lower()
+        if not stream_id or stream_id == "chat_global" or not platform:
+            continue
+        person_id = str(_get("person_id") or "").strip()
+        last_active = float(_get("last_active_time") or 0.0)
+        if chat_type == "group":
+            group_id = str(_get("group_id") or "").strip()
+            group_name = str(_get("group_name") or "").strip()
+            if not group_id:
+                continue
+            targets.append(
+                SendTarget(
+                    target_key="",
+                    stream_id=stream_id,
+                    platform=platform,
+                    chat_type="group",
+                    display_name=group_name or f"群聊 {group_id}",
+                    group_id=group_id,
+                    group_name=group_name,
+                    last_active_time=last_active,
+                )
+            )
+            continue
+        target_user_id, target_user_name = await _private_user_for_person_id(
+            platform, person_id
+        )
+        display_name = target_user_name or str(_get("group_name") or "") or f"私聊 {target_user_id or stream_id[:8]}"
+        targets.append(
+            SendTarget(
+                target_key="",
+                stream_id=stream_id,
+                platform=platform,
+                chat_type="private",
+                display_name=display_name,
+                target_user_id=target_user_id,
+                target_user_name=target_user_name or display_name,
+                last_active_time=last_active,
+            )
+        )
+    return targets
+
+
 async def list_recent_send_targets(
     *,
     current_stream_id: str = "",
     limit: int = 8,
     active_window_hours: float = 24.0,
 ) -> list[SendTarget]:
+    # 权威主源：chat_streams 持久化表（platform 完整、真实流）。
+    targets: list[SendTarget] = await _targets_from_stream_table()
+
+    # 补充：内存 stream_manager 当前活跃流（表源缺失时兜底）。
     try:
         from src.core.managers.stream_manager import get_stream_manager
 
@@ -223,8 +318,11 @@ async def list_recent_send_targets(
 
     now = time.time()
     cutoff = now - max(0.1, float(active_window_hours or 24.0)) * 3600.0
-    targets: list[SendTarget] = []
+    known_streams = {target.stream_id for target in targets}
     for stream in streams:
+        stream_id = str(getattr(stream, "stream_id", "") or "").strip()
+        if stream_id in known_streams:
+            continue
         target = await _stream_to_target(stream, current_stream_id=current_stream_id)
         if target is None:
             continue
@@ -233,6 +331,7 @@ async def list_recent_send_targets(
         ):
             continue
         targets.append(target)
+        known_streams.add(target.stream_id)
 
     # 事件账本兜底：进程重启后内存流缺失的最近流（如飞书）从这里恢复，
     # 保证心跳「你可以触达的人和地方」不因重启而只剩单个流。
@@ -240,7 +339,6 @@ async def list_recent_send_targets(
         limit=limit,
         active_window_hours=active_window_hours,
     )
-    known_streams = {target.stream_id for target in targets}
     for recovered_target in recovered:
         if recovered_target.stream_id not in known_streams:
             targets.append(recovered_target)

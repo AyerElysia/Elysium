@@ -5,9 +5,8 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
-from mofox_wire import MessageEnvelope
-
 from src.app.plugin_system.api.log_api import get_logger
+from src.core.transport.wire import MessageEnvelope
 
 logger = get_logger("ayla_adapter")
 

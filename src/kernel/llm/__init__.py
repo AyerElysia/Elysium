@@ -1,6 +1,6 @@
 """LLM request framework.
 
-对齐《MoFox 重构指导总览》中 kernel/llm 设计稿：
+对齐 Elysium 的 kernel/llm 架构契约：
 - `LLMRequest`：构建 payloads 并发起请求
 - `LLMResponse`：同时支持 `await`（收集全量）与 `async for`（流式）
 - `LLMPayload`：`role + content` 的标准消息单元

@@ -699,6 +699,34 @@ async def test_auxiliary_subject_source_is_exactly_paged_through_public_port(
         )
 
 
+async def test_auxiliary_subject_source_notes_path_opens_with_note_kind() -> None:
+    authority = _Authority()
+    notes = _AuxiliarySubjectPortFake(
+        "local",
+        logical_path="life_engine_workspace/notes/relationships/xiaoxi.md",
+        content="# 汐汐关系档案\n".encode("utf-8"),
+    )
+    session = _session(
+        authority,
+        _Repository(),
+        _Ledger(),
+        subject_documents=notes,
+    )
+    opened = await session.open(_actor())
+
+    auxiliary = await session.open_auxiliary_source(
+        _actor("tool-call:open-notes-auxiliary"),
+        session_id=opened.session_id,
+        expected_subject_revision=opened.subject_revision,
+        memory_version_id=opened.memory_version_id,
+        memory_sha256=opened.memory_sha256,
+        logical_path="life_engine_workspace/notes/relationships/xiaoxi.md",
+        max_bytes=1024,
+    )
+
+    assert auxiliary.source_kind == "note_document"
+
+
 @pytest.mark.parametrize(
     "logical_path",
     [
@@ -712,7 +740,7 @@ async def test_auxiliary_subject_source_is_exactly_paged_through_public_port(
         "life_engine_workspace/../diaries/witness.md",
         "life_engine_workspace/diaries/../../MEMORY.md",
         "life_engine_workspace\\diaries\\witness.md",
-        "notes/uncontrolled.md",
+        "life_engine_workspace/notes/../../MEMORY.md",
     ],
 )
 async def test_auxiliary_subject_path_is_confined_to_controlled_diaries(

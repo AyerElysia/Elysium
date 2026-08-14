@@ -884,16 +884,22 @@ class MemoryWitnessCoordinator:
                 except asyncio.CancelledError:
                     raise
                 except Exception as renew_exc:
-                    if not _is_unmanaged_author_claim_error(renew_exc):
+                    claim_was_lost = isinstance(
+                        renew_exc,
+                        (SingletonWriterClaimLost, _PluginsWriterClaimLost),
+                    )
+                    if not claim_was_lost and not _is_unmanaged_author_claim_error(
+                        renew_exc
+                    ):
                         # A DB/network failure or any other unclassified renewal
                         # error does not prove lease loss.  Keep the exact local
                         # snapshot so the managed loop can retry it without
                         # colliding with the runtime's still-owned claim entry.
                         raise
-                    # 续租线程可能在 2013/claim lost 后 invalidate 了本地管理表
-                    # （_handle_managed_singleton_loss），本协程仍持有旧 claim
-                    # 引用，renew 会报 "not managed locally"。此时丢弃旧 claim
-                    # 重新 acquire，而不是让见证循环卡死。
+                    # An explicit claim-loss or runtime detachment proves this
+                    # snapshot is stale. Re-acquire in the same authoring round;
+                    # a competing live writer will surface the normal conflict
+                    # path and no witness cursor will advance.
                     self._author_claim = None
                     self._author_claim_mode = "selected_runtime_claim_failed"
                     self._author_claim = await acquire(

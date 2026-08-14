@@ -1,6 +1,6 @@
 # Feishu Adapter
 
-把飞书自建应用接入 Neo-MoFox 的统一消息流。
+把飞书自建应用接入 Elysium 的统一消息流。
 
 ## 当前能力
 
@@ -90,13 +90,13 @@ subscription_mode = "http_callback"
 https://你的公网域名/feishu/events
 ```
 
-本地调试可以用 frp、cloudflared 或 ngrok 把 Neo-MoFox 的 HTTP 端口映射到公网。
+本地调试可以用 frp、cloudflared 或 ngrok 把 Elysium 的 HTTP 端口映射到公网。
 
-填写同一个 `Verification Token` 到 Neo-MoFox 配置，暂时不要启用 Encrypt Key。
+填写同一个 `Verification Token` 到 Elysium 配置，暂时不要启用 Encrypt Key。
 
 ## 本地冒烟测试
 
-Neo-MoFox 启动后：
+Elysium 启动后：
 
 ```bash
 curl http://127.0.0.1:<Neo端口>/feishu/api/status

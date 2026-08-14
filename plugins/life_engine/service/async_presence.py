@@ -237,7 +237,15 @@ class AsyncConsciousnessRegistry:
             raise RuntimeError(
                 f"PresenceSnapshotCorrupt: stream has multiple owners: {identity}"
             )
-        return owners[0] if owners else None
+        if owners:
+            return owners[0]
+        # Keep parity with the synchronous registry: an unowned stream belongs
+        # to the default global chat window, never to nobody.  Without this
+        # fallback, heartbeat-side retrieval (which binds stream_id="chat_global"
+        # as its identity) resolves to None and conversation_evidence fails with
+        # instance_unverified/cross_instance_denied even though the stream and
+        # its messages exist in the message store.
+        return self._instances.get(CHAT_GLOBAL_INSTANCE_ID)
 
     @property
     def active_count(self) -> int:

@@ -31,7 +31,7 @@ def create_life_backup(
     output: Path,
     *,
     writer_frozen: bool = False,
-    core_sqlite_relative: Path = Path("MoFox.db"),
+    core_sqlite_relative: Path = Path("Elysium.db"),
     precreated_output: bool = False,
 ) -> dict[str, Any]:
     """Compatibility wrapper around the versioned snapshot implementation."""
@@ -101,8 +101,8 @@ def main() -> int:
     parser.add_argument(
         "--core-sqlite-relative",
         type=Path,
-        default=Path("MoFox.db"),
-        help="Core SQLite path relative to --data-root (default: MoFox.db)",
+        default=Path("Elysium.db"),
+        help="Core SQLite path relative to --data-root (default: Elysium.db)",
     )
     parser.add_argument(
         "--precreated-output",

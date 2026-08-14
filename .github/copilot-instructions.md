@@ -30,7 +30,7 @@
 - 新模块完成后在 `examples/` 下提供可运行示例（见 `代码规范.md`）。
 
 ## Integration Points
-- 外部核心依赖：`openai`, `chromadb`, `fastapi`, `mcp`, `mofox-wire`, `sqlalchemy`（见 `pyproject.toml`）。
+- 外部核心依赖：`openai`, `chromadb`, `fastapi`, `mcp`, `aiohttp`, `sqlalchemy`（见 `pyproject.toml`）；统一消息协议由仓库内 `src/core/transport/wire.py` 维护。
 - 模型与平台配置主要来自 `config/models.toml`、`config/core.toml`。
 - 传输链路围绕 Adapter/Sink/Receiver 组织（见 `src/core/transport/` 与 `src/core/components/base/adapter.py`）。
 - 插件支持目录、zip、`.mfp` 形式加载（见 `src/core/components/loader.py`、`src/core/managers/plugin_manager.py`）。

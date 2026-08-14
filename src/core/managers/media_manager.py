@@ -1196,7 +1196,7 @@ class MediaManager:
         frame_results: list[str] = []
 
         try:
-            with TemporaryDirectory(prefix="mofox_video_") as temp_dir:
+            with TemporaryDirectory(prefix="elysium_video_") as temp_dir:
                 temp_path = Path(temp_dir)
                 input_path = temp_path / f"input{suffix}"
                 await asyncio.to_thread(input_path.write_bytes, binary_data)
