@@ -716,10 +716,11 @@ class _MySQLPort:
         values = {str(item) for item in getattr(exc.orig, "args", ())}
         message = str(exc.orig).lower()
         return bool(
-            {"1062", "1205", "1213"} & values
+            {"1062", "1205", "1213", "2013"} & values
             or "duplicate entry" in message
             or "deadlock" in message
             or "lock wait timeout" in message
+            or "lost connection" in message
         )
 
     async def _write(
