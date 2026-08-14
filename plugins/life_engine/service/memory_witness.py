@@ -131,6 +131,7 @@ _TRANSIENT_ERROR_ESCALATION_COUNT = 3
 # 前 8 次只记 debug/warning，第 9 次才升级 ERROR，避免常态竞争刷 ERROR。
 _CONCURRENCY_ERROR_ESCALATION_COUNT = 9
 _MYSQL_LOST_CONNECTION_ERROR_CODE = 2013
+_MYSQL_LOCK_WAIT_TIMEOUT_ERROR_CODE = 1205
 _LEGACY_MIGRATION_GUARD = Lock()
 _LEGACY_MIGRATION_COMPLETED: set[str] = set()
 _LEGACY_MIGRATION_IN_PROGRESS: set[str] = set()
@@ -497,6 +498,17 @@ class MemoryWitnessCoordinator:
                     # The concurrent owner retired the instance; re-register.
                     return
                 instance = refreshed
+            except DBAPIError as db_exc:
+                if _dbapi_error_code(db_exc) != _MYSQL_LOCK_WAIT_TIMEOUT_ERROR_CODE:
+                    raise
+                if attempt >= 2:
+                    logger.warning(
+                        "memory witness presence world-projection lock "
+                        "contention after retries; continuing with a local "
+                        "read-only instance handle: "
+                        f"attempts={attempt + 1}"
+                    )
+                    return
 
     async def loop(self) -> None:
         cfg = self.config
