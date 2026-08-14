@@ -436,7 +436,7 @@ class UnifiedScheduler:
             "interval_seconds" if task.is_recurring and "interval_seconds" in config else "delay_seconds"
         )
 
-        if interval_key in config:
+        if interval_key in config and "trigger_at" not in config:
             interval = float(config[interval_key])
 
             # 一次性任务：从创建时间算起

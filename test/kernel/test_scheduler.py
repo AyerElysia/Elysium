@@ -1133,10 +1133,16 @@ class TestSchedulerTimeUtils:
 
     async def test_recurring_task_with_trigger_at_and_interval(self):
         """测试循环任务使用trigger_at和interval_seconds"""
-        executed = []
+        executed_at: list[datetime] = []
+        first_execution = asyncio.Event()
+        second_execution = asyncio.Event()
 
         async def interval_task():
-            executed.append(1)
+            executed_at.append(datetime.now())
+            if len(executed_at) == 1:
+                first_execution.set()
+            if len(executed_at) >= 2:
+                second_execution.set()
 
         # 设置触发时间为当前时间，并使用间隔
         trigger_time = datetime.now() + timedelta(seconds=0.5)
@@ -1152,10 +1158,14 @@ class TestSchedulerTimeUtils:
             task_name="test_trigger_at_interval",
         )
 
-        await asyncio.sleep(4)
-        assert len(executed) >= 2
+        try:
+            await asyncio.wait_for(first_execution.wait(), timeout=3.0)
+            await asyncio.wait_for(second_execution.wait(), timeout=3.0)
 
-        await get_unified_scheduler().remove_schedule(schedule_id)
+            assert len(executed_at) >= 2
+            assert executed_at[0] >= trigger_time
+        finally:
+            await get_unified_scheduler().remove_schedule(schedule_id)
 
     async def test_manual_trigger_with_exception(self):
         """测试手动触发任务时发生异常"""

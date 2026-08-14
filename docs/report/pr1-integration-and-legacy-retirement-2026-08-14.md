@@ -16,6 +16,8 @@
 5. 当前数据库默认名统一为 `Elysium.db`，PostgreSQL 示例默认库名统一为 `elysium`；不会自动移动、重命名或删除已有数据库文件，显式配置的非默认路径仍按配置读取。
 6. 删除两个仅服务旧目录结构、且硬编码失效路径的一次性脚本：`check_live_broadcast.py`、`test_history.py`。
 7. 活动范围（排除 `.git`、测试虚拟环境、运行数据、日志和用户保留的 `docs/archive/**`）大小写不敏感扫描旧项目名称为零结果。
+8. 删除已禁用且未纳入正式实现的旧姐妹直连桥接插件；正式 `.venv` 已按 `uv.lock` 重新同步，确认旧消息线包不再安装。
+9. 清理仓库根目录下明确损坏的旧虚拟环境备份和过期启动日志；不触碰 `docs/archive/**`、`.codex-backups/**`、个人 report/scratch 材料或任何权威运行数据。
 
 ## PR 审查中修复的问题
 
@@ -35,13 +37,14 @@ flush 与历史分区压缩原先使用不同锁，维护线程可能在 append/
 
 - WatchDog 的健康判断改用 monotonic 时间，墙钟回拨时展示时间仍保持非递减，避免心跳时间倒退和错误超时判断。
 - Scheduler timeout 测试改为等待 callback started、cancelled 与 schedule removed 三个真实生命周期事件，不再用固定 sleep 猜测全仓负载下的完成时机。
+- Scheduler 同时配置 `trigger_at` 与 `interval_seconds` 时，首次指定时间不再被间隔分支遮蔽；回归测试等待两次真实触发并验证首次执行不早于 `trigger_at`。
 
 ## 验证证据
 
 - 消息适配、部署、备份、同步、模型路由、Memory Witness、Life Engine 风险回归：`341 passed`。
 - Trajectory/Bash 专项：`26 passed`；归档竞态专项连续 20 轮通过。
 - WatchDog/Scheduler 全套：`189 passed`。
-- 全仓最终：`4722 passed / 21 skipped / 3 warnings`，覆盖率 `70.96%`。
+- 全仓最终：`4722 passed / 20 skipped / 3 warnings`，覆盖率 `70.17%`。
 - `compileall`：通过。
 - 变更差异检查：通过。
 - 旧项目名称活动范围残留扫描：零结果。
