@@ -1827,19 +1827,26 @@ class MySQLDocumentIndexProjection(_MySQLPort):
 
     async def read_chunk_index_state(self) -> ChunkIndexState | None:
         assert self.runtime.engine is not None
-        async with self.runtime.engine.connect() as connection:
-            row = (
-                (
-                    await connection.execute(
-                        text(
-                            "SELECT * FROM memory_index_state WHERE state_key = :state_key"
-                        ),
-                        {"state_key": ACTIVE_CHUNK_STATE_KEY},
+        row: Any = None
+        for _attempt in range(_MAX_WRITE_ATTEMPTS):
+            try:
+                async with self.runtime.engine.connect() as connection:
+                    row = (
+                        (
+                            await connection.execute(
+                                text(
+                                    "SELECT * FROM memory_index_state WHERE state_key = :state_key"
+                                ),
+                                {"state_key": ACTIVE_CHUNK_STATE_KEY},
+                            )
+                        )
+                        .mappings()
+                        .one_or_none()
                     )
-                )
-                .mappings()
-                .one_or_none()
-            )
+                break
+            except DBAPIError as exc:
+                if _attempt + 1 >= _MAX_WRITE_ATTEMPTS or not self._retryable(exc):
+                    raise
         if row is None:
             return None
         return ChunkIndexState(
@@ -1915,36 +1922,43 @@ class MySQLDocumentIndexProjection(_MySQLPort):
             # that may have run against the wrong backend collection.
             return 0
         assert self.runtime.engine is not None
-        async with self.runtime.engine.connect() as connection:
-            rows = (
-                (
-                    await connection.execute(
-                        text(
-                            "SELECT t.tombstone_id, t.chunk_id, t.force_delete, "
-                            "t.collection_name, "
-                            "EXISTS(SELECT 1 FROM memory_chunks c "
-                            "JOIN memory_nodes n ON n.node_id = c.node_id "
-                            "WHERE c.chunk_id = t.chunk_id "
-                            "AND COALESCE(n.is_deleted, FALSE) = FALSE) AS is_live "
-                            "FROM memory_vector_tombstones t "
-                            "WHERE t.consumed_at IS NULL "
-                            "AND (t.collection_name = :collection_name OR ("
-                            "t.collection_name = '' AND EXISTS ("
-                            "SELECT 1 FROM memory_index_state s "
-                            "WHERE s.state_key = :state_key "
-                            "AND s.collection_name = :collection_name))) "
-                            "ORDER BY t.tombstone_id LIMIT :limit"
-                        ),
-                        {
-                            "limit": _safe_limit(limit),
-                            "collection_name": target_collection_name,
-                            "state_key": ACTIVE_CHUNK_STATE_KEY,
-                        },
+        rows: list[Any] = []
+        for _attempt in range(_MAX_WRITE_ATTEMPTS):
+            try:
+                async with self.runtime.engine.connect() as connection:
+                    rows = (
+                        (
+                            await connection.execute(
+                                text(
+                                    "SELECT t.tombstone_id, t.chunk_id, t.force_delete, "
+                                    "t.collection_name, "
+                                    "EXISTS(SELECT 1 FROM memory_chunks c "
+                                    "JOIN memory_nodes n ON n.node_id = c.node_id "
+                                    "WHERE c.chunk_id = t.chunk_id "
+                                    "AND COALESCE(n.is_deleted, FALSE) = FALSE) AS is_live "
+                                    "FROM memory_vector_tombstones t "
+                                    "WHERE t.consumed_at IS NULL "
+                                    "AND (t.collection_name = :collection_name OR ("
+                                    "t.collection_name = '' AND EXISTS ("
+                                    "SELECT 1 FROM memory_index_state s "
+                                    "WHERE s.state_key = :state_key "
+                                    "AND s.collection_name = :collection_name))) "
+                                    "ORDER BY t.tombstone_id LIMIT :limit"
+                                ),
+                                {
+                                    "limit": _safe_limit(limit),
+                                    "collection_name": target_collection_name,
+                                    "state_key": ACTIVE_CHUNK_STATE_KEY,
+                                },
+                            )
+                        )
+                        .mappings()
+                        .all()
                     )
-                )
-                .mappings()
-                .all()
-            )
+                break
+            except DBAPIError as exc:
+                if _attempt + 1 >= _MAX_WRITE_ATTEMPTS or not self._retryable(exc):
+                    raise
         if not rows:
             return 0
         # 同一个 chunk_id 可能因多次文档替换/删除产生多条未消费墓碑；
@@ -2352,71 +2366,80 @@ class MySQLDocumentIndexProjection(_MySQLPort):
         payloads: list[tuple[IndexJob, DocumentChunk, str, str]] = []
         stale: list[_IndexJobIdentity] = []
         errors: dict[_IndexJobIdentity, str] = {}
-        async with self.runtime.engine.connect() as connection:
-            for job in jobs:
-                identity = _index_job_identity(job)
-                node = (
-                    (
-                        await connection.execute(
-                            text("SELECT * FROM memory_nodes WHERE node_id = :node_id"),
-                            {"node_id": job.node_id},
+        for _load_attempt in range(_MAX_WRITE_ATTEMPTS):
+            try:
+                async with self.runtime.engine.connect() as connection:
+                    for job in jobs:
+                        identity = _index_job_identity(job)
+                        node = (
+                            (
+                                await connection.execute(
+                                    text("SELECT * FROM memory_nodes WHERE node_id = :node_id"),
+                                    {"node_id": job.node_id},
+                                )
+                            )
+                            .mappings()
+                            .one_or_none()
                         )
-                    )
-                    .mappings()
-                    .one_or_none()
-                )
-                is_deleted = bool(node.get("is_deleted")) if node is not None else False
-                if node is None or is_deleted:
-                    # 节点不存在或已删除：立即归类 stale，不做 chunks 检查，
-                    # 避免已删除文档的 job 反复空转（InvalidDocumentIdentity）。
-                    stale.append(identity)
-                    errors[identity] = "InvalidDocumentIdentity"
-                    continue
-                if (
-                    str(node["node_type"]) != "file"
-                    or str(node["content_hash"] or "") != job.content_hash
-                    or int(node["index_revision"]) != int(job.index_revision)
-                ):
-                    stale.append(identity)
-                    errors[identity] = "StaleRevision"
-                    continue
-                chunks = (
-                    (
-                        await connection.execute(
-                            text(
-                                "SELECT * FROM memory_chunks WHERE node_id = :node_id "
-                                "ORDER BY chunk_index, chunk_id"
-                            ),
-                            {"node_id": job.node_id},
+                        is_deleted = bool(node.get("is_deleted")) if node is not None else False
+                        if node is None or is_deleted:
+                            # 节点不存在或已删除：立即归类 stale，不做 chunks 检查，
+                            # 避免已删除文档的 job 反复空转（InvalidDocumentIdentity）。
+                            stale.append(identity)
+                            errors[identity] = "InvalidDocumentIdentity"
+                            continue
+                        if (
+                            str(node["node_type"]) != "file"
+                            or str(node["content_hash"] or "") != job.content_hash
+                            or int(node["index_revision"]) != int(job.index_revision)
+                        ):
+                            stale.append(identity)
+                            errors[identity] = "StaleRevision"
+                            continue
+                        chunks = (
+                            (
+                                await connection.execute(
+                                    text(
+                                        "SELECT * FROM memory_chunks WHERE node_id = :node_id "
+                                        "ORDER BY chunk_index, chunk_id"
+                                    ),
+                                    {"node_id": job.node_id},
+                                )
+                            )
+                            .mappings()
+                            .all()
                         )
-                    )
-                    .mappings()
-                    .all()
-                )
-                if not chunks:
-                    stale.append(identity)
-                    errors[identity] = "EmptyDocument"
-                    continue
-                job_payloads: list[tuple[IndexJob, DocumentChunk, str, str]] = []
-                for expected_index, row in enumerate(chunks):
-                    chunk = self._chunk_from_row(row)
-                    if (
-                        chunk.node_id != job.node_id
-                        or chunk.chunk_index != expected_index
-                        or compute_content_hash(chunk.content) != chunk.content_hash
-                        or chunk.chunk_id
-                        != f"{job.node_id}:{expected_index}:{chunk.content_hash}"
-                    ):
-                        stale.append(identity)
-                        errors[identity] = "InvalidChunkIdentity"
-                        break
-                    job_payloads.append(
-                        (job, chunk, str(node["file_path"]), str(node["title"] or ""))
-                    )
-                else:
-                    # Publish a job's chunks as one validation unit.  A late
-                    # corrupt chunk must not leave earlier chunks exportable.
-                    payloads.extend(job_payloads)
+                        if not chunks:
+                            stale.append(identity)
+                            errors[identity] = "EmptyDocument"
+                            continue
+                        job_payloads: list[tuple[IndexJob, DocumentChunk, str, str]] = []
+                        for expected_index, row in enumerate(chunks):
+                            chunk = self._chunk_from_row(row)
+                            if (
+                                chunk.node_id != job.node_id
+                                or chunk.chunk_index != expected_index
+                                or compute_content_hash(chunk.content) != chunk.content_hash
+                                or chunk.chunk_id
+                                != f"{job.node_id}:{expected_index}:{chunk.content_hash}"
+                            ):
+                                stale.append(identity)
+                                errors[identity] = "InvalidChunkIdentity"
+                                break
+                            job_payloads.append(
+                                (job, chunk, str(node["file_path"]), str(node["title"] or ""))
+                            )
+                        else:
+                            # Publish a job's chunks as one validation unit.  A late
+                            # corrupt chunk must not leave earlier chunks exportable.
+                            payloads.extend(job_payloads)
+                break
+            except DBAPIError as exc:
+                if _load_attempt + 1 >= _MAX_WRITE_ATTEMPTS or not self._retryable(exc):
+                    raise
+                stale.clear()
+                errors.clear()
+                payloads.clear()
 
         for identity in dict.fromkeys(stale):
             job = jobs_by_identity[identity]
