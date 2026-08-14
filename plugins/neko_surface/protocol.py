@@ -1,4 +1,4 @@
-"""Versioned wire protocol shared by Neo-MoFox and N.E.K.O."""
+"""Versioned wire protocol shared by Elysium and N.E.K.O."""
 
 from __future__ import annotations
 

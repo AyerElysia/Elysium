@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
-from unittest.mock import AsyncMock, Mock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
-from src.core.components import BaseAdapter
-from src.core.components import BasePlugin
+from src.core.components import BaseAdapter, BasePlugin
 
 
 class TestAdapter(BaseAdapter):
@@ -23,7 +22,7 @@ class TestAdapter(BaseAdapter):
 
     async def from_platform_message(self, raw: Any):
         """解析平台消息。"""
-        from mofox_wire import MessageEnvelope
+        from src.core.transport.wire import MessageEnvelope
 
         return MessageEnvelope(
             direction="incoming",
@@ -117,7 +116,7 @@ class TestBaseAdapter:
             mock_tm.return_value = mock_tm_instance
 
             # Mock 父类 start
-            with patch("mofox_wire.AdapterBase.start", new_callable=AsyncMock):
+            with patch("src.core.transport.wire.AdapterBase.start", new_callable=AsyncMock):
                 await adapter.start()
 
                 assert adapter._running is True
@@ -136,7 +135,7 @@ class TestBaseAdapter:
             mock_tm.return_value = mock_tm_instance
 
             # Mock 父类 stop
-            with patch("mofox_wire.AdapterBase.stop", new_callable=AsyncMock):
+            with patch("src.core.transport.wire.AdapterBase.stop", new_callable=AsyncMock):
                 await adapter.stop()
 
                 assert adapter._running is False
@@ -149,7 +148,7 @@ class TestBaseAdapter:
         adapter.on_adapter_unloaded = AsyncMock()  # type: ignore[method-assign]
 
         with patch(
-            "mofox_wire.AdapterBase.stop",
+            "src.core.transport.wire.AdapterBase.stop",
             new=AsyncMock(side_effect=RuntimeError("wire cleanup failed")),
         ), pytest.raises(RuntimeError, match="wire cleanup failed"):
             await adapter.stop()
@@ -412,7 +411,7 @@ class AdapterWithCommandResponse(TestAdapter):
 
     async def from_platform_message(self, raw: Any):
         """解析平台消息，包括adapter_command和adapter_response。"""
-        from mofox_wire import MessageEnvelope
+        from src.core.transport.wire import MessageEnvelope
 
         # 记录收到的命令（用于测试验证）
         if isinstance(raw, dict) and raw.get("type") == "adapter_command":
@@ -483,7 +482,7 @@ class TestAdapterCommandResponseMechanism:
 
     async def test_adapter_command_request_response_flow(self):
         """测试完整的命令请求-响应流程。"""
-        from mofox_wire import MessageEnvelope
+        from src.core.transport.wire import MessageEnvelope
         
         # 创建mock core_sink
         mock_sink = MagicMock()

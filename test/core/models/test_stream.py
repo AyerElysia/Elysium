@@ -227,11 +227,11 @@ class TestChatStream:
             platform="qq",
             chat_type="private",
             bot_id="123456",
-            bot_nickname="MoFoxBot",
+            bot_nickname="Elysia",
         )
 
         assert stream.bot_id == "123456"
-        assert stream.bot_nickname == "MoFoxBot"
+        assert stream.bot_nickname == "Elysia"
 
     def test_chat_stream_context_initialization(self):
         """测试聊天流上下文初始化。"""

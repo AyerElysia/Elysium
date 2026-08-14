@@ -2,7 +2,7 @@
 
 提供进程内和进程间的 CoreSink 实现，作为 Adapter 与核心消息系统的桥梁。
 
-注意：这里的 CoreSink 必须与 mofox_wire.adapter_utils.CoreSink 协议保持一致，
+注意：这里的 CoreSink 必须与 Elysium wire contract 保持一致，
 至少实现 send/push_outgoing/close 等方法；否则 AdapterBase 会在运行时崩溃。
 """
 
@@ -11,8 +11,7 @@ from __future__ import annotations
 import contextlib
 from typing import Any, Callable, Coroutine
 
-from mofox_wire import CoreSink, MessageEnvelope
-
+from src.core.transport.wire import CoreSink, MessageEnvelope
 from src.kernel.concurrency import get_task_manager
 from src.kernel.logger import get_logger
 

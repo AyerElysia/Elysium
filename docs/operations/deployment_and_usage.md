@@ -1,8 +1,8 @@
 # Elysium 部署、配置、测试与使用说明
 
 > 文档状态：持续维护中
-> 当前版本：Windows/WSL 本地运行、QQ/飞书文本聊天与图片查看验收基线；阶段三 `/api/v1` 应用接口
-> 最后核对日期：2026-08-09
+> 当前版本：Windows/WSL/Linux 共用部署脚本；QQ/飞书文本聊天与图片查看验收基线；阶段三 `/api/v1` 应用接口
+> 最后核对日期：2026-08-13
 
 本文面向第一次接手 Elysium 的开发者和维护者，目标是让接手者能够独立完成环境准备、配置、启动、验证、故障排查和日常使用，并逐步覆盖项目的全部功能。
 
@@ -13,6 +13,8 @@ Elysium 是数字生命系统，不是通用聊天机器人框架。修改配置
 - [`docs/architecture/Elysium当前架构.md`](../architecture/Elysium当前架构.md)
 
 尤其注意：工程安全限制与主体的认知裁决必须分离，不得用关键词匹配、固定阈值、默认类别、代码截断或情境自动触发替代主体判断。
+
+新机器必须先按[安全部署脚本](./deployment_scripts.md)执行 `bootstrap` 与只读 `doctor`。本长文解释各子系统配置和真实验收；凡与脚本的 create-only、locked dependency、主体文件主权或手工前台运行合同冲突的历史命令均不再有效。
 
 ---
 
@@ -108,7 +110,7 @@ main.py
 
 ### 3.1 必需环境
 
-- Windows 10/11（本版已验证环境）
+- Windows 10/11、WSL 或 Linux；部署脚本已做离线契约验证，具体机器仍需手工运行验收
 - Python 3.11 或更高版本
 - Git
 - `uv`（推荐的依赖管理器）
@@ -123,7 +125,7 @@ requires-python = ">=3.11"
 
 ### 3.2 本版不使用 Docker
 
-本阶段采用项目根目录下的 `.venv`。不要因为仓库存在 `Dockerfile` 或 `docker-compose.yml` 就默认改用 Docker；除非后续专门建立并验收容器部署流程。
+本阶段只采用项目根目录下由 `uv` 管理的 `.venv`。旧根目录容器资产含 Elysium 自动重启和非锁定构建语义，已经退役；除非以后单独设计、审计并验收容器合同，否则不得自行恢复。
 
 ### 3.3 进入项目目录
 
@@ -145,120 +147,39 @@ cd "<Elysium项目目录>"
 
 ## 4. 创建虚拟环境并安装依赖
 
-### 4.1 推荐方式：uv 同步锁定依赖
+### 4.1 规范入口
+
+生产依赖：
 
 ```powershell
-uv sync --dev
+.\deploy.ps1 bootstrap
 ```
 
-该命令会按 `pyproject.toml` 和 `uv.lock` 创建或更新 `.venv`，并安装主依赖和开发测试依赖。
+Linux / WSL / Git Bash：
 
-确认解释器：
-
-```powershell
-.\.venv\Scripts\python.exe --version
+```bash
+./deploy.sh bootstrap
 ```
 
-### 4.2 无可用 `uv` 时：使用项目虚拟环境安装
+开发机增加 `--with-dev`。脚本使用 `uv sync --locked`，随后执行 `uv pip check`；解析或安装输出不会原样回显，避免私有 index URL 中的凭据进入日志。`uv` 是硬前置，缺失时必须先从官方发行渠道安装，禁止改用全局 `pip` 或维护第二份手写依赖清单。
 
-若当前机器暂时没有可用的 `uv`，可以使用明确的 Python 解释器创建 `.venv`，再让该环境自己的 pip 按 `pyproject.toml` 安装项目。以下命令必须在原生 PowerShell 和项目根目录执行；不要把 Windows 盘符路径传入 Git Bash 后再拼接，以免产生错误的嵌套目录。
+### 4.2 锁与恢复边界
 
-```powershell
-& "<Python解释器绝对路径>" -m venv ".venv"
-& ".\.venv\Scripts\python.exe" -m pip install --upgrade pip setuptools wheel
-& ".\.venv\Scripts\python.exe" -m pip install -e .
-```
+生产运行使用 `uv run --frozen --no-sync`，启动过程中不得解析新版本、安装插件包或修改 lock。`config/core.toml.example` 因此默认设置 `[plugin_deps].enabled = false`。可选插件缺包时，先把依赖加入 `pyproject.toml`，更新并审查 `uv.lock`，完成测试后再部署；禁止在启动日志报错后逐包 `pip install`。
 
-`pip install -e .` 会从当前项目的 `pyproject.toml` 安装完整运行依赖，并以 editable 方式安装 Elysium。不要只逐个安装启动时报告的顶层缺包；这会留下传递依赖不完整的环境。
+MySQL 异步引擎要求 SQLAlchemy ≥ 2.0.50；项目声明已经固定该下限，当前 lock 为 2.0.52。旧环境出现半卸载、元数据漂移或依赖不闭合时，不要原地强装单包。先保留可恢复的旧 `.venv`，再由操作者创建空的新环境并重新执行 `bootstrap`；新环境通过 doctor 与手工启动验收前不要删除旧环境。
 
-安装结束后必须检查依赖闭合和启动导入链：
-
-```powershell
-& ".\.venv\Scripts\python.exe" -m pip check
-& ".\.venv\Scripts\python.exe" -c "import asyncmy, annotated_types, pydantic; import main; print('Environment OK')"
-```
-
-只有 `pip check` 输出 `No broken requirements found.`，且第二条命令输出 `Environment OK`，才可认为基础运行依赖安装完成。该检查只导入 `main.py`，不会执行 `if __name__ == "__main__"` 下的正式启动。
-
-> **SQLAlchemy 版本要求**：MySQL 异步引擎（`pool_pre_ping=True`）依赖 SQLAlchemy ≥ **2.0.50**。2.0.46 及更早版本在 `pymysql` 代码 ≥ 1.2.0（其 `Connection.ping(reconnect=False)` 带默认值）时会触发已知 bug（SQLAlchemy issue #13306）：`_send_false_to_ping` 判定翻转导致 `do_ping` 零参调用 asyncmy 适配连接的 `ping()`，而该适配连接无默认参数，插件启动时报 `AsyncAdapt_asyncmy_connection.ping() missing 1 required positional argument: 'reconnect'`，`life_engine` 等插件加载失败。2.0.50+ 已修复。若从旧版升级时被本机安全工具拦截导致 SQLAlchemy 半卸载（dist-info 缺失、import 失败），用 `uv pip install --upgrade --link-mode=copy "sqlalchemy[asyncio]>=2.0.50"` 重新安装。`pymysql` 属于 SQLAlchemy 探测性依赖（`pyproject.toml` 未直接声明），若 site-packages 出现代码版本与 dist-info 元数据不一致的脏安装，应 `--force-reinstall` 干净重装该包。
-
-如需开发测试依赖，仍优先安装项目声明的开发组；在无法使用 `uv` 时，应以 `pyproject.toml` 当前声明为准，不能长期维护一份与项目配置分离的手写依赖清单。
-
-#### 4.2.1 为项目环境补装 `uv`
-
-插件依赖安装器会调用 `uv pip install ...`。即使项目运行依赖已经通过 pip 安装完整，只要启动进程的 `PATH` 中找不到 `uv`，插件扫描仍会把本可加载的插件判定为依赖安装失败。可以把 `uv` 安装到项目自己的 `.venv`，避免污染全局 Python：
-
-```powershell
-& ".\.venv\Scripts\python.exe" -m pip install uv
-& ".\.venv\Scripts\uv.exe" --version
-```
-
-只安装到 `.venv` 并不保证未激活环境时能通过裸命令找到它。启动 Elysium 前应激活该环境：
-
-```powershell
-& ".\.venv\Scripts\Activate.ps1"
-Get-Command uv
-uv --version
-& ".\.venv\Scripts\python.exe" ".\main.py"
-```
-
-如果不激活虚拟环境、而是通过解释器绝对路径启动，则先把 `.venv\Scripts` 显式加入当前进程的 `PATH`：
-
-```powershell
-$env:Path = "$(Resolve-Path '.\.venv\Scripts');$env:Path"
-Get-Command uv
-& ".\.venv\Scripts\python.exe" ".\main.py"
-```
-
-该 `PATH` 修改只作用于当前 PowerShell 会话及其子进程，不会创建系统级环境变量或自动启动项。验收时，`Get-Command uv` 应解析到当前项目的 `.venv\Scripts\uv.exe`，而不是其他项目或全局环境中的同名程序。
-
-### 4.3 已有或损坏的 `.venv`
-
-已有环境且依赖完整时，仍建议执行：
-
-```powershell
-uv sync --dev
-```
-
-如果 `pip check` 报告大量传递依赖缺失，或安装过程中反复尝试覆盖残缺的旧文件，不要继续逐项补包。先停止 Elysium，将旧环境改名保留，再创建干净环境：
-
-```powershell
-Rename-Item -LiteralPath ".venv" -NewName ".venv.broken"
-& "<Python解释器绝对路径>" -m venv ".venv"
-```
-
-随后按 4.1 使用 `uv sync --dev`，或按 4.2 使用新环境自己的 pip 完整安装。新环境完成 `pip check`、启动导入和一次真实启动冒烟前，不要删除旧环境；需要回退时先改名保存新环境，再把旧环境恢复为 `.venv`。
-
-不要通过全局 `pip install` 补包，以免本机环境与项目环境混淆。安装期间不要同时运行第二个 pip/uv 进程，也不要启动 Elysium，否则多个进程会并发写入或读取尚未完成的 `.venv`。
-
-### 4.4 插件依赖
-
-`config/core.toml` 的 `[plugin_deps]` 默认允许启动时按各插件 `manifest.json` 自动补装缺失依赖。飞书适配器依赖包括：
-
-- `fastapi`
-- `httpx`
-- `lark-oapi`
-- `pydantic`
-
-生产或受控环境建议仍在部署阶段通过 `uv sync` 明确安装依赖，不依赖运行时临时安装。
-
-如果日志出现 `找不到安装命令 'uv'`，这表示插件依赖安装器自身无法定位安装工具，不代表日志中列出的所有插件分别损坏。应先按 4.2.1 补装并验证 `uv` 的命令可见性，再由用户手动重启 Elysium 重新扫描插件。不要仅根据当次日志逐个补装缺失包：那只能绕过当前依赖，无法修复后续插件依赖安装。
+安装期间不得并发运行第二个 uv，也不得启动 Elysium。依赖回退必须同时恢复匹配的 `pyproject.toml` 和 `uv.lock` 后重新 bootstrap，不能只降级 site-packages。
 
 ---
 
 ## 5. 首次生成配置
 
-新克隆的仓库通常没有完整的 `config/core.toml` 和 `config/models.toml`。Core 配置可以由现有配置系统补全；生产模型注册表必须在启动前由示例显式创建，因为缺失或非法注册表会阻止启动，系统不会静默回退旧配置。
+`bootstrap` 会从当前 schema 示例创建缺失的 `core.toml` 与 `models.toml`，同时写入默认关闭的可选插件工程配置。已存在普通文件绝不覆盖，异常目标类型直接失败。不要依赖一次失败启动来自动生成配置。
 
-首次启动前先从仓库示例创建模型注册表：
+模型密钥保持为 `${ELYSIUM_NEXUS_API_KEY}` 等环境引用，真实值由当前终端或受控 secret manager 注入。正式模型加载会拒绝空值、未解析变量和示例占位符；部署 doctor 还会拒绝明文密钥。部署不创建 `.env`，也不把密钥放入命令参数或日志。本地 Router 等可选侧车在独立验收后再加入配置。
 
-```bash
-cp config/models.toml.example config/models.toml
-```
-
-随后只在被 Git 忽略的 `config/models.toml` 中填写真实 Provider 地址和密钥。也可以从 `config/core.toml.example` 创建 Core 配置，但仍必须核对实际配置项。完成这一步后再手动启动 Elysium；不要依赖一次失败启动来生成模型配置。
-
-配置文件由 TOML 解析。修改后必须保存，并重新启动进程；不要只在编辑器里改完但未保存。
+主体权威 `SOUL.md`、`USER.md`、`MEMORY.md` 不属于工程配置；只能从可信历史逐字节恢复。bootstrap、doctor 和普通启动都不得创作或补模板。完成配置与可信恢复后先运行 `doctor`，再由用户手工执行 `run`。
 
 ---
 
@@ -303,11 +224,13 @@ http_router_port = 8000
 api_keys = []
 ```
 
-Windows PowerShell 设置密码环境变量（只在当前用户环境变量中保存，不把密码写入 TOML）：
+Windows PowerShell 为当前终端设置密码环境变量（终端关闭后不保留）：
 
 ```powershell
-[Environment]::SetEnvironmentVariable("ELYSIUM_MYSQL_PASSWORD", "<MYSQL_PASSWORD>", "User")
+$env:ELYSIUM_MYSQL_PASSWORD = "<MYSQL_PASSWORD>"
 ```
+
+需要长期托管时使用受控 secret manager 在运行终端注入，不要把明文密码持久写入用户环境、TOML 或 Git。
 
 Git Bash 临时设置当前终端环境变量：
 
@@ -348,8 +271,8 @@ export ELYSIUM_MYSQL_PASSWORD='<MYSQL_PASSWORD>'
 现役 MySQL generation 合并新版本后，如果启动报某个新增生命域表不存在，不得让业务启动自动建表，也不要重新执行旧 SQLite 全量迁移。先停止 Elysium，在维护窗口使用同一份 `config/core.toml` 执行对应的幂等增量升级：
 
 ```powershell
-& ".\.venv\Scripts\python.exe" ".\scripts\adopt_life_mysql_baseline.py" upgrade-runtime-state
-& ".\.venv\Scripts\python.exe" ".\scripts\adopt_life_mysql_baseline.py" upgrade-attention
+uv run --frozen --no-sync python .\scripts\adopt_life_mysql_baseline.py upgrade-runtime-state
+uv run --frozen --no-sync python .\scripts\adopt_life_mysql_baseline.py upgrade-attention
 ```
 
 `upgrade-runtime-state` 只安装 `runtime_states/runtime_events`；`upgrade-attention` 只安装 AttentionThread canonical/legacy 五张表、迁移账本和不可变触发器。两者都不修改 generation、authority、配置或现有领域数据，可以幂等重放。命令成功后应确认输出状态分别为 `runtime_state_schema_upgraded` 或 `attention_schema_upgraded`，目标表审计完成，再手工启动 Elysium。若失败，保留原数据库与日志，不删除表、不关闭证书校验、不改成应用层不可变。
@@ -540,7 +463,7 @@ config/models.toml
 ```toml
 [providers.YourProvider]
 base_url = "https://provider.example.com/v1"
-api_key = "<YOUR_API_KEY>"
+api_key = "${ELYSIUM_YOUR_PROVIDER_API_KEY}"
 client_type = "openai"
 max_retry = 3
 timeout = 120
@@ -560,6 +483,8 @@ tokens = 32000
 context_tokens = 100000
 temp = 0.7
 ```
+
+在用户准备执行 `doctor` 和手工启动的同一终端中设置 `ELYSIUM_YOUR_PROVIDER_API_KEY`。未设置、空值、明文 key 或示例占位符都会被部署检查拒绝，密钥值不会输出到诊断。
 
 ### 7.3 当前文本路由原则
 
@@ -981,9 +906,9 @@ qq_nickname = "<机器人昵称>"
 
 [napcat_server]
 mode = "reverse"
-host = "localhost"
+host = "127.0.0.1"
 port = 0  # 替换为部署环境选择的未占用端口
-access_token = ""
+access_token = "<仅写入本机忽略配置的强随机令牌>"
 ```
 
 字段说明：
@@ -994,9 +919,9 @@ access_token = ""
 | `bot.qq_id` | 独立机器人 QQ 号，必须与 NapCat 实际登录账号一致 |
 | `bot.qq_nickname` | Elysium 内部使用的机器人昵称 |
 | `napcat_server.mode` | 当前固定为 `reverse`，表示 Elysium 监听、NapCat 主动连接 |
-| `napcat_server.host` | 本机部署使用 `localhost` |
+| `napcat_server.host` | 同一网络命名空间使用 `127.0.0.1`；NapCat 位于 Docker bridge 时，只绑定宿主的精确 bridge 地址，不绑定所有网卡 |
 | `napcat_server.port` | 当前约定为 `<OneBot端口>` |
-| `napcat_server.access_token` | 可选；若启用，NapCat 与 Elysium 两端必须填写相同值，且不得提交真实令牌 |
+| `napcat_server.access_token` | NapCat 与 Elysium 两端填写相同值，且不得提交真实令牌；reverse 服务端会在接管连接前校验 `Authorization: Bearer <token>` |
 
 ### 10.3 配置 NapCat OneBot 11 客户端
 
@@ -1013,7 +938,9 @@ access_token = ""
 4. 如果设置 Access Token，必须与 Elysium `access_token` 完全一致；真实令牌不得写入文档或提交。
 5. 保存配置后确认 NapCat 使用的是独立机器人 QQ，而不是个人 QQ。
 
-这里不需要额外配置正向 WebSocket 服务端，也不需要为本机连接开放公网端口。`<OneBot端口>` 只用于本机 NapCat 与 Elysium 之间的 OneBot 连接。
+这里不需要额外配置正向 WebSocket 服务端，也不需要为本机连接开放公网端口。`<OneBot端口>` 只用于本机 NapCat 与 Elysium 之间的 OneBot 连接。若 NapCat 运行在 Docker bridge 中，容器内的 `127.0.0.1` 只指向容器自身；此时应让 Elysium 只监听宿主 bridge 地址，并让 WebSocket Client 连接同一地址。不得为了省事把监听暴露到公网网卡。
+
+配置非空 token 后，Elysium reverse 服务端会在设置连接 owner、绑定 NapCat client 或进入监听循环之前，以常量时间比较 Bearer token。缺失或错误 token 会以通用 `Unauthorized` 拒绝，真实 token 不进入响应头、关闭原因或日志。空 token 仅保留旧部署兼容，不是新部署建议。
 
 ### 10.4 恢复启用后的正式启动顺序
 
@@ -1032,7 +959,8 @@ access_token = ""
 
    ```powershell
    cd <Elysium项目目录>
-   .\.venv\Scripts\python.exe main.py
+   .\deploy.ps1 doctor
+   .\deploy.ps1 run
    ```
 
 5. Elysium 加载 NapCat 适配器并开始监听 `127.0.0.1:<OneBot端口>` 后，NapCat 应自动建立反向 WebSocket 连接。
@@ -1090,26 +1018,18 @@ NapCat 是否启用由部署环境决定；2026-08-04 的 WSL 环境已启用并
 PowerShell：
 
 ```powershell
-.\.venv\Scripts\python.exe main.py
+.\deploy.ps1 doctor
+.\deploy.ps1 run
 ```
 
-Git Bash：
+Linux / WSL / Git Bash：
 
 ```bash
-./.venv/Scripts/python.exe main.py
+./deploy.sh doctor
+./deploy.sh run
 ```
 
-使用 uv：
-
-```powershell
-uv run main.py
-```
-
-`start.bat` 当前内容也是：
-
-```bat
-uv run main.py
-```
+`start.bat` 只是 `deploy.ps1 run` 的兼容转发器，不再执行 lease 清理、数据库写入或依赖安装。`run` 只在同仓库 PID、端口、锁定环境、配置和主体权威检查全部通过后，前台执行 `uv run --frozen --no-sync python main.py`。
 
 ### 11.2 Elysium 只允许手工前台启动
 
@@ -1142,7 +1062,7 @@ Ctrl+C
 ### 12.1 基础进程
 
 - [ ] `.venv` 中 Python 版本不低于 3.11。
-- [ ] `uv sync --dev` 成功。
+- [ ] `deploy.sh bootstrap` 或 `deploy.ps1 bootstrap` 成功，依赖与 `uv.lock` 一致。
 - [ ] `config/core.toml`、`config/models.toml` 已生成并保存；真实密钥未进入 Git。
 - [ ] SQLite 文件可创建或打开。
 - [ ] 启动过程无 Fatal error。
@@ -1230,7 +1150,7 @@ Ayla 后端（`Ayla/backend`）一键启动入口为 `python launcher.py`（Wind
 ### 13.1 全量测试
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest test -q --import-mode=importlib
+uv run --group dev python -m pytest test -q --no-cov -n 0
 ```
 
 `pyproject.toml` 默认启用并行、覆盖率、30 秒超时和严格 marker。全量测试可能受机器资源、外部依赖或尚未完成的功能影响；必须记录本次实际结果，不能引用历史通过数量代替当前验收。
@@ -1238,13 +1158,13 @@ Ayla 后端（`Ayla/backend`）一键启动入口为 `python launcher.py`（Wind
 ### 13.2 飞书适配器测试
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest test/plugins/test_feishu_adapter.py -q
+uv run --group dev python -m pytest test/plugins/test_feishu_adapter.py -q --no-cov -n 0
 ```
 
 需要快速排除并行、覆盖率和超时插件干扰时，可定向运行：
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest `
+uv run --group dev python -m pytest `
     -n 0 `
     -p no:timeout `
     -p no:cov `
@@ -1263,7 +1183,7 @@ Ayla 后端（`Ayla/backend`）一键启动入口为 `python launcher.py`（Wind
 飞书与 NapCat 适配器定向测试：
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest `
+uv run --group dev python -m pytest `
     test/plugins/test_feishu_adapter.py `
     test/plugins/test_napcat_adapter_startup_validation.py `
     test/plugins/test_napcat_image_handler.py `
@@ -1277,7 +1197,7 @@ Ayla 后端（`Ayla/backend`）一键启动入口为 `python launcher.py`（Wind
 Ayla 注册级契约（接入文档 §8.1）由以下测试保护：
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest `
+uv run --group dev python -m pytest `
     test/plugins/test_ayla_adapter.py `
     test/plugins/test_ayla_message_sender.py `
     test/api/v1/test_chat_commands.py `
@@ -1314,17 +1234,17 @@ Python 改动还应按项目约定运行相应 `ruff` 和定向测试。
 uv: command not found
 ```
 
-处理：安装或修复 `uv`，确认新终端能执行 `uv --version`。短期可用已建立的 `.venv\Scripts\python.exe` 启动，但依赖同步仍应回归 `uv`。
+处理：安装或修复 `uv`，确认新终端能执行 `uv --version`，然后重新运行 `bootstrap`。不要绕过 doctor 直接调用虚拟环境解释器。
 
 ### 14.2 模块缺失
 
 先执行：
 
 ```powershell
-uv sync --dev
+.\deploy.ps1 bootstrap --with-dev
 ```
 
-不要直接向全局 Python 安装依赖。若仅某插件缺包，检查其 `manifest.json` 的 `python_dependencies` 和 `[plugin_deps]` 日志。
+不要直接向全局 Python 安装依赖。若仅某插件缺包，检查其 `manifest.json`，把依赖纳入 `pyproject.toml` 和 `uv.lock` 后重新 bootstrap；生产配置禁止运行时安装。
 
 ### 14.3 HTTP 8000 端口被占用
 
@@ -1422,7 +1342,7 @@ chatter_task_name = "expression"
 }
 ```
 
-加载器仍会读取清单，但会在构建加载计划时跳过该插件，不再检查或导入入口文件。`astrbot_sister_bridge` 当前用此方式停用，以保留原目录和恢复可能；不要通过伪造空 `plugin.py` 掩盖未完成实现。恢复前必须先补齐真实入口和组件，再把 `enabled` 改回 `true`。
+加载器仍会读取清单，但会在构建加载计划时跳过该插件，不再检查或导入入口文件。该机制仅适用于实现仍完整、需要可逆停用的插件；已经正式退役的插件必须同时删除清单、入口、组件与专项测试，不能用 `enabled = false` 长期保留隐式复活路径，也不能用空 `plugin.py` 掩盖未完成实现。
 
 ### 14.14 改了配置但运行行为没有变化
 
@@ -1454,7 +1374,7 @@ chatter_task_name = "expression"
 至少关注：
 
 ```text
-data/MoFox.db
+data/Elysium.db
 data/life_engine_workspace/
 data/training_data_lake/
 logs/
@@ -1477,10 +1397,10 @@ config/
 推荐顺序：
 
 1. 拉取代码并检查变更说明。
-2. 执行 `uv sync --dev`。
+2. 执行 `deploy.ps1 bootstrap --with-dev` 或 `./deploy.sh bootstrap --with-dev`。
 3. 核对部署环境中未提交的 `config/` 和 `data/`，避免误覆盖。
 4. 按部署环境需要启用或停用可选适配器；启用 QQ 接入时按 10.4 启动独立机器人 QQ。
-5. 启动 Elysium。
+5. 执行 doctor，通过后由用户手工前台执行 run。
 6. 查看 LLM 预检、HTTP、Life Engine 和已启用适配器的连接日志。
 7. 对已启用的消息平台执行文本和媒体冒烟；新启用或恢复的适配器应单独重做对应端到端验收。
 8. 如本次改动涉及某功能，运行对应定向测试。
@@ -1511,8 +1431,8 @@ config/
 
 按建议优先级持续完善：
 
-- [ ] Linux 原生 `.venv` 手工前台部署（明确不引入 systemd 自启动）
-- [ ] 配置模板与环境变量密钥注入
+- [x] Windows/WSL/Linux 共用 `.venv` 部署脚本（离线契约通过；真实机器仍需手工前台验收）
+- [x] 当前 schema 配置模板与模型环境变量密钥注入
 - [ ] 模型 Provider 兼容性矩阵
 - [x] ASR 协议接入、Opus/WAV 转码和飞书端到端验收
 - [ ] IndexTTS2 本地部署、模型/声音 revision、参考音频、任务合同和独立语音发送验收
@@ -1530,7 +1450,7 @@ config/
 - [ ] 直播和实时语音场景意识接入
 - [ ] PostgreSQL 部署、迁移、备份与恢复
 - [ ] 日志轮转、监控、告警与长期运行
-- [ ] Windows 手工启动与异常恢复说明（明确不引入服务/计划任务自启动）
+- [x] Windows 手工前台启动入口（明确不引入服务/计划任务自启动）
 - [ ] 发布前全功能验收表
 
 ---
@@ -1539,6 +1459,7 @@ config/
 
 | 日期 | 阶段 | 变更 |
 | --- | --- | --- |
+| 2026-08-13 | 安全部署脚本 | 新增跨平台 bootstrap/doctor/run/backup；配置 create-only、主体权威只读校验、模型密钥环境引用、可选插件默认关闭，移除 Elysium systemd/Docker 自动重启资产 |
 | 2026-08-01 | 阶段一 | 建立 Windows `.venv`、文本模型、Life Engine、飞书长连接的部署运行基线；明确 ASR/TTS 尚未验收 |
 | 2026-08-02 | 验收基线 | QQ 聊天、飞书聊天、QQ 图片查看、飞书图片查看完成真实验收；回退图片保存注册改动，其他功能统一暂不验收；补全飞书最小权限、审批发布和 `99991672` 排障说明 |
 | 2026-08-02 | Embedding 配置 | 补充 Embedding 通用配置、真实 API 冒烟要求、索引维度约束、历史失败任务单批重试和验收检查项 |

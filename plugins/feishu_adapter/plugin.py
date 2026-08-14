@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 from src.core.components.base.plugin import BasePlugin
 from src.core.components.loader import register_plugin
 from src.kernel.logger import get_logger
@@ -27,4 +29,7 @@ class FeishuAdapterPlugin(BasePlugin):
         logger.info("FeishuAdapterPlugin 初始化完成")
 
     def get_components(self) -> list[type]:
+        config = cast(FeishuAdapterConfig | None, self.config)
+        if config is None or not config.plugin.enabled:
+            return []
         return [FeishuRouter, FeishuAdapter]

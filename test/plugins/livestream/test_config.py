@@ -5,6 +5,19 @@ from pydantic import ValidationError
 
 from plugins.livestream.config import LivestreamConfig
 from plugins.livestream.platform.factory import create_platform_adapter
+from plugins.livestream.plugin import LivestreamPlugin
+
+
+def test_new_livestream_install_registers_no_router_until_explicitly_enabled() -> None:
+    config = LivestreamConfig()
+    assert config.plugin.enabled is False
+    assert LivestreamPlugin(config).get_components() == []
+
+    enabled_config = LivestreamConfig(plugin={"enabled": True})
+    assert [
+        component.__name__
+        for component in LivestreamPlugin(enabled_config).get_components()
+    ] == ["LivestreamRouter"]
 
 
 def test_livestream_can_only_be_started_manually() -> None:

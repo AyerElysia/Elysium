@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import sqlite3
 from dataclasses import replace
@@ -11,6 +12,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from sqlalchemy.exc import OperationalError
 
 from plugins.life_engine.memory.experience import (
     EpistemicKind,
@@ -38,6 +40,7 @@ from plugins.life_engine.service.memory_witness import (
 from plugins.life_engine.service.perception_gateway import (
     PerceptionDeliveryReceipt,
 )
+from plugins.life_engine.storage.contracts import StorageRuntimeError
 from plugins.life_engine.storage.memory.local import (
     create_local_memory_storage_bundle,
 )
@@ -1193,6 +1196,166 @@ async def test_selected_runtime_uses_durable_singleton_claim(
     assert claim_health["status"] == "durable_singleton_claim"
     assert claim_health["cross_process_safe"] is True
     assert "owner" not in claim_health
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "renew_error",
+    (
+        OSError("temporary network failure"),
+        OperationalError(
+            "SELECT claim",
+            {},
+            OSError(2013, "temporary MySQL disconnect"),
+            connection_invalidated=True,
+        ),
+    ),
+    ids=("network", "dbapi"),
+)
+async def test_transient_author_claim_renewal_failure_preserves_managed_claim(
+    tmp_path: Path,
+    renew_error: Exception,
+) -> None:
+    """An inconclusive renew failure must not manufacture a reacquire."""
+
+    coordinator, service = _coordinator(tmp_path, [])
+    calls: list[str] = []
+    claim = SimpleNamespace(lease_epoch=1, lease_until=_now())
+    renew_attempts = 0
+
+    class _Runtime:
+        enabled = True
+        authority_token = SimpleNamespace(owner_id="test-owner")
+
+        async def validate_writer(self) -> None:
+            calls.append("validate")
+
+        async def acquire_singleton_writer(self, **kwargs: Any) -> Any:
+            assert kwargs["namespace"] == "life_engine.memory_witness"
+            calls.append("acquire")
+            return claim
+
+        async def renew_singleton_writer(
+            self,
+            current: Any,
+            **_kwargs: Any,
+        ) -> Any:
+            nonlocal renew_attempts
+            assert current is claim
+            calls.append("renew")
+            renew_attempts += 1
+            if renew_attempts == 1:
+                raise renew_error
+            return claim
+
+    service.storage_runtime = _Runtime()
+    await coordinator._ensure_authoring_claim()
+
+    with pytest.raises(type(renew_error)):
+        await coordinator._ensure_authoring_claim()
+
+    assert coordinator._author_claim is claim
+    assert coordinator._author_claim_mode == "selected_runtime_claim_failed"
+    assert calls == ["validate", "acquire", "validate", "renew"]
+
+    await coordinator._ensure_authoring_claim()
+    assert coordinator._author_claim is claim
+    assert coordinator._author_claim_mode == "durable_singleton_claim"
+    assert calls == [
+        "validate",
+        "acquire",
+        "validate",
+        "renew",
+        "validate",
+        "renew",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_unmanaged_author_claim_is_reacquired(
+    tmp_path: Path,
+) -> None:
+    """Only an explicit runtime detachment permits replacing the claim."""
+
+    coordinator, service = _coordinator(tmp_path, [])
+    calls: list[str] = []
+    old_claim = SimpleNamespace(lease_epoch=1, lease_until=_now())
+    new_claim = SimpleNamespace(lease_epoch=2, lease_until=_now())
+    acquire_calls = 0
+
+    class _Runtime:
+        enabled = True
+        authority_token = SimpleNamespace(owner_id="test-owner")
+
+        async def validate_writer(self) -> None:
+            calls.append("validate")
+
+        async def acquire_singleton_writer(self, **kwargs: Any) -> Any:
+            nonlocal acquire_calls
+            assert kwargs["namespace"] == "life_engine.memory_witness"
+            calls.append("acquire")
+            acquire_calls += 1
+            return old_claim if acquire_calls == 1 else new_claim
+
+        async def renew_singleton_writer(
+            self,
+            current: Any,
+            **_kwargs: Any,
+        ) -> Any:
+            assert current is old_claim
+            calls.append("renew")
+            raise StorageRuntimeError(
+                "singleton writer is not managed locally: "
+                "life_engine.memory_witness:memory_witness"
+            )
+
+    service.storage_runtime = _Runtime()
+    await coordinator._ensure_authoring_claim()
+    await coordinator._ensure_authoring_claim()
+
+    assert coordinator._author_claim is new_claim
+    assert coordinator._author_claim_mode == "durable_singleton_claim"
+    assert calls == ["validate", "acquire", "validate", "renew", "acquire"]
+
+
+@pytest.mark.asyncio
+async def test_author_claim_renewal_cancellation_propagates(
+    tmp_path: Path,
+) -> None:
+    """Cancellation retains the claim snapshot and never starts reacquisition."""
+
+    coordinator, service = _coordinator(tmp_path, [])
+    calls: list[str] = []
+    claim = SimpleNamespace(lease_epoch=1, lease_until=_now())
+
+    class _Runtime:
+        enabled = True
+        authority_token = SimpleNamespace(owner_id="test-owner")
+
+        async def validate_writer(self) -> None:
+            calls.append("validate")
+
+        async def acquire_singleton_writer(self, **_kwargs: Any) -> Any:
+            calls.append("acquire")
+            return claim
+
+        async def renew_singleton_writer(
+            self,
+            current: Any,
+            **_kwargs: Any,
+        ) -> Any:
+            assert current is claim
+            calls.append("renew")
+            raise asyncio.CancelledError
+
+    service.storage_runtime = _Runtime()
+    await coordinator._ensure_authoring_claim()
+
+    with pytest.raises(asyncio.CancelledError):
+        await coordinator._ensure_authoring_claim()
+
+    assert coordinator._author_claim is claim
+    assert calls == ["validate", "acquire", "validate", "renew"]
 
 
 @pytest.mark.asyncio

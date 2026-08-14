@@ -32,7 +32,7 @@ def isolated_global_metrics_collector(tmp_path, monkeypatch):
     if monitor._global_collector is not None:
         monitor._global_collector.shutdown()
     monkeypatch.setattr(monitor, "_global_collector", None)
-    monkeypatch.setenv("MOFOX_LLM_METRICS_PATH", str(tmp_path / "llm_metrics.json"))
+    monkeypatch.setenv("ELYSIUM_LLM_METRICS_PATH", str(tmp_path / "llm_metrics.json"))
 
     yield
 

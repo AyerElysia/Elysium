@@ -4,7 +4,19 @@ from __future__ import annotations
 
 import asyncio
 
+from plugins.kook_adapter.config import KookAdapterConfig
 from plugins.kook_adapter.gateway import KookGateway
+from plugins.kook_adapter.plugin import KookAdapter, KookAdapterPlugin
+
+
+def test_new_kook_install_registers_no_adapter_until_explicitly_enabled() -> None:
+    config = KookAdapterConfig()
+    assert config.plugin.enabled is False
+    assert KookAdapterPlugin(config=config).get_components() == []
+    assert KookAdapterPlugin(config=None).get_components() == []
+
+    enabled_config = KookAdapterConfig.from_dict({"plugin": {"enabled": True}})
+    assert KookAdapterPlugin(config=enabled_config).get_components() == [KookAdapter]
 
 
 async def test_gateway_start_is_idempotent_and_stop_awaits_listener() -> None:

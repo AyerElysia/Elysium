@@ -273,7 +273,6 @@ if TYPE_CHECKING:
 
 
 logger = get_logger("life_engine", display="life_engine")
-_USER_TEMPLATE_PATH = Path(__file__).resolve().parents[1] / "templates" / "USER.md"
 LIFE_CHATTER_WORLD_MAX_BYTES = 32 * 1024
 LIFE_CHATTER_PROJECTED_SUFFIX_MAX_BYTES = 60 * 1024
 LIFE_CHATTER_EFFECTIVE_TEXT_MAX_BYTES = 64 * 1024
@@ -795,24 +794,23 @@ class LifeEngineService(BaseService):
         # 选定后端下本地 world_state.json 不是权威来源，也不是迁移源：
         # 世界事实只能来自远端事件账本派生的 World Projection。读取本地
         # 快照会在远端为准时引入撕裂的旧世界事实，因此这里不读。
+        # Loading the optional legacy JSON snapshot is read-only. Local
+        # Presence initialization remains deferred because opening its SQLite
+        # store creates files and must happen only after subject preflight.
         self._world_state: WorldState | None
         if self._selectable_storage_enabled:
             self._world_state = None
         else:
+            workspace = Path(self._cfg().settings.workspace_path).resolve()
             self._world_state = WorldState.load(
-                self._workspace_dir() / "runtime" / "world_state.json"
+                workspace / "runtime" / "world_state.json"
             )
 
         # 意识实例注册表（多意识协调）
         self._consciousness_registry: (
             ConsciousnessRegistry | AsyncConsciousnessRegistry | None
         )
-        if self._selectable_storage_enabled:
-            self._consciousness_registry = None
-        else:
-            self._consciousness_registry = ConsciousnessRegistry.load(
-                self._workspace_dir() / "runtime" / "consciousness_registry.json"
-            )
+        self._consciousness_registry = None
 
         # 集成管理器
         self._dfc_integration: DFCIntegration | None = None
@@ -1241,6 +1239,10 @@ class LifeEngineService(BaseService):
         """Return the non-authoritative legacy migration snapshot."""
 
         if self._world_state is None:
+            if not self._selectable_storage_enabled:
+                self._initialize_local_runtime_state()
+                assert self._world_state is not None
+                return self._world_state
             # Fail closed: under the selected backend there is no local legacy
             # snapshot, and fabricating an empty WorldState would present a
             # blank world as if it were a real one.
@@ -1278,6 +1280,10 @@ class LifeEngineService(BaseService):
         """Return the initialized operational Presence registry."""
 
         if self._consciousness_registry is None:
+            if not self._selectable_storage_enabled:
+                self._initialize_local_runtime_state()
+                assert self._consciousness_registry is not None
+                return self._consciousness_registry
             raise RuntimeError(
                 "SelectedPresenceNotStarted: await LifeEngineService.start() first"
             )
@@ -3396,23 +3402,20 @@ class LifeEngineService(BaseService):
         workspace.mkdir(parents=True, exist_ok=True)
         return workspace
 
-    def _ensure_workspace_templates(self) -> None:
-        """补齐显式本地模式下可由运行态长期维护的模板文件。"""
+    def _initialize_local_runtime_state(self) -> None:
+        """Open local runtime state only after subject-authority preflight."""
 
         if self._selectable_storage_enabled:
-            # Selected Subject heads are remote-only; creating a local USER.md
-            # would reintroduce a second source with no authoritative revision.
             return
         workspace = self._workspace_dir()
-        user_file = workspace / "USER.md"
-        if user_file.exists():
-            return
-        try:
-            template = _USER_TEMPLATE_PATH.read_text(encoding="utf-8")
-            user_file.write_text(template, encoding="utf-8")
-            logger.info(f"已创建 USER.md 使用说明模板: {user_file}")
-        except Exception as e:
-            logger.warning(f"创建 USER.md 使用说明模板失败: {e}")
+        if self._world_state is None:
+            self._world_state = WorldState.load(
+                workspace / "runtime" / "world_state.json"
+            )
+        if self._consciousness_registry is None:
+            self._consciousness_registry = ConsciousnessRegistry.load(
+                workspace / "runtime" / "consciousness_registry.json"
+            )
 
     async def _validate_local_subject_authority(self) -> None:
         """Fail before startup when the local subject snapshot is incomplete."""
@@ -3427,7 +3430,7 @@ class LifeEngineService(BaseService):
         # and the canonical unified revision before any runtime is acquired.
         await asyncio.to_thread(
             read_subject_authority_sources,
-            self._workspace_dir(),
+            Path(self._cfg().settings.workspace_path).resolve(),
         )
 
     def snapshot(self) -> dict[str, Any]:
@@ -3556,9 +3559,10 @@ class LifeEngineService(BaseService):
 
         if not legacy_event.source_instance_id:
             stream_id = str(legacy_event.stream_id or "").strip()
+            registry = self._consciousness_registry
             owner = (
-                self._consciousness_registry.get_for_stream(stream_id)
-                if stream_id
+                registry.get_for_stream(stream_id)
+                if stream_id and registry is not None
                 else None
             )
             if owner is not None:
@@ -9262,6 +9266,21 @@ class LifeEngineService(BaseService):
         try:
             await self._start_impl()
         except BaseException as primary:
+            # Subject-authority validation and other preflight checks run before
+            # ``_stop_event`` is created. Skip the write-capable full shutdown
+            # only while no selected runtime ownership has been acquired. A
+            # claim wait may fail or be cancelled after that runtime is open,
+            # and its authority must still be revoked and closed.
+            if self._stop_event is None and self._storage_runtime is None:
+                if self._minecraft_session is not None:
+                    try:
+                        await self._close_minecraft_session()
+                    except Exception as cleanup_error:  # noqa: BLE001
+                        primary.add_note(
+                            "LifeEngineService Minecraft startup cleanup also failed: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}"
+                        )
+                raise
             try:
                 await self.stop()
             except Exception as cleanup_error:  # noqa: BLE001 - preserve primary
@@ -9285,7 +9304,6 @@ class LifeEngineService(BaseService):
                 await self.clear_runtime_context()
             return
 
-        self._ensure_workspace_templates()
         await self._validate_local_subject_authority()
         sleep_enabled, sleep_desc = self._sleep_window_status()
         if not sleep_enabled and sleep_desc != "disabled":
@@ -9297,6 +9315,7 @@ class LifeEngineService(BaseService):
         # The selected runtime acquires writer authority before returning. Start
         # renewal immediately so slow Memory recovery cannot outlive that lease.
         self._stop_event = asyncio.Event()
+        self._initialize_local_runtime_state()
         await self._open_selected_storage_runtime()
         self._start_storage_authority_renewal()
 

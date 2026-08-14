@@ -1,15 +1,48 @@
 from __future__ import annotations
 
 import random
+from pathlib import Path
 
 import pytest
 
+from plugins.werewolf_game.config import WerewolfConfig
 from plugins.werewolf_game.engine import WerewolfEngine
 from plugins.werewolf_game.event_handler import WerewolfCommandEventHandler
 from plugins.werewolf_game.models import Phase, Role
+from plugins.werewolf_game.plugin import WerewolfGamePlugin
 from plugins.werewolf_game.service import WerewolfGameService
 from src.core.models.message import Message
 from src.kernel.event import EventDecision
+
+
+async def test_new_werewolf_install_is_disabled_without_creating_ledger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    config = WerewolfConfig()
+    plugin = WerewolfGamePlugin(config)
+
+    assert config.plugin.enabled is False
+    assert plugin.get_components() == []
+    assert not (tmp_path / "runtime" / "api" / "tabletop.sqlite3").exists()
+
+
+async def test_explicitly_enabled_werewolf_keeps_components_and_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    config = WerewolfConfig(plugin={"enabled": True})
+    plugin = WerewolfGamePlugin(config)
+
+    assert plugin.get_components() == [
+        WerewolfGameService,
+        WerewolfCommandEventHandler,
+    ]
+    assert (tmp_path / "runtime" / "api" / "tabletop.sqlite3").is_file()
+
+    await plugin.on_plugin_unloaded()
 
 
 def _game_with_players(count: int = 6):

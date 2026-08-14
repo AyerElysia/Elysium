@@ -8,25 +8,26 @@ from __future__ import annotations
 
 import asyncio
 import threading
-import pytest
 from datetime import datetime
 from unittest.mock import patch
 
+import pytest
+
 from src.kernel.concurrency import (
-    get_task_manager,
-    TaskManager,
-    TaskGroup,
-    TaskInfo,
-    get_watchdog,
-    WatchDog,
     StreamHeartbeat,
+    TaskGroup,
     TaskGroupError,
+    TaskInfo,
+    TaskManager,
+    WatchDog,
+    get_task_manager,
+    get_watchdog,
 )
 from src.kernel.concurrency.exceptions import (
-    TaskNotFoundError,
-    TaskTimeoutError,
     TaskGroupAlreadyExists,
     TaskGroupNotFoundError,
+    TaskNotFoundError,
+    TaskTimeoutError,
     WatchDogError,
 )
 
@@ -1113,6 +1114,7 @@ class TestWatchDogStreamMonitoring:
         from datetime import timedelta
 
         heartbeat.last_tick = datetime.now() - timedelta(seconds=5.0)
+        heartbeat.last_tick_monotonic -= 5.0
 
         wd._check_streams()
         wd._check_streams()

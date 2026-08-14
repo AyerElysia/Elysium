@@ -17,10 +17,10 @@ from pathlib import Path
 from typing import Any, cast
 
 import httpx
-from mofox_wire import CoreSink, MessageEnvelope
 from PIL import Image as PILImage
 
 from src.core.components.base.adapter import BaseAdapter
+from src.core.transport.wire import CoreSink, MessageEnvelope
 from src.core.utils.audio_transcode import (
     probe_audio_duration_ms,
     transcode_audio_to_opus,
@@ -170,7 +170,9 @@ class FeishuAdapter(BaseAdapter):
     platform = PLATFORM
     run_in_subprocess = False
 
-    def __init__(self, core_sink: CoreSink, plugin: Any | None = None, **kwargs: Any) -> None:
+    def __init__(
+        self, core_sink: CoreSink, plugin: Any | None = None, **kwargs: Any
+    ) -> None:
         super().__init__(core_sink, plugin=plugin, transport=None, **kwargs)
         self._tenant_access_token: str = ""
         self._tenant_access_token_expires_at: float = 0.0
@@ -211,7 +213,9 @@ class FeishuAdapter(BaseAdapter):
             logger.info("FeishuAdapter 已禁用")
             return
         if not config.app.app_id or not config.app.app_secret:
-            logger.warning("FeishuAdapter 缺少 app_id/app_secret；入站可接收，出站发送会失败")
+            logger.warning(
+                "FeishuAdapter 缺少 app_id/app_secret；入站可接收，出站发送会失败"
+            )
         self._feishu_stop_event.clear()
         if (
             config.connection.subscription_mode == "long_connection"
@@ -262,13 +266,16 @@ class FeishuAdapter(BaseAdapter):
             "bot_name": config.bot.bot_name or "爱莉",
         }
 
-    async def execute_action(self, action: str, params: dict[str, Any]) -> dict[str, Any]:
+    async def execute_action(
+        self, action: str, params: dict[str, Any]
+    ) -> dict[str, Any]:
         """Execute a named action via the Feishu action executor.
 
         Used by the unified platform_action tool.
         """
         if not hasattr(self, "_action_executor"):
             from .actions import FeishuActionExecutor
+
             self._action_executor = FeishuActionExecutor(self)
         return await self._action_executor.execute(action, params)
 
@@ -278,7 +285,9 @@ class FeishuAdapter(BaseAdapter):
             return {"success": False, "ignored": True, "reason": "adapter_disabled"}
 
         if "encrypt" in payload:
-            raise ValueError("Feishu encrypted callbacks are not supported yet; disable Encrypt Key first")
+            raise ValueError(
+                "Feishu encrypted callbacks are not supported yet; disable Encrypt Key first"
+            )
 
         envelope = await self.from_platform_message(payload)
         if envelope is None:
@@ -356,11 +365,7 @@ class FeishuAdapter(BaseAdapter):
         sdk_loop = self._long_connection_loop
         stop_signal = self._long_connection_stop_signal
 
-        if (
-            sdk_loop is not None
-            and sdk_loop.is_running()
-            and stop_signal is not None
-        ):
+        if sdk_loop is not None and sdk_loop.is_running() and stop_signal is not None:
             sdk_loop.call_soon_threadsafe(stop_signal.set)
 
         if thread is not None and thread.is_alive():
@@ -491,7 +496,9 @@ class FeishuAdapter(BaseAdapter):
             or _lark_oapi_ws_client_module is None
         ):
             logger.error(
-                "飞书长连接启动失败：缺少 lark-oapi。请安装 `pip install lark-oapi`。"
+                "飞书长连接启动失败：锁定环境缺少 lark-oapi。"
+                "请停止本次启动并执行 `deploy.sh bootstrap` 恢复依赖，"
+                "禁止运行时临时 pip install。"
                 f"error={_LARK_IMPORT_ERROR}",
                 exc_info=_LARK_IMPORT_ERROR,
             )
@@ -524,15 +531,13 @@ class FeishuAdapter(BaseAdapter):
                     event_handler=event_handler,
                     domain=config.app.api_base_url,
                     auto_reconnect=True,
-                    source="neo-mofox-feishu-adapter",
+                    source="elysium-feishu-adapter",
                 )
                 self._long_connection_client = client
                 self._set_long_connection_state("connecting")
                 logger.info("飞书长连接正在连接开放平台")
                 try:
-                    sdk_loop.run_until_complete(
-                        self._run_lark_client_session(client)
-                    )
+                    sdk_loop.run_until_complete(self._run_lark_client_session(client))
                 except Exception as exc:
                     if not self._feishu_stop_event.is_set():
                         self._set_long_connection_state("failed")
@@ -573,7 +578,9 @@ class FeishuAdapter(BaseAdapter):
             payload = self._lark_event_to_payload(event)
             loop = self._main_loop
             if loop and loop.is_running():
-                future = asyncio.run_coroutine_threadsafe(self.handle_event(payload), loop)
+                future = asyncio.run_coroutine_threadsafe(
+                    self.handle_event(payload), loop
+                )
                 try:
                     future.result(timeout=30)
                 except Exception as exc:
@@ -582,8 +589,9 @@ class FeishuAdapter(BaseAdapter):
                 asyncio.run(self.handle_event(payload))
 
         return (
-            lark_module.EventDispatcherHandler
-            .builder(config.app.encrypt_key, config.app.verification_token)
+            lark_module.EventDispatcherHandler.builder(
+                config.app.encrypt_key, config.app.verification_token
+            )
             .register_p2_im_message_receive_v1(on_message)
             .build()
         )
@@ -610,7 +618,9 @@ class FeishuAdapter(BaseAdapter):
             "schema": "2.0",
             "header": {
                 "event_id": str(getattr(header, "event_id", "") or ""),
-                "event_type": str(getattr(header, "event_type", "im.message.receive_v1") or ""),
+                "event_type": str(
+                    getattr(header, "event_type", "im.message.receive_v1") or ""
+                ),
                 "token": str(getattr(header, "token", "") or ""),
             },
             "event": {
@@ -654,9 +664,7 @@ class FeishuAdapter(BaseAdapter):
         if person is None:
             return "", ""
         display_name = str(getattr(person, "nickname", "") or "").strip()
-        canonical_key = str(
-            getattr(person, "canonical_person_key", "") or ""
-        ).strip()
+        canonical_key = str(getattr(person, "canonical_person_key", "") or "").strip()
         if self._looks_like_raw_id(display_name) or display_name.startswith(
             "身份未解析的飞书用户"
         ):
@@ -792,9 +800,13 @@ class FeishuAdapter(BaseAdapter):
 
             segments: list[dict[str, Any]] = []
             if normalized.get("root_message_id"):
-                segments.append({"type": "reply", "data": normalized["root_message_id"]})
+                segments.append(
+                    {"type": "reply", "data": normalized["root_message_id"]}
+                )
             segments.extend(self._mention_segments(normalized.get("mentions") or []))
-            media_segments = await self._download_incoming_media_segments(message_id, media_refs)
+            media_segments = await self._download_incoming_media_segments(
+                message_id, media_refs
+            )
             if media_segments:
                 if content and content not in {"[图片]", "[语音]"}:
                     segments.append({"type": "text", "data": content})
@@ -874,8 +886,7 @@ class FeishuAdapter(BaseAdapter):
                 text=text,
             )
             logger.info(
-                "飞书私聊消息发送成功: "
-                f"{receive_id_type}={receive_id} text={text[:80]}"
+                f"飞书私聊消息发送成功: {receive_id_type}={receive_id} text={text[:80]}"
             )
             return response
 
@@ -885,11 +896,15 @@ class FeishuAdapter(BaseAdapter):
         expected = self._config().app.verification_token
         if not expected:
             return True
-        token = str(payload.get("token") or payload.get("header", {}).get("token") or "")
+        token = str(
+            payload.get("token") or payload.get("header", {}).get("token") or ""
+        )
         return token == expected
 
     def _config(self) -> FeishuAdapterConfig:
-        if self.plugin and isinstance(getattr(self.plugin, "config", None), FeishuAdapterConfig):
+        if self.plugin and isinstance(
+            getattr(self.plugin, "config", None), FeishuAdapterConfig
+        ):
             return cast(FeishuAdapterConfig, self.plugin.config)
         return FeishuAdapterConfig()
 
@@ -918,12 +933,16 @@ class FeishuAdapter(BaseAdapter):
             chat_type = "private" if message.get("chat_type") == "p2p" else "group"
             return {
                 "event_id": str(header.get("event_id") or ""),
-                "message_id": str(message.get("message_id") or f"feishu_{uuid.uuid4().hex}"),
+                "message_id": str(
+                    message.get("message_id") or f"feishu_{uuid.uuid4().hex}"
+                ),
                 "message_type": message_type,
                 "chat_id": str(message.get("chat_id") or ""),
                 "chat_type": chat_type,
                 "chat_name": str(message.get("chat_name") or ""),
-                "open_id": str(sender_id.get("open_id") or sender_id.get("user_id") or ""),
+                "open_id": str(
+                    sender_id.get("open_id") or sender_id.get("user_id") or ""
+                ),
                 "user_id": str(sender_id.get("user_id") or ""),
                 "union_id": str(sender_id.get("union_id") or ""),
                 "sender_name": self._sender_name(sender, sender_id),
@@ -931,7 +950,9 @@ class FeishuAdapter(BaseAdapter):
                 "content": content_text,
                 "timestamp": self._parse_time(message.get("create_time")),
                 "mentions": message.get("mentions") or [],
-                "root_message_id": message.get("root_id") or message.get("parent_id") or "",
+                "root_message_id": message.get("root_id")
+                or message.get("parent_id")
+                or "",
                 "media_refs": media_refs,
             }
 
@@ -943,7 +964,9 @@ class FeishuAdapter(BaseAdapter):
         )
         return {
             "event_id": str(raw.get("event_id") or ""),
-            "message_id": str(raw.get("message_id") or f"feishu_local_{uuid.uuid4().hex}"),
+            "message_id": str(
+                raw.get("message_id") or f"feishu_local_{uuid.uuid4().hex}"
+            ),
             "message_type": message_type,
             "chat_id": str(raw.get("chat_id") or raw.get("group_id") or ""),
             "chat_type": str(raw.get("chat_type") or "private"),
@@ -968,7 +991,10 @@ class FeishuAdapter(BaseAdapter):
             if isinstance(message, dict):
                 event_message_id = str(message.get("message_id") or "")
         dedupe_key = event_message_id or str(
-            raw.get("message_id") or raw.get("header", {}).get("event_id") or raw.get("event_id") or ""
+            raw.get("message_id")
+            or raw.get("header", {}).get("event_id")
+            or raw.get("event_id")
+            or ""
         )
         if not dedupe_key:
             return False
@@ -985,7 +1011,9 @@ class FeishuAdapter(BaseAdapter):
         if config.behavior.ignore_bot_messages:
             sender_type = str(message.get("sender_type") or "")
             open_id = str(message.get("open_id") or "")
-            if sender_type == "app" or (config.bot.bot_open_id and open_id == config.bot.bot_open_id):
+            if sender_type == "app" or (
+                config.bot.bot_open_id and open_id == config.bot.bot_open_id
+            ):
                 logger.debug("忽略飞书 Bot 自身消息")
                 return False
 
@@ -1036,7 +1064,9 @@ class FeishuAdapter(BaseAdapter):
         return str(parsed.get("text") or parsed.get("content") or "")
 
     @staticmethod
-    def _extract_incoming_media_refs(message_type: str, content: Any) -> list[dict[str, str]]:
+    def _extract_incoming_media_refs(
+        message_type: str, content: Any
+    ) -> list[dict[str, str]]:
         parsed = FeishuAdapter._parse_content_payload(content)
         refs: list[dict[str, str]] = []
         if not isinstance(parsed, dict):
@@ -1051,10 +1081,12 @@ class FeishuAdapter(BaseAdapter):
         if message_type in {"audio", "file"}:
             file_key = str(parsed.get("file_key") or "").strip()
             if file_key:
-                refs.append({
-                    "type": "voice" if message_type == "audio" else "file",
-                    "key": file_key,
-                })
+                refs.append(
+                    {
+                        "type": "voice" if message_type == "audio" else "file",
+                        "key": file_key,
+                    }
+                )
             return refs
 
         if message_type == "post":
@@ -1113,14 +1145,16 @@ class FeishuAdapter(BaseAdapter):
                 )
                 continue
             if media_type == "voice":
-                segments.append({
-                    "type": segment_type,
-                    "data": {
-                        "base64": media_base64,
-                        "mime_type": "audio/ogg",
-                        "filename": f"{media_key}.opus",
-                    },
-                })
+                segments.append(
+                    {
+                        "type": segment_type,
+                        "data": {
+                            "base64": media_base64,
+                            "mime_type": "audio/ogg",
+                            "filename": f"{media_key}.opus",
+                        },
+                    }
+                )
             else:
                 segments.append({"type": segment_type, "data": media_base64})
         return segments
@@ -1150,13 +1184,19 @@ class FeishuAdapter(BaseAdapter):
         content_type = str(resp.headers.get("content-type") or "").lower()
         if resp.status_code >= 400:
             if "json" in content_type:
-                raise RuntimeError(f"Feishu resource API failed: {self._decode_response(resp)}")
-            raise RuntimeError(f"Feishu resource API http error: status={resp.status_code}")
+                raise RuntimeError(
+                    f"Feishu resource API failed: {self._decode_response(resp)}"
+                )
+            raise RuntimeError(
+                f"Feishu resource API http error: status={resp.status_code}"
+            )
         if "json" in content_type:
             data = self._decode_response(resp)
             if int(data.get("code", 0)) != 0:
                 raise RuntimeError(f"Feishu resource API failed: {data}")
-            raise RuntimeError(f"Feishu resource API returned json without binary resource: {data}")
+            raise RuntimeError(
+                f"Feishu resource API returned json without binary resource: {data}"
+            )
         if not resp.content:
             raise RuntimeError("Feishu resource API returned empty body")
         return base64.b64encode(resp.content).decode("ascii")
@@ -1191,8 +1231,12 @@ class FeishuAdapter(BaseAdapter):
                 return str(value)
         return "Feishu User"
 
-    def _sender_name_alias(self, sender: dict[str, Any], sender_id: dict[str, Any]) -> str:
-        aliases = self._parse_user_name_aliases(self._config().identity.user_name_aliases)
+    def _sender_name_alias(
+        self, sender: dict[str, Any], sender_id: dict[str, Any]
+    ) -> str:
+        aliases = self._parse_user_name_aliases(
+            self._config().identity.user_name_aliases
+        )
         if not aliases:
             return ""
 
@@ -1272,8 +1316,7 @@ class FeishuAdapter(BaseAdapter):
         normalized = str(stable_account_id or "").strip()
         suffix = normalized[-6:] if normalized else "unknown"
         return (
-            f"身份未解析的飞书用户（账号…{suffix}；"
-            "不可根据消息内容推断为任何已知人物）"
+            f"身份未解析的飞书用户（账号…{suffix}；不可根据消息内容推断为任何已知人物）"
         )
 
     def _cache_display_name(self, key: str, name: str) -> None:
@@ -1309,7 +1352,9 @@ class FeishuAdapter(BaseAdapter):
         reason = self._identity_failure_reason(source, exc)
         self._identity_last_failure_at = time.time()
         self._identity_last_failure_reason = reason
-        warning_key = "permission_denied" if reason.endswith(":permission_denied") else reason
+        warning_key = (
+            "permission_denied" if reason.endswith(":permission_denied") else reason
+        )
         if warning_key in self._identity_warned_failures:
             return
         self._identity_warned_failures.add(warning_key)
@@ -1355,7 +1400,11 @@ class FeishuAdapter(BaseAdapter):
                 self._parse_user_name_aliases(config.user_name_aliases)
             ),
             "configured_canonical_identities": len(
-                set(self._parse_user_name_aliases(config.canonical_identity_aliases).values())
+                set(
+                    self._parse_user_name_aliases(
+                        config.canonical_identity_aliases
+                    ).values()
+                )
             ),
             "resolved_messages": self._identity_resolved_message_count,
             "unresolved_messages": self._identity_unresolved_message_count,
@@ -1521,14 +1570,20 @@ class FeishuAdapter(BaseAdapter):
             if not isinstance(mention, dict):
                 continue
             mention_id = mention.get("id") or {}
-            user_id = mention_id.get("open_id") if isinstance(mention_id, dict) else mention_id
+            user_id = (
+                mention_id.get("open_id")
+                if isinstance(mention_id, dict)
+                else mention_id
+            )
             if not user_id:
                 continue
-            segments.append({
-                "type": "at",
-                "data": str(user_id),
-                "name": str(mention.get("name") or ""),
-            })
+            segments.append(
+                {
+                    "type": "at",
+                    "data": str(user_id),
+                    "name": str(mention.get("name") or ""),
+                }
+            )
         return segments
 
     @staticmethod
@@ -1583,7 +1638,9 @@ class FeishuAdapter(BaseAdapter):
         image_key = await self._upload_image_data(image_data)
         if self._config().behavior.reply_to_message and reply_to:
             response = await self._reply_image(reply_to, image_key)
-            logger.info(f"飞书引用图片发送成功: reply_to={reply_to} image_key={image_key}")
+            logger.info(
+                f"飞书引用图片发送成功: reply_to={reply_to} image_key={image_key}"
+            )
             return response
         if chat_id:
             response = await self._send_image("chat_id", chat_id, image_key)
@@ -1613,7 +1670,10 @@ class FeishuAdapter(BaseAdapter):
                 if max(image.size) > max_dimension:
                     scale = max_dimension / max(image.size)
                     image = image.resize(
-                        (max(1, round(image.width * scale)), max(1, round(image.height * scale))),
+                        (
+                            max(1, round(image.width * scale)),
+                            max(1, round(image.height * scale)),
+                        ),
                         PILImage.Resampling.LANCZOS,
                     )
                 for quality in (85, 75, 65, 55, 45):
@@ -1697,11 +1757,15 @@ class FeishuAdapter(BaseAdapter):
             if open_id:
                 receive_id_type, receive_id = self._private_receive_target(open_id)
                 return await self._send_text(receive_id_type, receive_id, fallback_text)
-            raise ValueError("飞书出站语音缺少 chat_id/open_id，无法确定发送目标") from exc
+            raise ValueError(
+                "飞书出站语音缺少 chat_id/open_id，无法确定发送目标"
+            ) from exc
 
         if self._config().behavior.reply_to_message and reply_to:
             response = await self._reply_audio(reply_to, file_key, duration_ms)
-            logger.info(f"飞书引用语音发送成功: reply_to={reply_to} file_key={file_key}")
+            logger.info(
+                f"飞书引用语音发送成功: reply_to={reply_to} file_key={file_key}"
+            )
             return response
 
         if chat_id:
@@ -1732,7 +1796,9 @@ class FeishuAdapter(BaseAdapter):
 
     async def _upload_audio(self, voice_data: str) -> tuple[str, int]:
         audio_bytes = self._decode_media_data(voice_data)
-        opus_bytes, duration_ms = await asyncio.to_thread(self._convert_audio_to_opus, audio_bytes)
+        opus_bytes, duration_ms = await asyncio.to_thread(
+            self._convert_audio_to_opus, audio_bytes
+        )
         token = await self._get_tenant_access_token()
         url = self._api_url("/open-apis/im/v1/files")
         filename = "voice.opus"
@@ -1762,7 +1828,9 @@ class FeishuAdapter(BaseAdapter):
             raise ValueError(f"飞书文件上传响应缺少 file_key: {payload}")
         return file_key, duration_ms
 
-    async def _reply_audio(self, message_id: str, file_key: str, duration_ms: int) -> dict[str, Any]:
+    async def _reply_audio(
+        self, message_id: str, file_key: str, duration_ms: int
+    ) -> dict[str, Any]:
         normalized_message_id = self._normalize_message_id(message_id)
         return await self._post_json(
             f"/open-apis/im/v1/messages/{normalized_message_id}/reply",
@@ -1878,7 +1946,9 @@ class FeishuAdapter(BaseAdapter):
             },
         )
 
-    async def _send_text(self, receive_id_type: str, receive_id: str, text: str) -> dict[str, Any]:
+    async def _send_text(
+        self, receive_id_type: str, receive_id: str, text: str
+    ) -> dict[str, Any]:
         return await self._post_json(
             f"/open-apis/im/v1/messages?receive_id_type={receive_id_type}",
             {
@@ -1973,10 +2043,7 @@ class FeishuAdapter(BaseAdapter):
 
         async with self._tenant_token_lock:
             now = time.time()
-            if (
-                self._tenant_access_token
-                and self._tenant_access_token_expires_at > now
-            ):
+            if self._tenant_access_token and self._tenant_access_token_expires_at > now:
                 return self._tenant_access_token
 
             config = self._config()
@@ -2019,9 +2086,13 @@ class FeishuAdapter(BaseAdapter):
         try:
             data = resp.json()
         except Exception as exc:
-            raise RuntimeError(f"Feishu API returned non-json: status={resp.status_code}") from exc
+            raise RuntimeError(
+                f"Feishu API returned non-json: status={resp.status_code}"
+            ) from exc
         if resp.status_code >= 400:
-            raise RuntimeError(f"Feishu API http error: status={resp.status_code}, response={data}")
+            raise RuntimeError(
+                f"Feishu API http error: status={resp.status_code}, response={data}"
+            )
         if not isinstance(data, dict):
             raise RuntimeError(f"Feishu API returned invalid json: {data}")
         return data

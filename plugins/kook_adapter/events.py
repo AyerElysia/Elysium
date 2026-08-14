@@ -12,10 +12,13 @@ import json
 import re
 from typing import Any, Callable
 
-from mofox_wire import MessageBuilder, MessageEnvelope, SegPayload
-from mofox_wire.types import UserRole
-
 from src.app.plugin_system.api.log_api import get_logger
+from src.core.transport.wire import (
+    MessageBuilder,
+    MessageEnvelope,
+    SegPayload,
+    UserRole,
+)
 
 from .client import KookAPIClient
 from .config import KookAdapterConfig

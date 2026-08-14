@@ -6,15 +6,14 @@ import asyncio
 import base64
 import mimetypes
 import os
-from pathlib import Path
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Mapping
-
-from mofox_wire import CoreSink, MessageEnvelope
 
 from src.core.components.base.adapter import BaseAdapter
 from src.core.managers.event_manager import get_event_manager
+from src.core.transport.wire import CoreSink, MessageEnvelope
 from src.kernel.logger import get_logger
 
 from .protocol import (

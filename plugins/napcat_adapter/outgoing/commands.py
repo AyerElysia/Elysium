@@ -9,9 +9,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from mofox_wire import MessageEnvelope, SegPayload
-
 from src.app.plugin_system.api.log_api import get_logger
+from src.core.transport.wire import MessageEnvelope, SegPayload
 
 from ..utils.constants import CommandType
 

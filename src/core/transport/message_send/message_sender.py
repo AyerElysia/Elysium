@@ -11,8 +11,7 @@ import time
 from collections import deque
 from typing import TYPE_CHECKING, Any
 
-from mofox_wire import MessageEnvelope
-
+from src.core.transport.wire import MessageEnvelope
 from src.kernel.logger import get_logger
 
 if TYPE_CHECKING:

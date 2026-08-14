@@ -2181,7 +2181,7 @@ async def main_async(db_path: str):
 def main():
     """交互式主函数"""
     print("=" * 60)
-    print("  Neo-MoFox 数据库迁移工具")
+    print("  Elysium 数据库迁移工具")
     print("=" * 60)
     print()
 
@@ -2193,7 +2193,7 @@ def main():
         sys.exit(1)
 
     # 2. 输入目标路径
-    default_target = str(project_root / "data" / "MoFox.db")
+    default_target = str(project_root / "data" / "Elysium.db")
     target_db = input(f"请输入迁移目标路径 [默认: {default_target}]: ").strip().strip('"').strip("'")
     if not target_db:
         target_db = default_target

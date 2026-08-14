@@ -7,8 +7,6 @@ from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 
-import pytest
-
 from plugins.skill_manager.config import SkillManagerConfig
 from plugins.skill_manager.models import SkillEntry
 from plugins.skill_manager.plugin import SkillManagerPlugin
@@ -18,7 +16,12 @@ from plugins.skill_manager.tools import SkillGetScriptTool, SkillGetTool
 def _build_plugin() -> SkillManagerPlugin:
     """创建测试用插件实例。"""
 
-    return SkillManagerPlugin(config=SkillManagerConfig())
+    return SkillManagerPlugin(
+        config=SkillManagerConfig(
+            plugin={"enabled": True},
+            manager={"enabled": True, "allow_script_execution": True},
+        )
+    )
 
 
 def _register_skill(plugin: SkillManagerPlugin, root_dir: Path, name: str = "demo") -> SkillEntry:
@@ -76,11 +79,11 @@ async def test_get_script_executes_python_script(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    success, result = await tool.execute("demo", "scripts/echo.py", ["Neo-MoFox"])
+    success, result = await tool.execute("demo", "scripts/echo.py", ["Elysium"])
 
     assert success is True
     assert "脚本已执行: echo.py" in cast(str, result)
-    assert "[stdout]\nNeo-MoFox" in cast(str, result)
+    assert "[stdout]\nElysium" in cast(str, result)
 
 
 async def test_get_script_executes_powershell_script_via_subprocess(tmp_path: Path) -> None:

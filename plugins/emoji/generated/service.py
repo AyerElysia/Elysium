@@ -245,7 +245,7 @@ class ElysiaGeneratedEmojiService(BaseService):
             "Accept": "application/zip",
             "Origin": "https://novelai.net",
             "Referer": "https://novelai.net",
-            "User-Agent": "Neo-MoFox ElysiaGeneratedEmoji/0.1",
+            "User-Agent": "Elysium ElysiaGeneratedEmoji/0.1",
             "x-correlation-id": self._correlation_id(),
         }
         timeout = aiohttp.ClientTimeout(

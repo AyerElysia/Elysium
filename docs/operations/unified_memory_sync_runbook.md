@@ -15,10 +15,12 @@
 ```bash
 uv run python scripts/backup_life_data.py \
   --data-root /root/Elysia/Elysium/data \
+  --core-sqlite-relative Elysium.db \
   --output /root/Elysia/Elysium-backups/unified-memory-YYYYMMDD-HHMMSS
 ```
 
 脚本使用 SQLite online backup API，不会只复制可能依赖 WAL 的主文件；workspace 会递归备份主体文件。远端 MySQL 在迁移前还应使用现有 `backup_mysql.py` 或受控 `mysqldump` 创建逻辑备份并保存校验清单。
+非默认数据库文件名必须从已验证的 `config/core.toml` 显式传入；工具不会根据文件是否存在自动猜测权威库，也不会移动或改名既有数据。
 
 ## 3. 首次全量同步
 

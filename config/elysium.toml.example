@@ -1,11 +1,9 @@
-# Elysium 统一配置（模板）
+# Elysium unified-kernel compatibility configuration.
 #
-# 使用方式：复制为 config/elysium.toml 并填写你的配置。
-# 此文件为可选。若不存在，系统自动从 core.toml + model.toml 兼容加载。
-# 若存在，则作为唯一配置源（老文件被忽略）。
-#
-# 环境变量插值：api_key = "${OPENAI_API_KEY}"
-# 环境变量覆盖：ELYSIUM_RUNTIME_LOG_LEVEL=DEBUG
+# This file does not replace config/core.toml or config/models.toml in the
+# current runtime. Core HTTP/storage/permissions still come from core.toml and
+# production model routing still comes from models.toml. Do not create this
+# file unless a subsystem-specific document explicitly requires it.
 
 [runtime]
 log_level = "INFO"

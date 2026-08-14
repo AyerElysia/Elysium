@@ -327,8 +327,15 @@ class TestSchedulerTimeUtils:
 
     async def test_task_timeout(self):
         """测试任务超时"""
+        callback_started = asyncio.Event()
+        callback_cancelled = asyncio.Event()
+
         async def timeout_task():
-            await asyncio.sleep(5)  # 超过默认超时时间
+            callback_started.set()
+            try:
+                await asyncio.sleep(5)  # 超过默认超时时间
+            finally:
+                callback_cancelled.set()
 
         # 创建带超时的任务
         schedule_id = await get_unified_scheduler().create_schedule(
@@ -339,8 +346,15 @@ class TestSchedulerTimeUtils:
             task_name="test_timeout",
         )
 
-        # 等待任务执行和超时
-        await asyncio.sleep(3)
+        # 以真实生命周期事件为准，不用全仓负载下不稳定的固定 sleep 猜测。
+        await asyncio.wait_for(callback_started.wait(), timeout=5.0)
+        await asyncio.wait_for(callback_cancelled.wait(), timeout=3.0)
+
+        async def _wait_until_removed() -> None:
+            while await get_unified_scheduler().get_task_info(schedule_id) is not None:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(_wait_until_removed(), timeout=2.0)
 
         # 验证任务已移除（超时失败）
         task_info = await get_unified_scheduler().get_task_info(schedule_id)
@@ -1119,10 +1133,16 @@ class TestSchedulerTimeUtils:
 
     async def test_recurring_task_with_trigger_at_and_interval(self):
         """测试循环任务使用trigger_at和interval_seconds"""
-        executed = []
+        executed_at: list[datetime] = []
+        first_execution = asyncio.Event()
+        second_execution = asyncio.Event()
 
         async def interval_task():
-            executed.append(1)
+            executed_at.append(datetime.now())
+            if len(executed_at) == 1:
+                first_execution.set()
+            if len(executed_at) >= 2:
+                second_execution.set()
 
         # 设置触发时间为当前时间，并使用间隔
         trigger_time = datetime.now() + timedelta(seconds=0.5)
@@ -1138,10 +1158,14 @@ class TestSchedulerTimeUtils:
             task_name="test_trigger_at_interval",
         )
 
-        await asyncio.sleep(4)
-        assert len(executed) >= 2
+        try:
+            await asyncio.wait_for(first_execution.wait(), timeout=3.0)
+            await asyncio.wait_for(second_execution.wait(), timeout=3.0)
 
-        await get_unified_scheduler().remove_schedule(schedule_id)
+            assert len(executed_at) >= 2
+            assert executed_at[0] >= trigger_time
+        finally:
+            await get_unified_scheduler().remove_schedule(schedule_id)
 
     async def test_manual_trigger_with_exception(self):
         """测试手动触发任务时发生异常"""

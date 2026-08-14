@@ -1,6 +1,6 @@
 # Feishu Adapter
 
-把飞书自建应用接入 Neo-MoFox 的统一消息流。
+把飞书自建应用接入 Elysium 的统一消息流。
 
 ## 当前能力
 
@@ -23,6 +23,9 @@ config/plugins/feishu_adapter/config.toml
 需要填写：
 
 ```toml
+[plugin]
+enabled = true
+
 [app]
 app_id = "cli_xxx"
 app_secret = "xxx"
@@ -59,7 +62,7 @@ im.message.receive_v1
 
 7. 权限或事件变更后创建新版本，提交管理员审批并发布；只保存权限配置但不发布，运行中的应用不会获得新权限。
 8. 确认应用可用范围包含测试用户，并把机器人添加到飞书私聊或目标群。
-9. 启动 Elysium。看到 `飞书长连接后台线程已启动` 后，再验收文本与图片。
+9. 先执行 `./deploy.sh doctor`，通过后再由用户在可观察终端执行 `./deploy.sh run`。看到 `飞书长连接后台线程已启动` 后，再验收文本与图片。
 
 长连接模式不需要公网域名，不需要回调地址，也不需要 frp/cloudflared/ngrok。
 飞书 SDK 的瞬时断线由 SDK 自动恢复，正常的连接、断开和逐次重试日志会被聚合，
@@ -87,13 +90,13 @@ subscription_mode = "http_callback"
 https://你的公网域名/feishu/events
 ```
 
-本地调试可以用 frp、cloudflared 或 ngrok 把 Neo-MoFox 的 HTTP 端口映射到公网。
+本地调试可以用 frp、cloudflared 或 ngrok 把 Elysium 的 HTTP 端口映射到公网。
 
-填写同一个 `Verification Token` 到 Neo-MoFox 配置，暂时不要启用 Encrypt Key。
+填写同一个 `Verification Token` 到 Elysium 配置，暂时不要启用 Encrypt Key。
 
 ## 本地冒烟测试
 
-Neo-MoFox 启动后：
+Elysium 启动后：
 
 ```bash
 curl http://127.0.0.1:<Neo端口>/feishu/api/status

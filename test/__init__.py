@@ -1,1 +1,1 @@
-"""Tests for Neo-MoFox project."""
+"""Tests for the Elysium project."""

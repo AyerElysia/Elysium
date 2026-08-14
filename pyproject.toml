@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "aiofiles>=25.1.0",
+    "aiohttp>=3.11.0",
     "aiosqlite>=0.22.1",
     "anthropic>=0.57.1",
     "async-lru>=2.1.0",
@@ -18,15 +19,15 @@ dependencies = [
     "json-repair>=0.57.1",
     "lark-oapi==1.6.8",
     "mcp>=1.26.0",
-    "mofox-wire>=0.1.7",
     "openai>=2.16.0",
+    "orjson>=3.10.0",
     "packaging>=26.0",
     "pillow>=12.3.0",
     "psutil>=7.2.2",
     "pydantic>=2.12.5",
     "pyfiglet>=1.0.4",
     "rich>=14.3.1",
-    "sqlalchemy[asyncio]>=2.0.46",
+    "sqlalchemy[asyncio]>=2.0.50",
     "tiktoken>=0.12.0",
     "websockets>=14.2",
 ]

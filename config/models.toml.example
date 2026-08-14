@@ -1,24 +1,17 @@
 # Elysium unified model registry (LiteLLM-style)
-# Copy to config/models.toml and replace both provider credentials locally.
+# Copy to config/models.toml and export the provider credential locally.
+# Unset or empty variables make production initialization fail closed.
 # This file is the sole authority for production automatic task routing.
 # Startup fails on invalid references; it never falls back to model.toml.
 # Priority is defined only by each tasks.*.models array, from left to right.
 
 [providers.NexusAI]
 base_url = "http://localhost:3000/v1"
-api_key = "replace-with-new-api-token"
+api_key = "${ELYSIUM_NEXUS_API_KEY}"
 client_type = "openai"
 max_retry = 3
 timeout = 120
 retry_interval = 5
-
-[providers.LocalRouter]
-base_url = "http://127.0.0.1:8849/v1"
-api_key = "replace-with-local-router-token"
-client_type = "openai"
-max_retry = 1
-timeout = 5
-retry_interval = 2
 
 # Non-generative models
 [models."sensevoice-small"]
@@ -103,13 +96,6 @@ id = "claude-sonnet-5"
 ctx = 1000000
 vision = true
 extra = { thinking = { budget_tokens = 16000, type = "enabled" } }
-
-# Registered for explicit manual use. Runtime tasks remain cloud-first.
-[models."qwen3-0.6b-router"]
-provider = "LocalRouter"
-id = "qwen3-0.6b-router"
-ctx = 2048
-extra = { enable_thinking = false }
 
 # Generative budgets include hidden reasoning and final output. Qualified
 # non-multimodal tasks temporarily prefer the formal DeepSeek V4 Flash route;

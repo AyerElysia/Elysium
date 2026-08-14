@@ -136,7 +136,7 @@ def get_database_config_from_toml(db_type: str) -> dict | None:
     db_config = config_data.get("database", {})
 
     if db_type == "sqlite":
-        sqlite_path = db_config.get("sqlite_path") or "data/MoFox.db"
+        sqlite_path = db_config.get("sqlite_path") or "data/Elysium.db"
         if not os.path.isabs(sqlite_path):
             sqlite_path = os.path.join(PROJECT_ROOT, sqlite_path)
         return {"path": sqlite_path}
@@ -145,7 +145,7 @@ def get_database_config_from_toml(db_type: str) -> dict | None:
         return {
             "host": db_config.get("postgresql_host") or "localhost",
             "port": db_config.get("postgresql_port") or 5432,
-            "database": db_config.get("postgresql_database") or "mofox",
+            "database": db_config.get("postgresql_database") or "elysium",
             "user": db_config.get("postgresql_user") or "postgres",
             "password": db_config.get("postgresql_password") or "",
             # core.toml 暂无 schema 配置项，默认 public
@@ -1011,7 +1011,7 @@ def fix_postgresql_boolean_columns(engine: Engine) -> None:
 def parse_args() -> argparse.Namespace:
     """解析命令行参数。"""
     parser = argparse.ArgumentParser(
-        description="Neo-MoFox 数据库迁移工具 - 在 SQLite、PostgreSQL 之间迁移数据",
+        description="Elysium 数据库迁移工具 - 在 SQLite、PostgreSQL 之间迁移数据",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""示例:
   # 从 SQLite 迁移到 PostgreSQL
@@ -1020,7 +1020,7 @@ def parse_args() -> argparse.Namespace:
     --target postgresql \\
     --target-host localhost \\
     --target-port 5432 \\
-    --target-database mofox \\
+    --target-database elysium \\
     --target-user postgres \\
     --target-password your_password
 
@@ -1029,11 +1029,11 @@ def parse_args() -> argparse.Namespace:
     --source postgresql \\
     --source-host localhost \\
     --source-port 5432 \\
-    --source-database mofox \\
+    --source-database elysium \\
     --source-user postgres \\
     --source-password your_password \\
     --target sqlite \\
-    --target-path data/MoFox_backup.db
+    --target-path data/Elysium_backup.db
 
   # 使用交互式向导模式（推荐）
   python scripts/migrate_database.py
@@ -1101,7 +1101,7 @@ def build_config_from_args(args: argparse.Namespace, prefix: str, db_type: str) 
         return {
             "host": host,
             "port": getattr(args, f"{prefix}_port") or 5432,
-            "database": getattr(args, f"{prefix}_database") or "mofox",
+            "database": getattr(args, f"{prefix}_database") or "elysium",
             "user": getattr(args, f"{prefix}_user") or "postgres",
             "password": getattr(args, f"{prefix}_password") or "",
             "schema": getattr(args, f"{prefix}_schema", "public"),
@@ -1178,7 +1178,7 @@ def interactive_setup() -> dict:
         用于初始化 DatabaseMigrator 的参数字典
     """
     print("=" * 60)
-    print("Neo-MoFox 数据库迁移向导")
+    print("Elysium 数据库迁移向导")
     print("只需回答几个问题，我会帮你构造迁移配置。")
     print("=" * 60)
 
@@ -1205,12 +1205,12 @@ def interactive_setup() -> dict:
     else:
         print("请手动输入源数据库连接信息：")
         if source_type == "sqlite":
-            source_path = _ask_str("源 SQLite 文件路径", default="data/MoFox.db")
+            source_path = _ask_str("源 SQLite 文件路径", default="data/Elysium.db")
             source_config: dict | None = {"path": source_path}
         else:
             host = _ask_str("源数据库 host", default="localhost")
             port = _ask_int("源数据库 port", default=5432)
-            database = _ask_str("源数据库名", default="mofox")
+            database = _ask_str("源数据库名", default="elysium")
             user = _ask_str("源数据库用户名", default="postgres")
             password = _ask_str("源数据库密码（输入时不回显）", default="", is_password=True)
             source_config = {
@@ -1225,13 +1225,13 @@ def interactive_setup() -> dict:
     if target_type == "sqlite":
         target_path = _ask_str(
             "目标 SQLite 文件路径（若不存在会自动创建）",
-            default="data/MoFox.db",
+            default="data/Elysium.db",
         )
         target_config: dict = {"path": target_path}
     else:
         host = _ask_str("目标数据库 host", default="localhost")
         port = _ask_int("目标数据库 port", default=5432)
-        database = _ask_str("目标数据库名", default="mofox")
+        database = _ask_str("目标数据库名", default="elysium")
         user = _ask_str("目标数据库用户名", default="postgres")
         password = _ask_str("目标数据库密码（输入时不回显）", default="", is_password=True)
         target_config = {

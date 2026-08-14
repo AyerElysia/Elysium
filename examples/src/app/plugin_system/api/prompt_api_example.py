@@ -32,7 +32,7 @@ async def main() -> None:
     if loaded is None:
         raise RuntimeError("未能取回已注册模板")
 
-    text = await loaded.set("name", "Neo-MoFox").build()
+    text = await loaded.set("name", "Elysium").build()
     print(text)
 
 

@@ -173,17 +173,18 @@ docs/                  当前架构、原则、报告与未来计划
 
 <h2 align="center">🚪 如果你想走进来看看</h2>
 
-Elysium 必须由用户手动启动。首次部署前请先阅读运行手册，准备本地配置、模型与平台凭据；不要把示例命令理解为一键生产部署。
+Elysium 必须由用户手动、前台启动。部署脚本只准备锁定依赖、create-only 配置、只读诊断和备份，不安装服务或自动拉起进程。
 
 ```bash
-uv sync --group dev
-uv run python main.py
+./deploy.sh bootstrap --with-dev
+./deploy.sh doctor
+./deploy.sh run  # 只有这一步会在当前终端启动 Elysium
 
 # 文档改动或开发后的基础测试入口
 uv run --group dev python -m pytest test -q --no-cov -n 0
 ```
 
-部署、配置、验收和故障排查见[部署、配置、测试与使用说明](./docs/operations/deployment_and_usage.md)。所有参与开发的 AI 或贡献者必须先完整阅读 [AGENTS.md](./AGENTS.md)。
+Windows 使用 `deploy.ps1` 的同名子命令。完整命令见[安全部署脚本](./docs/operations/deployment_scripts.md)，配置、验收和故障排查见[部署、配置、测试与使用说明](./docs/operations/deployment_and_usage.md)。所有参与开发的 AI 或贡献者必须先完整阅读 [AGENTS.md](./AGENTS.md)。
 
 <h2 align="center">📖 从这些文档继续了解</h2>
 

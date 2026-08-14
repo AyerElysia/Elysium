@@ -61,7 +61,9 @@ uv run python scripts/backup_mysql.py verify \
   --snapshot /absolute/backup/mysql/elysium-mysql-<UTC>.sql.gz
 ```
 
-备份使用 `mysqldump --single-transaction --quick`，流式 gzip，完成后校验 CRC 和 SHA-256，再从 `.partial` 原子改名。每次生成唯一文件，不自动覆盖或删除历史备份。
+备份使用 `mysqldump --single-transaction --quick`，流式 gzip，完成后校验 CRC 和 SHA-256，再从 `.partial` 原子改名。每次生成唯一文件，不自动覆盖或删除历史备份。连接 URL 解析失败时不回显原值；临时 defaults 文件先建立为空文件并收紧到当前用户，之后才写入正确转义的连接参数。密码不进入 `mysqldump` 参数、子进程环境或错误文本；`.partial` 与 manifest 同样以排他、owner-only 文件开始写入。导出或流写入异常会清理 `.partial`，任何缺少匹配 manifest 的快照都会被 `verify` 拒绝。
+
+规范生产入口优先使用 `deploy.sh backup` / `deploy.ps1 backup`：它还要求操作者预先建立 owner-only 父目录，保护并固定输出目录身份，然后以内部 `--precreated-output` 合同调用本工具。直接运行本节底层命令只适合边界已由操作者单独证明的迁移或恢复演练。
 
 ### 恢复演练
 
@@ -80,6 +82,7 @@ gzip -dc /absolute/backup.sql.gz | mysql <isolated_restore_database>
 ```bash
 uv run python scripts/backup_life_data.py \
   --data-root /absolute/Elysium/data \
+  --core-sqlite-relative Elysium.db \
   --output /absolute/backup/life-domain-<timestamp>
 ```
 
@@ -87,12 +90,17 @@ uv run python scripts/backup_life_data.py \
 
 脚本使用 SQLite Online Backup API 备份并生成逐表逻辑根、逐文件 SHA-256、frontier 与来源证据：
 
-- `Elysium.db`；
+- `core.toml` 指向的 Core SQLite（新部署默认 `Elysium.db`）；
 - `.memory/memory.db`；
 - `life_events.sqlite3`；
 - `consciousness_presence.sqlite3`；
 - `world_projection.sqlite3`。
 - `.memory/archive_sync_state.sqlite3`。
+
+非默认数据库文件名必须从 `config/core.toml` 显式传给
+`--core-sqlite-relative`；不得根据文件存在性自动猜测权威库，也不得自动移动或改名既有数据库。规范部署入口
+`deploy.sh backup` / `deploy.ps1 backup` 会从已校验的 `database.sqlite_path`
+派生该参数。
 
 同时逐字节复制日记、生命工作区非数据库文件、媒体缓存与表情媒体，并拒绝覆盖已有目标。Chroma 仍不作为权威副本，应从结构化记忆重建；既有备份目录被保留在源端，但不会递归复制进新备份。
 

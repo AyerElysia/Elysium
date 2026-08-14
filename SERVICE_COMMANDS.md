@@ -1,41 +1,15 @@
-# Elysium systemd 服务
+# Elysium 进程管理边界
 
-> 服务文件位于仓库根目录 `elysium.service`。安装和启用是部署操作，仓库不会自动修改系统服务。
+Elysium 不提供 systemd、Windows 服务、cron、计划任务、登录启动项、Docker restart policy 或其他无人值守拉起方式。旧 `elysium.service`、根目录 `Dockerfile` 与 `docker-compose.yml` 已退役，因为它们会绕过用户手工前台启动、锁定依赖、主体恢复和端口 owner 检查。
 
-## 安装
-
-```bash
-sudo install -m 0644 /root/Elysia/Elysium/elysium.service /etc/systemd/system/elysium.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now elysium
-```
-
-## 日常操作
+唯一规范入口：
 
 ```bash
-systemctl status elysium
-journalctl -u elysium -f
-systemctl restart elysium
-systemctl stop elysium
-systemctl start elysium
+./deploy.sh bootstrap
+./deploy.sh doctor
+./deploy.sh run
 ```
 
-## 更新服务文件
+PowerShell 使用 `deploy.ps1` 的同名子命令。`run` 必须由用户在可观察终端中主动执行；正常停止时按一次 `Ctrl+C` 并等待有序关闭。脚本不会停止、重启或替换既有实例。
 
-```bash
-sudo install -m 0644 /root/Elysia/Elysium/elysium.service /etc/systemd/system/elysium.service
-sudo systemctl daemon-reload
-sudo systemctl restart elysium
-```
-
-## 运行语义
-
-- 标准输入关闭后进入无交互模式，不会因 EOF 退出。
-- 关闭终端产生的 `SIGHUP` 不会结束进程；停止服务使用 `SIGTERM` 触发优雅关闭。
-- 只有异常退出才会在 10 秒后重启；人工 `systemctl stop` 不会自动拉起。
-- stdout/stderr 统一进入 journal，应用自己的结构化日志仍由现有日志系统管理。
-- `TimeoutStopSec=60` 给后台任务、数据库和日志清理留下排空时间。
-
-## 边界
-
-当前 unit 按仓库的实际部署位置使用 `User=root` 和固定路径。迁移目录或改用非 root 用户时，必须同时核对工作目录、模型/配置权限、Windows/WSL 桥接与私人工作区访问权限。
+NapCat/QQNT 可以由各自明确的生命周期 owner 自动启动或恢复；本地 New API 必须由其独立 owner 保持自动启动。不得把 Elysium 纳入任何 restart loop。完整合同见[安全部署脚本](./docs/operations/deployment_scripts.md)。

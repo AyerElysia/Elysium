@@ -13,7 +13,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any, cast
 from unittest.mock import AsyncMock
 
@@ -60,6 +59,14 @@ def _adapter(plugin: AylaAdapterPlugin | None = None) -> AylaAdapter:
 def test_platform_is_ayla() -> None:
     assert AylaAdapter.platform == "ayla"
     assert AylaAdapter.adapter_name == "ayla_adapter"
+
+
+def test_new_ayla_install_defaults_disabled() -> None:
+    config = AylaAdapterConfig()
+
+    assert config.plugin.enabled is False
+    assert AylaAdapterPlugin(config=config).get_components() == []
+    assert AylaAdapterPlugin(config=None).get_components() == []
 
 
 def test_disabled_plugin_registers_no_adapter_component() -> None:

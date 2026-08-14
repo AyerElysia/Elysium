@@ -31,7 +31,7 @@ def configure_db() -> None:
 
     kernel/db 不读取用户配置；这里直接注入 SQLite 参数。
     """
-    db_file = Path("data") / "mofox_example.db"
+    db_file = Path("data") / "elysium_example.db"
     db_file.parent.mkdir(parents=True, exist_ok=True)
 
     # Windows 绝对路径需要转成 posix 风格以适配 SQLAlchemy URL
@@ -291,7 +291,7 @@ async def demo_stream_iteration():
 async def main():
     """主函数"""
     logger.info("=" * 50)
-    logger.info("Neo-MoFox 数据库模块使用示例")
+    logger.info("Elysium 数据库模块使用示例")
     logger.info("=" * 50)
 
     try:

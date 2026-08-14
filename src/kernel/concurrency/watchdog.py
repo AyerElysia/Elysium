@@ -10,13 +10,13 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
-from .task_manager import TaskManager
-from .exceptions import WatchDogError
+from src.kernel.logger import COLOR, get_logger
 
-from src.kernel.logger import get_logger, COLOR
+from .exceptions import WatchDogError
+from .task_manager import TaskManager
 
 logger = get_logger("WatchDog", display="WatchDog", color=COLOR.YELLOW)
 
@@ -28,6 +28,7 @@ class StreamHeartbeat:
     Attributes:
         stream_id: 聊天流 ID
         last_tick: 最后一次心跳时间
+        last_tick_monotonic: 用于超时判断的单调时钟采样
         tick_interval: 正常 tick 间隔（秒）
         warning_threshold: 警告阈值（秒），超过此值输出警告
         restart_threshold: 重启阈值（秒），超过此值尝试重启
@@ -36,6 +37,7 @@ class StreamHeartbeat:
 
     stream_id: str
     last_tick: datetime = field(default_factory=datetime.now)
+    last_tick_monotonic: float = field(default_factory=time.monotonic)
     tick_interval: float = 1.0  # 默认 1 秒
     warning_threshold: float = 150.0  # 超过 150 秒警告
     restart_threshold: float = 300.0  # 超过 300 秒重启
@@ -145,13 +147,12 @@ class WatchDog:
         if not streams:
             return
 
-        now = datetime.now()
         now_monotonic = time.monotonic()
 
         # 遍历所有注册的流
         for stream_id, heartbeat in streams:
             # 计算距离上次心跳的时间
-            delta = (now - heartbeat.last_tick).total_seconds()
+            delta = max(0.0, now_monotonic - heartbeat.last_tick_monotonic)
 
             # 检查是否超过警告阈值
             if delta > heartbeat.warning_threshold:
@@ -279,7 +280,12 @@ class WatchDog:
         with self._stream_registry_lock:
             heartbeat = self._stream_registry.get(stream_id)
             if heartbeat is not None:
-                heartbeat.last_tick = datetime.now()
+                wall_now = datetime.now()
+                heartbeat.last_tick = max(
+                    wall_now,
+                    heartbeat.last_tick + timedelta(microseconds=1),
+                )
+                heartbeat.last_tick_monotonic = time.monotonic()
 
     def get_stream_heartbeat(self, stream_id: str) -> StreamHeartbeat | None:
         """获取聊天流心跳信息

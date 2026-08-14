@@ -6,6 +6,7 @@
 
 ## 从这里开始
 
+- [安全部署脚本](./operations/deployment_scripts.md) — locked bootstrap、只读 doctor、手工前台 run 与不可覆盖备份
 - [当前架构](./architecture/Elysium当前架构.md) — **当前代码与运行边界的权威总图**
 - [接入 Ayla 平台模块](./architecture/Elysium接入Ayla平台模块.md) — 第四个聊天通道 `ayla`：inject 入站 + SSE 出站投影 + 独立 ayla 流（避开历史飞书流）
 - [principles.md](./principles.md) — 主体性、零规则、仿生、意识实例与渐进式披露（设计底线）

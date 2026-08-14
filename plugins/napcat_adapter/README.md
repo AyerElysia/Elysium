@@ -1,13 +1,13 @@
-# NEW_napcat_adapter
+# napcat_adapter
 
-基于 mofox-wire v2.x 的 Napcat 适配器（使用 BaseAdapter 架构）
+基于 Elysium wire contract 的 NapCat 适配器（使用 BaseAdapter 架构）。
 
 ## 🏗️ 架构设计
 
-本插件采用 **BaseAdapter 继承模式** 重写，完全抛弃旧版 maim_message 库，改用 mofox-wire 的 TypedDict 数据结构。
+本插件采用 **BaseAdapter 继承模式**，统一使用 Elysium 自有的 TypedDict 消息信封。
 
 ### 核心组件
-- **NapcatAdapter**: 继承自 `mofox_wire.AdapterBase`，负责 OneBot 11 协议与 MessageEnvelope 的双向转换
+- **NapcatAdapter**: 继承自 `src.core.transport.wire.AdapterBase`，负责 OneBot 11 协议与 MessageEnvelope 的双向转换
 - **WebSocketAdapterOptions**: 自动管理 WebSocket 连接，提供 incoming_parser 和 outgoing_encoder
 - **CoreMessageSink**: 通过 `InProcessCoreSink` 将消息递送到核心系统
 - **Handlers**: 独立的消息处理器，分为 to_core（接收）和 to_napcat（发送）两个方向
@@ -15,7 +15,7 @@
 ## 📁 项目结构
 
 ```
-NEW_napcat_adapter/
+napcat_adapter/
 ├── plugin.py                      # ✅ 主插件文件（BaseAdapter实现）
 ├── _manifest.json                 # 插件清单
 │
@@ -50,9 +50,10 @@ NEW_napcat_adapter/
 
 ### 使用方式
 
-1. **配置文件**: 在 `config/plugins/NEW_napcat_adapter.toml` 中配置 WebSocket URL 和其他参数
-2. **启动插件**: 插件自动在系统启动时加载
-3. **WebSocket连接**: 自动连接到 Napcat OneBot 11 服务器
+1. **配置文件**: 在 `config/plugins/napcat_adapter/config.toml` 中配置 WebSocket URL 和其他参数。
+2. **显式启用**: 把 `[plugin].enabled` 改为 `true`；部署默认值为 `false`。
+3. **启动前检查**: 执行 `./deploy.sh doctor`，再由用户在可观察终端执行 `./deploy.sh run`。
+4. **WebSocket连接**: 显式启用后连接到 NapCat OneBot 11 服务器。
 
 ### 黑白名单过滤系统
 
@@ -129,8 +130,8 @@ ban_user_id = ["333333333", "444444444"]
 
 #### 🔧 配置文件位置
 
-- **示例配置**: `src/plugins/built_in/napcat_adapter/config.example.toml`
-- **实际配置**: `config/plugins/NEW_napcat_adapter.toml`
+- **配置 schema**: `plugins/napcat_adapter/config.py`
+- **实际配置**: `config/plugins/napcat_adapter/config.toml`
 
 #### 📊 日志信息
 
@@ -143,10 +144,10 @@ ban_user_id = ["333333333", "444444444"]
 
 ## 🔑 核心数据结构
 
-### MessageEnvelope (mofox-wire v2.x)
+### MessageEnvelope（Elysium wire contract）
 
 ```python
-from mofox_wire import MessageEnvelope, SegPayload, MessageInfoPayload
+from src.core.transport.wire import MessageEnvelope, SegPayload, MessageInfoPayload
 
 # 创建消息信封
 envelope: MessageEnvelope = {
@@ -334,13 +335,13 @@ class NapcatAdapter(BaseAdapter):
 
 ```python
 # ❌ 旧版（maim_message）
-from mofox_wire import Seg, MessageBase
+from src.core.transport.wire import MessageEnvelope, SegPayload
 
 seg = Seg(type="text", data="hello")
 message = MessageBase(message_info=info, message_segment=seg)
 
-# ✅ 新版（mofox-wire v2.x）
-from mofox_wire import SegPayload, MessageEnvelope
+# ✅ 当前 Elysium wire contract
+from src.core.transport.wire import SegPayload, MessageEnvelope
 
 seg_payload: SegPayload = {"type": "text", "data": "hello"}
 envelope: MessageEnvelope = {
@@ -444,8 +445,8 @@ async def from_platform_message(self, message: dict[str, Any]) -> MessageEnvelop
 
 ## 📚 参考资料
 
-- **mofox-wire 文档**: 查看 `mofox_wire/types.py` 了解 TypedDict 定义
-- **BaseAdapter 示例**: 参考 `docs/mofox_wire_demo_adapter.py`
+- **Elysium wire contract**: 查看 `src/core/transport/wire.py` 了解 TypedDict 定义
+- **BaseAdapter 示例**: 参考当前插件与 `src/core/components/base/adapter.py`
 - **旧版实现**: `src/plugins/built_in/napcat_adapter_plugin/` (仅参考逻辑)
 - **OneBot 11 协议**: [OneBot 11 标准](https://github.com/botuniverse/onebot-11)
 
