@@ -227,23 +227,38 @@ async def _assert_presence_contract(stores: PresenceWorldStores) -> None:
         )
     await asyncio.sleep(1.05)
 
-    takeover = await presence.takeover_expired(
-        _instance(
-            "instance:claimant",
-            "stream:shared",
-            process_epoch="epoch:new",
-        ),
-        expected_revision=None,
-        process_epoch="epoch:new",
-        lease_seconds=60,
-    )
+    # WSL/host wall-clock resynchronization can briefly move UTC backwards.
+    # Poll the real lease contract with a monotonic test deadline instead of
+    # assuming one fixed sleep proves that the adapter clock crossed expiry.
+    async with asyncio.timeout(5.0):
+        while True:
+            try:
+                takeover = await presence.takeover_expired(
+                    _instance(
+                        "instance:claimant",
+                        "stream:shared",
+                        process_epoch="epoch:new",
+                    ),
+                    expected_revision=None,
+                    process_epoch="epoch:new",
+                    lease_seconds=60,
+                )
+            except StreamOwnershipConflict:
+                await asyncio.sleep(0.05)
+                continue
+            break
     assert takeover.claimant.revision == 1
     assert takeover.claimant.instance["status"] == "active"
     assert [item.instance["instance_id"] for item in takeover.displaced] == [
         "instance:owner"
     ]
     assert takeover.displaced[0].instance["status"] == "suspended"
-    expired = await presence.expire_leases(limit=10)
+    async with asyncio.timeout(5.0):
+        while True:
+            expired = await presence.expire_leases(limit=10)
+            if expired:
+                break
+            await asyncio.sleep(0.05)
     assert [item.instance["instance_id"] for item in expired] == [
         "instance:background-expiry"
     ]

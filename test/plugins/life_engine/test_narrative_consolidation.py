@@ -185,6 +185,11 @@ def test_section_shows_last_entry_snippet(tmp_path: Path) -> None:
     entry = store.consolidate(text="我开始有了来路。", quiet=False, moment_count=0)
     state = store.load_state()
     state["last_consolidated_at"] = (_now() - timedelta(hours=48)).isoformat()
+    # This test exercises the previous-entry snippet, not cursor chronology.
+    # Pin the material cursor to an unambiguous past instant so a WSL/host
+    # wall-clock resynchronization cannot move the following trace records
+    # behind a just-created entry.
+    state["cursor_timestamp"] = "2000-01-01T00:00:00+00:00"
     store._save_state(state)
     _fill_river(tmp_path, count=3)
 
