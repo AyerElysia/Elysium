@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 from io import BytesIO
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -599,6 +601,76 @@ async def test_feishu_audio_event_downloads_to_voice_segment(
     }
 
 
+async def test_feishu_file_event_materializes_content_free_local_reference(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    adapter = make_adapter()
+    body = "飞书收到的附件".encode()
+
+    async def fake_download_resource_bytes(
+        *,
+        message_id: str,
+        resource_key: str,
+        resource_type: str,
+    ) -> bytes:
+        assert (message_id, resource_key, resource_type) == (
+            "om_file",
+            "file_v3_document",
+            "file",
+        )
+        return body
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        adapter,
+        "_download_message_resource_bytes",
+        fake_download_resource_bytes,
+    )
+    payload = {
+        "schema": "2.0",
+        "header": {"event_id": "evt_file"},
+        "event": {
+            "sender": {"sender_type": "user", "sender_id": {"open_id": "ou_1"}},
+            "message": {
+                "message_id": "om_file",
+                "chat_id": "oc_private",
+                "chat_type": "p2p",
+                "message_type": "file",
+                "content": json.dumps(
+                    {
+                        "file_key": "file_v3_document",
+                        "file_name": "故事进度.md",
+                        "file_size": len(body),
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        },
+    }
+
+    envelope = await adapter.from_platform_message(payload)
+
+    assert envelope is not None
+    assert envelope["message_info"]["extra"]["feishu_media_refs"] == [
+        {
+            "type": "file",
+            "key": "file_v3_document",
+            "filename": "故事进度.md",
+            "size": len(body),
+        }
+    ]
+    assert len(envelope["message_segment"]) == 1
+    segment = envelope["message_segment"][0]
+    assert segment["type"] == "file"
+    data = segment["data"]
+    assert data["materialized"] is True
+    assert data["name"] == "故事进度.md"
+    assert data["sha256"] == hashlib.sha256(body).hexdigest()
+    assert "base64" not in data
+    assert Path(data["path"]).read_bytes() == body
+
+
 async def test_feishu_image_event_falls_back_to_text_when_download_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -904,6 +976,61 @@ async def test_feishu_outgoing_voice_sends_audio_message(monkeypatch: pytest.Mon
         "file_key": "file-key-1",
         "duration": 1200,
     }
+
+
+async def test_feishu_outgoing_file_uploads_and_sends_file_message(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    adapter = make_adapter()
+    file_path = tmp_path / "handoff.pdf"
+    file_path.write_bytes(b"pdf-body")
+    calls = []
+
+    async def fake_upload_file_data(file_data: str, *, file_name: str):
+        assert file_data == str(file_path)
+        assert file_name == "handoff.pdf"
+        return "file-key-2", file_name
+
+    async def fake_post(path, body):
+        calls.append((path, body))
+        return {"code": 0}
+
+    monkeypatch.setattr(adapter, "_upload_file_data", fake_upload_file_data)
+    monkeypatch.setattr(adapter, "_post_json", fake_post)
+
+    await adapter._send_platform_message(
+        {
+            "direction": "outgoing",
+            "message_info": {
+                "platform": "feishu",
+                "message_id": "out_file",
+                "time": 1.0,
+                "user_info": {
+                    "platform": "feishu",
+                    "user_id": "ou_1",
+                    "user_nickname": "",
+                },
+            },
+            "message_segment": [{"type": "file", "data": str(file_path)}],
+        }
+    )
+
+    assert calls[0][0] == "/open-apis/im/v1/messages?receive_id_type=open_id"
+    assert calls[0][1]["receive_id"] == "ou_1"
+    assert calls[0][1]["msg_type"] == "file"
+    assert json.loads(calls[0][1]["content"]) == {"file_key": "file-key-2"}
+
+
+async def test_feishu_outgoing_file_rejects_empty_file_before_upload(
+    tmp_path: Path,
+) -> None:
+    adapter = make_adapter()
+    file_path = tmp_path / "empty.bin"
+    file_path.touch()
+
+    with pytest.raises(ValueError, match="空文件"):
+        await adapter._upload_file_data(str(file_path), file_name=file_path.name)
 
 
 def test_lark_event_object_to_payload() -> None:

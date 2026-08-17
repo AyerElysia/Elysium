@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -363,6 +364,66 @@ async def test_life_save_media_tool_writes_image_inside_workspace(
     assert saved_path.read_bytes() == b"fake-image"
 
 
+async def test_life_save_media_tool_copies_received_file_without_body_in_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    received_root = tmp_path / "data" / "received_files" / "qq"
+    received_root.mkdir(parents=True)
+    source = received_root / "story.md"
+    body = "故事的真实进度".encode()
+    source.write_bytes(body)
+    workspace = tmp_path / "workspace"
+    file_message = Message(
+        message_id="file-1",
+        content={
+            "media": [
+                {
+                    "type": "file",
+                    "data": {
+                        "name": "story.md",
+                        "storage_key": "qq/story.md",
+                        "size": len(body),
+                        "materialized": True,
+                    },
+                }
+            ]
+        },
+        processed_plain_text="[文件:story.md]",
+        message_type=MessageType.FILE,
+        sender_id="user-1",
+        sender_name="Ayer",
+        platform="qq",
+        chat_type="private",
+        stream_id="stream-1",
+    )
+    config = LifeEngineConfig()
+    config.settings.workspace_path = str(workspace)
+    tool = LifeSaveMediaTool.__new__(LifeSaveMediaTool)
+    tool.plugin = SimpleNamespace(config=config)
+    tool.chat_stream = SimpleNamespace(
+        context=SimpleNamespace(
+            unread_messages=[file_message],
+            current_message=file_message,
+            history_messages=[],
+        )
+    )
+    monkeypatch.chdir(tmp_path)
+
+    ok, result = await tool.execute("latest", "file", "received/story.md")
+
+    assert ok is True
+    assert isinstance(result, dict)
+    saved_path = Path(result["saved_to"])
+    assert saved_path == workspace / "received" / "story.md"
+    assert saved_path.read_bytes() == body
+    assert source.read_bytes() == body
+    assert result["kind"] == "file"
+    assert result["size_bytes"] == len(body)
+    assert result["sha256"] == hashlib.sha256(body).hexdigest()
+    assert body.decode() not in str(result)
+
+
 async def test_life_recognize_voice_tool_uses_current_audio(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -513,7 +574,7 @@ def test_life_send_voice_schema_contains_only_local_tts_parameters() -> None:
 
 
 def test_life_media_capabilities_are_registered_for_enabled_chatter() -> None:
-    """四项媒体能力只在 LifeChatter 启用时注册，并保持主体主动调用。"""
+    """附件能力只在 LifeChatter 启用时注册，并保持主体主动调用。"""
     enabled_config = LifeEngineConfig()
     enabled_config.chatter.enabled = True
     enabled_components = LifeEnginePlugin(enabled_config).get_components()
@@ -523,6 +584,7 @@ def test_life_media_capabilities_are_registered_for_enabled_chatter() -> None:
     disabled_components = LifeEnginePlugin(disabled_config).get_components()
 
     media_components = {
+        LifeSendFileAction,
         LifeSendImageAction,
         LifeSendVoiceAction,
         LifeRecognizeVoiceTool,
@@ -533,8 +595,8 @@ def test_life_media_capabilities_are_registered_for_enabled_chatter() -> None:
     assert all(component.chatter_allow == ["life_chatter"] for component in media_components)
 
 
-def test_life_send_file_action_is_not_registered() -> None:
-    """零使用的旧文件 action 保留实现兼容，但不再暴露给意识实例。"""
+def test_life_send_file_action_is_registered_only_for_enabled_chatter() -> None:
+    """普通文件是正式主体能力，但不会在 Chatter 关闭时泄漏注册。"""
     enabled_config = LifeEngineConfig()
     enabled_config.chatter.enabled = True
     enabled_components = LifeEnginePlugin(enabled_config).get_components()
@@ -544,7 +606,7 @@ def test_life_send_file_action_is_not_registered() -> None:
     disabled_components = LifeEnginePlugin(disabled_config).get_components()
 
     assert LifeSendFileAction.chatter_allow == ["life_chatter"]
-    assert LifeSendFileAction not in enabled_components
+    assert LifeSendFileAction in enabled_components
     assert LifeSendFileAction not in disabled_components
 
 

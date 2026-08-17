@@ -13,6 +13,7 @@ import re
 from typing import Any, Callable
 
 from src.app.plugin_system.api.log_api import get_logger
+from src.core.transport.received_files import persist_received_file
 from src.core.transport.wire import (
     MessageBuilder,
     MessageEnvelope,
@@ -241,41 +242,39 @@ class KookEventHandler:
         if content and self._client:
             try:
                 media_bytes = await self._client.download_media_bytes(content)
-                local_path = await self._save_received_file(file_name, media_bytes)
+                reference = await persist_received_file(
+                    media_bytes,
+                    filename=file_name,
+                    platform="kook",
+                )
                 return [
                     SegPayload(
                         type="file",
                         data={
-                            "name": file_name,
-                            "size": file_size or len(media_bytes),
-                            "path": local_path,
-                            "url": content,
+                            "name": reference.filename,
+                            "size": reference.size_bytes,
+                            "path": str(reference.path),
+                            "sha256": reference.sha256,
+                            "storage_key": reference.storage_key,
+                            "materialized": True,
                         },
                     )
                 ]
             except Exception as exc:
-                logger.error(f"KOOK 文件下载失败: {exc}")
-        return [SegPayload(type="file", data={"name": file_name, "size": file_size, "url": content})]
-
-    @staticmethod
-    async def _save_received_file(file_name: str, data: bytes) -> str:
-        """将接收的文件保存到 data/received_files/ 目录。"""
-        import asyncio
-        from pathlib import Path
-
-        def _write() -> str:
-            base_dir = Path("data/received_files")
-            base_dir.mkdir(parents=True, exist_ok=True)
-            safe_name = Path(file_name).name or "file"
-            target = base_dir / safe_name
-            suffix_num = 1
-            while target.exists():
-                target = base_dir / f"{Path(safe_name).stem}_{suffix_num}{Path(safe_name).suffix}"
-                suffix_num += 1
-            target.write_bytes(data)
-            return str(target.resolve())
-
-        return await asyncio.to_thread(_write)
+                logger.error(
+                    "KOOK 文件下载失败，保留元数据: "
+                    f"error_type={type(exc).__name__}"
+                )
+        return [
+            SegPayload(
+                type="file",
+                data={
+                    "name": file_name,
+                    "size": file_size,
+                    "materialized": False,
+                },
+            )
+        ]
 
     async def _parse_kmarkdown(self, content: str) -> list[SegPayload]:
         """解析 KMarkdown：文本/@/内嵌媒体/表情。"""

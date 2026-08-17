@@ -128,6 +128,7 @@ class LifeEnginePlugin(BasePlugin):
                 LifePassAndWaitAction,
                 LifeRecognizeVoiceTool,
                 LifeSaveMediaTool,
+                LifeSendFileAction,
                 LifeSendImageAction,
                 LifeSendTextAction,
                 LifeSendVoiceAction,
@@ -137,6 +138,7 @@ class LifeEnginePlugin(BasePlugin):
                 [
                     LifeChatter,
                     LifeSendTextAction,
+                    LifeSendFileAction,
                     LifeSendImageAction,
                     LifeSendVoiceAction,
                     LifePassAndWaitAction,

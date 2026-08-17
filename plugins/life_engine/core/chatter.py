@@ -1500,21 +1500,130 @@ class LifeRecognizeVoiceTool(LifeInspectMediaTool):
 
 
 class LifeSaveMediaTool(LifeInspectMediaTool):
-    """把收到的图片/媒体存到 workspace，供后续处理或分析使用。"""
+    """把收到的媒体或普通附件存到 workspace。"""
 
     tool_name = "nucleus_save_media"
     tool_description = (
-        "把用户发来的图片、语音或视频保存到 workspace 目录，持久化到磁盘。\n\n"
+        "把用户发来的图片、语音、视频或普通文件保存到 workspace，持久化到磁盘。\n\n"
         "**与 inspect_media 的区别：**\n"
         "- inspect_media：让你「看」媒体，只进 LLM 上下文，不落盘\n"
-        "- nucleus_save_media：把媒体存到 workspace 文件里，可持久保留、二次使用\n\n"
+        "- nucleus_save_media：保存收到的媒体/附件，可持久保留、读取或再次发送\n\n"
         "**save_path 说明：**\n"
-        "- 留空 → 自动存到 workspace/received/<时间戳>.<扩展名>\n"
+        "- 留空 → 自动存到 workspace/received/，普通文件保留安全化后的原文件名\n"
         "- 相对路径（如 'vibes/ref.png'）→ workspace/<路径>\n"
         "- 必须在 workspace 内\n\n"
-        "**返回：** 保存路径、文件大小、媒体类型"
+        "**返回：** 保存路径、文件大小、SHA-256、附件类型；文件正文不会进入工具结果"
     )
     chatter_allow: list[str] = ["life_chatter"]
+    _SAVEABLE_MEDIA_TYPES = {"auto", "image", "video", "audio", "file"}
+    MAX_SAVABLE_BYTES = 200 * 1024 * 1024
+
+    def _select_saveable_media(
+        self,
+        target: str,
+        media_type: str,
+    ) -> _SelectedMedia | None:
+        expected_message_id = (
+            "" if target.lower() in {"", "latest", "recent"} else target
+        )
+        seen_messages: set[str] = set()
+        for message in self._iter_candidate_messages():
+            message_id = str(getattr(message, "message_id", "") or "")
+            if message_id and message_id in seen_messages:
+                continue
+            if message_id:
+                seen_messages.add(message_id)
+            if expected_message_id and message_id != expected_message_id:
+                continue
+            for media in reversed(self._get_message_media(message)):
+                original_type = str(media.get("type", "") or "").strip().lower()
+                if original_type == "file":
+                    kind = "file"
+                    data = self._extract_media_data(media, kind)
+                    raw = data if isinstance(data, dict) else {}
+                    source = ""
+                    if isinstance(data, str):
+                        source = data.strip()
+                    else:
+                        for key in (
+                            "base64",
+                            "data",
+                            "path",
+                            "file_path",
+                            "local_path",
+                            "file",
+                            "url",
+                            "storage_key",
+                        ):
+                            value = raw.get(key)
+                            if (
+                                not isinstance(value, str)
+                                or not value.strip()
+                                or value.strip() == "[removed]"
+                            ):
+                                continue
+                            if key == "storage_key":
+                                source = str(
+                                    Path.cwd()
+                                    / "data"
+                                    / "received_files"
+                                    / value.strip()
+                                )
+                            else:
+                                source = value.strip()
+                            break
+                    filename = str(
+                        raw.get("name")
+                        or raw.get("filename")
+                        or raw.get("file_name")
+                        or media.get("filename")
+                        or media.get("name")
+                        or "attachment.bin"
+                    )
+                    mime_type = str(
+                        raw.get("mime_type")
+                        or media.get("mime_type")
+                        or "application/octet-stream"
+                    )
+                    selected = _SelectedMedia(
+                        message=message,
+                        media=media,
+                        kind=kind,
+                        original_type=original_type,
+                        data={**raw, "filename": filename},
+                        data_for_native=source,
+                        mime_type=mime_type,
+                    )
+                else:
+                    selected = self._normalize_media_item(message, media)
+                if selected is None:
+                    continue
+                if media_type != "auto" and selected.kind != media_type:
+                    continue
+                return selected
+        return None
+
+    @staticmethod
+    def _managed_received_path(raw: str) -> Path | None:
+        if not raw or raw.startswith(("data:", "base64|", "base64://")):
+            return None
+        if raw.startswith(("http://", "https://")):
+            return None
+        try:
+            source = Path(raw).expanduser().resolve(strict=True)
+            managed_root = (Path.cwd() / "data" / "received_files").resolve()
+            source.relative_to(managed_root)
+        except (OSError, ValueError):
+            return None
+        return source if source.is_file() else None
+
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
 
     async def execute(
         self,
@@ -1524,7 +1633,7 @@ class LifeSaveMediaTool(LifeInspectMediaTool):
         ] = "latest",
         media_type: Annotated[
             str,
-            "媒体类型过滤：auto/image/video/audio",
+            "附件类型过滤：auto/image/video/audio/file",
         ] = "auto",
         save_path: Annotated[
             str,
@@ -1532,28 +1641,56 @@ class LifeSaveMediaTool(LifeInspectMediaTool):
         ] = "",
     ) -> tuple[bool, str | dict]:
         import base64
+        import binascii
         import mimetypes
+        import shutil
+        import tempfile
         import time as _time
 
         from ..tools._utils import _get_workspace
 
-        selected = self._select_media(target, media_type)
+        normalized_type = self._normalize_choice(
+            media_type,
+            self._SAVEABLE_MEDIA_TYPES,
+            "auto",
+        )
+        selected = self._select_saveable_media(target, normalized_type)
         if selected is None:
-            return False, "当前会话没有找到可保存的媒体，或指定 message_id 不存在"
+            return False, "当前会话没有找到可保存的媒体/附件，或指定 message_id 不存在"
 
         raw = selected.data_for_native
         if not raw:
             return False, "找到了媒体记录，但原始数据不在当前运行态，无法保存"
 
-        # 解码 base64
-        try:
-            if raw.startswith("data:") and ";base64," in raw:
-                raw = raw.split(";base64,", 1)[1]
-            elif raw.startswith("base64|"):
-                raw = raw.split("|", 1)[1]
-            image_bytes = base64.b64decode(raw)
-        except Exception as exc:
-            return False, f"媒体数据解码失败: {exc}"
+        source_path = self._managed_received_path(raw)
+        decoded_bytes: bytes | None = None
+        if source_path is None:
+            if raw.startswith(("http://", "https://")):
+                return (
+                    False,
+                    "远程 URL 尚未物化；请先使用 nucleus_download 下载到 workspace",
+                )
+            encoded = raw
+            if encoded.startswith("data:"):
+                _, separator, encoded = encoded.partition(",")
+                if not separator:
+                    return False, "附件 data URL 不合法"
+            if encoded.startswith("base64|"):
+                encoded = encoded.removeprefix("base64|")
+            elif encoded.startswith("base64://"):
+                encoded = encoded.removeprefix("base64://")
+            if len(encoded) > ((self.MAX_SAVABLE_BYTES + 2) // 3) * 4 + 4:
+                return False, "附件超过保存字节上限"
+            try:
+                decoded_bytes = base64.b64decode(encoded, validate=True)
+            except (ValueError, binascii.Error):
+                return False, "附件既不是受管本地文件，也不是合法 base64 数据"
+            if len(decoded_bytes) > self.MAX_SAVABLE_BYTES:
+                return False, "附件超过保存字节上限"
+        else:
+            source_size = await asyncio.to_thread(lambda: source_path.stat().st_size)
+            if source_size > self.MAX_SAVABLE_BYTES:
+                return False, "附件超过保存字节上限"
 
         # 推断扩展名
         mime = selected.mime_type or ""
@@ -1562,29 +1699,66 @@ class LifeSaveMediaTool(LifeInspectMediaTool):
             ext = {"image": ".png", "video": ".mp4", "audio": ".mp3"}.get(
                 selected.kind, ".bin"
             )
+        selected_data = selected.data if isinstance(selected.data, dict) else {}
+        original_name = Path(
+            str(selected_data.get("filename") or f"attachment{ext}")
+        ).name
+        original_name = original_name.strip().replace("\x00", "") or f"attachment{ext}"
 
-        workspace = _get_workspace(self.plugin)
+        workspace = _get_workspace(self.plugin).resolve()
 
         # 解析保存路径
         raw_path = str(save_path or "").strip()
         if not raw_path:
             ts = int(_time.time())
-            filename = f"{ts}{ext}"
+            filename = (
+                f"{ts}_{original_name}" if selected.kind == "file" else f"{ts}{ext}"
+            )
             dest = workspace / "received" / filename
         else:
             candidate = Path(raw_path)
             dest = candidate if candidate.is_absolute() else workspace / candidate
             try:
-                dest.resolve().relative_to(workspace)
+                dest.resolve().relative_to(workspace.resolve())
             except ValueError:
                 return False, f"保存路径超出 workspace 范围: {dest}"
             if dest.is_dir():
-                dest = dest / f"{int(_time.time())}{ext}"
+                filename = (
+                    f"{int(_time.time())}_{original_name}"
+                    if selected.kind == "file"
+                    else f"{int(_time.time())}{ext}"
+                )
+                dest = dest / filename
 
         await asyncio.to_thread(dest.parent.mkdir, parents=True, exist_ok=True)
-        await asyncio.to_thread(dest.write_bytes, image_bytes)
 
-        size = len(image_bytes)
+        def _write_atomically() -> None:
+            descriptor = tempfile.NamedTemporaryFile(
+                mode="wb",
+                prefix=".save-media-",
+                suffix=".tmp",
+                dir=dest.parent,
+                delete=False,
+            )
+            temp_path = Path(descriptor.name)
+            try:
+                with descriptor:
+                    if source_path is not None:
+                        with source_path.open("rb") as source:
+                            shutil.copyfileobj(source, descriptor, 1024 * 1024)
+                    else:
+                        assert decoded_bytes is not None
+                        descriptor.write(decoded_bytes)
+                    descriptor.flush()
+                    os.fsync(descriptor.fileno())
+                os.replace(temp_path, dest)
+            finally:
+                temp_path.unlink(missing_ok=True)
+
+        await asyncio.to_thread(_write_atomically)
+
+        size = await asyncio.to_thread(lambda: dest.stat().st_size)
+        digest = await asyncio.to_thread(self._sha256_file, dest)
         size_str = (
             f"{size / 1024:.1f} KB"
             if size < 1024 * 1024
@@ -1597,6 +1771,7 @@ class LifeSaveMediaTool(LifeInspectMediaTool):
             "workspace_relative": rel,
             "size": size_str,
             "size_bytes": size,
+            "sha256": digest,
             "kind": selected.kind,
             "mime_type": mime or "unknown",
         }

@@ -20,6 +20,10 @@ import httpx
 from PIL import Image as PILImage
 
 from src.core.components.base.adapter import BaseAdapter
+from src.core.transport.received_files import (
+    MAX_RECEIVED_FILE_BYTES,
+    persist_received_file,
+)
 from src.core.transport.wire import CoreSink, MessageEnvelope
 from src.core.utils.audio_transcode import (
     probe_audio_duration_ms,
@@ -48,6 +52,7 @@ _LARK_REPEAT_LOG_INTERVAL_SECONDS = 300.0
 # 飞书图片消息上传接口的实际限制低于媒体动作允许保存的上限。
 # 发送前只压缩传输副本，不能改写主体已保存的原始媒体。
 _FEISHU_IMAGE_UPLOAD_MAX_BYTES = 9 * 1024 * 1024
+_FEISHU_FILE_UPLOAD_MAX_BYTES = 30 * 1024 * 1024
 
 
 def _redact_lark_sdk_log_message(message: str) -> str:
@@ -808,7 +813,7 @@ class FeishuAdapter(BaseAdapter):
                 message_id, media_refs
             )
             if media_segments:
-                if content and content not in {"[图片]", "[语音]"}:
+                if content and content not in {"[图片]", "[语音]", "[文件]"}:
                     segments.append({"type": "text", "data": content})
                 segments.extend(media_segments)
             elif content:
@@ -837,8 +842,10 @@ class FeishuAdapter(BaseAdapter):
         reply_to = outgoing["reply_to"]
         image_data = outgoing["image_data"]
         voice_data = outgoing["voice_data"]
+        file_data = outgoing["file_data"]
+        file_name = outgoing["file_name"]
 
-        if not text and not image_data and not voice_data:
+        if not text and not image_data and not voice_data and not file_data:
             logger.info("飞书出站消息为空，跳过发送")
             return
 
@@ -862,6 +869,15 @@ class FeishuAdapter(BaseAdapter):
                 open_id=open_id,
                 reply_to=reply_to,
                 voice_data=voice_data,
+            )
+
+        if file_data:
+            return await self._send_file_message(
+                chat_id=chat_id,
+                open_id=open_id,
+                reply_to=reply_to,
+                file_data=file_data,
+                file_name=file_name,
             )
 
         if self._config().behavior.reply_to_message and reply_to:
@@ -1066,9 +1082,9 @@ class FeishuAdapter(BaseAdapter):
     @staticmethod
     def _extract_incoming_media_refs(
         message_type: str, content: Any
-    ) -> list[dict[str, str]]:
+    ) -> list[dict[str, Any]]:
         parsed = FeishuAdapter._parse_content_payload(content)
-        refs: list[dict[str, str]] = []
+        refs: list[dict[str, Any]] = []
         if not isinstance(parsed, dict):
             return refs
 
@@ -1081,12 +1097,20 @@ class FeishuAdapter(BaseAdapter):
         if message_type in {"audio", "file"}:
             file_key = str(parsed.get("file_key") or "").strip()
             if file_key:
-                refs.append(
-                    {
-                        "type": "voice" if message_type == "audio" else "file",
-                        "key": file_key,
-                    }
-                )
+                reference: dict[str, Any] = {
+                    "type": "voice" if message_type == "audio" else "file",
+                    "key": file_key,
+                }
+                if message_type == "file":
+                    filename = str(
+                        parsed.get("file_name") or parsed.get("name") or ""
+                    ).strip()
+                    if filename:
+                        reference["filename"] = filename
+                    file_size = parsed.get("file_size") or parsed.get("size")
+                    if isinstance(file_size, int) and not isinstance(file_size, bool):
+                        reference["size"] = file_size
+                refs.append(reference)
             return refs
 
         if message_type == "post":
@@ -1128,23 +1152,56 @@ class FeishuAdapter(BaseAdapter):
             media_type = str(media_ref.get("type") or "").strip()
             media_key = str(media_ref.get("key") or "").strip()
             resource_type = "image" if media_type == "image" else "file"
-            segment_type = "image" if media_type == "image" else "voice"
-            if media_type not in {"image", "voice"} or not media_key:
+            segment_type = (
+                "image"
+                if media_type == "image"
+                else "voice"
+                if media_type == "voice"
+                else "file"
+            )
+            if media_type not in {"image", "voice", "file"} or not media_key:
                 continue
             try:
-                media_base64 = await self._download_message_resource_as_base64(
-                    message_id=message_id,
-                    resource_key=media_key,
-                    resource_type=resource_type,
-                )
+                if media_type == "file":
+                    file_bytes = await self._download_message_resource_bytes(
+                        message_id=message_id,
+                        resource_key=media_key,
+                        resource_type=resource_type,
+                    )
+                    reference = await persist_received_file(
+                        file_bytes,
+                        filename=str(media_ref.get("filename") or f"{media_key}.bin"),
+                        platform="feishu",
+                    )
+                else:
+                    media_base64 = await self._download_message_resource_as_base64(
+                        message_id=message_id,
+                        resource_key=media_key,
+                        resource_type=resource_type,
+                    )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "飞书媒体下载失败，保留文本占位: "
                     f"message_id={message_id}, media_type={media_type}, "
-                    f"media_key={media_key}, error={exc}"
+                    f"media_key={media_key}, error_type={type(exc).__name__}"
                 )
                 continue
-            if media_type == "voice":
+            if media_type == "file":
+                segments.append(
+                    {
+                        "type": segment_type,
+                        "data": {
+                            "name": reference.filename,
+                            "size": reference.size_bytes,
+                            "id": media_key,
+                            "path": str(reference.path),
+                            "sha256": reference.sha256,
+                            "storage_key": reference.storage_key,
+                            "materialized": True,
+                        },
+                    }
+                )
+            elif media_type == "voice":
                 segments.append(
                     {
                         "type": segment_type,
@@ -1166,6 +1223,20 @@ class FeishuAdapter(BaseAdapter):
         resource_key: str,
         resource_type: str,
     ) -> str:
+        content = await self._download_message_resource_bytes(
+            message_id=message_id,
+            resource_key=resource_key,
+            resource_type=resource_type,
+        )
+        return base64.b64encode(content).decode("ascii")
+
+    async def _download_message_resource_bytes(
+        self,
+        *,
+        message_id: str,
+        resource_key: str,
+        resource_type: str,
+    ) -> bytes:
         token = await self._get_tenant_access_token()
         url = self._api_url(
             f"/open-apis/im/v1/messages/{message_id}/resources/{resource_key}"
@@ -1199,7 +1270,9 @@ class FeishuAdapter(BaseAdapter):
             )
         if not resp.content:
             raise RuntimeError("Feishu resource API returned empty body")
-        return base64.b64encode(resp.content).decode("ascii")
+        if len(resp.content) > MAX_RECEIVED_FILE_BYTES:
+            raise RuntimeError("Feishu resource exceeds the received-file byte limit")
+        return bytes(resp.content)
 
     @staticmethod
     def _flatten_post_content(content: dict[str, Any]) -> str:
@@ -1600,6 +1673,8 @@ class FeishuAdapter(BaseAdapter):
         reply_to = ""
         image_data = ""
         voice_data = ""
+        file_data = ""
+        file_name = ""
         for seg in segments:
             if not isinstance(seg, dict):
                 continue
@@ -1613,11 +1688,26 @@ class FeishuAdapter(BaseAdapter):
                 image_data = FeishuAdapter._stringify_media_data(data)
             elif seg_type == "voice" and not voice_data:
                 voice_data = FeishuAdapter._stringify_media_data(data)
+            elif seg_type == "file" and not file_data:
+                file_data = FeishuAdapter._stringify_media_data(data)
+                if isinstance(data, dict):
+                    file_name = str(
+                        data.get("name") or data.get("filename") or ""
+                    ).strip()
+                if (
+                    not file_name
+                    and file_data
+                    and len(file_data) < 4096
+                    and not file_data.startswith(("data:", "base64|", "base64://"))
+                ):
+                    file_name = Path(file_data).name
         return {
             "text": "".join(text_parts).strip(),
             "reply_to": reply_to,
             "image_data": image_data,
             "voice_data": voice_data,
+            "file_data": file_data,
+            "file_name": file_name,
         }
 
     def _private_receive_target(self, open_id: str) -> tuple[str, str]:
@@ -1859,6 +1949,132 @@ class FeishuAdapter(BaseAdapter):
                     {"file_key": file_key, "duration": duration_ms},
                     ensure_ascii=False,
                 ),
+            },
+        )
+
+    async def _send_file_message(
+        self,
+        *,
+        chat_id: str,
+        open_id: str,
+        reply_to: str,
+        file_data: str,
+        file_name: str,
+    ) -> dict[str, Any]:
+        file_key, uploaded_name = await self._upload_file_data(
+            file_data,
+            file_name=file_name,
+        )
+        if self._config().behavior.reply_to_message and reply_to:
+            response = await self._reply_file(reply_to, file_key)
+            logger.info(
+                f"飞书引用文件发送成功: reply_to={reply_to} file_name={uploaded_name}"
+            )
+            return response
+        if chat_id:
+            response = await self._send_file("chat_id", chat_id, file_key)
+            logger.info(
+                f"飞书群文件发送成功: chat_id={chat_id} file_name={uploaded_name}"
+            )
+            return response
+        if open_id:
+            receive_id_type, receive_id = self._private_receive_target(open_id)
+            response = await self._send_file(
+                receive_id_type,
+                receive_id,
+                file_key,
+            )
+            logger.info(
+                "飞书私聊文件发送成功: "
+                f"{receive_id_type}={receive_id} file_name={uploaded_name}"
+            )
+            return response
+        raise ValueError("飞书出站文件缺少 chat_id/open_id，无法确定发送目标")
+
+    async def _upload_file_data(
+        self,
+        file_data: str,
+        *,
+        file_name: str = "",
+    ) -> tuple[str, str]:
+        raw = str(file_data or "").strip()
+        if not raw:
+            raise ValueError("飞书文件数据为空")
+
+        source_path: Path | None = None
+        if len(raw) < 4096:
+            try:
+                candidate = Path(raw).expanduser()
+                if candidate.exists() and candidate.is_file():
+                    source_path = candidate.resolve()
+            except OSError:
+                source_path = None
+
+        if source_path is not None:
+            stat = await asyncio.to_thread(source_path.stat)
+            if stat.st_size <= 0:
+                raise ValueError("飞书不允许上传空文件")
+            if stat.st_size > _FEISHU_FILE_UPLOAD_MAX_BYTES:
+                raise ValueError("飞书文件超过上传字节上限")
+            file_bytes = await asyncio.to_thread(source_path.read_bytes)
+            default_name = source_path.name
+        else:
+            file_bytes = await asyncio.to_thread(
+                self._decode_media_data,
+                raw,
+                media_label="文件",
+            )
+            default_name = "attachment.bin"
+
+        if not file_bytes:
+            raise ValueError("飞书不允许上传空文件")
+        if len(file_bytes) > _FEISHU_FILE_UPLOAD_MAX_BYTES:
+            raise ValueError("飞书文件超过上传字节上限")
+        safe_name = Path(str(file_name or default_name)).name.strip() or default_name
+
+        token = await self._get_tenant_access_token()
+        resp = await self._request_with_retry(
+            "POST",
+            self._api_url("/open-apis/im/v1/files"),
+            timeout=120.0,
+            headers={"Authorization": f"Bearer {token}"},
+            data={"file_type": "stream", "file_name": safe_name},
+            files={
+                "file": (
+                    safe_name,
+                    file_bytes,
+                    "application/octet-stream",
+                )
+            },
+        )
+        payload = self._decode_response(resp)
+        file_key = str((payload.get("data") or {}).get("file_key") or "")
+        if not file_key:
+            raise ValueError("飞书文件上传响应缺少 file_key")
+        return file_key, safe_name
+
+    async def _reply_file(self, message_id: str, file_key: str) -> dict[str, Any]:
+        normalized_message_id = self._normalize_message_id(message_id)
+        return await self._post_json(
+            f"/open-apis/im/v1/messages/{normalized_message_id}/reply",
+            {
+                "msg_type": "file",
+                "content": json.dumps({"file_key": file_key}, ensure_ascii=False),
+            },
+        )
+
+    async def _send_file(
+        self,
+        receive_id_type: str,
+        receive_id: str,
+        file_key: str,
+    ) -> dict[str, Any]:
+        return await self._post_json(
+            f"/open-apis/im/v1/messages?receive_id_type={receive_id_type}",
+            {
+                "receive_id": receive_id,
+                "msg_type": "file",
+                "content": json.dumps({"file_key": file_key}, ensure_ascii=False),
             },
         )
 

@@ -513,6 +513,7 @@ class TestConsciousnessManifestContracts:
             "tool-nucleus_memory_continuity_review",
             "tool-nucleus_relations",
             "tool-nucleus_memory_stats",
+            "action-life_send_file",
             "action-life_send_image",
             "action-life_send_voice",
             "tool-recognize_voice",

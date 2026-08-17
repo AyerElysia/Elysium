@@ -172,6 +172,12 @@
     },
     {
       "component_type": "action",
+      "component_name": "life_send_file",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
+      "component_type": "action",
       "component_name": "life_send_image",
       "dependencies": [],
       "enabled": true

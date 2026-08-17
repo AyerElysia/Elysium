@@ -26,6 +26,7 @@ CONSCIOUSNESS_TOOL_MANIFESTS: dict[str, list[str]] = {
     # 她必须能在对话里自主调用进入工具，而不是等别人带她。
     "chat": [
         "action-life_send_text",
+        "action-life_send_file",
         "action-life_send_image",
         "action-life_send_voice",
         "action-life_pass_and_wait",
