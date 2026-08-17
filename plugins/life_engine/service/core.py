@@ -2829,8 +2829,7 @@ class LifeEngineService(BaseService):
             mc_config=config,
             consciousness_registry=self.consciousness_registry,
             save_consciousness_registry=self.save_consciousness_registry_async,
-            prepare_perception=self.prepare_perception,
-            commit_perception=self.commit_perception,
+            get_recent_subconscious_context=self.get_recent_subconscious_context,
             report_world_observation=self.report_world_observation,
         )
 

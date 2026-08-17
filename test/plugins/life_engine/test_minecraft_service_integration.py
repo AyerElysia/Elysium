@@ -91,6 +91,20 @@ def test_manifest_declares_stable_minecraft_tool_signature() -> None:
     ]
 
 
+def test_minecraft_session_uses_recent_subconscious_provider(
+    tmp_path: Path,
+) -> None:
+    """The service wires its bounded read-only continuity API into Minecraft."""
+
+    service = LifeEngineService(_DummyPlugin(_config(tmp_path, minecraft=True)))
+
+    session = service._create_minecraft_session()
+
+    callback = session._get_recent_subconscious_context
+    assert callback.__self__ is service
+    assert callback.__func__ is LifeEngineService.get_recent_subconscious_context
+
+
 async def test_minecraft_session_initializes_when_learning_is_disabled(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
