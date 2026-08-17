@@ -880,7 +880,7 @@ async def test_surface_dynamic_context_includes_realtime_guidance(monkeypatch) -
     assert high_water == 0
     assert "N.E.K.O 实时私聊" in context_text
     assert "第一次模型决策里直接调用 `life_send_text`" in context_text
-    assert "不要主动调用 `tts_voice_action`" in context_text
+    assert "不要主动调用任何 TTS/语音发送工具" in context_text
 
 
 def test_surface_request_overrides_are_temporary(monkeypatch) -> None:

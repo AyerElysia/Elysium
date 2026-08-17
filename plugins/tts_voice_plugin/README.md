@@ -1,73 +1,63 @@
-# TTS Voice Plugin (tts_voice_plugin)
+# TTS Voice Plugin (`tts_voice_plugin`)
 
-> **遗留兼容组件：** 当前爱莉的本地 TTS 主路径是 `tasks.tts → IndexTTS2`，不经过本插件。本 README 只说明仍保留的 GPT-SoVITS/Higgs 协议实现；不得据此把 GPT-SoVITS 写成项目当前 TTS 模型。
+Elysium 的本地消息 TTS Service。当前本机部署连接 IndexTTS2 包装器；该包装器暴露历史 GPT-SoVITS `api_v2` 兼容端点，因此插件中的部分字段继续保留协议兼容名称。协议名称不代表当前模型仍是 GPT-SoVITS，更不代表使用 MiMo。
 
-文本转语音插件，为 Elysium 提供高质量、多语言、多风格的语音合成能力。当前本地音色基线为 IndexTTS2，并可接入已配置的云端语音服务。
+## 责任边界
 
-## 🌟 功能特性
+- `tts_voice_plugin:service:tts`：把已经决定表达的文本合成为 Base64 音频；
+- `tts_voice_action`：供非 Life Chatter 场景显式发送语音；
+- Life Chatter 使用自己的 `life_send_voice`，通过 Service 签名调用本插件，不再经过 `tasks.tts`；
+- N.E.K.O Surface 的普通文字回复由 Surface Adapter 自动调用 Service，显式 Action 会被抑制，避免重复播放；
+- 直播与 Voice Live 有独立运行合同，不由本 Action 冒充。
 
-- **多语言支持**：支持中文 (zh)、英文 (en)、日文 (ja)、粤语 (yue) 等，具备智能语言检测功能。
-- **多风格切换**：支持配置多个语音风格（模型权重+参考音频），并可根据需求动态切换。
-- **智能文本清洗**：自动处理文本中的特殊符号、表情符号缩写（如 `www`, `233`），并进行智能截断以适应 TTS 合成。
-- **空间音效处理**：内置基于 `Pedalboard` 的音效处理器，支持标准混响 (Reverb) 和卷积混响 (Convolution)，营造更真实的听感。
-- **灵活的触发方式**：
-  - **Action 模式**：允许 AI 根据上下文主动决定是否发送语音。
-  - **Command 模式**：支持通过指令手动触发语音合成。
-- **模型动态切换**：本地 GPT-SoVITS 支持在合成前动态切换 GPT 和 SoVITS 模型权重。
-- **云端音色克隆**：支持 Boson Higgs Audio custom voice；未配置 voice ID 时可回退到参考音频一次性克隆。
+TTS 不决定正文、情绪或是否表达。Service 缺失、合成失败、返回空音频或平台发送失败时必须如实失败，禁止换成陌生默认音色。
 
-## 🛠️ 安装依赖
+## 功能
 
-本插件需要 `aiohttp`、`soundfile` 和 `pedalboard`。启用前必须由开发者将它们加入 `pyproject.toml` 并更新 `uv.lock`，随后由部署入口安装锁定依赖：
+- 本地 `/tts` HTTP 合成与按需启动；
+- 参考音频、多风格、语言检测与文本清洗；
+- 可选空间音效；
+- Action 与 `/tts` Command；
+- IndexTTS2 空闲卸载由后端服务自身负责。
+
+## 配置
+
+部署配置位于被 Git 忽略的 `config/plugins/tts_voice_plugin/config.toml`。
+
+关键字段：
+
+- `[plugin].enable`：是否注册 Service/Action/Command；
+- `[tts].server`：本地 TTS HTTP 地址；
+- `[tts].auto_start`、`server_dir`、`start_command`、`startup_timeout`：后端按需启动合同；
+- `[tts].timeout`、`max_text_length`：请求上限；
+- `[[tts_styles]]`：必须至少有 `default`，包含参考音频、提示文本、语言与可选历史兼容权重字段；
+- `[spatial_effects]`：可选混响与卷积。
+
+当前 IndexTTS2 包装器接受兼容请求但使用自己的调优 preset；客户端不会把历史 GPT-SoVITS 的 3～10 秒参考音频限制强加给 IndexTTS2。参考文件仍必须存在，真实能力由当前本地后端判断。
+
+## 依赖与部署
+
+插件依赖 `aiohttp`、`soundfile` 和 `pedalboard`，必须由锁定的部署入口安装：
 
 ```bash
 ./deploy.sh bootstrap
 ```
 
-禁止在生产启动时临时 `pip install` 或 `uv pip install`。未入锁的依赖表示该可选插件尚未具备可复现部署条件，应保持关闭。
+禁止在生产启动期间临时安装依赖。TTS 后端可以由一次真实合成请求按配置启动，但不得启动、停止或重启 Elysium/NapCat，也不得建立操作系统自启动。
 
-> **注意**：使用 `gpt_sovits` 引擎时需要一个运行中的 [GPT-SoVITS API 服务](https://github.com/RVC-Boss/GPT-SoVITS/blob/main/docs/cn/API.md)。使用 `higgs_cloud` 引擎时需要配置 Boson API Key。
+## 验收
 
-## ⚙️ 配置说明
+至少验证：
 
-配置文件位于 `config/plugins/tts_voice_plugin/config.toml`。
+1. Service 可解析本机 `default` 风格；
+2. 固定短句生成非空、可解码音频；
+3. Life Chatter 不依赖 `tasks.tts`；
+4. Surface 不重复合成；
+5. 空音频、超时和发送失败不记录伪成功；
+6. 日志不包含合成正文、完整请求体或凭据。
 
-### 基础配置 `[plugin]`
-- `enable`: 是否启用插件。
-- `keywords`: 触发语音合成的关键词列表。
+完整架构见 [TTS 语音合成](../../docs/architecture/TTS语音合成.md)。
 
-### TTS 服务配置 `[tts]`
-- `engine`: TTS 引擎。可选 `gpt_sovits`、`mimo_cloud`、`higgs_cloud`。
-- `server`: GPT-SoVITS API 服务地址（默认 `http://127.0.0.1:9880`）。
-- `max_text_length`: 单次合成的最大文本长度。
+## 许可
 
-### 语音风格配置 `[[tts_styles]]`
-你可以配置多个风格，必须包含一个名为 `default` 的风格。
-- `style_name`: 风格唯一标识。
-- `name`: 显示名称。
-- `refer_wav_path`: 参考音频的绝对路径。
-- `prompt_text`: 参考音频对应的文本内容。
-- `gpt_weights`: GPT 模型权重路径。
-- `sovits_weights`: SoVITS 模型权重路径。
-- `text_language`: 文本语言模式 (`zh`/`en`/`ja`/`yue`/`auto`/`auto_yue`)。
-
-### Boson Higgs 配置 `[higgs_cloud]`
-- `base_url`: Boson Create Speech 接口地址，默认 `https://api.boson.ai/v1/audio/speech`。
-- `api_key`: Boson API Key。
-- `model`: Higgs TTS 模型，默认 `higgs-audio-v3-tts`。
-- `voice`: 已注册的 custom voice ID。为空时，插件会使用当前风格的 `refer_wav_path` 和 `prompt_text` 做一次性参考音频克隆。
-- `response_format`: 输出音频格式，默认 `mp3`。
-
-### 空间音效 `[spatial_effects]`
-- `enabled`: 是否启用音效。
-- `reverb_enabled`: 是否启用标准混响。
-- `convolution_enabled`: 是否启用卷积混响（需在插件 `assets/` 目录下放置 `small_room_ir.wav`）。
-
-## 🚀 使用方法
-
-1. **主动语音**：在对话中，如果 AI 认为需要使用语音表达（或匹配到关键词），它会自动调用 `tts_voice_action`。
-2. **手动指令**：使用配置的指令（如 `/tts`，具体取决于指令组件实现）来合成特定文本。
-
-## 📄 开源协议
-
-本项目采用 [AGPL-v3.0](LICENSE) 协议。
+AGPL-v3.0。

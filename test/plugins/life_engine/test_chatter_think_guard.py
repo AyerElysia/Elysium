@@ -24,11 +24,11 @@ from plugins.life_engine.core.tool_parallel import (
     is_life_tool_call_parallel_safe,
     iter_life_tool_call_batches,
 )
-from src.kernel.llm.exceptions import LLMContextError
-from src.kernel.llm.context import LLMContextManager
 from src.core.components.base.chatter import BaseChatter
 from src.core.models.message import Message, MessageType
-from src.kernel.llm import LLMPayload, ROLE, Text, ToolCall, ToolResult
+from src.kernel.llm import ROLE, LLMPayload, Text, ToolCall, ToolResult
+from src.kernel.llm.context import LLMContextManager
+from src.kernel.llm.exceptions import LLMContextError
 
 
 class _FakeResponse:
@@ -400,19 +400,16 @@ async def test_life_recognize_voice_tool_uses_current_audio(
     manager.recognize_voice.assert_awaited_once()
 
 
-async def test_life_send_voice_action_synthesizes_with_tts_task(
+async def test_life_send_voice_action_uses_local_tts_service(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """text 模式应调用 model_tasks.tts 并把合成音频发送到当前聊天。"""
+    """text 模式应调用正式本地 TTS Service，并原样发送 Base64 音频。"""
     action = LifeSendVoiceAction.__new__(LifeSendVoiceAction)
     action.chat_stream = SimpleNamespace(stream_id="stream-1", platform="feishu")
-    model_entry = {"model_identifier": "mimo-v2.5-tts"}
-    speech_client = SimpleNamespace(
-        create_speech=AsyncMock(return_value=b"RIFF-demo-audio"),
+    service = SimpleNamespace(
+        generate_voice=AsyncMock(return_value="LOCAL_AUDIO_BASE64"),
     )
-    registry = SimpleNamespace(
-        get_speech_client_for_model=lambda entry: speech_client,
-    )
+    resolved: list[str] = []
     sent: dict[str, object] = {}
 
     async def fake_send_voice(voice_data, stream_id, **kwargs):
@@ -420,12 +417,8 @@ async def test_life_send_voice_action_synthesizes_with_tts_task(
         return True
 
     monkeypatch.setattr(
-        "src.app.plugin_system.api.llm_api.get_model_set_by_task",
-        lambda task: [model_entry] if task == "tts" else None,
-    )
-    monkeypatch.setattr(
-        "src.kernel.llm.model_client.registry.get_default_model_client_registry",
-        lambda: registry,
+        "plugins.tts_voice_plugin.api.get_local_tts_service",
+        lambda: resolved.append("tts_voice_plugin:service:tts") or service,
     )
     monkeypatch.setattr(
         "src.app.plugin_system.api.send_api.send_voice",
@@ -434,16 +427,89 @@ async def test_life_send_voice_action_synthesizes_with_tts_task(
 
     ok, result = await action.execute(
         text="晚上好。",
-        voice="mimo_default",
-        instructions="温柔地说",
+        voice_style="gentle",
+        text_language="zh",
     )
 
     assert ok is True
     assert "已合成并发送语音" in result
-    speech_client.create_speech.assert_awaited_once()
+    assert resolved == ["tts_voice_plugin:service:tts"]
+    service.generate_voice.assert_awaited_once_with(
+        text="晚上好。",
+        style_hint="gentle",
+        language_hint="zh",
+    )
+    assert sent["voice_data"] == "LOCAL_AUDIO_BASE64"
     assert sent["stream_id"] == "stream-1"
     assert sent["platform"] == "feishu"
     assert sent["processed_plain_text"] == "[语音:晚上好。]"
+
+
+async def test_life_send_voice_action_fails_closed_without_local_tts_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    action = LifeSendVoiceAction.__new__(LifeSendVoiceAction)
+    action.chat_stream = SimpleNamespace(stream_id="stream-1", platform="feishu")
+    monkeypatch.setattr(
+        "plugins.tts_voice_plugin.api.get_local_tts_service",
+        lambda: None,
+    )
+
+    ok, result = await action.execute(text="晚上好。")
+
+    assert ok is False
+    assert result == "本地消息 TTS 服务未启用或尚未就绪"
+
+
+async def test_life_send_voice_action_does_not_duplicate_surface_auto_tts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    action = LifeSendVoiceAction.__new__(LifeSendVoiceAction)
+    action.chat_stream = SimpleNamespace(
+        stream_id="surface-stream",
+        platform="neko.surface",
+    )
+
+    def fail_if_resolved(_signature: str) -> None:
+        raise AssertionError("Surface text mode must not resolve message TTS")
+
+    monkeypatch.setattr(
+        "plugins.tts_voice_plugin.api.get_local_tts_service",
+        lambda: fail_if_resolved("tts_voice_plugin:service:tts"),
+    )
+
+    ok, result = await action.execute(text="这句话只应由 Surface 自动朗读。")
+
+    assert ok is False
+    assert result == "N.E.K.O Surface 已由本地自动语音链接管"
+
+
+async def test_life_send_voice_action_rejects_empty_local_tts_audio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    action = LifeSendVoiceAction.__new__(LifeSendVoiceAction)
+    action.chat_stream = SimpleNamespace(stream_id="stream-1", platform="feishu")
+    service = SimpleNamespace(generate_voice=AsyncMock(return_value=""))
+    monkeypatch.setattr(
+        "plugins.tts_voice_plugin.api.get_local_tts_service",
+        lambda: service,
+    )
+
+    ok, result = await action.execute(text="不会被伪装成成功。")
+
+    assert ok is False
+    assert result == "本地消息 TTS 未返回音频"
+
+
+def test_life_send_voice_schema_contains_only_local_tts_parameters() -> None:
+    schema = LifeSendVoiceAction.to_schema()["function"]
+    properties = schema["parameters"]["properties"]
+
+    assert set(properties) == {"path", "text", "voice_style", "text_language"}
+    assert "voice" not in properties
+    assert "instructions" not in properties
+    assert "model_tasks.tts" not in schema["description"]
+    assert "MiMo" not in schema["description"]
 
 
 def test_life_media_capabilities_are_registered_for_enabled_chatter() -> None:

@@ -92,12 +92,12 @@ main.py
 | --- | --- |
 | `main.py` | 当前主入口 |
 | `config/core.toml` | Core、数据库、HTTP、日志、全局 LLM 行为 |
-| `config/models.toml` | 生产 Provider、模型注册和有序任务路由（唯一权威）；`tasks.tts` 当前绑定 IndexTTS2 |
+| `config/models.toml` | 生产 Provider、模型注册和有序语义任务路由；不承载本地消息 TTS |
 | `config/model.toml` | 旧格式显式迁移兼容；生产启动不读取，也不参与任务回退 |
 | `config/mcp.toml` | MCP 服务配置 |
 | `config/plugins/life_engine/config.toml` | Life Engine、心跳、Chatter、记忆及场景能力 |
 | `config/plugins/feishu_adapter/config.toml` | 飞书应用、连接和消息行为 |
-| `config/plugins/tts_voice_plugin/config.toml` | 遗留 GPT-SoVITS/Higgs 兼容插件；不是当前主 TTS |
+| `config/plugins/tts_voice_plugin/config.toml` | 当前本地消息 TTS Service；本机部署连接 IndexTTS2 兼容服务 |
 | `data/life_engine_workspace/SOUL.md` | 主体灵魂文件；Life Chatter 表达的硬前提 |
 | `logs/` | 运行日志 |
 | `data/` | SQLite、记忆、事件和运行数据 |
@@ -573,10 +573,16 @@ retry_failed = true
 语音链路的通用实现和协议要求为：
 
 - `tasks.voice` 必须指向兼容当前音频输入合同的音频理解或 ASR 模型。飞书入站 Opus 会先转为 16 kHz 单声道 WAV；`MediaManager` 可先尝试原生音频理解，失败后回退 ASR。
-- 当前任务式 TTS 使用本地 **IndexTTS2**。必须先在 `models.toml` 显式注册模型并配置 `tasks.tts`；未配置时不得回退旧 `model.toml` 或遗留插件伪装为可用。聊天意识的语音表达动作消费该任务取得合成音频，再由飞书适配器转为 Opus、上传并发送 `audio` 消息。
-- IndexTTS2 任务链不经过 `tts_voice_plugin`。旧插件保持独立的 GPT-SoVITS/Higgs 协议，仅作为遗留兼容实现；插件停用时不会导入其 `soundfile`、`pedalboard` 等可选音频依赖。
-- 若某个部署仍显式启用遗留 GPT-SoVITS 插件，必须另外安装并声明音频处理依赖，配置服务地址、权重和参考音频，并单独完成离线契约与真实端到端验收；不能复用 IndexTTS2 任务链的验收结果，也不得把它记录成当前主模型。
+- 当前消息 TTS 使用本地 **IndexTTS2**，由 `tts_voice_plugin:service:tts` 通过本机 `config/plugins/tts_voice_plugin/config.toml` 接入。`models.toml` 没有也不需要 `tasks.tts`；Life Chatter 的 `life_send_voice(text=...)` 直接消费 Service，绝不回退旧 `model.toml`、MiMo speech client 或其他模型任务。
+- IndexTTS2 本机包装器暴露历史 GPT-SoVITS `api_v2` 兼容 `/tts` 协议，所以 Service 保留部分兼容字段；这不表示当前模型是 GPT-SoVITS。启用插件时必须安装锁定的 `aiohttp`、`soundfile`、`pedalboard` 依赖，并单独验证本机地址、参考音频和 IndexTTS2 revision。
+- N.E.K.O Surface 自动调用同一消息 TTS Service 并按回复顺序播放，显式 TTS 动作在该场景必须抑制。直播使用自己的有界 HTTP TTS 客户端；Voice Live 使用 Realtime Provider，二者都不能冒充消息 TTS 的平台发送回执。
 - QQ/NapCat 与飞书共用核心 `voice` 消息段，但出站协议不同：NapCat 映射为 OneBot `record`，飞书转为 Opus 并发送 `audio`。QQ/NapCat 语音收发尚未完成真实端到端验收。
+
+可在不发送平台消息的情况下验证本地合成；脚本只输出字符数、格式、音频字节数与 SHA-256，不落合成正文：
+
+```bash
+PYTHONPATH=. .venv/bin/python scripts/verify_local_tts.py
+```
 
 具体 Provider 地址、模型条目 ID、音色资产路径和插件启停状态属于部署环境配置，不写入公共文档；当前模型家族为 IndexTTS2 是项目事实，不应再写成 GPT-SoVITS。
 
@@ -642,7 +648,7 @@ SOUL.md 不可用，life_chatter 拒绝生成回复
 | --- | --- | --- |
 | `tool-nucleus_save_media` | 保存当前会话收到的图片、语音或视频到 Life Engine workspace | 只能写入 workspace 内；图片保存是本轮目标，其他类型沿用既有实现 |
 | `action-life_send_image` | 发送已有本地图片 | 接受绝对路径或 `~` 路径；不负责生成图片 |
-| `action-life_send_voice` | 发送已有本地音频文件，或通过 `model_tasks.tts` 合成后发送 | 飞书发送使用项目依赖 `imageio-ffmpeg` 转为 Opus；TTS 效果仍取决于所选模型协议 |
+| `action-life_send_voice` | 发送已有本地音频文件，或通过本地 `tts_voice_plugin:service:tts` 合成后发送 | 飞书发送使用项目依赖 `imageio-ffmpeg` 转为 Opus；Surface 自动语音场景拒绝重复显式合成 |
 | `tool-recognize_voice` | 识别当前会话里的语音 | 优先音频理解，失败时将入站 Opus 转为 WAV 并回退 ASR；实际效果取决于模型协议兼容性 |
 
 这些能力只进入聊天意识工具清单，由主体在理解上下文后主动选择。不得增加关键词匹配、消息类型触发器或“收到图片/语音就自动调用”的机械规则。
@@ -818,8 +824,8 @@ display_name_negative_cache_ttl = 300.0
 - 应用身份权限 `im:message:readonly`、`im:message:send_as_bot` 已审批并随新版本发布。
 - 项目依赖已安装 `imageio-ffmpeg>=0.6.0`，或启动进程 PATH 中存在支持 `libopus` 的 FFmpeg；不再要求独立安装 `ffprobe`。
 - `model_tasks.voice` 指向真实可调用且兼容 `input_audio` 的音频理解或 ASR 模型；仅有模型名不算协议兼容。
-- `model_tasks.tts` 指向真实可调用的本地 IndexTTS2，并能按当前模型任务合同返回音频。
-- 保持遗留 `tts_voice_plugin` 停用；只有明确需要历史 GPT-SoVITS/Higgs 协议时才单独启用并完成服务、可选音频依赖和端到端验收。
+- `tts_voice_plugin` 已显式启用，`tts_voice_plugin:service:tts` 可取得，且本机配置指向真实 IndexTTS2 兼容服务；`config/models.toml` 不需要 `tasks.tts`。
+- 插件的可选音频依赖已由锁定环境安装；固定短句能生成非空、可解码音频，日志不打印正文或完整请求体。
 - `data/life_engine_workspace/received/` 所在磁盘有足够空间并纳入隐私保护与备份策略。
 
 逐项验收：
@@ -1435,7 +1441,7 @@ config/
 - [x] 当前 schema 配置模板与模型环境变量密钥注入
 - [ ] 模型 Provider 兼容性矩阵
 - [x] ASR 协议接入、Opus/WAV 转码和飞书端到端验收
-- [ ] IndexTTS2 本地部署、模型/声音 revision、参考音频、任务合同和独立语音发送验收
+- [ ] IndexTTS2 本地部署、模型/声音 revision、参考音频、Service 合同和独立语音发送验收
 - [x] QQ/NapCat 与飞书私聊文本、图片查看真实端到端验收
 - [x] 飞书图片保存、图片发送、语音合成发送和语音接收识别验收
 - [ ] 飞书群聊、普通文件和视频验收
@@ -1464,9 +1470,10 @@ config/
 | 2026-08-02 | 验收基线 | QQ 聊天、飞书聊天、QQ 图片查看、飞书图片查看完成真实验收；回退图片保存注册改动，其他功能统一暂不验收；补全飞书最小权限、审批发布和 `99991672` 排障说明 |
 | 2026-08-02 | Embedding 配置 | 补充 Embedding 通用配置、真实 API 冒烟要求、索引维度约束、历史失败任务单批重试和验收检查项 |
 | 2026-08-02 | 媒体能力接入 | 为聊天意识注册保存媒体、发送图片、发送已有语音和识别语音能力；补飞书图片出站与语音入站资源链、离线契约和真实端到端验收标准 |
-| 2026-08-02 | 飞书媒体验收与 TTS 边界 | 记录飞书图片保存/发送、语音合成发送和语音接收识别均已真实验收；明确任务式 TTS 与独立 GPT-SoVITS 插件链路分离，停用插件时不要求加载其可选音频依赖 |
+| 2026-08-02 | 飞书媒体验收与 TTS 边界 | 记录飞书图片保存/发送、语音合成发送和语音接收识别均已真实验收；当时的任务式 TTS 结论已被 2026-08-17 现场审计纠正 |
 | 2026-08-03 | 依赖安装与环境恢复 | 补充无 `uv` 时通过项目 `.venv` 安装完整依赖、为插件安装器补装并暴露项目级 `uv`、`pip check` 与启动导入验收，以及损坏环境改名备份、重建和回退流程 |
-| 2026-08-04 | TTS 现状修正 | 明确当前任务式本地 TTS 为 IndexTTS2；GPT-SoVITS/Higgs 仅属于停用的遗留兼容插件，不再作为爱莉当前 TTS 模型描述 |
+| 2026-08-04 | TTS 文档过渡 | 将当前模型记为 IndexTTS2，但错误保留了不存在的 `tasks.tts` 路由；该偏差于 2026-08-17 修正 |
+| 2026-08-17 | 本地 TTS 路由收口 | 移除 Life Chatter 的 MiMo/`tasks.tts` 遗留调用，统一到启用的本地 TTS Service；明确消息、Surface、直播与 Voice Live 的场景所有权 |
 | 2026-08-04 | 阶段三 P3-07 | 接入 8 个受管媒体端点、`runtime/media/` 持久化、resource grant、完整性校验、既有 `sync_outbox` 和聊天图片/语音 `media_id` resolver；明确尚未做真实客户端/Provider E2E |
 | 2026-08-05 | 阶段三 P3-08 | 接入直播状态、场次与事件历史、5 类耐久命令和统一 stage ticket/WS；保持手工开播、observer 只读、平台断线 degraded，并明确 B站弹幕写能力尚未具备真实凭据与 E2E |
 | 2026-08-05 | 阶段三 P3-09 | 接入语音通话耐久登记、状态/转写查询、4 类耐久命令、资源绑定 ticket 和 participant/observer WS；保留 PCM16 二进制协议与旧路由，明确真实 Provider/双向音频/重连 E2E 暂未验收 |

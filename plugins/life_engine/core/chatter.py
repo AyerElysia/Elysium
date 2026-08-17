@@ -37,12 +37,12 @@ from src.core.components.base.action import ActionResultDetail
 from src.core.config import get_core_config
 from src.core.models.message import Message, MessageType
 from src.kernel.llm import (
+    ROLE,
     Audio,
     Content,
     Image,
     LLMPayload,
     ReasoningText,
-    ROLE,
     Text,
     ToolCall,
     ToolRegistry,
@@ -51,24 +51,31 @@ from src.kernel.llm import (
     Video,
 )
 from src.kernel.llm.media_capabilities import normalize_media_capabilities
-from .context_compaction import (
-    DEFAULT_MAX_GROUPS as _CONTEXT_COMPRESSION_MAX_GROUPS,
-    DEFAULT_MAX_PART_CHARS as _CONTEXT_COMPRESSION_MAX_PART_CHARS,
-    DEFAULT_SNAPSHOT_CHAR_BUDGET as _ROLLING_CONTEXT_SNAPSHOT_CHAR_BUDGET,
-    compact_payloads,
-    compress_dropped_payload_groups,
-    hierarchical_compact_payloads,
-)
-from src.kernel.logger import get_logger, COLOR
+from src.kernel.logger import COLOR, get_logger
 from src.kernel.storage import canonical_json_sha256
-from ..memory.prompting import analyze_memory_text, render_memory_prompt
+
 from ..constants import LIFE_CHATTER_GLOBAL_CURSOR_KEY
+from ..memory.prompting import analyze_memory_text, render_memory_prompt
 from .chat_history import (
     build_chat_history_text,
     build_global_chat_history_text_from_db,
     message_flag,
 )
 from .context_assembly import LifeChatterContextAssembler
+from .context_compaction import (
+    DEFAULT_MAX_GROUPS as _CONTEXT_COMPRESSION_MAX_GROUPS,
+)
+from .context_compaction import (
+    DEFAULT_MAX_PART_CHARS as _CONTEXT_COMPRESSION_MAX_PART_CHARS,
+)
+from .context_compaction import (
+    DEFAULT_SNAPSHOT_CHAR_BUDGET as _ROLLING_CONTEXT_SNAPSHOT_CHAR_BUDGET,
+)
+from .context_compaction import (
+    compact_payloads,
+    compress_dropped_payload_groups,
+    hierarchical_compact_payloads,
+)
 from .multimodal import (
     MediaBudget,
     MediaItem,
@@ -80,6 +87,7 @@ from .tool_parallel import is_life_tool_call_parallel_safe
 
 if TYPE_CHECKING:
     from src.core.models.stream import ChatStream
+
     from ..service.core import LifeEngineService
 
 logger = get_logger("life_chatter", display="生命对话器", color=COLOR.MAGENTA)
@@ -843,7 +851,8 @@ class LifeSendVoiceAction(_LifeSendMediaAction):
     action_name = "life_send_voice"
     action_description = (
         "向当前聊天发送语音。已有音频文件时填写 path；需要把文字合成为语音时填写 text。"
-        "path 与 text 二选一。合成使用 model_tasks.tts 配置的模型，主体自行决定是否使用。"
+        "path 与 text 二选一。文字合成使用已启用的本地消息 TTS 服务，主体自行决定是否使用。"
+        "N.E.K.O Surface 的文字回复由该场景自己的自动语音链处理，不要重复调用本动作。"
     )
     chatter_allow: list[str] = ["life_chatter"]
     media_type = MessageType.VOICE
@@ -863,14 +872,14 @@ class LifeSendVoiceAction(_LifeSendMediaAction):
             str,
             "需要由 TTS 合成并发送的口语文本；与 path 二选一。",
         ] = "",
-        voice: Annotated[
+        voice_style: Annotated[
             str,
-            "MiMo 预置音色，默认 mimo_default；只有明确想选其他可用音色时再填写。",
-        ] = "mimo_default",
-        instructions: Annotated[
-            str,
-            "可选的自然语言声音表演指令，如温柔、轻声、语速稍慢；不需要时留空。",
-        ] = "",
+            "本地 TTS 风格名称；不确定时使用 default。",
+        ] = "default",
+        text_language: Annotated[
+            str | None,
+            "可选语言代码，如 zh、en、ja；不填写时由本地 TTS 自动判断。",
+        ] = None,
     ) -> tuple[bool, str]:
         normalized_path = str(path or "").strip()
         normalized_text = str(text or "").strip()
@@ -879,43 +888,38 @@ class LifeSendVoiceAction(_LifeSendMediaAction):
         if normalized_path:
             return await self._send_path(normalized_path)
 
+        platform = str(getattr(self.chat_stream, "platform", "") or "").strip().lower()
+        if platform == "neko.surface":
+            return False, "N.E.K.O Surface 已由本地自动语音链接管"
+
         try:
-            from src.app.plugin_system.api.llm_api import get_model_set_by_task
+            from plugins.tts_voice_plugin.api import get_local_tts_service
             from src.app.plugin_system.api.send_api import send_voice
-            from src.kernel.llm.model_client.registry import (
-                get_default_model_client_registry,
-            )
 
-            model_set = get_model_set_by_task("tts")
-            if not isinstance(model_set, list) or not model_set:
-                return False, "未配置 model_tasks.tts，无法合成语音"
-            model_entry = model_set[0]
-            client = get_default_model_client_registry().get_speech_client_for_model(
-                model_entry
-            )
-            audio_bytes = await client.create_speech(
-                model_name=str(model_entry.get("model_identifier") or ""),
+            service = get_local_tts_service()
+            generate_voice = getattr(service, "generate_voice", None)
+            if not callable(generate_voice):
+                return False, "本地消息 TTS 服务未启用或尚未就绪"
+
+            encoded = await generate_voice(
                 text=normalized_text,
-                request_name="life_send_voice",
-                model_set=model_entry,
-                voice=str(voice or "mimo_default").strip() or "mimo_default",
-                instructions=str(instructions or "").strip(),
-                output_format="wav",
+                style_hint=str(voice_style or "default").strip() or "default",
+                language_hint=(str(text_language).strip() if text_language else None),
             )
-            import base64
+            if not isinstance(encoded, str) or not encoded.strip():
+                return False, "本地消息 TTS 未返回音频"
 
-            encoded = base64.b64encode(audio_bytes).decode("ascii")
             success = await send_voice(
-                encoded,
-                self.chat_stream.stream_id,
+                voice_data=encoded,
+                stream_id=self.chat_stream.stream_id,
                 platform=self.chat_stream.platform,
                 processed_plain_text=f"[语音:{normalized_text}]",
             )
             if not success:
                 return False, "语音已合成，但平台发送失败"
-            return True, f"已合成并发送语音: {normalized_text[:80]}"
+            return True, f"已合成并发送语音（{len(normalized_text)} 字）"
         except Exception as exc:  # noqa: BLE001
-            logger.error(f"MiMo TTS 合成或发送失败: {exc}", exc_info=True)
+            logger.error(f"本地消息 TTS 合成或发送失败: {exc}", exc_info=True)
             return False, f"语音合成或发送失败: {exc}"
 
 
@@ -992,9 +996,10 @@ class LifeSendFileAction(BaseAction):
         target_stream_id = self.chat_stream.stream_id
         context = self.chat_stream.context
 
+        from uuid import uuid4
+
         from src.core.managers.adapter_manager import get_adapter_manager
         from src.core.transport.message_send import get_message_sender
-        from uuid import uuid4
 
         bot_info = await get_adapter_manager().get_bot_info_by_platform(platform)
         last_msg = self._get_context_message_for_target()
@@ -1603,6 +1608,7 @@ class LifeSaveMediaTool(LifeInspectMediaTool):
         import base64
         import mimetypes
         import time as _time
+
         from ..tools._utils import _get_workspace
 
         selected = self._select_media(target, media_type)
@@ -3353,7 +3359,7 @@ class LifeChatter(BaseChatter):
             "`think`、`record_inner_monologue` 或 TTS 工具。\n"
             "- 只有确实需要查询或操作时才先调用其他工具；拿到结果后立即回复。\n"
             "- 回复保持口语化、适合直接朗读，尽量一次发成一个完整短段。\n"
-            "- 语音由 Surface 自动用 Neo TTS 合成，不要主动调用 `tts_voice_action`。"
+            "- 语音由 Surface 本地自动语音链合成，不要主动调用任何 TTS/语音发送工具。"
         )
 
     @classmethod

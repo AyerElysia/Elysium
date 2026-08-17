@@ -1,12 +1,17 @@
 """TTS Voice 插件配置。
 
 定义本地语音合成插件的配置项，包括基础设置、风格列表、高级参数和空间音效。
-引擎后端可替换（当前默认对接 GPT-SoVITS API 协议）。
+当前 IndexTTS2 部署通过历史兼容 HTTP 协议接入；具体地址与启动命令由本机配置决定。
 """
 
 from typing import ClassVar
 
-from src.core.components.base.config import BaseConfig, Field, SectionBase, config_section
+from src.core.components.base.config import (
+    BaseConfig,
+    Field,
+    SectionBase,
+    config_section,
+)
 
 
 @config_section("plugin")
@@ -98,7 +103,7 @@ class TTSStyle(SectionBase):
     name: str = Field(default="默认", description="显示名称")
     refer_wav_path: str = Field(
         default="C:/path/to/your/reference.wav",
-        description="主参考音频路径（时长必须在 3~10 秒之间，超出会被引擎拒绝）",
+        description="主参考音频路径；允许时长由当前本地 TTS 后端决定",
     )
     aux_refer_wav_paths: list[str] = Field(
         default_factory=list,

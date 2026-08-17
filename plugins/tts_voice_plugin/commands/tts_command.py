@@ -1,7 +1,4 @@
-"""TTS 语音合成命令。
-
-提供 /tts 命令，用户通过命令手动触发 GPT-SoVITS 语音合成。
-"""
+"""本地 TTS 语音合成命令。"""
 
 from __future__ import annotations
 
@@ -21,7 +18,7 @@ class TTSVoiceCommand(BaseCommand):
     """通过 /tts 命令手动触发 TTS 语音合成。"""
 
     command_name: str = "tts"
-    command_description: str = "使用GPT-SoVITS将文本转换为语音并发送，用法：/tts <文本> [风格]"
+    command_description: str = "使用本地 TTS 将文本转换为语音并发送，用法：/tts <文本> [风格]"
     command_prefix: str = "/"
     auto_reply: bool = False
 

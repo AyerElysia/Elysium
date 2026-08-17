@@ -1,7 +1,4 @@
-"""TTS Voice 插件入口。
-
-基于 GPT-SoVITS 的文本转语音插件，支持多种语言和多风格语音合成。
-"""
+"""本地消息 TTS 插件入口。"""
 
 from __future__ import annotations
 
@@ -23,13 +20,13 @@ logger = get_logger("tts_voice_plugin")
 
 @register_plugin
 class TTSVoicePlugin(BasePlugin):
-    """GPT-SoVITS 语音合成插件。"""
+    """可配置的本地参考音频语音合成插件。"""
 
     plugin_name: str = "tts_voice_plugin"
     plugin_description: str = (
-        "基于GPT-SoVITS的文本转语音插件，支持多种语言和多风格语音合成"
+        "本地消息文本转语音插件；当前部署使用 IndexTTS2 兼容服务"
     )
-    plugin_version: str = "3.1.2"
+    plugin_version: str = "3.2.0"
 
     configs = [TTSVoiceConfig]
 
