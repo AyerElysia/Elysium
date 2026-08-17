@@ -103,6 +103,24 @@ class UnverifiedContextProvider(FakeProvider):
         )
 
 
+class DeferredRefreshProvider(FakeProvider):
+    """Require the provider receive loop to continue after response.done."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.refresh_started = asyncio.Event()
+        self.refresh_release = asyncio.Event()
+
+    async def inject_context(
+        self,
+        text: str,
+    ) -> RealtimeContextDeliveryReceipt:
+        if self.contexts:
+            self.refresh_started.set()
+            await self.refresh_release.wait()
+        return await super().inject_context(text)
+
+
 class FakeConsciousness:
     instance_id = "voice_live_test"
     stream_id = "voice_live_test"
@@ -110,7 +128,6 @@ class FakeConsciousness:
     def __init__(self) -> None:
         self.is_active = False
         self.reasons: list[str] = []
-        self.committed_perceptions: list[tuple[Any, Any]] = []
 
     async def activate(self, provider_name: str) -> None:
         assert provider_name == "fake_realtime"
@@ -122,10 +139,6 @@ class FakeConsciousness:
     async def suspend(self, *, reason: str) -> None:
         self.is_active = False
         self.reasons.append(reason)
-
-    async def commit_perception(self, prepared: Any, receipt: Any) -> None:
-        self.committed_perceptions.append((prepared, receipt))
-
 
 class BlockingStateConsciousness(FakeConsciousness):
     def __init__(self) -> None:
@@ -171,36 +184,44 @@ class BundleBridge(FakeBridge):
         )
 
 
-class PerceptionBridge(FakeBridge):
-    """Expose one transient delivery without putting it in the system prompt."""
+class SubconsciousBridge(FakeBridge):
+    """Expose one transient projection without putting it in the system prompt."""
 
     def __init__(self) -> None:
         super().__init__()
-        content = 'world-perception:test-delivery\n{"presence":"active"}'
+        content = "【潜意识近期上下文】\n最近形成的想法"
         encoded = content.encode("utf-8")
-        self.prepared = SimpleNamespace(
-            delivery_id="test-delivery",
+        self.projection = SimpleNamespace(
             projection_sha256=hashlib.sha256(encoded).hexdigest(),
             delivered_bytes=len(encoded),
+            through_sequence=42,
             content=content,
         )
 
     async def build_llm_context_prefix(self) -> tuple[str, object]:
-        return "transient-presence", self.prepared
+        return "recent-subconscious-prefix", self.projection
+
+    def dynamic_context_projection_stats(self) -> dict[str, Any]:
+        return {
+            "projection_kind": "recent_subconscious_context",
+            "projection_sha256": self.projection.projection_sha256,
+            "delivered_bytes": self.projection.delivered_bytes,
+            "through_sequence": self.projection.through_sequence,
+        }
 
 
-class CoordinatedPerceptionBridge(PerceptionBridge):
+class CoordinatedSubconsciousBridge(SubconsciousBridge):
     def __init__(
         self,
         provider_started: asyncio.Event,
-        perception_started: asyncio.Event,
+        context_started: asyncio.Event,
     ) -> None:
         super().__init__()
         self._provider_started = provider_started
-        self._perception_started = perception_started
+        self._context_started = context_started
 
     async def build_llm_context_prefix(self) -> tuple[str, object]:
-        self._perception_started.set()
+        self._context_started.set()
         await self._provider_started.wait()
         return await super().build_llm_context_prefix()
 
@@ -209,16 +230,16 @@ class CoordinatedProvider(FakeProvider):
     def __init__(
         self,
         provider_started: asyncio.Event,
-        perception_started: asyncio.Event,
+        context_started: asyncio.Event,
     ) -> None:
         super().__init__()
         self._provider_started = provider_started
-        self._perception_started = perception_started
+        self._context_started = context_started
 
     async def connect(self, session_config: dict[str, Any]) -> None:
         self.connected = session_config
         self._provider_started.set()
-        await self._perception_started.wait()
+        await self._context_started.wait()
         await self._emit_state(ProviderState.LISTENING)
 
 
@@ -297,6 +318,16 @@ def make_config(tmp_path: Path) -> VoiceLiveConfig:
     return config
 
 
+async def _wait_for_context_count(provider: FakeProvider, count: int) -> None:
+    for _ in range(100):
+        if len(provider.contexts) >= count:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(
+        f"expected {count} injected contexts, got {len(provider.contexts)}"
+    )
+
+
 @pytest.mark.asyncio
 async def test_slow_world_state_report_does_not_delay_session_ready(
     tmp_path: Path,
@@ -327,14 +358,14 @@ async def test_slow_world_state_report_does_not_delay_session_ready(
 
 
 @pytest.mark.asyncio
-async def test_provider_connect_and_world_prepare_overlap_during_startup(
+async def test_provider_connect_and_subconscious_prepare_overlap_during_startup(
     tmp_path: Path,
 ) -> None:
     config = make_config(tmp_path)
     provider_started = asyncio.Event()
-    perception_started = asyncio.Event()
-    provider = CoordinatedProvider(provider_started, perception_started)
-    bridge = CoordinatedPerceptionBridge(provider_started, perception_started)
+    context_started = asyncio.Event()
+    provider = CoordinatedProvider(provider_started, context_started)
+    bridge = CoordinatedSubconsciousBridge(provider_started, context_started)
     session = CallSession(
         config,
         "parallel-startup",
@@ -350,114 +381,26 @@ async def test_provider_connect_and_world_prepare_overlap_during_startup(
     )
 
     assert await asyncio.wait_for(session.start(), timeout=2) is True
-    assert provider.contexts == ["transient-presence"]
+    assert provider.contexts == ["recent-subconscious-prefix"]
     await session.stop()
 
 
 @pytest.mark.asyncio
-async def test_voice_perception_commits_only_after_completed_model_turn(
+async def test_voice_subconscious_context_is_reinjected_once_per_turn_frontier(
     tmp_path: Path,
 ) -> None:
     config = make_config(tmp_path)
     provider = FakeProvider()
     consciousness = FakeConsciousness()
-    bridge = PerceptionBridge()
-    session = CallSession(
-        config,
-        "perception",
-        provider_factory=lambda _: provider,
-        store=VoiceEpisodeStore(tmp_path, "voice_perception", "perception"),
-        consciousness=consciousness,
-        bridge=bridge,
-        tool_broker=FakeBroker(),
-    )
-
-    assert await session.start() is True
-    assert provider.contexts == ["transient-presence"]
-    assert consciousness.committed_perceptions == []
-    await provider._emit_response_done(True)
-    assert len(consciousness.committed_perceptions) == 1
-    committed, receipt = consciousness.committed_perceptions[0]
-    assert committed is bridge.prepared
-    assert receipt.delivery_id == bridge.prepared.delivery_id
-    assert receipt.projection_sha256 == bridge.prepared.projection_sha256
-    assert receipt.delivered_bytes == bridge.prepared.delivered_bytes
-    assert receipt.exact is True
-    assert provider.contexts == ["transient-presence", "transient-presence"]
-    await session.stop()
-
-
-@pytest.mark.asyncio
-async def test_voice_perception_rejection_does_not_commit(
-    tmp_path: Path,
-) -> None:
-    config = make_config(tmp_path)
-    provider = RejectingContextProvider()
-    consciousness = FakeConsciousness()
-    bridge = PerceptionBridge()
-    session = CallSession(
-        config,
-        "perception-rejected",
-        provider_factory=lambda _: provider,
-        store=VoiceEpisodeStore(
-            tmp_path,
-            "voice_perception_rejected",
-            "perception-rejected",
-        ),
-        consciousness=consciousness,
-        bridge=bridge,
-        tool_broker=FakeBroker(),
-    )
-
-    assert await session.start() is False
-    assert consciousness.committed_perceptions == []
-
-
-@pytest.mark.asyncio
-async def test_failed_voice_model_turn_keeps_perception_uncommitted(
-    tmp_path: Path,
-) -> None:
-    config = make_config(tmp_path)
-    provider = FakeProvider()
-    consciousness = FakeConsciousness()
-    bridge = PerceptionBridge()
-    session = CallSession(
-        config,
-        "perception-failed-turn",
-        provider_factory=lambda _: provider,
-        store=VoiceEpisodeStore(
-            tmp_path,
-            "voice_perception_failed_turn",
-            "perception-failed-turn",
-        ),
-        consciousness=consciousness,
-        bridge=bridge,
-        tool_broker=FakeBroker(),
-    )
-
-    assert await session.start() is True
-    await provider._emit_response_done(False)
-    assert consciousness.committed_perceptions == []
-    assert provider.contexts == ["transient-presence", "transient-presence"]
-    await session.stop()
-
-
-@pytest.mark.asyncio
-async def test_voice_response_done_without_exact_provider_receipt_stays_pending(
-    tmp_path: Path,
-) -> None:
-    config = make_config(tmp_path)
-    provider = UnverifiedContextProvider()
-    consciousness = FakeConsciousness()
-    bridge = PerceptionBridge()
+    bridge = SubconsciousBridge()
     store = VoiceEpisodeStore(
         tmp_path,
-        "voice_perception_unverified",
-        "perception-unverified",
+        "voice_subconscious",
+        "subconscious",
     )
     session = CallSession(
         config,
-        "perception-unverified",
+        "subconscious",
         provider_factory=lambda _: provider,
         store=store,
         consciousness=consciousness,
@@ -466,14 +409,154 @@ async def test_voice_response_done_without_exact_provider_receipt_stays_pending(
     )
 
     assert await session.start() is True
+    assert provider.contexts == ["recent-subconscious-prefix"]
+    await provider._emit_state(ProviderState.SPEAKING)
+    await provider._emit_state(ProviderState.LISTENING)
+    await _wait_for_context_count(provider, 1)
+    assert provider.contexts == ["recent-subconscious-prefix"]
     await provider._emit_response_done(True)
-
-    assert consciousness.committed_perceptions == []
+    await _wait_for_context_count(provider, 2)
+    assert provider.contexts == [
+        "recent-subconscious-prefix",
+        "recent-subconscious-prefix",
+    ]
+    audit_payloads = json.dumps(
+        [record.payload for record in store.read_all()],
+        ensure_ascii=False,
+    )
+    assert "最近形成的想法" not in audit_payloads
+    assert "recent-subconscious-prefix" not in audit_payloads
     assert any(
-        record.event == "perception.delivery_unverified"
+        record.event == "subconscious_context.delivered"
         for record in store.read_all()
     )
-    assert provider.contexts == ["transient-presence"]
+    await session.stop()
+
+
+@pytest.mark.asyncio
+async def test_response_done_does_not_block_provider_receipt_processing(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    provider = DeferredRefreshProvider()
+    session = CallSession(
+        config,
+        "subconscious-nonblocking",
+        provider_factory=lambda _: provider,
+        store=VoiceEpisodeStore(
+            tmp_path,
+            "voice_subconscious_nonblocking",
+            "subconscious-nonblocking",
+        ),
+        consciousness=FakeConsciousness(),
+        bridge=SubconsciousBridge(),
+        tool_broker=FakeBroker(),
+    )
+
+    assert await session.start() is True
+    await asyncio.wait_for(provider._emit_response_done(True), timeout=0.2)
+    await asyncio.wait_for(provider.refresh_started.wait(), timeout=0.2)
+    provider.refresh_release.set()
+    await _wait_for_context_count(provider, 2)
+    await session.stop()
+
+
+@pytest.mark.asyncio
+async def test_voice_subconscious_context_rejection_fails_startup_cleanly(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    provider = RejectingContextProvider()
+    consciousness = FakeConsciousness()
+    bridge = SubconsciousBridge()
+    session = CallSession(
+        config,
+        "subconscious-rejected",
+        provider_factory=lambda _: provider,
+        store=VoiceEpisodeStore(
+            tmp_path,
+            "voice_subconscious_rejected",
+            "subconscious-rejected",
+        ),
+        consciousness=consciousness,
+        bridge=bridge,
+        tool_broker=FakeBroker(),
+    )
+
+    assert await session.start() is False
+
+
+@pytest.mark.asyncio
+async def test_failed_voice_model_turn_still_opens_a_new_context_frontier(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    provider = FakeProvider()
+    consciousness = FakeConsciousness()
+    bridge = SubconsciousBridge()
+    session = CallSession(
+        config,
+        "subconscious-failed-turn",
+        provider_factory=lambda _: provider,
+        store=VoiceEpisodeStore(
+            tmp_path,
+            "voice_subconscious_failed_turn",
+            "subconscious-failed-turn",
+        ),
+        consciousness=consciousness,
+        bridge=bridge,
+        tool_broker=FakeBroker(),
+    )
+
+    assert await session.start() is True
+    await provider._emit_response_done(False)
+    await _wait_for_context_count(provider, 2)
+    assert provider.contexts == [
+        "recent-subconscious-prefix",
+        "recent-subconscious-prefix",
+    ]
+    await session.stop()
+
+
+@pytest.mark.asyncio
+async def test_unverified_subconscious_delivery_is_observable_and_bounded_per_turn(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    provider = UnverifiedContextProvider()
+    consciousness = FakeConsciousness()
+    bridge = SubconsciousBridge()
+    store = VoiceEpisodeStore(
+        tmp_path,
+        "voice_subconscious_unverified",
+        "subconscious-unverified",
+    )
+    session = CallSession(
+        config,
+        "subconscious-unverified",
+        provider_factory=lambda _: provider,
+        store=store,
+        consciousness=consciousness,
+        bridge=bridge,
+        tool_broker=FakeBroker(),
+    )
+
+    assert await session.start() is True
+    await provider._emit_state(ProviderState.SPEAKING)
+    await provider._emit_state(ProviderState.LISTENING)
+    await _wait_for_context_count(provider, 1)
+    assert provider.contexts == ["recent-subconscious-prefix"]
+    await provider._emit_response_done(True)
+    await _wait_for_context_count(provider, 2)
+
+    assert any(
+        record.event == "subconscious_context.delivery_unverified"
+        for record in store.read_all()
+    )
+    assert provider.contexts == [
+        "recent-subconscious-prefix",
+        "recent-subconscious-prefix",
+    ]
     await session.stop()
 
 

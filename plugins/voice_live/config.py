@@ -197,7 +197,11 @@ class VoiceLiveConfig(BaseConfig):
             default=True, description="把最终转写写入统一生命事件流"
         )
         cross_scene_awareness: bool = Field(
-            default=True, description="感知完整 WorldState"
+            default=True,
+            description=(
+                "注入同一主体已持久化的潜意识近期上下文；兼容保留旧字段名，"
+                "不读取其他意识实例私有上下文或 WorldState"
+            ),
         )
 
         subject_context_max_bytes: int = Field(
@@ -235,7 +239,10 @@ class VoiceLiveConfig(BaseConfig):
             default=8 * 1024,
             ge=4096,
             le=128 * 1024,
-            description="实时 Provider 单次注入的低延迟世界感知胶囊字节上限；完整投影仍由 LifeEngine 保留",
+            description=(
+                "实时 Provider 单次注入的潜意识近期上下文 UTF-8 字节上限；"
+                "兼容保留旧字段名，完整 Life Event 历史不被修改"
+            ),
         )
 
     @config_section("audio", title="音频传输", tag="audio", order=40)

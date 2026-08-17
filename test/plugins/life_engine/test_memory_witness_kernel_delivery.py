@@ -21,11 +21,15 @@ from plugins.life_engine.memory.experience import (
 )
 from plugins.life_engine.service import memory_witness as witness_module
 from plugins.life_engine.service.consciousness import ConsciousnessInstance
+from plugins.life_engine.service.event_builder import EventType, LifeEngineEvent
 from plugins.life_engine.service.memory_witness import (
     MEMORY_WITNESS_INSTANCE_ID,
     MemoryWitnessCoordinator,
 )
 from plugins.life_engine.service.perception_gateway import PreparedPerception
+from plugins.life_engine.service.subconscious_context import (
+    SubconsciousContextManager,
+)
 from src.kernel.llm import request as request_module
 from src.kernel.llm.context import LLMContextManager
 from src.kernel.llm.exceptions import LLMAPIError
@@ -99,8 +103,14 @@ class _NoopMetricsCollector:
 
 
 class _WitnessService:
-    def __init__(self, perception: PreparedPerception) -> None:
+    def __init__(
+        self,
+        perception: PreparedPerception,
+        *,
+        recent_subconscious: Any | None = None,
+    ) -> None:
         self._perception = perception
+        self._recent_subconscious = recent_subconscious
         self._config = SimpleNamespace(
             memory_witness=SimpleNamespace(
                 model_task_name="witness-kernel-test",
@@ -147,6 +157,14 @@ synthetic MEMORY projection
         assert projection_kind == "memory_witness"
         assert max_bytes == 24 * 1024
         return dict(self._subject_snapshot)
+
+    async def get_recent_subconscious_context(
+        self,
+        *,
+        max_bytes: int,
+    ) -> Any | None:
+        assert 0 < max_bytes < 8 * 1024
+        return self._recent_subconscious
 
 
 def _model(
@@ -328,6 +346,78 @@ async def test_witness_accepts_untrimmed_exact_world_through_real_kernel(
     assert authored.world_payload["proof_state"] == "exact_final_attempt"
     assert authored.world_payload["receipt"]["transport_request_id"] == "101"
     assert len(client.attempts) == 1
+    assert _marker_parts(client.attempts[0], perception) == (perception.content,)
+    assert all(
+        "<recent_subconscious_context>" not in part
+        for part in client.attempts[0].text_parts
+    )
+
+
+@pytest.mark.asyncio
+async def test_witness_marks_recent_subconscious_as_non_evidence_and_redacts_args(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    perception = _perception(body_chars=256, identity="recent-context")
+    client = _FakeNetworkClient(request_ids={"recent-model": 111})
+    _install_real_kernel_harness(
+        monkeypatch,
+        tmp_path,
+        model_set=[_model("recent-model", route_scope="recent")],
+        client=client,
+    )
+    tool_call = LifeEngineEvent(
+        event_id="tool-call-recent",
+        event_type=EventType.TOOL_CALL,
+        timestamp="2026-08-18T02:00:00+08:00",
+        sequence=11,
+        source="life_engine",
+        source_detail="witness-test",
+        content="inspect",
+        content_type="tool_call",
+        heartbeat_run_id="heartbeat-recent",
+        call_id="call-recent",
+        tool_name="inspect",
+        tool_args={"private": "RAW_TOOL_ARGUMENT_MUST_NOT_LEAK"},
+    )
+    projection = SubconsciousContextManager().project_recent(
+        [tool_call],
+        max_bytes=4096,
+    )
+    service = _WitnessService(
+        perception,
+        recent_subconscious=projection,
+    )
+
+    authored = await MemoryWitnessCoordinator(service)._author_witness(
+        _instance(),
+        [_occurrence()],
+    )
+
+    assert authored.text == "synthetic witness"
+    parts = client.attempts[0].text_parts
+    combined = "\n".join(parts)
+    background_index = next(
+        index
+        for index, part in enumerate(parts)
+        if "<recent_subconscious_context>" in part
+    )
+    experience_index = next(
+        index
+        for index, part in enumerate(parts)
+        if "synthetic immutable experience" in part
+    )
+    world_index = next(
+        index
+        for index, part in enumerate(parts)
+        if perception.delivery_marker in part
+    )
+    assert background_index < experience_index < world_index == len(parts) - 1
+    assert "不是本次 Witness 的 Experience 证据" in combined
+    assert "只有 Experience 窗口定义本次见证的经历范围" in combined
+    assert "TOOL_CALL inspect" in combined
+    assert "call-recent" in combined
+    assert "RAW_TOOL_ARGUMENT_MUST_NOT_LEAK" not in combined
     assert _marker_parts(client.attempts[0], perception) == (perception.content,)
 
 
