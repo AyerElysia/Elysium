@@ -359,12 +359,14 @@ async def test_build_chatter_runtime_filters_tool_call_noise() -> None:
             event_type=EventType.TOOL_CALL,
             content="tool_args_blob",
             tool_name="search",
+            tool_args={"query": "tool_args_blob"},
             source_detail="tool",
         ),
     ]
     text, hw = await service.build_chatter_runtime_context(chat)
-    assert "### 新增 life 事件流" in text
+    assert "【潜意识近期上下文】" in text
     assert "HB_NOISE" in text
+    assert "TOOL_CALL search" in text
     assert "tool_args_blob" not in text
     assert "AGENT_DONE" in text
     assert hw == 3

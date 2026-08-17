@@ -438,6 +438,7 @@ def test_recent_projection_shares_thoughts_and_tools_without_private_messages() 
     assert projected.through_sequence == 5
     assert "我刚刚想到要继续看看这件事" in projected.content
     assert "TOOL_CALL inspect" in projected.content
+    assert "notes.txt" not in projected.content
     assert "TOOL_RESULT inspect success" in projected.content
     assert "现在更清楚了" in projected.content
     assert "source=life_chatter instance=chat_global" in projected.content

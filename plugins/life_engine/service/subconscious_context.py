@@ -699,7 +699,15 @@ class SubconsciousContextManager:
             provenance = f"source={source}"
             if instance:
                 provenance += f" instance={instance}"
-            lines.append(f"{self._render_event(event)} [{provenance}]")
+            if event.event_type == EventType.TOOL_CALL:
+                rendered = (
+                    f"- #{int(event.sequence or 0)} TOOL_CALL "
+                    f"{event.tool_name or 'tool'} "
+                    f"call_id={event.call_id or 'legacy'}"
+                )
+            else:
+                rendered = self._render_event(event)
+            lines.append(f"{rendered} [{provenance}]")
         return "\n".join(lines)
 
     @staticmethod
