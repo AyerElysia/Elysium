@@ -235,16 +235,20 @@ async def test_heartbeat_placeholder_requires_explicit_streams() -> None:
         await tool._resolve_streams(None)
 
 
-async def test_target_key_resolves_to_full_stream(monkeypatch: pytest.MonkeyPatch) -> None:
-    """「你可以触达的人和地方」的 target_key（p-20403fdb）应解析为完整 stream_id。"""
+async def test_surface_ref_resolves_to_exact_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reachability surface refs resolve only at the evidence boundary."""
     tool = _tool()
+    full = "20403fdb0e6df94137c9071e62c44c09eb8090b534279ef5695c4b4aa5fae7bc"
 
-    resolved = {"p-20403fdb": "20403fdb0e6df94137c9071e62c44c09eb8090b534279ef5695c4b4aa5fae7bc"}
+    async def _surfaces() -> tuple[SimpleNamespace, ...]:
+        return (SimpleNamespace(surface_ref="surface:exact", stream_id=full),)
 
-    async def _resolve_key(ref: str) -> str | None:
-        return resolved.get(ref)
-
-    monkeypatch.setattr(tool, "_resolve_target_key", _resolve_key)
+    monkeypatch.setattr(
+        "plugins.life_engine.initiative.reachability.load_reachable_surfaces",
+        _surfaces,
+    )
 
     class _Result:
         def __init__(self, rows: list[str]) -> None:
@@ -265,7 +269,7 @@ async def test_target_key_resolves_to_full_stream(monkeypatch: pytest.MonkeyPatc
 
     @asynccontextmanager
     async def _session() -> Any:
-        yield _Session(["20403fdb0e6df94137c9071e62c44c09eb8090b534279ef5695c4b4aa5fae7bc"])
+        yield _Session([full])
 
     registry = SimpleNamespace(
         get_for_stream=lambda _stream_id: SimpleNamespace(instance_id="chat_global")
@@ -278,84 +282,25 @@ async def test_target_key_resolves_to_full_stream(monkeypatch: pytest.MonkeyPatc
         lambda: SimpleNamespace(consciousness_registry=registry),
     )
 
-    streams = await tool._resolve_streams(["p-20403fdb"])
-    assert streams == (
-        "20403fdb0e6df94137c9071e62c44c09eb8090b534279ef5695c4b4aa5fae7bc",
-    )
+    streams = await tool._resolve_streams(["surface:exact"])
+    assert streams == (full,)
 
 
-async def test_resolve_target_key_accepts_uuid_hallucination(
+async def test_surface_ref_never_uses_prefix_or_name_guessing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """模型脑补的 UUID 形式流 ID（20403fdb-6f1a-...）应去连字符按前缀解析为完整流。"""
+    """Unknown opaque refs fail; guessed UUIDs are not expanded by recency."""
     tool = _tool()
-    full = "20403fdb0e6df94137c9071e62c44c09eb8090b534279ef5695c4b4aa5fae7bc"
-    uuid_form = "20403fdb-6f1a-441c-9596-4d7e4f85e3c8"
-
-    class _Result:
-        def __init__(self, rows: list[tuple[str, str]]) -> None:
-            self._rows = rows
-
-        def all(self) -> list[tuple[str, str]]:
-            return self._rows
-
-    class _Session:
-        def __init__(self, rows: list[tuple[str, str]]) -> None:
-            self._rows = rows
-
-        async def execute(self, _statement: Any) -> _Result:
-            return _Result(self._rows)
-
-    @asynccontextmanager
-    async def _session() -> Any:
-        yield _Session([(full, "feishu")])
+    async def _surfaces() -> tuple[SimpleNamespace, ...]:
+        return ()
 
     monkeypatch.setattr(
-        "plugins.life_engine.tools.conversation_evidence.get_db_session", _session
+        "plugins.life_engine.initiative.reachability.load_reachable_surfaces",
+        _surfaces,
     )
-    monkeypatch.setattr(
-        "plugins.life_engine.core.send_targets.resolve_send_target_key",
-        lambda _ref: None,
-    )
-
-    resolved = await tool._resolve_target_key(uuid_form)
-    assert resolved == full
-
-
-async def test_resolve_target_key_uuid_hallucination_returns_original_when_ambiguous(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """UUID 形式解析不到唯一真实流时原样返回（后续精确匹配会显式报错，不伪造）。"""
-    tool = _tool()
-    uuid_form = "deadbeef-6f1a-441c-9596-4d7e4f85e3c8"
-
-    class _Result:
-        def __init__(self, rows: list[tuple[str, str]]) -> None:
-            self._rows = rows
-
-        def all(self) -> list[tuple[str, str]]:
-            return self._rows
-
-    class _Session:
-        def __init__(self, rows: list[tuple[str, str]]) -> None:
-            self._rows = rows
-
-        async def execute(self, _statement: Any) -> _Result:
-            return _Result(self._rows)
-
-    @asynccontextmanager
-    async def _session() -> Any:
-        yield _Session([])
-
-    monkeypatch.setattr(
-        "plugins.life_engine.tools.conversation_evidence.get_db_session", _session
-    )
-    monkeypatch.setattr(
-        "plugins.life_engine.core.send_targets.resolve_send_target_key",
-        lambda _ref: None,
-    )
-
-    assert await tool._resolve_target_key(uuid_form) == uuid_form
+    assert await tool._resolve_surface_ref("surface:unknown") is None
+    guessed = "20403fdb-6f1a-441c-9596-4d7e4f85e3c8"
+    assert await tool._resolve_surface_ref(guessed) == guessed
 
 
 async def test_search_without_streams_scans_all_real_streams(
@@ -439,16 +384,16 @@ async def test_search_without_streams_fails_when_no_real_streams(
         await tool._resolve_streams(None, operation="search")
 
 
-async def test_target_key_unresolvable_keeps_original_and_fails_explicitly(
+async def test_surface_ref_unresolvable_fails_explicitly(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """target_key 解析失败时保留原值；精确匹配不到即显式 stream_not_found，不伪造结果。"""
+    """An unavailable surface is never redirected to another stream."""
     tool = _tool()
 
-    async def _resolve_key(_ref: str) -> str | None:
-        return None  # 活跃列表与前缀兜底都解析不到
+    async def _resolve_surface(_ref: str) -> str | None:
+        return None
 
-    monkeypatch.setattr(tool, "_resolve_target_key", _resolve_key)
+    monkeypatch.setattr(tool, "_resolve_surface_ref", _resolve_surface)
 
     class _Result:
         def scalars(self) -> _Result:
@@ -477,61 +422,16 @@ async def test_target_key_unresolvable_keeps_original_and_fails_explicitly(
     )
 
     with pytest.raises(ConversationEvidenceError) as error:
-        await tool._resolve_streams(["p-20403fdb"])
+        await tool._resolve_streams(["surface:missing"])
     assert error.value.code == "stream_not_found"
 
 
-async def test_resolve_target_key_prefix_scan_prefers_real_stream(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """_resolve_target_key 前缀扫描：排除空 platform 占位，返回唯一真实流。"""
-    tool = _tool()
-
-    # send_targets 活跃列表解析失败
-    async def _no_target(_key: str) -> Any:
-        return None
-
-    monkeypatch.setattr(
-        "plugins.life_engine.core.send_targets.resolve_send_target_key", _no_target
-    )
-
-    class _Rows:
-        def __init__(self, rows: list[tuple[str, str]]) -> None:
-            self._rows = rows
-
-        def all(self) -> list[tuple[str, str]]:
-            return self._rows
-
-    class _Session:
-        def __init__(self, rows: list[tuple[str, str]]) -> None:
-            self._rows = rows
-
-        async def execute(self, _statement: Any) -> _Rows:
-            return _Rows(self._rows)
-
-    rows = [
-        ("20403fdb", ""),
-        ("20403fdb0e6df94137c9071e62c44c09eb8090b534279ef5695c4b4aa5fae7bc", "ayla"),
-    ]
-
-    @asynccontextmanager
-    async def _session() -> Any:
-        yield _Session(rows)
-
-    monkeypatch.setattr(
-        "plugins.life_engine.tools.conversation_evidence.get_db_session", _session
-    )
-
-    full = await tool._resolve_target_key("p-20403fdb")
-    assert full == "20403fdb0e6df94137c9071e62c44c09eb8090b534279ef5695c4b4aa5fae7bc"
-
-
-async def test_resolve_target_key_passthrough_for_full_stream_id() -> None:
-    """完整 stream_id 不是 target_key 格式，应原样返回。"""
+async def test_resolve_surface_ref_passthrough_for_full_stream_id() -> None:
+    """Exact internal stream IDs remain valid evidence refs, not action routes."""
     tool = _tool()
     full = "20403fdb0e6df94137c9071e62c44c09eb8090b534279ef5695c4b4aa5fae7bc"
-    assert await tool._resolve_target_key(full) == full
-    assert await tool._resolve_target_key("") == ""
+    assert await tool._resolve_surface_ref(full) == full
+    assert await tool._resolve_surface_ref("") == ""
 
 
 async def test_cross_instance_stream_read_is_denied(

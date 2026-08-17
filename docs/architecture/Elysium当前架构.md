@@ -88,7 +88,7 @@ main.py
                                                             ↓
                                                      成功后 commit 游标
                                                             ↓
-                                World Projection / 思考流 / 记忆 / 学习 / 自主意向
+                      World Projection / 主体持续关注 / 记忆 / 学习 / 主体主动线索
                                                             ↓
                                                  各意识实例按场景表达
 ```
@@ -99,7 +99,7 @@ main.py
 
 1. 收集未处理事件、后台代理与使命结果；
 2. 通过潜意识上下文建立固定快照；
-3. 注入事件上下文、带来源 World Projection、Presence、记忆、思考流和自主意向；
+3. 注入事件上下文、带来源 World Projection、Presence、记忆、主体持续关注、认知机会和到期的一次性主体线索；
 4. 运行模型与工具循环；
 5. 记录结果；
 6. 成功后提交消费游标；
@@ -200,12 +200,17 @@ Life Event（追加式发生历史）
 
 ---
 
-## 7. 好奇心、自主性与叙事
+## 7. 认知机会、主体主动性与叙事
 
-- `CuriosityEngine` 异步审阅未解问题并形成轻量注意牵引；
-- `autonomy.py` 管理自主意向的形成、计划、到期、恢复与完成回注；
+- `CuriosityEngine` 只生成有来源的 `epistemic_opportunity` 外部候选，不宣称主体已经好奇；
+- `initiative/` 保存活跃意识明确写下的 `InitiativeSeed`，并支持一次性重新相遇；它没有分数、周期任务、目标 stream 或预写回复；
+- 真正行动时，当前意识分别选择对象 `audience_ref` 与物理表面 `surface_ref`；来源实例不会锁定未来平台，跨平台身份只接受显式 `canonical_person_key`；
+- 目标表达实例在该表面的真实上下文中重新决定表达或沉默，`life_send_text` 只作用于当前表面；
+- 旧 `AutonomyIntent`、延迟续话以及 `nucleus_tell_dfc` 最近流唤醒只读退役，不再注册、恢复调度或产生新主体决定；
 - Narrative Store 追加记录叙事事件，自传投影由主体通过工具主动沉淀；
-- 系统提供机会、边界与证据，不替爱莉决定什么时候行动、什么对她有意义。
+- 系统只提供机会、连续性、可达事实与安全回执，不替爱莉决定什么时候行动、面向谁或什么对她有意义。
+
+完整契约见[主体主动性与外联](./主体主动性与外联.md)。
 
 ---
 
@@ -290,7 +295,7 @@ NapCat 适配器已按 `client / events / outgoing / utils` 模块化：
 - `runtime/world_state.json`：只读旧快照迁移源；
 - FTS、Chroma 与索引 outbox；
 - 意识实例滚动上下文；
-- World Projection、思考流、自主意向、学习洞察和叙事投影；
+- World Projection、主体持续关注、主体主动线索、学习洞察和叙事投影；
 - 结构化日志数据库与运行 trace。
 
 原则上，权威数据与派生索引必须可区分；派生层损坏应通过修复/回放重建，而不是修改原始经历来迁就索引。

@@ -82,7 +82,6 @@ from .multimodal import (
     build_multimodal_content,
     extract_media_from_messages,
 )
-from .send_targets import SendTarget, resolve_send_target_key
 from .tool_parallel import is_life_tool_call_parallel_safe
 
 if TYPE_CHECKING:
@@ -328,8 +327,8 @@ class LifeSendTextAction(BaseAction):
         "content 中只能包含要发给用户的纯文本正文。"
         "严禁把 reason/thought/expected_reaction 等元信息写进 content。"
         "私聊场景下 reply_to 默认不要使用，除非确实需要引用某条历史消息来避免歧义。"
-        "target_key 通常留空，表示回复当前聊天；只有明确要发到后缀提示词"
-        "“可发送目标”列表中的其他聊天时，才填写列表给出的 target_key。"
+        "本动作只在当前意识实例的物理表面发送；跨表面主动外联必须先由主体通过"
+        "nucleus_reachability 与 nucleus_begin_outreach 显式选择对象和表面。"
     )
 
     chatter_allow: list[str] = ["life_chatter"]
@@ -357,6 +356,11 @@ class LifeSendTextAction(BaseAction):
         for field_name in cls._ATOMIC_RESPONSE_FIELDS:
             if field_name not in required:
                 required.append(field_name)
+        # Historical direct Python callers may still pass target_key, but it is
+        # no longer a model capability. A visible expression action must not
+        # also choose a different consciousness surface.
+        parameters.get("properties", {}).pop("target_key", None)
+        required = [name for name in required if name != "target_key"]
         parameters["required"] = required
         return schema
 
@@ -476,79 +480,12 @@ class LifeSendTextAction(BaseAction):
         base_delay = len(content) / chars_per_sec
         return max(min_delay, min(base_delay, max_delay))
 
-    def _send_target_options(self) -> tuple[int, float]:
-        cfg = getattr(self.plugin, "config", None)
-        runtime_cfg = getattr(cfg, "runtime_sync", None)
-        limit = int(getattr(runtime_cfg, "send_targets_limit", 8) or 8)
-        window_hours = float(
-            getattr(runtime_cfg, "send_targets_window_hours", 24.0) or 24.0
-        )
-        return max(1, limit), max(0.1, window_hours)
-
-    async def _resolve_send_target(self, target_key: str) -> SendTarget | None:
-        limit, window_hours = self._send_target_options()
-        return await resolve_send_target_key(
-            target_key,
-            current_stream_id=str(getattr(self.chat_stream, "stream_id", "") or ""),
-            limit=limit,
-            active_window_hours=window_hours,
-        )
-
-    async def _send_one_segment_to_target(
-        self,
-        content: str,
-        target: SendTarget,
-        segment_index: int = 0,
-    ) -> bool:
-        from src.core.managers.adapter_manager import get_adapter_manager
-        from src.core.transport.message_send import get_message_sender
-
-        bot_info = await get_adapter_manager().get_bot_info_by_platform(target.platform)
-
-        extra: dict[str, str] = {}
-        if target.chat_type == "group":
-            if target.group_id:
-                extra["target_group_id"] = target.group_id
-            if target.group_name:
-                extra["target_group_name"] = target.group_name
-        else:
-            if target.target_user_id:
-                extra["target_user_id"] = target.target_user_id
-            if target.target_user_name:
-                extra["target_user_name"] = target.target_user_name
-        extra.update(self._action_origin_extra())
-
-        message = Message(
-            message_id=self._action_message_id(target.stream_id, segment_index),
-            content=content,
-            processed_plain_text=content,
-            message_type=MessageType.TEXT,
-            sender_id=bot_info.get("bot_id", "") if bot_info else "",
-            sender_name=bot_info.get("bot_name", "Bot") if bot_info else "Bot",
-            platform=target.platform,
-            chat_type=target.chat_type,
-            stream_id=target.stream_id,
-        )
-        message.extra.update(extra)
-
-        success = await get_message_sender().send_message(message)
-        self._last_delivery_status = str(message.extra.get("delivery_status") or "")
-        return success
-
     async def _send_one_segment(
         self,
         content: str,
         reply_to: str | None = None,
-        target: SendTarget | None = None,
         segment_index: int = 0,
     ) -> bool:
-        if target is not None:
-            return await self._send_one_segment_to_target(
-                content,
-                target,
-                segment_index=segment_index,
-            )
-
         if reply_to:
             target_stream_id = self.chat_stream.stream_id
             platform = self.chat_stream.platform
@@ -664,9 +601,7 @@ class LifeSendTextAction(BaseAction):
         ] = None,
         target_key: Annotated[
             str,
-            "可选发送目标。通常留空表示按旧逻辑回复当前聊天；"
-            "只有明确要发到后缀提示词“可发送目标”列表中的某个聊天时，"
-            "才填写列表里的 target_key，禁止凭空编写。",
+            "退役兼容参数；模型不可见，非空值会 fail closed。",
         ] = "",
     ) -> tuple[bool, str]:
         self._last_delivery_status = ""
@@ -691,21 +626,14 @@ class LifeSendTextAction(BaseAction):
         if not cleaned_segments:
             return False, "发送内容不能只是省略号或占位符"
 
-        # 参数和目标必须先校验；失败的发送不能污染重复消息缓存。
-        resolved_target: SendTarget | None = None
+        # 发送动作不能同时承担对象/表面选择。旧参数保留只为让历史
+        # Python 调用明确失败，而不是静默回退到当前或近期聊天。
         normalized_target_key = str(target_key or "").strip()
         if normalized_target_key:
-            if reply_to:
-                return (
-                    False,
-                    "跨聊天发送不能同时使用 reply_to；请去掉 reply_to 或不填 target_key",
-                )
-            resolved_target = await self._resolve_send_target(normalized_target_key)
-            if resolved_target is None:
-                return (
-                    False,
-                    f"未知或不可用的发送目标 target_key: {normalized_target_key}",
-                )
+            return False, (
+                "target_key 已退役；请由主体先调用 nucleus_reachability，"
+                "再用 nucleus_begin_outreach 明确选择对象与可达表面"
+            )
 
         structured_context = {
             "mood": str(mood or mode or "").strip(),
@@ -740,7 +668,6 @@ class LifeSendTextAction(BaseAction):
             success = await self._send_one_segment(
                 segment,
                 segment_reply_to,
-                target=resolved_target,
                 segment_index=index,
             )
             if not success:
@@ -753,8 +680,7 @@ class LifeSendTextAction(BaseAction):
             sent_count += 1
 
         preview = cleaned_segments[0][:80] if cleaned_segments else ""
-        target_desc = f" -> {resolved_target.display_name}" if resolved_target else ""
-        return True, f"已发送{sent_count}条消息{target_desc}: {preview}"
+        return True, f"已发送{sent_count}条消息: {preview}"
 
 
 class _LifeSendMediaAction(BaseAction):
@@ -3399,7 +3325,10 @@ class LifeChatter(BaseChatter):
             "- 普通问题直接在同轮调用 `life_send_text` 回复；多个独立查询也应同轮发出，不要逐个等待。\n"
             "- 只有后一个动作必须依赖前一个工具的未知结果时才分轮；例如先 `nucleus_view_screen`，看到结果后再 `life_send_text`。\n"
             "### 核心工具\n"
-            "- `life_send_text`：**发送文字给用户**（用户唯一能看到的途径）。`content` 只写纯文本正文，长内容用 `\\n` 分段。`target_key` 通常留空。\n"
+            "- `life_send_text`：**在当前意识实例表面发送文字**。`content` 只写纯文本正文，长内容用 `\\n` 分段；它不负责选择其他聊天。\n"
+            "- `nucleus_manage_initiative_seed`：显式保存、改写、再次遇见或释放主体主动线索。\n"
+            "- `nucleus_reachability`：只读查看已登记对象和物理表面；不按最近活跃替你排序。\n"
+            "- `nucleus_begin_outreach`：明确选择对象与表面，启动一次新的表达判断。\n"
             "- `life_send_file`：发送本地文件给用户。\n"
             "- `action-life_pass_and_wait`：结束本轮，等待用户新消息。\n"
             "- `nucleus_bash`：查看或操作电脑终端。\n"
@@ -3573,13 +3502,23 @@ class LifeChatter(BaseChatter):
     ) -> dict[str, Any]:
         """路由：是否把这批消息交给表达层继续处理。"""
 
-        # 内部主动机会/自主意向 → 交给主模型重新判断。
-        # 这不是强制回复，只是让表达层看到这个机会。
+        if unread_msgs and all(
+            self._message_flag(msg, "is_proactive_followup_trigger")
+            for msg in unread_msgs
+        ):
+            return {
+                "reason": "旧延迟续话触发已退役，不进入表达决策",
+                "should_respond": False,
+                "force_reply": False,
+            }
+
+        # 外部机会或主体显式外联决定 → 交给主模型重新判断。
+        # 这不是强制回复，只是让表达层看到新的真实上下文。
         if unread_msgs and all(
             self._is_proactive_trigger_message(msg) for msg in unread_msgs
         ):
             return {
-                "reason": "内部主动机会或自主意向浮现，交给表达层判断",
+                "reason": "外部机会或主体显式外联进入当前表面，交给表达层判断",
                 "should_respond": True,
                 "force_reply": False,
             }
@@ -4725,8 +4664,7 @@ class LifeChatter(BaseChatter):
     def _is_proactive_trigger_message(cls, message: Message) -> bool:
         return bool(
             cls._message_flag(message, "is_proactive_opportunity_trigger")
-            or cls._message_flag(message, "is_proactive_followup_trigger")
-            or cls._message_flag(message, "is_autonomy_intent_trigger")
+            or cls._message_flag(message, "is_initiative_outreach_trigger")
         )
 
     @classmethod
@@ -4735,33 +4673,10 @@ class LifeChatter(BaseChatter):
         unread_msgs: list[Message],
         stream_id: str,
     ) -> list[dict[str, str]]:
-        """Collect causally active autonomy occurrences for the current turn."""
+        """Ignore retired scheduler triggers in the active expression runtime."""
 
-        occurrences: list[dict[str, str]] = []
-        seen: set[tuple[str, str]] = set()
-        for message in unread_msgs:
-            if not cls._message_flag(message, "is_autonomy_intent_trigger"):
-                continue
-            extra = getattr(message, "extra", {}) or {}
-            intent_id = str(extra.get("autonomy_intent_id") or "").strip()
-            occurrence_id = str(extra.get("autonomy_occurrence_id") or "").strip()
-            authorized_stream_id = str(
-                extra.get("autonomy_authorized_stream_id")
-                or getattr(message, "stream_id", "")
-                or stream_id
-            ).strip()
-            key = (intent_id, occurrence_id)
-            if not intent_id or not occurrence_id or key in seen:
-                continue
-            seen.add(key)
-            occurrences.append(
-                {
-                    "intent_id": intent_id,
-                    "occurrence_id": occurrence_id,
-                    "authorized_stream_id": authorized_stream_id,
-                }
-            )
-        return occurrences
+        del cls, unread_msgs, stream_id
+        return []
 
     async def _validate_autonomy_action_target(
         self,
@@ -4787,23 +4702,7 @@ class LifeChatter(BaseChatter):
         )
         if not target_key:
             return True, ""
-        runtime_cfg = getattr(
-            getattr(self.plugin, "config", None), "runtime_sync", None
-        )
-        target = await resolve_send_target_key(
-            target_key,
-            current_stream_id=stream_id,
-            limit=max(1, int(getattr(runtime_cfg, "send_targets_limit", 8) or 8)),
-            active_window_hours=max(
-                0.1,
-                float(getattr(runtime_cfg, "send_targets_window_hours", 24.0) or 24.0),
-            ),
-        )
-        if target is None:
-            return False, "unknown_target_key"
-        if str(target.stream_id or "").strip() != str(stream_id or "").strip():
-            return False, "cross_stream_not_authorized"
-        return True, ""
+        return False, "target_key_retired"
 
     @staticmethod
     def _unread_turn_key(unread_msgs: list[Message], stream_id: str) -> str:
@@ -4940,9 +4839,8 @@ class LifeChatter(BaseChatter):
         cleaned = [segment for segment in cleaned if segment]
         if not cleaned:
             return None
-        target_key = str(args.get("target_key", "") or "").strip()
         reply_to = str(args.get("reply_to", "") or "").strip()
-        scope = f"{stream_id}|{target_key}|{reply_to}"
+        scope = f"{stream_id}|{reply_to}"
         return str(turn_key or ""), scope, "\n".join(cleaned)
 
     @staticmethod

@@ -184,61 +184,25 @@ def test_file_write_records_stream_context(tmp_path: Path) -> None:
 # ── 4. 意图归宿入河 ─────────────────────────────────────────
 
 
-def _prepare_autonomy(service: LifeEngineService, monkeypatch: pytest.MonkeyPatch) -> None:
-    async def fake_register(plugin, intent) -> None:  # noqa: ANN001
-        intent.schedule_id = "test_schedule"
-
-    async def fake_queue(event) -> None:  # noqa: ANN001
-        return None
-
-    monkeypatch.setattr(
-        "plugins.life_engine.service.core.register_autonomy_schedule",
-        fake_register,
-    )
-    monkeypatch.setattr(service, "_queue_pending_event", fake_queue)
-
-
-def test_intent_formed_enters_river(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_retired_autonomy_cannot_create_life_trace_moments(tmp_path: Path) -> None:
     service = _make_service(tmp_path)
-    _prepare_autonomy(service, monkeypatch)
 
-    result = asyncio.run(
-        service.schedule_autonomy_intent(
-            kind="reflect", motivation="想整理一下今天的感受", delay_minutes=5
+    with pytest.raises(RuntimeError, match="LegacyAutonomyReadOnly"):
+        asyncio.run(
+            service.schedule_autonomy_intent(
+                kind="reflect",
+                motivation="legacy intent must remain evidence only",
+                delay_minutes=5,
+            )
         )
-    )
 
-    assert result["created"] is True
-    moments = LifeTraceStore(tmp_path).recent(limit=5, kind="intent")
-    assert len(moments) == 1
-    assert moments[0].operation == "formed"
-    assert "想整理一下今天的感受" in moments[0].summary
-    assert moments[0].source_event_id == result["intent_id"]
-
-
-def test_intent_silence_outcome_enters_river(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    service = _make_service(tmp_path)
-    _prepare_autonomy(service, monkeypatch)
-
-    created = asyncio.run(
-        service.schedule_autonomy_intent(
-            kind="silence", motivation="此刻不需要说话", delay_minutes=5
-        )
-    )
-    outcome = asyncio.run(service.trigger_autonomy_intent(created["intent_id"]))
-
-    assert outcome["dispatch"] == "silence"
-    operations = [
-        record.operation
-        for record in LifeTraceStore(tmp_path).recent(limit=5, kind="intent")
-    ]
-    # 形成与归宿都留痕：选择沉默与做了同等地位
-    assert set(operations) == {"formed", "silence"}
-
-
-# ── 5. 思考流闭合与好奇承接入河 ─────────────────────────────
+    outcome = asyncio.run(service.trigger_autonomy_intent("legacy-intent"))
+    assert outcome == {
+        "triggered": False,
+        "reason": "legacy_autonomy_read_only",
+        "intent_id": "legacy-intent",
+    }
+    assert LifeTraceStore(tmp_path).recent(limit=5, kind="intent") == []
 
 
 def _make_tool_env(

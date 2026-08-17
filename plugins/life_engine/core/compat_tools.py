@@ -134,13 +134,12 @@ class LifeRecordInnerMonologueAction(BaseAction):
 
 
 class LifeScheduleFollowupMessageAction(BaseAction):
-    """登记一条延迟续话计划。"""
+    """Retired stream-bound follow-up adapter kept for old direct callers."""
 
     action_name = "schedule_followup_message"
     action_description = (
-        "当你刚刚已经发出一条回复，但觉得过一小会儿在对方还没回复时"
-        "可能还想补一句时使用。它不会立刻发送消息，而是登记一条延迟续话计划。"
-        "这个动作会复用主动续话运行层的调度能力。"
+        "已退役：延迟续话会把一次想法绑定到当前聊天流并交给定时器续写。"
+        "未来连续性请使用 InitiativeSeed；真正行动时再明确选择对象和表面。"
     )
 
     chatter_allow: list[str] = ["life_chatter"]
@@ -155,29 +154,12 @@ class LifeScheduleFollowupMessageAction(BaseAction):
             "续话类型，例如 add_detail / clarify / soft_emotion / share_new_thought。",
         ] = "share_new_thought",
     ) -> tuple[bool, str]:
-        from ..service.core import LifeEngineService
-
-        service = LifeEngineService.get_instance()
-        if service is None:
-            return False, "life_engine 服务未就绪，无法登记延迟续话"
-
-        chat_stream = getattr(self, "chat_stream", None)
-        if chat_stream is None:
-            return False, "缺少当前聊天流，无法登记延迟续话"
-
-        try:
-            ok, message = await service.schedule_followup_for_stream(
-                chat_stream,
-                delay_seconds=delay_seconds,
-                thought=thought,
-                topic=topic,
-                followup_type=followup_type,
-                source="life_engine",
-            )
-        except Exception as exc:  # noqa: BLE001
-            return False, f"登记延迟续话失败: {exc}"
-
-        return ok, message
+        del delay_seconds, thought, topic, followup_type
+        return (
+            False,
+            "LegacyFollowupReadOnly: 使用 InitiativeSeed 保留未来连续性；"
+            "行动时通过 nucleus_reachability 与 nucleus_begin_outreach 明确选择对象和表面。",
+        )
 
 
 class LifeInnerDialogueTool(BaseTool):

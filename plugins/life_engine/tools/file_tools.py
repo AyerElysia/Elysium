@@ -18,13 +18,10 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
-from uuid import uuid4
 
 from src.app.plugin_system.api import log_api
 from src.app.plugin_system.base import BaseTool
-from src.core.models.message import Message, MessageType
 
-from ..constants import EXTERNAL_MESSAGE_ACTIVE_WINDOW_MINUTES
 from ..core.config import LifeEngineConfig
 from ..memory.eligibility import (
     DEFAULT_MAX_DOCUMENT_BYTES,
@@ -35,7 +32,6 @@ from ..memory.eligibility import (
 from ..memory.prompting import build_memory_write_warning
 from ._utils import (
     _get_workspace,
-    _pick_latest_target_stream_id,
     _resolve_path,
 )
 from .bounded_projection import (
@@ -373,398 +369,50 @@ def _subject_direct_mutation_error(path: str) -> str:
     )
 
 
-async def _resolve_tell_dfc_target(
-    plugin: Any,
-    stream_manager: Any,
-    *,
-    target_type: str,
-    stream_id: str,
-    platform: str,
-    target_user_id: str,
-    target_user_name: str,
-    target_group_id: str,
-    target_group_name: str,
-) -> tuple[bool, Any | str, dict[str, str], str]:
-    normalized_type = str(target_type or "auto").strip().lower() or "auto"
-    target_stream_id = str(stream_id or "").strip()
-    platform_name = str(platform or "").strip()
-    user_id = str(target_user_id or "").strip()
-    user_name = str(target_user_name or "").strip()
-    group_id = str(target_group_id or "").strip()
-    group_name = str(target_group_name or "").strip()
-
-    if normalized_type not in {"auto", "current", "stream", "private", "group"}:
-        return False, "target_type 仅支持 auto/current/stream/private/group", {}, normalized_type
-
-    if target_stream_id:
-        chat_stream = await stream_manager.get_or_create_stream(stream_id=target_stream_id)
-        if chat_stream is None:
-            return False, f"找不到目标聊天流: {target_stream_id}", {}, normalized_type
-        return True, chat_stream, {}, "stream"
-
-    if normalized_type == "stream":
-        return False, "target_type=stream 时必须提供 stream_id", {}, normalized_type
-    if normalized_type == "private" and group_id:
-        return False, "target_type=private 时不能同时提供 target_group_id", {}, normalized_type
-    if normalized_type == "group" and user_id:
-        return False, "target_type=group 时不能同时提供 target_user_id", {}, normalized_type
-
-    if normalized_type == "current":
-        user_id = ""
-        group_id = ""
-    elif normalized_type == "auto":
-        if user_id and group_id:
-            return False, "target_user_id 和 target_group_id 不能同时提供", {}, normalized_type
-        if user_id:
-            normalized_type = "private"
-        elif group_id:
-            normalized_type = "group"
-
-    fallback_stream_id = _pick_latest_target_stream_id(plugin) or ""
-
-    if normalized_type in {"private", "group"}:
-        if not platform_name and fallback_stream_id:
-            try:
-                fallback_info = await stream_manager.get_stream_info(fallback_stream_id)
-            except Exception as exc:  # noqa: BLE001
-                logger.debug(f"推断 tell_dfc 目标平台失败: {exc}")
-                fallback_info = None
-            if fallback_info:
-                platform_name = str(fallback_info.get("platform") or "").strip()
-
-        if not platform_name:
-            return False, "指定私聊/群聊目标时需要提供 platform，或先有可用于推断平台的当前聊天。", {}, normalized_type
-
-        if normalized_type == "private":
-            if not user_id:
-                return False, "target_type=private 时必须提供 target_user_id", {}, normalized_type
-            chat_stream = await stream_manager.get_or_create_stream(
-                platform=platform_name,
-                user_id=user_id,
-                chat_type="private",
-            )
-            extra: dict[str, str] = {"target_user_id": user_id}
-            if user_name:
-                extra["target_user_name"] = user_name
-            return True, chat_stream, extra, normalized_type
-
-        if not group_id:
-            return False, "target_type=group 时必须提供 target_group_id", {}, normalized_type
-        chat_stream = await stream_manager.get_or_create_stream(
-            platform=platform_name,
-            group_id=group_id,
-            group_name=group_name,
-            chat_type="group",
-        )
-        extra = {"target_group_id": group_id}
-        if group_name:
-            extra["target_group_name"] = group_name
-        return True, chat_stream, extra, normalized_type
-
-    if not fallback_stream_id:
-        return (
-            False,
-            "没有可用的目标聊天流。可能暂时没有外部对话活动。稍后有新消息时，表达层会自然处理，你无需担心。",
-            {},
-            normalized_type,
-        )
-
-    chat_stream = await stream_manager.get_or_create_stream(stream_id=fallback_stream_id)
-    if chat_stream is None:
-        return False, f"找不到目标聊天流: {fallback_stream_id}", {}, normalized_type
-    return True, chat_stream, {}, "current"
-
-
-def _discard_tell_dfc_unread(context: Any, message: Message) -> None:
-    """撤回本次失败唤醒写入的消息，不影响并发到达的其他未读消息。"""
-    unread_messages = getattr(context, "unread_messages", None)
-    if not isinstance(unread_messages, list):
-        return
-    for index in range(len(unread_messages) - 1, -1, -1):
-        if unread_messages[index] is message:
-            del unread_messages[index]
-            return
-
-
 class LifeEngineWakeDFCTool(BaseTool):
-    """向同一主体的表达层补充信息差，并默认唤醒表达层。"""
+    """Fail-closed shell for historical direct calls of the retired wake tool."""
 
     tool_name: str = "nucleus_tell_dfc"
     tool_description: str = (
-        "向同一主体的表达层补充信息差，并唤醒表达层处理这段新上下文。"
-        "一方面补一段它当前暂时看不到、但对接下来对话可能重要的背景；"
-        "另一方面，如果你想念对方或想主动向外界联系，也可以用它把这个动机交给表达层自行判断。"
-        "\n\n"
-        "**这不是在遥控社交态，更不是替它写台词；它不用于指导表达层怎么回复。**"
-        " 这不是在和另一个意识体对话，而是同一个你在不同运行状态之间补充上下文。"
-        "\n\n"
-        "**何时使用：**\n"
-        "- 你掌握了表达层当前可能不知道的事实、背景、记忆线索、情绪来源或潜在风险\n"
-        "- 你发现某段近期事件能解释对方现在为什么这样说/这样做\n"
-        "- 你需要补一个隐藏前提，避免表达层误解上下文\n"
-        "- **【主动社交】你想念对方了，或者你想主动向外界发起联系，需要把这个动机交给表达层。**\n"
-        "\n"
-        "**何时不用：**\n"
-        "- 你想教表达层该怎么回、该怎么问、该怎么安慰\n"
-        "- 你在替表达层写台词、步骤或策略\n"
-        "- 你自己其实想直接开口 → 交给表达层在正常对话里处理\n"
-        "\n"
-        "**注意：** 工具会默认唤醒表达层，让补充内容尽快进入对话判断；"
-        "这不用于催表达层开口，是否表达仍由它结合对话自行判断。"
-        " 写法尽量是观察/背景/风险/线索。如果是主动社交，直接写明想念的缘由或主动开启对话的意图。"
-        " 允许写“我刚看到 X，这可能解释 Y，风险是 Z”或“我想念他了，需要主动问候”；不要写“你应该回复 X”、"
-        "“你去安慰/追问 Y”或“按以下步骤说”。"
-        "\n\n"
-        "**参数写法建议：**\n"
-        "- `message`: 只写信息差本身或想念的理由/想主动联系的话题\n"
-        "- `reason`: 为什么这是表达层当前可能不知道的背景。如果是主动社交，写明想念对方或主动建立联系\n"
-        "- `importance`: 常规用 normal；只有紧急时用 high/critical\n"
-        "- `proactive_wake`: 默认 true，会唤醒表达层；传 false 时只入队，保留旧调用的队列模式。\n"
-        "- `target_type`: 默认 auto。不确定就留空，系统会回退到刚收到消息的聊天；要指定目标可用 private/group/stream/current\n"
-        "- `platform`: 指定私聊/群聊目标时的平台，如 qq；留空时尽量从当前聊天推断\n"
-        "- `target_user_id`: 想去某个私聊时填写对方平台用户 ID，并设置 target_type=private\n"
-        "- `target_group_id`: 想去某个群聊时填写群 ID，并设置 target_type=group\n"
-        "- `stream_id`: 精确目标聊天流 ID；不确定就留空，让系统自动路由\n"
-        "\n"
-        "**记住：补背景/唤醒社交，不下指导。**"
+        "Retired compatibility shell. It is not registered for model use and cannot "
+        "select a current, recent, named, account, group, or stream target. Shared "
+        "context uses canonical projections; proactive contact uses InitiativeSeed, "
+        "explicit reachability, and an audience/surface-bound outreach decision."
     )
     chatter_allow: list[str] = ["life_engine_internal"]
 
     async def execute(
         self,
-        message: Annotated[str, "要补充给表达层的信息差，或想主动联系的话题/想念理由（不要写指导台词）"],
-        reason: Annotated[
-            str,
-            "为什么这是表达层当前可能不知道、但值得补充的信息差，或是主动社交/想念对方的缘由",
-        ] = "",
-        importance: Annotated[str, "重要度（可选：low/normal/high/critical，默认 normal）"] = "normal",
-        proactive_wake: Annotated[
-            bool,
-            "是否唤醒表达层立即看见新上下文。默认 true；传 false 仅写入待处理队列，兼容旧调用。",
-        ] = True,
-        stream_id: Annotated[str, "目标聊天流ID（可选，不填则自动选择最近活跃的外部对话流）"] = "",
-        target_type: Annotated[
-            str,
-            "目标类型（auto/current/stream/private/group）。auto 默认回退到最近收到消息的聊天；private/group 可指定私聊或群聊。",
-        ] = "auto",
-        platform: Annotated[str, "目标平台（如 qq）。指定私聊/群聊但无法从当前聊天推断时必填。"] = "",
-        target_user_id: Annotated[str, "目标私聊用户的平台用户 ID（target_type=private 时使用）"] = "",
-        target_user_name: Annotated[str, "目标私聊用户昵称（可选，用于显示和下游发送信息）"] = "",
-        target_group_id: Annotated[str, "目标群聊 ID（target_type=group 时使用）"] = "",
-        target_group_name: Annotated[str, "目标群聊名称（可选，用于显示和下游发送信息）"] = "",
+        message: Annotated[str, "Historical context text"],
+        reason: Annotated[str, "Historical reason"] = "",
+        importance: Annotated[str, "Historical importance"] = "normal",
+        proactive_wake: Annotated[bool, "Historical wake flag"] = True,
+        stream_id: Annotated[str, "Historical stream id"] = "",
+        target_type: Annotated[str, "Historical target type"] = "auto",
+        platform: Annotated[str, "Historical platform"] = "",
+        target_user_id: Annotated[str, "Historical user id"] = "",
+        target_user_name: Annotated[str, "Historical user name"] = "",
+        target_group_id: Annotated[str, "Historical group id"] = "",
+        target_group_name: Annotated[str, "Historical group name"] = "",
     ) -> tuple[bool, str | dict]:
-        logger.debug(
-            f"[nucleus_tell_dfc] Life 调用表达层同步/社交工具:\n"
-            f"  message: {message}\n"
-            f"  reason: {reason}\n"
-            f"  importance: {importance}\n"
-            f"  proactive_wake: {proactive_wake}\n"
-            f"  stream_id: {stream_id}\n"
-            f"  target_type: {target_type}\n"
-            f"  platform: {platform}\n"
-            f"  target_user_id: {target_user_id}\n"
-            f"  target_user_name: {target_user_name}\n"
-            f"  target_group_id: {target_group_id}\n"
-            f"  target_group_name: {target_group_name}"
+        del (
+            message,
+            reason,
+            importance,
+            proactive_wake,
+            stream_id,
+            target_type,
+            platform,
+            target_user_id,
+            target_user_name,
+            target_group_id,
+            target_group_name,
         )
-
-        text = str(message or "").strip()
-        if not text:
-            return False, "message 不能为空"
-
-        normalized_importance = str(importance or "normal").strip().lower() or "normal"
-        if normalized_importance not in {"low", "normal", "high", "critical"}:
-            return False, "importance 仅支持 low/normal/high/critical"
-
-        # 获取服务实例以辅助路由判断
-        life_service = _get_life_engine_service(self.plugin)
-        if life_service:
-            minutes_since_external = life_service._minutes_since_external_message()
-
-            # 活跃检查：如果对话流很活跃，建议不要打扰
-            if (
-                minutes_since_external is not None
-                and minutes_since_external < EXTERNAL_MESSAGE_ACTIVE_WINDOW_MINUTES
-            ):
-                # 除非是 high 或 critical 级别，否则给出警告但不阻止
-                if normalized_importance not in ("high", "critical"):
-                    logger.debug(
-                        f"当前对话流正在活跃（{minutes_since_external} 分钟前有消息），"
-                        f"同步可能会打扰表达层的正常对话节奏，但仍然允许执行。"
-                    )
-
-        try:
-            from src.core.managers.stream_manager import get_stream_manager
-            from src.core.transport.distribution.stream_loop_manager import (
-                get_stream_loop_manager,
-            )
-        except Exception as e:  # noqa: BLE001
-            return False, f"加载核心管理器失败: {e}"
-
-        stream_manager = get_stream_manager()
-        ok, resolved, explicit_target_extra, resolved_target_type = await _resolve_tell_dfc_target(
-            self.plugin,
-            stream_manager,
-            target_type=target_type,
-            stream_id=stream_id,
-            platform=platform,
-            target_user_id=target_user_id,
-            target_user_name=target_user_name,
-            target_group_id=target_group_id,
-            target_group_name=target_group_name,
+        return (
+            False,
+            "LegacyRecentStreamWakeRetired: shared context uses canonical projections; "
+            "proactive contact requires explicit audience_ref and surface_ref.",
         )
-        if not ok:
-            return False, str(resolved)
-        chat_stream = resolved
-
-        target_extra: dict[str, Any] = dict(explicit_target_extra)
-        try:
-            stream_info = await stream_manager.get_stream_info(chat_stream.stream_id)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(f"life_engine 无法读取 tell_dfc 目标流信息: {exc}")
-            stream_info = None
-
-        if str(chat_stream.chat_type or "").lower() == "group":
-            group_id = str(target_extra.get("target_group_id") or "").strip()
-            group_name = str(target_extra.get("target_group_name") or "").strip()
-            if stream_info:
-                group_id = group_id or str(stream_info.get("group_id") or "").strip()
-                group_name = group_name or str(stream_info.get("group_name") or "").strip()
-            if group_id:
-                target_extra["target_group_id"] = group_id
-            if group_name:
-                target_extra["target_group_name"] = group_name
-        else:
-            if not target_extra.get("target_user_id"):
-                person_id = str(stream_info.get("person_id") or "").strip() if stream_info else ""
-                if person_id:
-                    try:
-                        from src.core.utils.user_query_helper import (
-                            get_user_query_helper,
-                        )
-
-                        person = await get_user_query_helper().person_crud.get_by(
-                            person_id=person_id
-                        )
-                        if person and person.user_id:
-                            target_extra["target_user_id"] = str(person.user_id)
-                        nickname = str(getattr(person, "nickname", "") or "").strip() if person else ""
-                        if nickname:
-                            target_extra["target_user_name"] = nickname
-                    except Exception as exc:  # noqa: BLE001
-                        logger.debug(f"life_engine 无法为表达层唤醒解析私聊目标: {exc}")
-            if target_extra.get("target_user_id") and not target_extra.get("target_user_name"):
-                person_id = str(stream_info.get("person_id") or "").strip() if stream_info else ""
-                if person_id:
-                    try:
-                        from src.core.utils.user_query_helper import (
-                            get_user_query_helper,
-                        )
-
-                        person = await get_user_query_helper().person_crud.get_by(
-                            person_id=person_id
-                        )
-                        nickname = str(getattr(person, "nickname", "") or "").strip() if person else ""
-                        if nickname:
-                            target_extra["target_user_name"] = nickname
-                    except Exception as exc:  # noqa: BLE001
-                        logger.debug(f"life_engine 无法为表达层唤醒解析私聊目标名称: {exc}")
-
-        wake_prompt = (
-            "[信息差补充]\n"
-            f"重要度: {normalized_importance}\n"
-            f"缘由: {reason or '潜意识波动'}\n"
-            f"补充背景/线索: {text}\n"
-            "（这是同一主体的内在层补充的一段上下文：可能有帮助，也可能只作为背景。"
-            "它不是命令，不是指定措辞，更不是必须照做的脚本。请结合当前对话上下文，自行判断是否吸收、如何吸收。）"
-        )
-
-        trigger_message = Message(
-            message_id=f"life_nucleus_wake_{uuid4().hex[:12]}",
-            platform=chat_stream.platform or "unknown",
-            chat_type=chat_stream.chat_type or "private",
-            stream_id=chat_stream.stream_id,
-            sender_id="life_engine_nucleus",
-            sender_name="生命中枢",
-            sender_role="other",
-            message_type=MessageType.TEXT,
-            content=wake_prompt,
-            processed_plain_text=wake_prompt,
-            time=time.time(),
-            is_life_engine_wake=True,
-            life_wake_reason=reason,
-            life_wake_importance=normalized_importance,
-            life_wake_message=text,
-            **target_extra,
-        )
-
-        wake_requested = bool(proactive_wake)
-        wake_triggered = False
-        chat_stream.context.add_unread_message(trigger_message)
-
-        if wake_requested:
-            try:
-                wake_triggered = bool(
-                    await get_stream_loop_manager().start_stream_loop(chat_stream.stream_id)
-                )
-            except Exception as exc:  # noqa: BLE001
-                _discard_tell_dfc_unread(chat_stream.context, trigger_message)
-                logger.warning(f"唤醒表达层失败，已撤回内在消息: {exc}")
-                return False, f"唤醒表达层失败，已撤回内在消息: {exc}"
-            if not wake_triggered:
-                _discard_tell_dfc_unread(chat_stream.context, trigger_message)
-                return False, "唤醒表达层失败：start_stream_loop 返回 false，已撤回内在消息"
-
-        # 记录传话时间
-        if life_service:
-            life_service.record_tell_dfc()
-
-        logger.info(
-            "中枢向内在状态池沉淀了想法碎片: "
-            f"stream_id={chat_stream.stream_id} "
-            f"importance={normalized_importance} "
-            f"proactive_wake={wake_requested} "
-            f"reason={reason or '未说明'} "
-        )
-
-        note = "已补充并唤醒同一主体的表达层。表达层会自行判断是否吸收；这不是指令。"
-        if not wake_requested:
-            note = "已补充到同一主体的表达层待处理队列。表达层会自行判断是否吸收；这不是指令。"
-
-        result = {
-            "action": "message_to_dfc",
-            "stream_id": chat_stream.stream_id,
-            "platform": chat_stream.platform,
-            "chat_type": chat_stream.chat_type,
-            "target_type": resolved_target_type,
-            "target_user_id": target_extra.get("target_user_id", ""),
-            "target_user_name": target_extra.get("target_user_name", ""),
-            "target_group_id": target_extra.get("target_group_id", ""),
-            "target_group_name": target_extra.get("target_group_name", ""),
-            "importance": normalized_importance,
-            "reason": reason,
-            "message": text,
-            "proactive_wake": wake_requested,
-            "wake_triggered": wake_triggered,
-            "note": note,
-        }
-
-        logger.debug(
-            f"[nucleus_tell_dfc] 工具返回结果:\n"
-            f"  stream_id: {result['stream_id']}\n"
-            f"  platform: {result['platform']}\n"
-            f"  chat_type: {result['chat_type']}\n"
-            f"  target_type: {result['target_type']}\n"
-            f"  target_user_id: {result['target_user_id']}\n"
-            f"  target_group_id: {result['target_group_id']}\n"
-            f"  importance: {result['importance']}\n"
-            f"  reason: {result['reason']}\n"
-            f"  message: {result['message']}\n"
-            f"  wake_triggered: {result['wake_triggered']}\n"
-            f"  note: {result['note']}"
-        )
-
-        return True, result
 
 
 class LifeEngineReadFileTool(BaseTool):
@@ -1675,7 +1323,6 @@ ALL_TOOLS = [
     LifeEngineWriteFileTool,
     LifeEngineEditFileTool,
     LifeEngineListFilesTool,
-    LifeEngineWakeDFCTool,
     LifeEngineRunAgentTool,
     FetchLifeMemoryTool,
 ]

@@ -204,7 +204,7 @@ def test_bounded_text_cursor_is_short_copyable_and_source_bound() -> None:
 
 
 @pytest.mark.asyncio
-async def test_autonomy_list_is_bounded_but_mutations_are_unchanged() -> None:
+async def test_autonomy_archive_list_is_bounded_and_mutations_fail_closed() -> None:
     intents = [
         {
             "intent_id": f"intent-{index}",
@@ -251,9 +251,13 @@ async def test_autonomy_list_is_bounded_but_mutations_are_unchanged() -> None:
         continuation="not-a-list-cursor",
         max_bytes=1024,
     )
-    assert ok is True
-    assert mutation == {"action": "pause", "mutated": True}
-    assert calls[-1]["action"] == "pause"
+    assert ok is False
+    assert mutation == {
+        "error": "LegacyAutonomyReadOnly",
+        "mutated": False,
+        "replacement": "nucleus_manage_initiative_seed",
+    }
+    assert [call["action"] for call in calls] == ["list", "list"]
 
 
 def test_bounded_items_compact_mode_delivers_full_listing() -> None:

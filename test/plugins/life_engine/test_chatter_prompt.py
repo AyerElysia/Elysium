@@ -3469,7 +3469,7 @@ def test_life_chatter_history_excludes_internal_prompt_messages() -> None:
     assert "内心独白" not in history
 
 
-def test_tell_dfc_tool_description_frames_as_runtime_mode_sync() -> None:
+def _legacy_tell_dfc_tool_description_frames_as_runtime_mode_sync() -> None:
     """nucleus_tell_dfc 的叙事应指向运行模式同步，而不是双意识。"""
     description = LifeEngineWakeDFCTool.tool_description
 
@@ -3499,7 +3499,7 @@ def test_execution_tool_descriptions_respect_heartbeat_boundary() -> None:
     assert "交给 life_chatter / 表达层判断和执行" in agent_description
 
 
-def test_heartbeat_prompt_bounds_tell_dfc_to_context_gap(tmp_path) -> None:
+def _legacy_heartbeat_prompt_bounds_tell_dfc_to_context_gap(tmp_path) -> None:
     """心跳 prompt 应把 nucleus_tell_dfc 限定为补信息差，而不是指导表达层。"""
     config = LifeEngineConfig()
     config.settings.workspace_path = str(tmp_path)
@@ -3521,6 +3521,23 @@ def test_heartbeat_prompt_bounds_tell_dfc_to_context_gap(tmp_path) -> None:
     assert "唤醒只是让新上下文被看见，不代表表达层必须开口" in prompt
     assert "没有明确需要时，可以安静结束本轮" in prompt
     assert "有冲动就行动" not in prompt
+
+
+def test_heartbeat_prompt_uses_explicit_subject_initiative_contract(
+    tmp_path,
+) -> None:
+    config = LifeEngineConfig()
+    config.settings.workspace_path = str(tmp_path)
+    service = LifeEngineService(_service_plugin(config))
+
+    prompt = "\n".join(service._build_prompt_header())
+
+    assert "nucleus_tell_dfc" not in prompt
+    assert "InitiativeSeed" in prompt
+    assert "nucleus_reachability" in prompt
+    assert "nucleus_begin_outreach" in prompt
+    assert "audience_ref" in prompt
+    assert "surface_ref" in prompt
 
 
 def test_impulse_rules_based_on_auditable_state() -> None:

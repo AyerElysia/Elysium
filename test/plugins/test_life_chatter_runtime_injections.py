@@ -7,14 +7,14 @@ from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
 
-from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.core.chatter import (
     LifeChatter,
     consume_runtime_assistant_injections,
     push_runtime_assistant_injection,
 )
+from plugins.life_engine.core.config import LifeEngineConfig
 from src.core.models.message import Message, MessageType
-from src.kernel.llm import LLMPayload, ROLE, Text
+from src.kernel.llm import ROLE, LLMPayload, Text
 
 
 class _FakeResponse:
@@ -440,7 +440,6 @@ async def test_build_chatter_runtime_includes_recent_file_trace(tmp_path) -> Non
     config = LifeEngineConfig()
     config.settings.workspace_path = str(tmp_path)
     config.runtime_sync.recent_chat_enabled = False
-    config.runtime_sync.send_targets_enabled = False
     config.runtime_sync.trace_recent_changes_enabled = True
     config.runtime_sync.trace_recent_changes_limit = 3
     service = LifeEngineService(SimpleNamespace(config=config))
