@@ -217,6 +217,7 @@ from .state_manager import (
 from .attention import AttentionRouter
 from .subconscious_context import (
     PreparedHeartbeatContext,
+    RecentSubconsciousContext,
     SubconsciousContextManager,
     SubconsciousSummary,
 )
@@ -5800,6 +5801,29 @@ class LifeEngineService(BaseService):
         if persist:
             await self._save_runtime_context(recoverable_on_shared_conflict=True)
 
+    async def get_recent_subconscious_context(
+        self,
+        *,
+        group_limit: int | None = None,
+        max_bytes: int | None = None,
+    ) -> RecentSubconsciousContext:
+        """Return the same bounded recent subconscious activity to any instance.
+
+        This is a pure read-only projection over committed LifeEngine history. It
+        does not drain pending events, move a heartbeat or consumer cursor, read a
+        private conversation payload, or create a new event. Callers may append the
+        returned text to their own transient prompt without sharing their rolling
+        context with another consciousness instance.
+        """
+
+        async with self._get_lock():
+            history = list(self._event_history)
+        return self._subconscious_context.project_recent(
+            history,
+            group_limit=group_limit,
+            max_bytes=max_bytes,
+        )
+
     async def _prepare_heartbeat_context(self) -> PreparedHeartbeatContext:
         """Drain pending events and prepare one fixed heartbeat snapshot."""
         registry = self.consciousness_registry
@@ -6872,13 +6896,25 @@ class LifeEngineService(BaseService):
 
         sections: list[str] = []
 
+        recent_subconscious = await self.get_recent_subconscious_context()
+        if recent_subconscious.content:
+            sections.append(recent_subconscious.content)
+            selected_events = [
+                event
+                for event in selected_events
+                if event.event_id not in recent_subconscious.event_ids
+            ]
+
         instance_id = self.resolve_consciousness_instance(stream_id)
         world_perception = await self.prepare_perception(
             instance_id,
             projection_kind="life_chatter",
             max_bytes=LIFE_CHATTER_WORLD_MAX_BYTES,
         )
-        sections.append(f"### 潜意识协调的瞬时世界感知\n{world_perception.content}")
+        sections.append(
+            "### 当前环境感知（World，仅表示有来源的环境事实，"
+            f"不承担跨意识同步）\n{world_perception.content}"
+        )
 
         new_thought_revision = thought_cursor
         if sync_streams:
