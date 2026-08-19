@@ -19,7 +19,7 @@ from .learning_contracts import (
 from .models import BackendKind
 from .writer_claims import ensure_singleton_writer_claim_schema
 
-LEARNING_SCHEMA_VERSION = 4
+LEARNING_SCHEMA_VERSION = 5
 
 LOCAL_LEARNING_SCHEMA_STATEMENTS = (
     """CREATE TABLE IF NOT EXISTS learning_events (
@@ -55,7 +55,13 @@ LOCAL_LEARNING_SCHEMA_STATEMENTS = (
         END""",
     """CREATE TRIGGER IF NOT EXISTS learning_events_immutable_delete_v1
         BEFORE DELETE ON learning_events BEGIN
-            SELECT RAISE(ABORT, 'LearningEventImmutable');
+            -- Allow deletion of redundant snapshot projection events.
+            -- Snapshot events are not authoritative history; they are
+            -- rebuildable projections. Real events remain protected.
+            SELECT CASE
+                WHEN OLD.event_kind LIKE '%.snapshot' THEN 1
+                ELSE RAISE(ABORT, 'LearningEventImmutable')
+            END;
         END""",
 )
 
@@ -106,7 +112,17 @@ _MYSQL_SCHEMA_MIGRATION = SchemaMigration(
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'LearningEventImmutable'""",
         """CREATE TRIGGER IF NOT EXISTS learning_events_immutable_delete_v1
         BEFORE DELETE ON learning_events FOR EACH ROW
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'LearningEventImmutable'""",
+        BEGIN
+            -- Allow deletion of redundant snapshot projection events.
+            -- Snapshot events are not authoritative history; they are
+            -- rebuildable projections that were incorrectly written to
+            -- learning_events table, causing unbounded growth.
+            -- Real authoritative events (insight_created, insight_reinforced,
+            -- maintenance.*, etc.) remain protected.
+            IF OLD.event_kind NOT LIKE '%.snapshot' THEN
+                SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'LearningEventImmutable';
+            END IF;
+        END""",
     ),
 )
 
@@ -311,6 +327,32 @@ MYSQL_LEARNING_PROJECTOR_CLAIM_GUARD_TRIGGERS = tuple(
 )
 
 
+# Snapshot projection events are redundant projections that were incorrectly
+# written to learning_events table, causing unbounded growth (26+ GB).
+# This migration updates the DELETE trigger to allow cleanup of snapshot
+# events while preserving immutability of authoritative events.
+MYSQL_LEARNING_SNAPSHOT_CLEANUP_MIGRATION = SchemaMigration(
+    version=5,
+    name="life_learning_snapshot_cleanup_v5",
+    statements=(
+        """DROP TRIGGER IF EXISTS learning_events_immutable_delete_v1""",
+        """CREATE TRIGGER IF NOT EXISTS learning_events_immutable_delete_v1
+        BEFORE DELETE ON learning_events FOR EACH ROW
+        BEGIN
+            -- Allow deletion of redundant snapshot projection events.
+            -- Snapshot events are not authoritative history; they are
+            -- rebuildable projections that were incorrectly written to
+            -- learning_events table, causing unbounded growth.
+            -- Real authoritative events (insight_created, insight_reinforced,
+            -- maintenance.*, etc.) remain protected.
+            IF OLD.event_kind NOT LIKE '%.snapshot' THEN
+                SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'LearningEventImmutable';
+            END IF;
+        END""",
+    ),
+)
+
+
 async def ensure_learning_schema(
     runtime: StorageBackendRuntime,
     *,
@@ -343,6 +385,7 @@ async def ensure_learning_schema(
                     MYSQL_LEARNING_CLAIM_GUARD_MIGRATION,
                     MYSQL_LEARNING_CLAIM_GUARD_RETIREMENT,
                     MYSQL_LEARNING_PROJECTOR_CLAIM_GUARD_MIGRATION,
+                    MYSQL_LEARNING_SNAPSHOT_CLEANUP_MIGRATION,
                 )
             )
             await verify_mysql_trigger_contract(
@@ -386,6 +429,7 @@ __all__ = [
     "MYSQL_LEARNING_CLAIM_GUARD_TRIGGERS",
     "MYSQL_LEARNING_PROJECTOR_CLAIM_GUARD_MIGRATION",
     "MYSQL_LEARNING_PROJECTOR_CLAIM_GUARD_TRIGGERS",
+    "MYSQL_LEARNING_SNAPSHOT_CLEANUP_MIGRATION",
     "ensure_learning_schema",
     "verify_learning_writer_claim_guard",
 ]

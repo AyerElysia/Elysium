@@ -1011,8 +1011,10 @@ async def test_selected_scheduler_uses_only_sql_and_survives_restart(
         ]
         assert "learning_insights.insight_created" in event_kinds
         assert "learning_skills.skill_created" in event_kinds
-        assert "learning_insights.snapshot" in event_kinds
-        assert "learning_skills.snapshot" in event_kinds
+        # Snapshot events are no longer written to learning_events table
+        # to prevent unbounded growth. State is preserved in learning_projections.
+        assert "learning_insights.snapshot" not in event_kinds
+        assert "learning_skills.snapshot" not in event_kinds
 
 
 async def test_legacy_learning_snapshot_import_is_lossless_idempotent_and_exportable(
