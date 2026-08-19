@@ -72,15 +72,29 @@ class SQLMessageStreamStore:
             attempts=int(row["attempts"]), created_at=_iso(row["created_at"]), updated_at=_iso(row["updated_at"]),
         )
 
+    def _parse_iso(self, value: str) -> datetime:
+        """Parse an ISO 8601 string into a datetime object."""
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
     async def record_message(self, message: InboundMessage) -> InboundMessage:
         try:
             async with self.runtime.unit_of_work() as uow:
+                # MySQL DATETIME columns don't accept timezone offsets;
+                # strip tzinfo for MySQL, keep ISO format for SQLite.
+                occurred = self._parse_iso(message.occurred_at)
+                received = self._parse_iso(message.received_at)
+                if self.backend == BackendKind.MYSQL:
+                    occurred = occurred.replace(tzinfo=None)
+                    received = received.replace(tzinfo=None)
+                else:
+                    occurred = occurred.isoformat()
+                    received = received.isoformat()
                 await uow.session.execute(text("""INSERT INTO inbound_messages
                     (message_id,platform,platform_event_id,occurrence_id,payload_sha256,stream_id,reply_target,source,occurred_at,received_at,raw_payload_ref)
                     VALUES (:id,:platform,:event,:occurrence,:digest,:stream,:target,:source,:occurred,:received,:ref)"""), {
                         "id": message.message_id, "platform": message.platform, "event": message.platform_event_id, "occurrence": message.occurrence_id,
                         "digest": message.payload_sha256, "stream": message.stream_id, "target": message.reply_target, "source": message.source,
-                        "occurred": message.occurred_at, "received": message.received_at, "ref": message.raw_payload_ref,
+                        "occurred": occurred, "received": received, "ref": message.raw_payload_ref,
                     })
         except IntegrityError:
             pass
