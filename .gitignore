@@ -114,6 +114,7 @@ data/life_engine_workspace/*
 !data/life_engine_workspace/skills/
 .claude/
 .workbuddy/
+/.dsh-meow/
 .vscode/
 .codex/
 /config/*
