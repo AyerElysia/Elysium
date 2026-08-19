@@ -76,6 +76,7 @@ from plugins.life_engine.storage.learning_schema import (
     MYSQL_LEARNING_CLAIM_GUARD_TRIGGERS,
     MYSQL_LEARNING_PROJECTOR_CLAIM_GUARD_MIGRATION,
     MYSQL_LEARNING_PROJECTOR_CLAIM_GUARD_TRIGGERS,
+    MYSQL_LEARNING_SNAPSHOT_CLEANUP_MIGRATION,
 )
 from plugins.life_engine.storage.models import (
     BackendGeneration,
@@ -1379,10 +1380,11 @@ async def test_claimed_mysql_learning_startup_requires_trigger_guard(
 def test_learning_mysql_claim_guard_is_projection_only_after_retirement() -> None:
     """All writers append evidence; one fenced owner mutates projections."""
 
-    assert LEARNING_SCHEMA_VERSION == 4
+    assert LEARNING_SCHEMA_VERSION == 5
     assert MYSQL_LEARNING_CLAIM_GUARD_MIGRATION.version == 2
     assert MYSQL_LEARNING_CLAIM_GUARD_RETIREMENT.version == 3
     assert MYSQL_LEARNING_PROJECTOR_CLAIM_GUARD_MIGRATION.version == 4
+    assert MYSQL_LEARNING_SNAPSHOT_CLEANUP_MIGRATION.version == 5
     assert {
         (trigger.table, trigger.manipulation)
         for trigger in MYSQL_LEARNING_PROJECTOR_CLAIM_GUARD_TRIGGERS

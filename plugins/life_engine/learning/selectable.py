@@ -357,7 +357,7 @@ class SelectedLearningPersistence:
                     exc,
                     writer_instance_id=self.writer_instance_id,
                     writes=writes,
-                    buffered_event_count=len(events),
+                    buffered_event_count=len(pending_events),
                     dirty_projections=dirty,
                 )
                 # 双实例共享 MySQL 时学习持久化投影的 CAS 冲突是合法竞争，
