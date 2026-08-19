@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -24,11 +25,11 @@ from plugins.life_engine.core.tool_parallel import (
     is_life_tool_call_parallel_safe,
     iter_life_tool_call_batches,
 )
-from src.kernel.llm.exceptions import LLMContextError
-from src.kernel.llm.context import LLMContextManager
 from src.core.components.base.chatter import BaseChatter
 from src.core.models.message import Message, MessageType
-from src.kernel.llm import LLMPayload, ROLE, Text, ToolCall, ToolResult
+from src.kernel.llm import ROLE, LLMPayload, Text, ToolCall, ToolResult
+from src.kernel.llm.context import LLMContextManager
+from src.kernel.llm.exceptions import LLMContextError
 
 
 class _FakeResponse:
@@ -363,6 +364,66 @@ async def test_life_save_media_tool_writes_image_inside_workspace(
     assert saved_path.read_bytes() == b"fake-image"
 
 
+async def test_life_save_media_tool_copies_received_file_without_body_in_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    received_root = tmp_path / "data" / "received_files" / "qq"
+    received_root.mkdir(parents=True)
+    source = received_root / "story.md"
+    body = "故事的真实进度".encode()
+    source.write_bytes(body)
+    workspace = tmp_path / "workspace"
+    file_message = Message(
+        message_id="file-1",
+        content={
+            "media": [
+                {
+                    "type": "file",
+                    "data": {
+                        "name": "story.md",
+                        "storage_key": "qq/story.md",
+                        "size": len(body),
+                        "materialized": True,
+                    },
+                }
+            ]
+        },
+        processed_plain_text="[文件:story.md]",
+        message_type=MessageType.FILE,
+        sender_id="user-1",
+        sender_name="Ayer",
+        platform="qq",
+        chat_type="private",
+        stream_id="stream-1",
+    )
+    config = LifeEngineConfig()
+    config.settings.workspace_path = str(workspace)
+    tool = LifeSaveMediaTool.__new__(LifeSaveMediaTool)
+    tool.plugin = SimpleNamespace(config=config)
+    tool.chat_stream = SimpleNamespace(
+        context=SimpleNamespace(
+            unread_messages=[file_message],
+            current_message=file_message,
+            history_messages=[],
+        )
+    )
+    monkeypatch.chdir(tmp_path)
+
+    ok, result = await tool.execute("latest", "file", "received/story.md")
+
+    assert ok is True
+    assert isinstance(result, dict)
+    saved_path = Path(result["saved_to"])
+    assert saved_path == workspace / "received" / "story.md"
+    assert saved_path.read_bytes() == body
+    assert source.read_bytes() == body
+    assert result["kind"] == "file"
+    assert result["size_bytes"] == len(body)
+    assert result["sha256"] == hashlib.sha256(body).hexdigest()
+    assert body.decode() not in str(result)
+
+
 async def test_life_recognize_voice_tool_uses_current_audio(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -400,19 +461,16 @@ async def test_life_recognize_voice_tool_uses_current_audio(
     manager.recognize_voice.assert_awaited_once()
 
 
-async def test_life_send_voice_action_synthesizes_with_tts_task(
+async def test_life_send_voice_action_uses_local_tts_service(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """text 模式应调用 model_tasks.tts 并把合成音频发送到当前聊天。"""
+    """text 模式应调用正式本地 TTS Service，并原样发送 Base64 音频。"""
     action = LifeSendVoiceAction.__new__(LifeSendVoiceAction)
     action.chat_stream = SimpleNamespace(stream_id="stream-1", platform="feishu")
-    model_entry = {"model_identifier": "mimo-v2.5-tts"}
-    speech_client = SimpleNamespace(
-        create_speech=AsyncMock(return_value=b"RIFF-demo-audio"),
+    service = SimpleNamespace(
+        generate_voice=AsyncMock(return_value="LOCAL_AUDIO_BASE64"),
     )
-    registry = SimpleNamespace(
-        get_speech_client_for_model=lambda entry: speech_client,
-    )
+    resolved: list[str] = []
     sent: dict[str, object] = {}
 
     async def fake_send_voice(voice_data, stream_id, **kwargs):
@@ -420,12 +478,8 @@ async def test_life_send_voice_action_synthesizes_with_tts_task(
         return True
 
     monkeypatch.setattr(
-        "src.app.plugin_system.api.llm_api.get_model_set_by_task",
-        lambda task: [model_entry] if task == "tts" else None,
-    )
-    monkeypatch.setattr(
-        "src.kernel.llm.model_client.registry.get_default_model_client_registry",
-        lambda: registry,
+        "plugins.tts_voice_plugin.api.get_local_tts_service",
+        lambda: resolved.append("tts_voice_plugin:service:tts") or service,
     )
     monkeypatch.setattr(
         "src.app.plugin_system.api.send_api.send_voice",
@@ -434,20 +488,93 @@ async def test_life_send_voice_action_synthesizes_with_tts_task(
 
     ok, result = await action.execute(
         text="晚上好。",
-        voice="mimo_default",
-        instructions="温柔地说",
+        voice_style="gentle",
+        text_language="zh",
     )
 
     assert ok is True
     assert "已合成并发送语音" in result
-    speech_client.create_speech.assert_awaited_once()
+    assert resolved == ["tts_voice_plugin:service:tts"]
+    service.generate_voice.assert_awaited_once_with(
+        text="晚上好。",
+        style_hint="gentle",
+        language_hint="zh",
+    )
+    assert sent["voice_data"] == "LOCAL_AUDIO_BASE64"
     assert sent["stream_id"] == "stream-1"
     assert sent["platform"] == "feishu"
     assert sent["processed_plain_text"] == "[语音:晚上好。]"
 
 
+async def test_life_send_voice_action_fails_closed_without_local_tts_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    action = LifeSendVoiceAction.__new__(LifeSendVoiceAction)
+    action.chat_stream = SimpleNamespace(stream_id="stream-1", platform="feishu")
+    monkeypatch.setattr(
+        "plugins.tts_voice_plugin.api.get_local_tts_service",
+        lambda: None,
+    )
+
+    ok, result = await action.execute(text="晚上好。")
+
+    assert ok is False
+    assert result == "本地消息 TTS 服务未启用或尚未就绪"
+
+
+async def test_life_send_voice_action_does_not_duplicate_surface_auto_tts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    action = LifeSendVoiceAction.__new__(LifeSendVoiceAction)
+    action.chat_stream = SimpleNamespace(
+        stream_id="surface-stream",
+        platform="neko.surface",
+    )
+
+    def fail_if_resolved(_signature: str) -> None:
+        raise AssertionError("Surface text mode must not resolve message TTS")
+
+    monkeypatch.setattr(
+        "plugins.tts_voice_plugin.api.get_local_tts_service",
+        lambda: fail_if_resolved("tts_voice_plugin:service:tts"),
+    )
+
+    ok, result = await action.execute(text="这句话只应由 Surface 自动朗读。")
+
+    assert ok is False
+    assert result == "N.E.K.O Surface 已由本地自动语音链接管"
+
+
+async def test_life_send_voice_action_rejects_empty_local_tts_audio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    action = LifeSendVoiceAction.__new__(LifeSendVoiceAction)
+    action.chat_stream = SimpleNamespace(stream_id="stream-1", platform="feishu")
+    service = SimpleNamespace(generate_voice=AsyncMock(return_value=""))
+    monkeypatch.setattr(
+        "plugins.tts_voice_plugin.api.get_local_tts_service",
+        lambda: service,
+    )
+
+    ok, result = await action.execute(text="不会被伪装成成功。")
+
+    assert ok is False
+    assert result == "本地消息 TTS 未返回音频"
+
+
+def test_life_send_voice_schema_contains_only_local_tts_parameters() -> None:
+    schema = LifeSendVoiceAction.to_schema()["function"]
+    properties = schema["parameters"]["properties"]
+
+    assert set(properties) == {"path", "text", "voice_style", "text_language"}
+    assert "voice" not in properties
+    assert "instructions" not in properties
+    assert "model_tasks.tts" not in schema["description"]
+    assert "MiMo" not in schema["description"]
+
+
 def test_life_media_capabilities_are_registered_for_enabled_chatter() -> None:
-    """四项媒体能力只在 LifeChatter 启用时注册，并保持主体主动调用。"""
+    """附件能力只在 LifeChatter 启用时注册，并保持主体主动调用。"""
     enabled_config = LifeEngineConfig()
     enabled_config.chatter.enabled = True
     enabled_components = LifeEnginePlugin(enabled_config).get_components()
@@ -457,6 +584,7 @@ def test_life_media_capabilities_are_registered_for_enabled_chatter() -> None:
     disabled_components = LifeEnginePlugin(disabled_config).get_components()
 
     media_components = {
+        LifeSendFileAction,
         LifeSendImageAction,
         LifeSendVoiceAction,
         LifeRecognizeVoiceTool,
@@ -467,8 +595,8 @@ def test_life_media_capabilities_are_registered_for_enabled_chatter() -> None:
     assert all(component.chatter_allow == ["life_chatter"] for component in media_components)
 
 
-def test_life_send_file_action_is_not_registered() -> None:
-    """零使用的旧文件 action 保留实现兼容，但不再暴露给意识实例。"""
+def test_life_send_file_action_is_registered_only_for_enabled_chatter() -> None:
+    """普通文件是正式主体能力，但不会在 Chatter 关闭时泄漏注册。"""
     enabled_config = LifeEngineConfig()
     enabled_config.chatter.enabled = True
     enabled_components = LifeEnginePlugin(enabled_config).get_components()
@@ -478,7 +606,7 @@ def test_life_send_file_action_is_not_registered() -> None:
     disabled_components = LifeEnginePlugin(disabled_config).get_components()
 
     assert LifeSendFileAction.chatter_allow == ["life_chatter"]
-    assert LifeSendFileAction not in enabled_components
+    assert LifeSendFileAction in enabled_components
     assert LifeSendFileAction not in disabled_components
 
 

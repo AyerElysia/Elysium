@@ -387,3 +387,85 @@ def test_acknowledges_only_complete_delta_groups() -> None:
 
     assert prepared.selected_event_ids == ["event-1", "event-2"]
     assert prepared.acknowledged_event_ids == ["event-1", "event-2"]
+
+
+def test_recent_projection_shares_thoughts_and_tools_without_private_messages() -> None:
+    manager = SubconsciousContextManager(recent_group_count=2)
+    private_message = _event(1, content="PRIVATE_TRANSCRIPT")
+    thought = _event(
+        2,
+        event_type=EventType.HEARTBEAT,
+        content="我刚刚想到要继续看看这件事",
+        heartbeat_run_id="run-1",
+    )
+    call = _event(
+        3,
+        event_type=EventType.TOOL_CALL,
+        tool_name="inspect",
+        heartbeat_run_id="run-1",
+        call_id="call-1",
+        parent_event_id="event-2",
+    )
+    call.tool_args = {"path": "notes.txt"}
+    result = _event(
+        4,
+        event_type=EventType.TOOL_RESULT,
+        content="看完了",
+        tool_name="inspect",
+        tool_success=True,
+        heartbeat_run_id="run-1",
+        call_id="call-1",
+        parent_event_id="event-3",
+    )
+    later_thought = _event(
+        5,
+        event_type=EventType.HEARTBEAT,
+        content="现在更清楚了",
+        content_type="chatter_inner_monologue",
+    )
+    later_thought.source = "life_chatter"
+    later_thought.source_instance_id = "chat_global"
+
+    projected = manager.project_recent(
+        [private_message, thought, call, result, later_thought]
+    )
+
+    assert projected.group_count == 2
+    assert projected.source_group_count == 2
+    assert projected.omitted_group_count == 0
+    assert projected.event_ids == ("event-2", "event-3", "event-4", "event-5")
+    assert projected.from_sequence == 2
+    assert projected.through_sequence == 5
+    assert "我刚刚想到要继续看看这件事" in projected.content
+    assert "TOOL_CALL inspect" in projected.content
+    assert "notes.txt" not in projected.content
+    assert "TOOL_RESULT inspect success" in projected.content
+    assert "现在更清楚了" in projected.content
+    assert "source=life_chatter instance=chat_global" in projected.content
+    assert "PRIVATE_TRANSCRIPT" not in projected.content
+    assert projected.delivered_bytes == len(projected.content.encode("utf-8"))
+
+
+def test_recent_projection_uses_latest_group_count_and_hard_utf8_budget() -> None:
+    manager = SubconsciousContextManager(recent_group_count=1)
+    projected = manager.project_recent(
+        [
+            _event(1, event_type=EventType.HEARTBEAT, content="旧想法"),
+            _event(
+                2,
+                event_type=EventType.HEARTBEAT,
+                content="爱莉🌸" * 1000,
+            ),
+        ],
+        max_bytes=512,
+    )
+
+    assert projected.group_count == 1
+    assert projected.source_group_count == 2
+    assert projected.omitted_group_count == 1
+    assert projected.event_ids == ("event-2",)
+    assert "旧想法" not in projected.content
+    assert "爱莉" in projected.content
+    assert projected.truncated is True
+    assert projected.delivered_bytes <= 512
+    assert projected.delivered_bytes == len(projected.content.encode("utf-8"))

@@ -62,6 +62,7 @@ class LifeEngineEvent:
     heartbeat_run_id: str | None = None
     call_id: str | None = None
     parent_event_id: str | None = None
+    occurrence_id: str | None = None
     causation_id: str | None = None
 
     # 工具调用特有字段

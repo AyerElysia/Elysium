@@ -94,6 +94,8 @@ def _legacy_channel(event: LifeEngineEvent) -> LifeEventChannel:
         return LifeEventChannel.AGENT
     if content_type == "proactive_opportunity":
         return LifeEventChannel.PROACTIVE
+    if content_type == "initiative_reencounter":
+        return LifeEventChannel.LIFE
     if content_type.startswith("autonomy_intent_"):
         return LifeEventChannel.LIFE
     if event.event_type == EventType.HEARTBEAT:
@@ -206,6 +208,7 @@ def life_event_from_legacy(event: LifeEngineEvent) -> LifeEvent:
         priority=priority,
         salience=salience,
         metadata=metadata,
+        occurrence_id=str(getattr(event, "occurrence_id", None) or ""),
         source_sequence=int(event.sequence or 0),
         source_instance_id=source_instance_id,
         causation_id=str(getattr(event, "causation_id", None) or ""),

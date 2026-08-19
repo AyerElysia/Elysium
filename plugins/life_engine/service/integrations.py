@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING, Any
 from src.app.plugin_system.api.log_api import get_logger
 
 from .event_builder import (
-    INTERNAL_PLATFORM,
     EventType,
     _format_time_display,
     _now_iso,
@@ -157,27 +156,6 @@ class DFCIntegration:
                 parts.append(f"【工具偏好】{', '.join(tool_names)}")
 
         return "\n".join(parts) if parts else ""
-
-    async def pick_latest_external_stream_id(self) -> str:
-        """选择最近的外部对话流作为注入目标。
-
-        Returns:
-            最近的 stream_id，如果无可用则返回空字符串
-        """
-        async with self._service._get_lock():
-            candidates = list(self._service._pending_events) + list(self._service._event_history)
-
-        for event in reversed(candidates):
-            if event.event_type != EventType.MESSAGE:
-                continue
-            stream_id = str(event.stream_id or "").strip()
-            if not stream_id:
-                continue
-            source = str(event.source or "").strip()
-            if source == INTERNAL_PLATFORM:
-                continue
-            return stream_id
-        return ""
 
     async def query_actor_context(self) -> str:
         """供 DFC 同步查询当前运行状态与 TODO。

@@ -16,7 +16,7 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from src.app.plugin_system.api import log_api
-from src.kernel.scheduler import TriggerType, get_unified_scheduler
+from src.kernel.scheduler import get_unified_scheduler
 
 from .storage_utils import atomic_write_text
 
@@ -562,32 +562,12 @@ def format_due_message(intent: AutonomyIntent) -> str:
 
 
 async def schedule_autonomy_intent(plugin: Any, intent: AutonomyIntent) -> str:
-    scheduler = get_unified_scheduler()
+    """Reject the retired executor; callers may only read legacy snapshots."""
 
-    async def _callback() -> None:
-        service = getattr(plugin, "service", None)
-        if service is None:
-            logger.warning(f"自主意向到点但 life_engine 服务不可用: intent_id={intent.intent_id}")
-            return
-        await service.trigger_autonomy_intent(intent.intent_id)
-
-    scheduled_at = parse_iso_datetime(intent.scheduled_at)
-    if scheduled_at is None:
-        raise ValueError("scheduled_at 无效")
-    trigger_config: dict[str, Any] = {"trigger_at": scheduled_at.replace(tzinfo=None)}
-    schedule_id = await scheduler.create_schedule(
-        callback=_callback,
-        trigger_type=TriggerType.TIME,
-        trigger_config=trigger_config,
-        # Recurrence is chained only after a terminal occurrence receipt. A
-        # scheduler-level recurring callback can overlap an unfinished turn.
-        is_recurring=False,
-        task_name=intent.task_name or normalize_intent_task_name(intent.intent_id),
-        force_overwrite=True,
+    del plugin, intent
+    raise RuntimeError(
+        "LegacyAutonomyReadOnly: stream-bound scheduling is retired"
     )
-    intent.schedule_id = schedule_id
-    intent.updated_at = iso_now()
-    return schedule_id
 
 
 async def restore_autonomy_intents(
@@ -596,75 +576,11 @@ async def restore_autonomy_intents(
     *,
     store: Any | None = None,
 ) -> int:
-    store = store or AsyncLocalAutonomyIntentStore(workspace_path)
-    intents = await store.load()
-    if not intents:
-        return 0
+    """Read the legacy ledger without scheduling or rewriting any row."""
 
-    scheduler = get_unified_scheduler()
-    restored = 0
-    async with _get_lock():
-        for intent in await store.load():
-            if intent.status == "in_flight" or intent.active_occurrence_id:
-                # The previous process cannot prove whether an external action
-                # crossed the crash boundary. Preserve it; never blindly replay.
-                occurrence_id = intent.active_occurrence_id
-                intent.status = "renewal_required"
-                intent.renewal_reason = "unfinished occurrence recovered after restart"
-                intent.active_occurrence_status = "delivery_unknown"
-                intent.updated_at = iso_now()
-                await store.upsert(intent)
-                await store.append_event(
-                    "recovered_delivery_unknown",
-                    intent,
-                    occurrence_id=occurrence_id,
-                    detail=intent.renewal_reason,
-                )
-                continue
-            if intent.status != "scheduled":
-                continue
-            lease_reason = recurring_lease_reason(intent)
-            if lease_reason:
-                intent.status = "renewal_required"
-                intent.renewal_reason = lease_reason
-                intent.updated_at = iso_now()
-                await store.upsert(intent)
-                await store.append_event(
-                    "renewal_required",
-                    intent,
-                    detail=lease_reason,
-                )
-                logger.warning(
-                    "自主意向等待主体续期: "
-                    f"intent_id={intent.intent_id[:12]} reason={lease_reason}"
-                )
-                continue
-            if not scheduler.is_running:
-                continue
-            scheduled_at = parse_iso_datetime(intent.scheduled_at)
-            if scheduled_at is None:
-                intent.status = "rejected"
-                intent.rejected_reason = "scheduled_at 无效"
-                intent.updated_at = iso_now()
-                await store.upsert(intent)
-                continue
-            if scheduled_at <= now_local():
-                # Missed while offline: surface soon, but still through the same path.
-                intent.scheduled_at = (now_local() + timedelta(seconds=5)).isoformat()
-            try:
-                await schedule_autonomy_intent(plugin, intent)
-                await store.upsert(intent)
-                restored += 1
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"恢复自主意向失败: intent_id={intent.intent_id} error={exc}")
-    remaining = await store.load()
-    if not scheduler.is_running and any(
-        intent.status == "scheduled" for intent in remaining
-    ):
-        logger.warning("调度器尚未运行，未恢复 scheduled 自主意向")
-    if restored:
-        logger.info(f"已恢复自主意向调度: count={restored}")
-    return restored
+    store = store or AsyncLocalAutonomyIntentStore(workspace_path)
+    await store.load()
+    return 0
 
 
 async def cleanup_autonomy_schedules(

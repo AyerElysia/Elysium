@@ -35,7 +35,6 @@ from src.core.components.utils import should_strip_auto_reason_argument
 from src.core.models.message import Message, MessageType
 from src.kernel.concurrency import get_task_manager
 from src.kernel.llm import LLMPayload, ROLE, Text, ToolRegistry, ToolResult
-from src.kernel.scheduler import get_unified_scheduler, TriggerType
 
 _STORAGE_RENEWAL_BACKOFF_BASE_SECONDS = 1.0
 _STORAGE_RENEWAL_BACKOFF_MAX_SECONDS = 30.0
@@ -164,22 +163,20 @@ from ..core.subject_context_projection import (
     build_subject_context_projection_prompt,
     validate_subject_projection_text,
 )
-from ..core.send_targets import format_send_targets_for_prompt, list_recent_send_targets
 from ..core.tool_parallel import (
     is_life_tool_call_parallel_safe,
     iter_life_tool_call_batches,
 )
 from ..autonomy import (
     AsyncLocalAutonomyIntentStore,
-    AutonomyIntent,
     SelectedAutonomyIntentStore,
-    build_intent,
     cleanup_autonomy_schedules,
-    format_due_message,
-    occurrence_id_for,
-    recurring_lease_reason,
-    restore_autonomy_intents,
-    schedule_autonomy_intent as register_autonomy_schedule,
+)
+from ..initiative.contracts import (
+    InitiativeOutreachCommand,
+    InitiativeSeedCommand,
+    InitiativeSeedCommit,
+    InitiativeSeedView,
 )
 from ..streams.manager import ThoughtStreamManager
 from ..drives.impulse import ImpulseEngine
@@ -212,7 +209,6 @@ from .event_builder import (
     _parse_hhmm,
     _shorten_text,
 )
-from .followup import FollowupState, PendingFollowup
 from .state_manager import (
     StatePersistence,
     get_file_metadata,
@@ -221,6 +217,7 @@ from .state_manager import (
 from .attention import AttentionRouter
 from .subconscious_context import (
     PreparedHeartbeatContext,
+    RecentSubconsciousContext,
     SubconsciousContextManager,
     SubconsciousSummary,
 )
@@ -649,6 +646,7 @@ class LifeEngineService(BaseService):
         self._slow_record_message_streak: int = 0
         self._heartbeat_task_id: str | None = None
         self._learning_maintenance_task_id: str | None = None
+        self._initiative_reencounter_task_id: str | None = None
         self._storage_authority_renew_task_id: str | None = None
         self._memory_index_task_id: str | None = None
         self._memory_witness_task_id: str | None = None
@@ -740,6 +738,7 @@ class LifeEngineService(BaseService):
         self._learning_stores: Any | None = None
         self._learning_event_store: Any | None = None
         self._attention_thread_service: Any | None = None
+        self._initiative_authority: Any | None = None
         self._subject_document_store: Any | None = None
         self._runtime_state_store: Any | None = None
         self._runtime_context_writer_claim: Any | None = None
@@ -850,8 +849,6 @@ class LifeEngineService(BaseService):
         self._pending_chatter_deliveries: dict[str, ChatterRuntimeDelivery] = {}
         self._attention_router: AttentionRouter | None = None
         self._last_memory_maintenance_prompt_at: str | None = None
-        self._followup_states: dict[str, FollowupState] = {}
-        self._scheduler = None
 
     @property
     def memory_service(self) -> LifeMemoryService | None:
@@ -1486,6 +1483,166 @@ class LifeEngineService(BaseService):
             )
         return service
 
+    @property
+    def initiative_authority(self) -> Any:
+        """Return the subject initiative authority or fail closed."""
+
+        authority = self._initiative_authority
+        if authority is None:
+            raise RuntimeError(
+                "InitiativeAuthorityNotStarted: subject initiative requires "
+                "the service-owned runtime event store"
+            )
+        return authority
+
+    async def decide_initiative_seed(
+        self,
+        command: InitiativeSeedCommand,
+    ) -> InitiativeSeedCommit:
+        """Commit one explicit subject decision without choosing a route."""
+
+        return await self.initiative_authority.decide_seed(command)
+
+    async def _initiative_life_event_exists(self, event_id: str) -> bool:
+        """Check one immutable occurrence without materializing event content."""
+
+        store = self._get_event_bus().store
+        occurrence_digest = getattr(store, "occurrence_digest", None)
+        if callable(occurrence_digest):
+            return await occurrence_digest(event_id) is not None
+        get_by_event_id = getattr(store, "get_by_event_id", None)
+        if callable(get_by_event_id):
+            return await get_by_event_id(event_id) is not None
+        return False
+
+    @staticmethod
+    def _initiative_reencounter_event_id(seed: InitiativeSeedView) -> str:
+        digest = hashlib.sha256(
+            f"{seed.seed_id}\0{seed.reencounter_revision}".encode()
+        ).hexdigest()
+        return f"initiative_reencounter_{digest}"
+
+    async def _surface_initiative_reencounter(
+        self,
+        seed: InitiativeSeedView,
+    ) -> None:
+        """Durably re-present one subject-authored seed without taking action."""
+
+        if (
+            seed.status != "open"
+            or not seed.reencounter_at
+            or seed.reencounter_revision <= 0
+            or seed.reencounter_delivered_at
+        ):
+            return
+        event_id = self._initiative_reencounter_event_id(seed)
+        if not await self._initiative_life_event_exists(event_id):
+            from ..initiative.projection import project_initiative_seed_content
+
+            content = str(project_initiative_seed_content(seed))
+            event = LifeEngineEvent(
+                event_id=event_id,
+                event_type=EventType.MESSAGE,
+                timestamp=seed.reencounter_at,
+                sequence=self._next_sequence(),
+                source="life_engine",
+                source_detail="主体主动线索的一次性技术投递",
+                content=content,
+                content_type="initiative_reencounter",
+                sender="主体先前的明确决定",
+                occurrence_id=event_id,
+                causation_id=seed.reencounter_event_id or seed.last_event_id,
+                correlation_id=(
+                    f"initiative-seed:{hashlib.sha256(seed.seed_id.encode()).hexdigest()}"
+                ),
+                content_ref=seed.reencounter_event_id or seed.last_event_id,
+                raw_content=content,
+            )
+            await self._queue_pending_event(event)
+        await self.initiative_authority.record_reencounter_delivery(
+            seed_id=seed.seed_id,
+            seed_revision=seed.reencounter_revision,
+            life_event_id=event_id,
+            occurred_at=_now_iso(),
+        )
+
+    async def _initiative_reencounter_loop(self) -> None:
+        """Deliver due seeds once in ledger order; never infer salience or action."""
+
+        while self._stop_event is not None and not self._stop_event.is_set():
+            try:
+                due = await self.initiative_authority.due_reencounters(
+                    now=_now_iso()
+                )
+                # Technical delivery order is stable ledger order, never a
+                # salience judgment. One event per pass prevents a recovered
+                # backlog from flooding the next heartbeat context.
+                for seed in due[:1]:
+                    await self._surface_initiative_reencounter(seed)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - retry durable projection
+                logger.warning(
+                    "主体主动线索技术投递暂未完成: "
+                    f"error_type={type(exc).__name__}"
+                )
+            stop_event = self._stop_event
+            if stop_event is None or stop_event.is_set():
+                return
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=15.0)
+            except TimeoutError:
+                pass
+
+    async def list_initiative_seeds(
+        self,
+        *,
+        include_released: bool = False,
+    ) -> tuple[InitiativeSeedView, ...]:
+        """Read initiatives in immutable event order, never salience order."""
+
+        return await self.initiative_authority.list_seeds(
+            include_released=include_released
+        )
+
+    async def get_initiative_seed(
+        self,
+        seed_id: str,
+    ) -> InitiativeSeedView | None:
+        """Read one exact initiative view without inferring an audience."""
+
+        return await self.initiative_authority.get_seed(seed_id)
+
+    async def begin_initiative_outreach(
+        self,
+        command: InitiativeOutreachCommand,
+    ) -> dict[str, Any]:
+        """Commit an explicit audience/surface choice, then wake that surface."""
+
+        from ..initiative.reachability import resolve_reachable_surface
+
+        surface = await resolve_reachable_surface(
+            audience_ref=command.audience_ref,
+            surface_ref=command.surface_ref,
+        )
+        receipt = await self.initiative_authority.begin_outreach(command)
+        # The stable synthetic message_id is de-duplicated across unread,
+        # current, and history messages. Replaying after an uncertain wake is
+        # therefore recoverable without duplicating the expression episode.
+        await self._wake_stream_for_initiative(
+            stream_id=surface.stream_id,
+            platform=surface.platform,
+            command=command,
+        )
+        return {
+            "begun": True,
+            "event_id": receipt.event_id,
+            "occurrence_id": receipt.occurrence_id,
+            "audience_ref": receipt.audience_ref,
+            "surface_ref": receipt.surface_ref,
+            "idempotent_replay": receipt.idempotent_replay,
+        }
+
     async def decide_attention_thread(
         self,
         command: AttentionThreadCommand,
@@ -1755,6 +1912,12 @@ class LifeEngineService(BaseService):
         else:
             learning_writer_claim = None
         registry = await AsyncConsciousnessRegistry.load(stores.presence)
+        from ..initiative import InitiativeAuthority
+
+        initiative_authority = InitiativeAuthority(
+            runtime_state_store,
+            validate_active_actor=self._validate_initiative_decision_actor,
+        )
         event_bus = LifeEventBus(ledger)
         gateway = AsyncPerceptionGateway(
             registry,
@@ -1767,6 +1930,7 @@ class LifeEngineService(BaseService):
         self._learning_stores = learning_stores
         self._learning_event_store = learning_event_store
         self._attention_thread_service = attention_service
+        self._initiative_authority = initiative_authority
         self._presence_world_stores = stores
         self._subject_document_store = subject_store
         self._runtime_state_store = runtime_state_store
@@ -1822,6 +1986,7 @@ class LifeEngineService(BaseService):
             register_outbox_intent_hook,
             register_outbox_settle_hook,
         )
+
         from ..storage import (
             MULTI_WRITER_PROTOCOL_VERSION,
             InstanceIdentity,
@@ -2256,6 +2421,7 @@ class LifeEngineService(BaseService):
         self._learning_stores = None
         self._learning_event_store = None
         self._attention_thread_service = None
+        self._initiative_authority = None
         if self._multi_writer_bridge is not None:
             try:
                 from src.core.transport.multi_writer_hooks import (
@@ -2663,8 +2829,7 @@ class LifeEngineService(BaseService):
             mc_config=config,
             consciousness_registry=self.consciousness_registry,
             save_consciousness_registry=self.save_consciousness_registry_async,
-            prepare_perception=self.prepare_perception,
-            commit_perception=self.commit_perception,
+            get_recent_subconscious_context=self.get_recent_subconscious_context,
             report_world_observation=self.report_world_observation,
         )
 
@@ -2744,6 +2909,20 @@ class LifeEngineService(BaseService):
         """Validate that a learning decision comes from an active runtime window."""
 
         instance = self.consciousness_registry.get(str(instance_id or "").strip())
+        return bool(instance is not None and instance.is_active)
+
+    async def _validate_initiative_decision_actor(self, instance_id: str) -> bool:
+        """Reconcile technical leases before accepting a subject initiative."""
+
+        registry = self.consciousness_registry
+        if isinstance(registry, AsyncConsciousnessRegistry):
+            await registry.reconcile_expired()
+        else:
+            await asyncio.to_thread(
+                registry.reconcile_expired,
+                timestamp=_now_iso(),
+            )
+        instance = registry.get(str(instance_id or "").strip())
         return bool(instance is not None and instance.is_active)
 
     @staticmethod
@@ -3331,14 +3510,6 @@ class LifeEngineService(BaseService):
         """计算距离上一条外部消息过去了多少分钟。"""
         return minutes_since_time(self._state.last_external_message_at)
 
-    def _minutes_since_tell_dfc(self) -> int | None:
-        """计算距离上一次传话给 DFC 过去了多少分钟。"""
-        return minutes_since_time(self._state.last_tell_dfc_at)
-
-    def _minutes_since_outer_sync(self) -> int | None:
-        """计算距离上一次同步给对外运行模式过去了多少分钟。"""
-        return self._minutes_since_tell_dfc()
-
     def _self_pause_status(self) -> tuple[bool, int | None, str | None, str | None]:
         """返回主动休息锁状态。"""
         return self_pause_status(self._state)
@@ -3386,15 +3557,6 @@ class LifeEngineService(BaseService):
         )
 
         return payload
-
-    def record_tell_dfc(self) -> None:
-        """记录一次传话给 DFC 的时间。"""
-        self._state.last_tell_dfc_at = _now_iso()
-        self._state.tell_dfc_count += 1
-
-    def record_outer_sync(self) -> None:
-        """记录一次同步给对外运行模式的时间。"""
-        self.record_tell_dfc()
 
     def _workspace_dir(self) -> Path:
         """返回 life workspace 目录。"""
@@ -3524,6 +3686,7 @@ class LifeEngineService(BaseService):
             "tool_args": event.tool_args or {},
             "tool_success": event.tool_success,
             "heartbeat_context_consumed": event.heartbeat_context_consumed,
+            "occurrence_id": event.occurrence_id,
             "source_instance_id": event.source_instance_id,
             "correlation_id": event.correlation_id,
             "content_ref": event.content_ref,
@@ -4691,22 +4854,6 @@ class LifeEngineService(BaseService):
                 if unlocked_self_pause:
                     self._state.consecutive_rest_count = 0
 
-                # 收到外界新消息时，重置并清除对应流的延迟续话状态
-                stream_id = getattr(message, "stream_id", "")
-                if stream_id and stream_id in self._followup_states:
-                    state = self._followup_states[stream_id]
-                    state.followup_chain_count = 0
-                    state.followup_cooldown_until = None
-                    if state.scheduler_task_name and self._scheduler:
-                        try:
-                            await self._scheduler.cancel_schedule(
-                                state.scheduler_task_name
-                            )
-                        except Exception:
-                            pass
-                    state.pending_followup = None
-                    state.is_waiting = False
-                    state.active_check_kind = None
         _phase_enqueue = time.monotonic() - _phase_start
         chat_fact = build_chat_message_event(
             message,
@@ -4945,11 +5092,6 @@ class LifeEngineService(BaseService):
             f"{_shorten_text(event.content, max_length=500)}"
         )
 
-    def get_or_create_followup_state(self, stream_id: str) -> FollowupState:
-        if stream_id not in self._followup_states:
-            self._followup_states[stream_id] = FollowupState(stream_id=stream_id)
-        return self._followup_states[stream_id]
-
     async def schedule_followup_for_stream(
         self,
         chat_stream: Any,
@@ -4960,194 +5102,13 @@ class LifeEngineService(BaseService):
         followup_type: str,
         source: str,
     ) -> tuple[bool, str]:
-        """为某个聊天流登记一次延迟续话。"""
-        stream_id = getattr(chat_stream, "stream_id", "")
-        if not stream_id:
-            return False, "缺少 stream_id"
+        """Reject the retired stream-bound follow-up scheduler."""
 
-        state = self.get_or_create_followup_state(stream_id)
-
-        # 检查冷却
-        if (
-            state.followup_cooldown_until
-            and datetime.now() < state.followup_cooldown_until
-        ):
-            return False, "当前仍处于延迟续话冷却期"
-
-        # 延迟续话链已达上限
-        max_chain = 2
-        if state.followup_chain_count >= max_chain:
-            return False, "延迟续话链已达上限"
-
-        min_delay = 20.0
-        max_delay = 90.0
-        delay_seconds = max(float(delay_seconds or 0), min_delay)
-        delay_seconds = min(delay_seconds, max_delay)
-
-        next_check_time = datetime.now() + timedelta(seconds=delay_seconds)
-
-        followup = PendingFollowup(
-            topic=str(topic or "未命名话题").strip() or "未命名话题",
-            thought=str(thought or "").strip(),
-            followup_type=str(followup_type or "share_new_thought").strip()
-            or "share_new_thought",
-            delay_seconds=delay_seconds,
-            scheduled_at=datetime.now(),
-            check_at=next_check_time,
-            source=source,
+        del chat_stream, delay_seconds, thought, topic, followup_type, source
+        return False, (
+            "LegacyFollowupReadOnly: use InitiativeSeed for future continuity; "
+            "choose an audience and surface explicitly at action time."
         )
-
-        state.pending_followup = followup
-        state.next_check_time = next_check_time
-        state.is_waiting = True
-        state.active_check_kind = "followup"
-
-        task_name = f"life_followup_check_{stream_id}"
-        state.scheduler_task_name = task_name
-
-        if self._scheduler is None:
-            self._scheduler = get_unified_scheduler()
-
-        async def _timeout_callback() -> None:
-            await self._on_followup_timeout(stream_id)
-
-        try:
-            await self._scheduler.create_schedule(
-                callback=_timeout_callback,
-                trigger_type=TriggerType.TIME,
-                trigger_config={"trigger_at": next_check_time},
-                task_name=task_name,
-                force_overwrite=True,
-            )
-            logger.info(
-                f"[{stream_id[:8]}] 已登记延迟续话，会在 {delay_seconds:.0f} 秒后重新判断。"
-            )
-            return True, f"已登记一条延迟续话，会在 {delay_seconds:.0f} 秒后重新判断。"
-        except Exception as e:
-            logger.error(f"调度续话检查任务失败：{e}")
-            return False, f"调度续话检查任务失败：{e}"
-
-    async def _on_followup_timeout(self, stream_id: str) -> None:
-        """延迟续话到点后执行判断。"""
-        state = self._followup_states.get(stream_id)
-        if (
-            state is None
-            or not state.is_waiting
-            or state.active_check_kind != "followup"
-            or state.pending_followup is None
-        ):
-            logger.debug(f"[{stream_id[:8]}] 跳过过期的延迟续话任务")
-            return
-
-        followup = state.pending_followup
-        state.pending_followup = None
-        state.is_waiting = False
-        state.active_check_kind = None
-
-        try:
-            from src.app.plugin_system.api.stream_api import get_stream
-            from src.core.managers.stream_manager import get_stream_manager
-
-            chat_stream = await get_stream(stream_id)
-            if chat_stream is None:
-                chat_stream = get_stream_manager()._streams.get(stream_id)
-            if chat_stream is None:
-                logger.warning(f"[{stream_id[:8]}] 延迟续话未找到 chat_stream")
-                return
-
-            max_chain = 2
-            if state.followup_chain_count >= max_chain:
-                logger.info(f"[{stream_id[:8]}] 延迟续话链已达上限，结束本轮续话")
-                state.followup_cooldown_until = datetime.now() + timedelta(minutes=10)
-                state.followup_chain_count = 0
-                return
-
-            state.followup_chain_count += 1
-            await self._wake_stream_for_followup(chat_stream, followup)
-        except Exception as exc:
-            logger.error(f"[{stream_id[:8]}] 延迟续话处理失败：{exc}", exc_info=True)
-            state.followup_cooldown_until = datetime.now() + timedelta(minutes=10)
-            state.followup_chain_count = 0
-
-    async def _wake_stream_for_followup(
-        self, chat_stream: Any, followup: PendingFollowup
-    ) -> None:
-        """向目标流注入一条续话机会触发消息，并唤醒当前运行模式。"""
-        from src.core.models.message import Message
-        from src.core.transport.distribution.stream_loop_manager import (
-            get_stream_loop_manager,
-        )
-        import time
-        import uuid
-
-        stream_id = chat_stream.stream_id
-        context = chat_stream.context
-        target_user_id, target_user_name = self._resolve_followup_target(chat_stream)
-
-        # 从聊天历史提取最近一次 bot 消息
-        history = list(getattr(chat_stream.context, "history_messages", []) or [])
-        last_bot_message = ""
-        for msg in reversed(history):
-            if str(getattr(msg, "sender_role", "") or "").lower() == "bot":
-                last_bot_message = str(getattr(msg, "content", "") or "")
-                break
-
-        elapsed_seconds = followup.delay_seconds
-
-        prompt = (
-            "[延迟续话机会] 这不是用户的新消息，而是一次由系统交给你的主动续话机会。"
-            "你必须先调用 action-record_inner_monologue，记录你此刻新的心理推进；"
-            "然后再二选一：如果你觉得刚才的话头还值得延续，就像平时一样使用当前对话器的动作自己回复；"
-            "如果觉得现在不该继续说，可以 pass_and_wait。"
-            f"\n- 当前执行者：{chat_stream.bot_nickname or '你'}"
-            f"\n- 距离你上一条显式消息已过去约 {elapsed_seconds:.0f} 秒"
-            f"\n- 你刚刚对对方说的是：{last_bot_message or '（上一条消息为空）'}"
-            f"\n- 你当时留下的未尽之意：{followup.thought or '（未填写）'}"
-            f"\n- 续话主题：{followup.topic}"
-            f"\n- 续话类型：{followup.followup_type}"
-            "\n- 重要：不要机械续话，不要为了说而说；如果不自然，就先停住。"
-        )
-
-        trigger_message = Message(
-            message_id=f"proactive_followup_{uuid.uuid4().hex[:12]}",
-            platform=chat_stream.platform or "unknown",
-            stream_id=stream_id,
-            sender_id=target_user_id or "system",
-            sender_name="系统（续话触发）",
-            sender_role="other",
-            content=prompt,
-            processed_plain_text=prompt,
-            time=time.time(),
-            target_user_id=target_user_id,
-            target_user_name=target_user_name,
-            is_proactive_followup_trigger=True,
-            proactive_followup_topic=followup.topic,
-            proactive_followup_type=followup.followup_type,
-        )
-        context.add_unread_message(trigger_message)
-        loop_mgr = get_stream_loop_manager()
-        removed = loop_mgr._wait_states.pop(stream_id, None)
-        if removed:
-            logger.debug(f"[{stream_id[:8]}] 已清除等待锁，准备让对话器处理续话机会")
-        logger.info(
-            f"[{stream_id[:8]}] 已注入续话机会触发消息：topic={followup.topic}, type={followup.followup_type}"
-        )
-
-    @staticmethod
-    def _resolve_followup_target(chat_stream: Any) -> tuple[str, str]:
-        """从当前流上下文推断续话对象。"""
-        bot_id = str(getattr(chat_stream, "bot_id", "") or "")
-        history = list(getattr(chat_stream.context, "history_messages", []) or [])
-        for msg in reversed(history):
-            sender_id = str(getattr(msg, "sender_id", "") or "")
-            sender_role = str(getattr(msg, "sender_role", "") or "").lower()
-            if sender_role == "bot":
-                continue
-            if bot_id and sender_id == bot_id:
-                continue
-            if sender_id:
-                return sender_id, str(getattr(msg, "sender_name", "") or "")
-        return "", ""
 
     async def enqueue_inner_dialogue(
         self,
@@ -5433,68 +5394,6 @@ class LifeEngineService(BaseService):
             )
         return self._narrative_store
 
-    async def _autonomy_next_scheduled_at(self, intent_id: str) -> str:
-        intent = await self._autonomy_store().get(intent_id)
-        if intent is None or intent.status != "scheduled":
-            return ""
-        return intent.scheduled_at
-
-    async def _record_life_moment(
-        self,
-        *,
-        kind: str,
-        summary: str,
-        operation: str,
-        reason: str = "",
-        source_event_id: str = "",
-        stream_id: str = "",
-    ) -> None:
-        """Append one turning point to the bound river authority."""
-        try:
-            await self.life_trace_store().record_moment(
-                kind=kind,
-                summary=summary,
-                operation=operation,
-                actor="life_engine",
-                reason=reason,
-                source_event_id=source_event_id,
-                stream_id=stream_id,
-            )
-        except Exception as exc:  # noqa: BLE001
-            if self._selectable_storage_enabled:
-                raise
-            logger.debug(f"长河留痕失败 kind={kind}: {exc}")
-
-    async def _resolve_autonomy_target_stream_id(
-        self,
-        *,
-        target_stream_id: str = "",
-        target_key: str = "",
-    ) -> str:
-        explicit = str(target_stream_id or "").strip()
-        if explicit:
-            return explicit
-        key = str(target_key or "").strip()
-        if not key:
-            return ""
-        try:
-            from ..core.send_targets import resolve_send_target_key
-
-            runtime_cfg = getattr(self._cfg(), "runtime_sync", None)
-            target = await resolve_send_target_key(
-                key,
-                current_stream_id="",
-                limit=int(getattr(runtime_cfg, "send_targets_limit", 8) or 8),
-                active_window_hours=float(
-                    getattr(runtime_cfg, "send_targets_window_hours", 24.0) or 24.0
-                ),
-            )
-            if target is not None:
-                return str(target.stream_id or "").strip()
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(f"解析自主意向 target_key 失败: {exc}")
-        return ""
-
     async def schedule_autonomy_intent(
         self,
         *,
@@ -5510,127 +5409,12 @@ class LifeEngineService(BaseService):
         max_occurrences: int | None = None,
         lease_minutes: int | None = None,
     ) -> dict[str, Any]:
-        """登记一个 life_engine 自主形成的延迟意向。"""
-        cfg = self._cfg()
-        autonomy_cfg = getattr(cfg, "autonomy", None)
-        if autonomy_cfg is not None and not bool(
-            getattr(autonomy_cfg, "enabled", True)
-        ):
-            raise RuntimeError("自主意向循环未启用")
+        """Reject legacy stream-bound intent mutation without touching evidence."""
 
-        resolved_stream_id = await self._resolve_autonomy_target_stream_id(
-            target_stream_id=target_stream_id,
-            target_key=target_key,
+        raise RuntimeError(
+            "LegacyAutonomyReadOnly: use InitiativeSeed and an explicit "
+            "audience/surface decision"
         )
-        intent = build_intent(
-            kind=kind,
-            motivation=motivation,
-            delay_minutes=int(delay_minutes or 0),
-            min_delay_minutes=int(getattr(autonomy_cfg, "min_delay_minutes", 1) or 1),
-            max_delay_minutes=int(
-                getattr(autonomy_cfg, "max_delay_minutes", 1440) or 1440
-            ),
-            target_hint=target_hint,
-            target_key=target_key,
-            target_stream_id=resolved_stream_id,
-            constraints=constraints or [],
-            repeat=repeat,
-            interval_minutes=interval_minutes,
-            max_occurrences=max_occurrences,
-            lease_minutes=lease_minutes,
-        )
-
-        async with self._get_lock():
-            store = self._autonomy_store()
-            try:
-                await register_autonomy_schedule(self.plugin, intent)
-            except RuntimeError as exc:
-                raise RuntimeError("调度器尚未启动，稍后再登记自主意向") from exc
-            await store.upsert(intent)
-            await store.append_event("formed", intent, detail="intent scheduled")
-
-        repeat_text = (
-            f"repeat=每隔{intent.interval_minutes}分钟 " if intent.repeat else ""
-        )
-        event_text = (
-            f"已登记自主意向：kind={intent.kind} delay={intent.delay_minutes}分钟 "
-            f"{repeat_text}motivation={intent.motivation}"
-        )
-        event = self._event_builder.build_autonomy_intent_event(
-            event_text,
-            content_type="autonomy_intent_scheduled",
-            stream_id=intent.target_stream_id,
-            sender_name="自主意向",
-        )
-        await self._queue_pending_event(event)
-        await self._record_life_moment(
-            kind="intent",
-            summary=f"形成意向（{intent.kind}）：{intent.motivation[:120]}",
-            operation="formed",
-            source_event_id=intent.intent_id,
-            stream_id=intent.target_stream_id,
-        )
-
-        logger.info(
-            "新意向: "
-            f"kind={intent.kind} delay={intent.delay_minutes}m "
-            f"repeat={intent.repeat} "
-            f"intent_id={intent.intent_id[:12]} "
-            f"stream={intent.target_stream_id or '-'}"
-        )
-        result: dict[str, Any] = {
-            "created": True,
-            "intent_id": intent.intent_id,
-            "kind": intent.kind,
-            "delay_minutes": intent.delay_minutes,
-            "repeat": intent.repeat,
-            "interval_minutes": intent.interval_minutes,
-            "max_occurrences": intent.max_occurrences,
-            "lease_until": intent.lease_until,
-            "scheduled_at": intent.scheduled_at,
-            "status": intent.status,
-            "target_stream_id": intent.target_stream_id,
-            "target_hint": intent.target_hint,
-            "schedule_id": intent.schedule_id,
-        }
-        if intent.kind == "speak" and not intent.target_stream_id:
-            # 降级必须有声：不能让她以为表达层会被唤醒而实际只是事件浮现
-            result["note"] = (
-                "未指定目标：到点后这个意向只会以事件形式浮现给心跳，不会唤醒表达层。"
-                "如果你想让它真正交给表达层，可以重新登记并填 target_key 或 target_stream_id。"
-            )
-            targets = await self._list_autonomy_send_targets()
-            if targets:
-                result["available_targets"] = targets
-        return result
-
-    async def _list_autonomy_send_targets(self) -> list[dict[str, str]]:
-        """列出近期可触达的发送目标，供意向登记时参考。"""
-        try:
-            from ..core.send_targets import list_recent_send_targets
-
-            runtime_cfg = getattr(self._cfg(), "runtime_sync", None)
-            targets = await list_recent_send_targets(
-                current_stream_id="",
-                limit=int(getattr(runtime_cfg, "send_targets_limit", 8) or 8),
-                active_window_hours=float(
-                    getattr(runtime_cfg, "send_targets_window_hours", 24.0) or 24.0
-                ),
-            )
-            return [
-                {
-                    "target_key": target.target_key,
-                    "name": target.display_name,
-                    "type": (
-                        f"{target.platform}"
-                        f"{'群聊' if target.chat_type == 'group' else '私聊'}"
-                    ),
-                }
-                for target in targets
-            ]
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(f"列出可发送目标失败: {exc}")
-            return []
 
     async def claim_autonomy_occurrences(
         self,
@@ -5639,48 +5423,15 @@ class LifeEngineService(BaseService):
         action_id: str,
         target_stream_id: str,
     ) -> dict[str, Any]:
-        """Atomically claim autonomous occurrences before an external action."""
+        """Reject legacy delivery claims; empty historical callbacks are no-ops."""
 
-        unique = {
-            (str(item.get("intent_id") or ""), str(item.get("occurrence_id") or ""))
-            for item in occurrences
-            if item.get("intent_id") and item.get("occurrence_id")
-        }
-        if not unique:
+        if not occurrences:
             return {"claimed": True, "count": 0}
-
-        async with self._get_lock():
-            store = self._autonomy_store()
-            loaded: list[AutonomyIntent] = []
-            for intent_id, occurrence_id in sorted(unique):
-                intent = await store.get(intent_id)
-                if intent is None:
-                    return {"claimed": False, "reason": f"intent_not_found:{intent_id}"}
-                if intent.status != "in_flight":
-                    return {"claimed": False, "reason": f"status={intent.status}"}
-                if intent.active_occurrence_id != occurrence_id:
-                    return {"claimed": False, "reason": "occurrence_mismatch"}
-                if intent.active_occurrence_status != "surfaced":
-                    return {
-                        "claimed": False,
-                        "reason": f"occurrence_status={intent.active_occurrence_status}",
-                    }
-                if str(intent.target_stream_id or "") != str(target_stream_id or ""):
-                    return {"claimed": False, "reason": "cross_stream_not_authorized"}
-                loaded.append(intent)
-
-            for intent in loaded:
-                intent.active_occurrence_status = "dispatching"
-                intent.active_action_id = str(action_id or "")
-                intent.updated_at = _now_iso()
-                await store.upsert(intent)
-                await store.append_event(
-                    "delivery_claimed",
-                    intent,
-                    occurrence_id=intent.active_occurrence_id,
-                    action_id=action_id,
-                )
-        return {"claimed": True, "count": len(loaded)}
+        return {
+            "claimed": False,
+            "count": 0,
+            "reason": "legacy_autonomy_read_only",
+        }
 
     async def complete_autonomy_occurrences(
         self,
@@ -5690,111 +5441,15 @@ class LifeEngineService(BaseService):
         action_id: str = "",
         detail: str = "",
     ) -> dict[str, Any]:
-        """Commit terminal occurrence receipts and only then chain recurrence."""
+        """Reject legacy receipts; empty historical callbacks are no-ops."""
 
-        unique = {
-            (str(item.get("intent_id") or ""), str(item.get("occurrence_id") or ""))
-            for item in occurrences
-            if item.get("intent_id") and item.get("occurrence_id")
-        }
-        if not unique:
+        if not occurrences:
             return {"completed": 0, "scheduled": 0}
-
-        safe_recurrence_outcomes = {
-            "sent",
-            "passed",
-            "reflected",
-            "silence",
-            "surfaced",
+        return {
+            "completed": 0,
+            "scheduled": 0,
+            "reason": "legacy_autonomy_read_only",
         }
-        to_schedule: list[str] = []
-        completed = 0
-        async with self._get_lock():
-            store = self._autonomy_store()
-            for intent_id, occurrence_id in sorted(unique):
-                intent = await store.get(intent_id)
-                if intent is None:
-                    continue
-                if (
-                    intent.last_occurrence_id == occurrence_id
-                    and intent.last_outcome == outcome
-                ):
-                    completed += 1
-                    continue
-                if intent.active_occurrence_id != occurrence_id:
-                    continue
-                if intent.status != "in_flight":
-                    continue
-
-                intent.last_occurrence_id = occurrence_id
-                intent.last_outcome = str(outcome or "unknown")
-                intent.active_occurrence_status = str(outcome or "unknown")
-                intent.active_action_id = str(action_id or intent.active_action_id)
-                intent.last_error = str(detail or "")[:240]
-                intent.updated_at = _now_iso()
-
-                lease_reason = recurring_lease_reason(intent)
-                if (
-                    intent.repeat
-                    and outcome in safe_recurrence_outcomes
-                    and not lease_reason
-                ):
-                    next_minutes = int(
-                        intent.interval_minutes or intent.delay_minutes or 1
-                    )
-                    intent.scheduled_at = (
-                        datetime.now(timezone.utc).astimezone()
-                        + timedelta(minutes=next_minutes)
-                    ).isoformat()
-                    intent.status = "scheduled"
-                    intent.renewal_reason = ""
-                    to_schedule.append(intent.intent_id)
-                elif intent.repeat:
-                    intent.status = "renewal_required"
-                    intent.renewal_reason = lease_reason or (
-                        "previous occurrence did not reach a retry-safe terminal state"
-                    )
-                else:
-                    intent.status = (
-                        "triggered" if outcome in safe_recurrence_outcomes else "failed"
-                    )
-
-                intent.active_occurrence_id = ""
-                intent.active_occurrence_status = ""
-                intent.active_occurrence_started_at = ""
-                await store.upsert(intent)
-                await store.append_event(
-                    f"occurrence_{outcome}",
-                    intent,
-                    occurrence_id=occurrence_id,
-                    action_id=action_id,
-                    detail=detail or intent.renewal_reason,
-                )
-                completed += 1
-
-        scheduled = 0
-        for intent_id in to_schedule:
-            store = self._autonomy_store()
-            intent = await store.get(intent_id)
-            if intent is None or intent.status != "scheduled":
-                continue
-            try:
-                await register_autonomy_schedule(self.plugin, intent)
-            except Exception as exc:  # noqa: BLE001
-                logger.error(
-                    "自主意向下一 occurrence 调度失败，状态已保留供恢复: "
-                    f"intent_id={intent.intent_id[:12]} error={exc}"
-                )
-                continue
-            async with self._get_lock():
-                current = await self._autonomy_store().get(intent.intent_id)
-                if current is None or current.status != "scheduled":
-                    continue
-                current.schedule_id = intent.schedule_id
-                current.updated_at = _now_iso()
-                await self._autonomy_store().upsert(current)
-            scheduled += 1
-        return {"completed": completed, "scheduled": scheduled}
 
     async def manage_autonomy_intent(
         self,
@@ -5804,370 +5459,100 @@ class LifeEngineService(BaseService):
         additional_occurrences: int = 0,
         lease_minutes: int = 0,
     ) -> dict[str, Any]:
-        """Expose explicit subject-owned pause/cancel/renew lifecycle choices."""
+        """Read the immutable legacy archive; reject every mutation."""
 
         normalized_action = str(action or "").strip().lower()
-        if normalized_action == "list":
-            intents = await self._autonomy_store().load()
-            return {
-                "intents": [
-                    {
-                        "intent_id": item.intent_id,
-                        "kind": item.kind,
-                        "motivation": item.motivation,
-                        "status": item.status,
-                        "repeat": item.repeat,
-                        "occurrence_count": item.occurrence_count,
-                        "max_occurrences": item.max_occurrences,
-                        "lease_until": item.lease_until,
-                        "scheduled_at": item.scheduled_at,
-                        "target_hint": item.target_hint,
-                        "renewal_reason": item.renewal_reason,
-                    }
-                    for item in intents
-                ]
-            }
-        if normalized_action not in {"pause", "cancel", "renew"}:
-            raise ValueError("action must be list / pause / cancel / renew")
-
-        target_id = str(intent_id or "").strip()
-        if not target_id:
-            raise ValueError("intent_id is required")
-
-        schedule_id = ""
-        should_schedule = False
-        async with self._get_lock():
-            store = self._autonomy_store()
-            intent = await store.get(target_id)
-            if intent is None:
-                raise ValueError("autonomy intent not found")
-            schedule_id = intent.schedule_id
-
-            if normalized_action in {"pause", "cancel"}:
-                active_occurrence_id = intent.active_occurrence_id
-                intent.status = (
-                    "paused" if normalized_action == "pause" else "cancelled"
-                )
-                intent.renewal_reason = ""
-                intent.schedule_id = ""
-                if active_occurrence_id:
-                    intent.last_occurrence_id = active_occurrence_id
-                    intent.last_outcome = normalized_action
-                intent.active_occurrence_id = ""
-                intent.active_occurrence_status = ""
-                intent.active_occurrence_started_at = ""
-                intent.active_action_id = ""
-                intent.updated_at = _now_iso()
-                await store.upsert(intent)
-                await store.append_event(
-                    normalized_action,
-                    intent,
-                    occurrence_id=active_occurrence_id,
-                )
-            else:
-                if not intent.repeat:
-                    raise ValueError("only recurring intents can be renewed")
-                if intent.status == "in_flight" or intent.active_occurrence_id:
-                    raise ValueError(
-                        "cannot renew while an occurrence is in flight; "
-                        "wait for its receipt or pause/cancel it first"
-                    )
-                was_scheduled = intent.status == "scheduled"
-                additional = int(additional_occurrences or 0)
-                lease = int(lease_minutes or 0)
-                if additional <= 0 and lease <= 0:
-                    raise ValueError(
-                        "renew requires additional_occurrences or lease_minutes"
-                    )
-                if additional < 0 or additional > 10_000:
-                    raise ValueError(
-                        "additional_occurrences must be between 1 and 10000"
-                    )
-                if lease < 0 or lease > 7 * 24 * 60:
-                    raise ValueError("lease_minutes must be between 1 and 10080")
-                if additional > 0:
-                    intent.max_occurrences = (
-                        max(intent.max_occurrences, intent.occurrence_count)
-                        + additional
-                    )
-                    if intent.max_occurrences > 10_000:
-                        raise ValueError("renewed max_occurrences cannot exceed 10000")
-                if lease > 0:
-                    intent.lease_until = (
-                        datetime.now(timezone.utc).astimezone()
-                        + timedelta(minutes=lease)
-                    ).isoformat()
-                intent.status = "scheduled"
-                intent.renewal_reason = ""
-                intent.active_occurrence_id = ""
-                intent.active_occurrence_status = ""
-                intent.active_occurrence_started_at = ""
-                intent.active_action_id = ""
-                if not was_scheduled:
-                    intent.scheduled_at = (
-                        datetime.now(timezone.utc).astimezone()
-                        + timedelta(
-                            minutes=int(
-                                intent.interval_minutes or intent.delay_minutes or 1
-                            )
-                        )
-                    ).isoformat()
-                    intent.schedule_id = ""
-                else:
-                    # The registered callback resolves the latest intent state
-                    # by ID, so an active schedule needs no destructive churn.
-                    schedule_id = ""
-                intent.updated_at = _now_iso()
-                await store.upsert(intent)
-                await store.append_event("renewed", intent)
-                should_schedule = not was_scheduled
-
-        if schedule_id:
-            try:
-                await get_unified_scheduler().remove_schedule(schedule_id)
-            except Exception as exc:  # noqa: BLE001
-                logger.debug(
-                    f"移除旧自主意向调度失败 intent_id={target_id[:12]}: {exc}"
-                )
-
-        if should_schedule:
-            intent = await self._autonomy_store().get(target_id)
-            if intent is None:
-                raise RuntimeError("renewed autonomy intent disappeared")
-            await register_autonomy_schedule(self.plugin, intent)
-            async with self._get_lock():
-                current = await self._autonomy_store().get(target_id)
-                if current is not None and current.status == "scheduled":
-                    current.schedule_id = intent.schedule_id
-                    current.updated_at = _now_iso()
-                    await self._autonomy_store().upsert(current)
-
-        current = await self._autonomy_store().get(target_id)
+        if normalized_action != "list":
+            raise RuntimeError(
+                "LegacyAutonomyReadOnly: legacy intent mutation is retired"
+            )
+        intents = await self._autonomy_store().load()
         return {
-            "intent_id": target_id,
-            "action": normalized_action,
-            "status": current.status if current is not None else "missing",
-            "scheduled_at": current.scheduled_at if current is not None else "",
-            "max_occurrences": current.max_occurrences if current is not None else 0,
-            "lease_until": current.lease_until if current is not None else "",
+            "intents": [
+                {
+                    "intent_id": item.intent_id,
+                    "kind": item.kind,
+                    "motivation": item.motivation,
+                    "status": item.status,
+                    "repeat": item.repeat,
+                    "occurrence_count": item.occurrence_count,
+                    "max_occurrences": item.max_occurrences,
+                    "lease_until": item.lease_until,
+                    "scheduled_at": item.scheduled_at,
+                    "target_hint": item.target_hint,
+                    "renewal_reason": item.renewal_reason,
+                }
+                for item in intents
+            ]
         }
 
     async def trigger_autonomy_intent(self, intent_id: str) -> dict[str, Any]:
-        """Surface one leased occurrence; never pre-schedule the next one."""
+        """Reject legacy scheduler callbacks without reading or mutating evidence."""
 
-        async with self._get_lock():
-            store = self._autonomy_store()
-            intent = await store.get(intent_id)
-            if intent is None:
-                logger.warning(f"到点意向不存在: intent_id={intent_id}")
-                return {"triggered": False, "reason": "not_found"}
-            if intent.status != "scheduled":
-                logger.debug(
-                    f"跳过非 scheduled 自主意向: intent_id={intent.intent_id[:12]} status={intent.status}"
-                )
-                return {"triggered": False, "reason": f"status={intent.status}"}
-
-            lease_reason = recurring_lease_reason(intent)
-            if lease_reason:
-                intent.status = "renewal_required"
-                intent.renewal_reason = lease_reason
-                intent.updated_at = _now_iso()
-                await store.upsert(intent)
-                await store.append_event(
-                    "renewal_required", intent, detail=lease_reason
-                )
-                return {"triggered": False, "reason": lease_reason}
-
-            intent.triggered_at = _now_iso()
-            intent.occurrence_count = max(0, int(intent.occurrence_count or 0)) + 1
-            intent.active_occurrence_id = occurrence_id_for(intent)
-            intent.active_occurrence_status = "surfaced"
-            intent.active_occurrence_started_at = intent.triggered_at
-            intent.active_action_id = ""
-            intent.retry_count = 0
-            intent.last_error = ""
-            intent.schedule_id = ""
-            intent.status = "in_flight"
-            intent.updated_at = intent.triggered_at
-            await store.upsert(intent)
-            await store.append_event(
-                "occurrence_surfaced",
-                intent,
-                occurrence_id=intent.active_occurrence_id,
-            )
-
-        occurrence_ref = [
-            {
-                "intent_id": intent.intent_id,
-                "occurrence_id": intent.active_occurrence_id,
-            }
-        ]
-        logger.info(
-            "到点: "
-            f"intent_id={intent.intent_id[:12]} kind={intent.kind} "
-            f"repeat={intent.repeat} occurrence={intent.occurrence_count} "
-            f"occurrence_id={intent.active_occurrence_id} "
-            f"stream={intent.target_stream_id or '-'}"
-        )
-
-        if intent.kind == "speak":
-            if not intent.target_stream_id:
-                event = self._event_builder.build_autonomy_intent_event(
-                    format_due_message(intent),
-                    content_type="autonomy_intent_due",
-                    sender_name="自主意向",
-                )
-                await self._queue_pending_event(event)
-                await self._record_life_moment(
-                    kind="intent",
-                    summary=f"意向到点无目标，浮现给心跳：{intent.motivation[:120]}",
-                    operation="surfaced",
-                    source_event_id=intent.active_occurrence_id,
-                )
-                await self.complete_autonomy_occurrences(
-                    occurrence_ref,
-                    outcome="surfaced",
-                )
-                logger.info(
-                    f"仲裁: downgraded intent_id={intent.intent_id[:12]} reason=no_target_stream"
-                )
-                return {
-                    "triggered": True,
-                    "dispatch": "life_event",
-                    "reason": "no_target_stream",
-                    "repeat": intent.repeat,
-                    "next_scheduled_at": await self._autonomy_next_scheduled_at(
-                        intent.intent_id
-                    ),
-                    "occurrence_id": intent.active_occurrence_id,
-                    "occurrence_count": intent.occurrence_count,
-                }
-            try:
-                await self._wake_stream_for_autonomy(intent)
-            except Exception as exc:
-                await self.complete_autonomy_occurrences(
-                    occurrence_ref,
-                    outcome="failed",
-                    detail=str(exc),
-                )
-                raise
-            await self._record_life_moment(
-                kind="intent",
-                summary=f"意向到点，交给表达层：{intent.motivation[:120]}",
-                operation="surfaced",
-                source_event_id=intent.active_occurrence_id,
-                stream_id=intent.target_stream_id,
-            )
-            logger.info(f"承接: life_chatter intent_id={intent.intent_id[:12]}")
-            return {
-                "triggered": True,
-                "dispatch": "life_chatter",
-                "stream_id": intent.target_stream_id,
-                "repeat": intent.repeat,
-                "next_scheduled_at": "",
-                "occurrence_id": intent.active_occurrence_id,
-                "occurrence_count": intent.occurrence_count,
-            }
-
-        if intent.kind == "reflect":
-            event = self._event_builder.build_autonomy_intent_event(
-                format_due_message(intent),
-                content_type="autonomy_intent_due",
-                sender_name="自主意向",
-            )
-            await self._queue_pending_event(event)
-            await self._record_life_moment(
-                kind="intent",
-                summary=f"意向到点，回到心跳继续思考：{intent.motivation[:120]}",
-                operation="reflected",
-                source_event_id=intent.active_occurrence_id,
-            )
-            await self.complete_autonomy_occurrences(
-                occurrence_ref,
-                outcome="reflected",
-            )
-            logger.info(f"承接: life_engine intent_id={intent.intent_id[:12]}")
-            return {
-                "triggered": True,
-                "dispatch": "life_engine",
-                "repeat": intent.repeat,
-                "next_scheduled_at": await self._autonomy_next_scheduled_at(
-                    intent.intent_id
-                ),
-                "occurrence_id": intent.active_occurrence_id,
-                "occurrence_count": intent.occurrence_count,
-            }
-
-        event = self._event_builder.build_autonomy_intent_event(
-            f"自主意向到点后选择沉默：{intent.motivation}",
-            content_type="autonomy_intent_silence",
-            sender_name="自主意向",
-        )
-        await self._queue_pending_event(event)
-        await self._record_life_moment(
-            kind="intent",
-            summary=f"意向到点，选择沉默：{intent.motivation[:120]}",
-            operation="silence",
-            source_event_id=intent.active_occurrence_id,
-        )
-        await self.complete_autonomy_occurrences(
-            occurrence_ref,
-            outcome="silence",
-        )
-        logger.info(f"承接: silence intent_id={intent.intent_id[:12]}")
         return {
-            "triggered": True,
-            "dispatch": "silence",
-            "repeat": intent.repeat,
-            "next_scheduled_at": await self._autonomy_next_scheduled_at(
-                intent.intent_id
-            ),
-            "occurrence_id": intent.active_occurrence_id,
-            "occurrence_count": intent.occurrence_count,
+            "triggered": False,
+            "reason": "legacy_autonomy_read_only",
+            "intent_id": str(intent_id or ""),
         }
 
-    async def _wake_stream_for_autonomy(self, intent: AutonomyIntent) -> None:
-        """把到点自主意向注入目标聊天流，交给 life_chatter 承接。"""
+    async def _wake_stream_for_initiative(
+        self,
+        *,
+        stream_id: str,
+        platform: str,
+        command: InitiativeOutreachCommand,
+    ) -> None:
+        """Wake one explicitly selected physical surface for fresh expression."""
+
+        import time
+
         from src.core.managers import get_stream_manager
         from src.core.transport.distribution.stream_loop_manager import (
             get_stream_loop_manager,
         )
-        import time
 
-        stream_id = str(intent.target_stream_id or "").strip()
+        exact_stream_id = str(stream_id or "").strip()
+        if not exact_stream_id:
+            raise RuntimeError("InitiativeSurfaceHasNoStream")
         chat_stream = await get_stream_manager().get_or_create_stream(
-            stream_id=stream_id
+            stream_id=exact_stream_id
         )
-        context = chat_stream.context
-        target_user_id, target_user_name = self._resolve_followup_target(chat_stream)
-        prompt = format_due_message(intent)
+        prompt = (
+            "主体刚刚明确选择发起一次外联。请在这个表面的真实上下文中重新判断"
+            "如何表达，或是否仍要保持沉默；不要把意向原文机械当成最终回复。\n"
+            f"对象引用：{command.audience_ref}\n"
+            f"主体公开意向：{command.public_intention}"
+        )
         trigger_message = Message(
             message_id=(
-                "autonomy_intent_"
-                f"{intent.intent_id[:16]}_{max(1, int(intent.occurrence_count or 0))}"
+                "initiative_outreach_"
+                + hashlib.sha256(command.occurrence_id.encode()).hexdigest()
             ),
-            platform=chat_stream.platform or "unknown",
-            stream_id=stream_id,
-            sender_id=target_user_id or "life_engine_autonomy",
-            sender_name="系统（自主意向浮现）",
+            platform=chat_stream.platform or platform or "unknown",
+            stream_id=exact_stream_id,
+            # This is an internal transport envelope, not a fabricated message
+            # from whichever human happened to speak most recently on the
+            # selected surface.
+            sender_id="life_engine_initiative",
+            sender_name="系统（主体主动外联）",
             sender_role="other",
             content=prompt,
             processed_plain_text=prompt,
             message_type=MessageType.TEXT,
             time=time.time(),
-            target_user_id=target_user_id,
-            target_user_name=target_user_name,
-            is_autonomy_intent_trigger=True,
-            autonomy_intent_id=intent.intent_id,
-            autonomy_intent_kind=intent.kind,
-            autonomy_occurrence_id=intent.active_occurrence_id,
-            autonomy_authorized_stream_id=stream_id,
+            is_initiative_outreach_trigger=True,
+            initiative_outreach_occurrence_id=command.occurrence_id,
+            initiative_audience_ref=command.audience_ref,
+            initiative_surface_ref=command.surface_ref,
+            initiative_seed_id=command.seed_id,
+            initiative_seed_revision=command.seed_revision,
         )
-        context.add_unread_message(trigger_message)
-        loop_mgr = get_stream_loop_manager()
-        removed = loop_mgr._wait_states.pop(stream_id, None)
+        chat_stream.context.add_unread_message(trigger_message)
+        removed = get_stream_loop_manager()._wait_states.pop(exact_stream_id, None)
         if removed:
-            logger.debug(f"[{stream_id[:8]}] 已清除等待锁，准备处理自主意向")
+            logger.debug(
+                f"[{exact_stream_id[:8]}] 已清除等待锁，准备承接主体主动外联"
+            )
 
     async def record_chatter_inner_monologue(
         self,
@@ -6414,6 +5799,29 @@ class LifeEngineService(BaseService):
             await self._publish_raw_events(events)
         if persist:
             await self._save_runtime_context(recoverable_on_shared_conflict=True)
+
+    async def get_recent_subconscious_context(
+        self,
+        *,
+        group_limit: int | None = None,
+        max_bytes: int | None = None,
+    ) -> RecentSubconsciousContext:
+        """Return the same bounded recent subconscious activity to any instance.
+
+        This is a pure read-only projection over committed LifeEngine history. It
+        does not drain pending events, move a heartbeat or consumer cursor, read a
+        private conversation payload, or create a new event. Callers may append the
+        returned text to their own transient prompt without sharing their rolling
+        context with another consciousness instance.
+        """
+
+        async with self._get_lock():
+            history = list(self._event_history)
+        return self._subconscious_context.project_recent(
+            history,
+            group_limit=group_limit,
+            max_bytes=max_bytes,
+        )
 
     async def _prepare_heartbeat_context(self) -> PreparedHeartbeatContext:
         """Drain pending events and prepare one fixed heartbeat snapshot."""
@@ -7441,19 +6849,6 @@ class LifeEngineService(BaseService):
             if runtime_cfg is not None
             else 3
         )
-        send_targets_enabled = bool(
-            runtime_cfg is None or getattr(runtime_cfg, "send_targets_enabled", True)
-        )
-        send_targets_limit = (
-            int(getattr(runtime_cfg, "send_targets_limit", 8) or 8)
-            if runtime_cfg is not None
-            else 8
-        )
-        send_targets_window_hours = (
-            float(getattr(runtime_cfg, "send_targets_window_hours", 24.0) or 24.0)
-            if runtime_cfg is not None
-            else 24.0
-        )
 
         async with self._get_lock():
             events = list(self._event_history)
@@ -7500,13 +6895,25 @@ class LifeEngineService(BaseService):
 
         sections: list[str] = []
 
+        recent_subconscious = await self.get_recent_subconscious_context()
+        if recent_subconscious.content:
+            sections.append(recent_subconscious.content)
+            selected_events = [
+                event
+                for event in selected_events
+                if event.event_id not in recent_subconscious.event_ids
+            ]
+
         instance_id = self.resolve_consciousness_instance(stream_id)
         world_perception = await self.prepare_perception(
             instance_id,
             projection_kind="life_chatter",
             max_bytes=LIFE_CHATTER_WORLD_MAX_BYTES,
         )
-        sections.append(f"### 潜意识协调的瞬时世界感知\n{world_perception.content}")
+        sections.append(
+            "### 当前环境感知（World，仅表示有来源的环境事实，"
+            f"不承担跨意识同步）\n{world_perception.content}"
+        )
 
         new_thought_revision = thought_cursor
         if sync_streams:
@@ -7574,17 +6981,6 @@ class LifeEngineService(BaseService):
             )
             if trace_recent_text:
                 sections.append(f"### 最近文件修改\n{trace_recent_text}")
-
-        if send_targets_enabled:
-            send_targets_text = format_send_targets_for_prompt(
-                await list_recent_send_targets(
-                    current_stream_id=stream_id,
-                    limit=send_targets_limit,
-                    active_window_hours=send_targets_window_hours,
-                )
-            )
-            if send_targets_text:
-                sections.append(f"### 可发送目标\n{send_targets_text}")
 
         if selected_events:
             event_text = self._build_wake_context_text(selected_events)
@@ -7860,9 +7256,9 @@ class LifeEngineService(BaseService):
             "1. **观察** — 读取最近事件，判断是否真的出现了新线索。",
             "2. **联想** — 回忆相关记忆，理解情绪、关系和上下文来源。",
             "3. **沉淀** — 把内在感受、梦后余韵、长期线索写入私有记忆或思考流。",
-            "4. **补充信息差** — 只在表达层当前看不到事实、背景、线索或风险时，使用 `nucleus_tell_dfc`。",
+            "4. **保留连续性** — 只有你明确愿意让未来的自己继续看见时，才保存 InitiativeSeed；共享事实仍由正式事件、世界与记忆投影承载。",
             "5. **安静结束** — 没有明确需要时，可以安静结束本轮；如果精力需要恢复，可以主动休息。",
-            "6. **尊重工具预算** — 心跳每轮最多 3 次工具调用：优先轻量动作（观察/沉淀/`nucleus_tell_dfc`/TODO），不要在心跳里做长查询（如翻完整对话历史、多轮检索）；需要完整上下文时交给表达层在聊天流里处理。",
+            "6. **尊重工具预算** — 心跳每轮最多 3 次工具调用：优先轻量动作（观察/沉淀/InitiativeSeed/TODO），不要在心跳里做长查询（如翻完整对话历史、多轮检索）；需要完整上下文时交给表达层在聊天流里处理。",
             "",
             "### `nucleus_manage_todo` — 承诺记录",
             "",
@@ -7874,44 +7270,20 @@ class LifeEngineService(BaseService):
             "",
             "当事件流里出现 `inner_dialogue` 时，那是主意识（表达层）刚刚沉下来的话——",
             "不是外部用户，也不是另一个人在问你。那是你自己心里的嘀咕。",
-            "认真对待它：可以联想、沉淀、补信息差；想通了若值得被场面感知，再用 `nucleus_tell_dfc` 浮回去。",
+            "认真对待它：可以联想、沉淀；若你明确希望未来继续拥有这个行动可能性，可保存 InitiativeSeed。",
             "想完也可以什么都不说——人类也常想完不说话。",
-            "浮回时用第一人称、同一主体的口吻，补事实/倾向/风险，不要命令表达层怎么说。",
+            "事实、世界状态和记忆通过正式共享投影到达其他意识实例；不要另选一个最近聊天流去注入提示。",
             "",
-            "### `nucleus_tell_dfc` — 给表达层补充信息差",
+            "### 主体主动性：意向、对象与表面分离",
             "",
-            "这个工具用于补充背景，不用于指导表达层怎么说、怎么做。",
-            "",
-            "你应该用它：",
-            "- 你发现了表达层当前未必看到的事实、背景、记忆线索、情绪来源或潜在风险",
-            "- 你补上一段信息后，表达层会更不容易误解对方或误判局势",
-            "- 你掌握了某条近期事件链，能解释对方现在为什么这样说/这样做",
-            "",
-            "你不该用它：",
-            "- 替表达层写回复、写台词、写步骤",
-            "- 告诉表达层“立刻去做什么”“不要怎么说”“应该怎么问”",
-            "- 你自己其实就想直接说一句：这种情况交给表达层在正常对话里处理",
-            "",
-            "可接受写法：`我刚看到 X 事实；这可能解释 Y；风险是 Z。`",
-            "不可接受写法：`你应该回复 X`、`你去安慰/追问 Y`、`按以下步骤说`。",
-            "默认目标是最近收到消息的聊天；如果你明确想去某个私聊或群聊，可以设置 `target_type=private/group`，并填写 `platform` 与 `target_user_id` 或 `target_group_id`。",
-            "如果你已经知道精确聊天流，可以直接填写 `stream_id`；不确定就不要填，让系统回退当前聊天。",
-            "工具会默认唤醒表达层；唤醒只是让新上下文被看见，不代表表达层必须开口。",
-            "",
-            "记住：`nucleus_tell_dfc` 是补信息差，不是遥控器。",
-            "",
-            "### `nucleus_schedule_autonomy_intent` — 登记延迟自主意向",
-            "",
-            "当你不是要立刻补信息差，而是自己形成了一个“过一会儿再让它浮上来”的意向时，用这个工具。",
-            "它不是规则触发器，也不是命令表达层；它只是给未来的你留下一个意向。",
-            "只填写 `delay_minutes`，不要填写绝对时间；系统会自动换算真实触发时间。",
-            "如果你想让同一个意向每隔一段时间自然浮现，可以设置 `repeat=true`；`interval_minutes` 留空时默认等于 `delay_minutes`。",
-            "周期意向也不是机械任务：每次到点都要重新判断是否承接、是否开口、是否保持沉默。",
-            "可用 kind：`speak`（到点交给 life_chatter 重新判断）、`reflect`（到点回到中枢继续想）、`silence`（到点记录选择沉默）。",
-            "`speak` 只能写动机、目标提示和约束；不要写最终回复话术，不要教表达层具体怎么说。",
-            "`speak` 的目标可以填「你可以触达的人和地方」里列出的 `target_key`，或精确 `target_stream_id`。",
-            "如果本轮心跳没有渲染「你可以触达的人和地方」列表（近 24 小时无消息会话），把 `target_key` 和 `target_stream_id` 留空就是正确选择——到点意向会浮现给你，由你重新判断是否开口。",
-            "保持沉默也是主体选择：如果你想确认自己不会打扰，可以登记 `kind=silence`。",
+            "`nucleus_manage_initiative_seed` 只保存你明确愿意让未来意识实例继续看见的第一人称意向。",
+            "它不是任务、隐藏推理、重要性评分或自动回复规则；后台候选不会替你创建线索。",
+            "`reencounter` 只代表你选择以后再次遇见一次，不会自动循环，也不会预写回复。",
+            "来源场景、相关对象、意向对象和最终发送表面是四件不同的事：Kook 中出现的材料不会把未来行动绑定到 Kook。",
+            "当你现在确实想发起一次外联时，先用 `nucleus_reachability` 读取已登记对象与物理表面，再用 `nucleus_begin_outreach` 明确选择完整 `audience_ref` 和 `surface_ref`。",
+            "可达列表按稳定技术标识排列，不按最近活跃、当前聊天或系统评分替你排序；同名账号不会被系统猜成同一个人。",
+            "`public_intention` 只写这次你选择做什么，不写最终话术；目标表达实例会结合真实上下文重新决定如何表达或保持沉默。",
+            "不查询、不保存、不行动都有效；基础设施不得把它们解释成冷淡、遗忘或低重要性。",
             "",
             "### `nucleus_skill` — 管理自己的做事方式",
             "",
@@ -8154,6 +7526,7 @@ class LifeEngineService(BaseService):
         from plugins.emoji.sender.collection_tools import EMOJI_COLLECTION_TOOLS
 
         from ..attention_threads.tools import ATTENTION_THREAD_TOOLS
+        from ..initiative.tools import INITIATIVE_TOOLS
         from ..learning.tools import LEARNING_TOOLS
         from ..memory.boundary_tools import MEMORY_BOUNDARY_TOOLS
         from ..memory.continuity_tools import CONTINUITY_REVIEW_TOOLS
@@ -8185,6 +7558,7 @@ class LifeEngineService(BaseService):
             + EVENT_GREP_TOOLS
             + LEARNING_TOOLS
             + ATTENTION_THREAD_TOOLS
+            + INITIATIVE_TOOLS
             + EMOJI_COLLECTION_TOOLS
         )
 
@@ -9531,15 +8905,24 @@ class LifeEngineService(BaseService):
 
         register_life_engine_service(self)
 
-        if getattr(getattr(cfg, "autonomy", None), "enabled", True):
-            try:
-                await restore_autonomy_intents(
-                    self.plugin,
-                    cfg.settings.workspace_path,
-                    store=self._autonomy_store(),
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"恢复自主意向失败: {exc}")
+        # Legacy AutonomyIntent snapshots remain readable evidence, but their
+        # stream-bound scheduler is intentionally not restored. Subject
+        # initiative now requires an explicit InitiativeSeed decision followed
+        # by a separate audience/surface decision at action time.
+        try:
+            legacy_scheduled = len(await self._autonomy_store().list_scheduled())
+            removed_schedules = await cleanup_autonomy_schedules(
+                self._cfg().settings.workspace_path,
+                store=self._autonomy_store(),
+            )
+        except Exception:  # noqa: BLE001 - diagnostic only, never mutates evidence
+            legacy_scheduled = -1
+            removed_schedules = -1
+        logger.info(
+            "旧 AutonomyIntent 已进入只读退役态: "
+            f"scheduled_count={legacy_scheduled} restored=0 "
+            f"technical_schedules_removed={removed_schedules}"
+        )
 
         shared_sync_cfg = getattr(cfg, "shared_sync", None)
         if bool(getattr(shared_sync_cfg, "enabled", False)):
@@ -9658,6 +9041,14 @@ class LifeEngineService(BaseService):
                 daemon=True,
             )
             self._learning_maintenance_task_id = learning_task.task_id
+
+        if self._initiative_authority is not None:
+            initiative_task = get_task_manager().create_task(
+                self._initiative_reencounter_loop(),
+                name="life_engine_initiative_reencounter",
+                daemon=True,
+            )
+            self._initiative_reencounter_task_id = initiative_task.task_id
 
         task = get_task_manager().create_task(
             self._heartbeat_loop(),
@@ -9802,6 +9193,11 @@ class LifeEngineService(BaseService):
         self._memory_index_task_id = None
         await self._await_managed_task(self._heartbeat_task_id, timeout=5.0)
         self._heartbeat_task_id = None
+        await self._await_managed_task(
+            self._initiative_reencounter_task_id,
+            timeout=5.0,
+        )
+        self._initiative_reencounter_task_id = None
         await self._await_managed_task(
             self._learning_maintenance_task_id,
             timeout=10.0,

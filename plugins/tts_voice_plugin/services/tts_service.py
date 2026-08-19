@@ -1,7 +1,7 @@
-"""TTS 核心服务。
+"""本地消息 TTS 核心服务。
 
-封装本地语音合成的核心逻辑，包括风格管理、文本清洗、API 调用和空间音效处理。
-引擎后端可替换（当前默认对接 GPT-SoVITS API 协议）。
+封装风格管理、文本清洗、兼容 HTTP API 调用和空间音效处理。当前部署由
+IndexTTS2 的兼容层提供 ``/tts``；历史 GPT-SoVITS 部署仍可复用同一协议。
 """
 
 from __future__ import annotations
@@ -34,8 +34,8 @@ class TTSService(BaseService):
     """本地 TTS 核心服务。"""
 
     service_name: str = "tts"
-    service_description: str = "本地语音合成服务"
-    version: str = "3.1.2"
+    service_description: str = "本地消息语音合成服务（当前部署 IndexTTS2）"
+    version: str = "3.2.0"
 
     def __init__(self, plugin: "BasePlugin") -> None:
         """初始化 TTS 服务。
@@ -48,6 +48,7 @@ class TTSService(BaseService):
         self.timeout: int = 60
         self.max_text_length: int = 500
         self._server_process: asyncio.subprocess.Process | None = None
+        self._server_start_lock = asyncio.Lock()
         self._load_config()
 
     # ------------------------------------------------------------------
@@ -130,8 +131,8 @@ class TTSService(BaseService):
     # 参考音频校验
     # ------------------------------------------------------------------
 
-    # GPT-SoVITS 在 _set_prompt_semantic 中按 16kHz 采样点数硬校验主参考音频：
-    # 48000 点（3s）~ 160000 点（10s），超界直接抛 OSError 并返回 400。
+    # 历史 GPT-SoVITS 后端曾要求 3~10 秒；当前 IndexTTS2 兼容层没有这个硬限制。
+    # 常量只用于给历史部署提供可观测提示，不再在通用客户端提前拒绝请求。
     MAIN_REF_MIN_SECONDS: float = 3.0
     MAIN_REF_MAX_SECONDS: float = 10.0
 
@@ -148,13 +149,13 @@ class TTSService(BaseService):
             return None
 
     def _validate_main_ref_duration(self, ref_wav_path: str) -> bool:
-        """校验主参考音频是否落在 GPT-SoVITS 允许的时长区间内。
+        """校验主参考音频存在，并观察历史协议的时长兼容性。
 
         Args:
             ref_wav_path: 主参考音频路径
 
         Returns:
-            校验是否通过。无法解析时长时放行，交由服务端判定。
+            文件存在时返回 True；具体时长能力由当前本地后端判定。
         """
         if not os.path.isfile(ref_wav_path):
             logger.error(f"主参考音频不存在: {ref_wav_path}")
@@ -165,13 +166,10 @@ class TTSService(BaseService):
             return True
 
         if not (self.MAIN_REF_MIN_SECONDS <= duration <= self.MAIN_REF_MAX_SECONDS):
-            logger.error(
-                f"主参考音频时长 {duration:.2f}s 超出 GPT-SoVITS 允许的 "
-                f"{self.MAIN_REF_MIN_SECONDS:.0f}~{self.MAIN_REF_MAX_SECONDS:.0f}s 区间: {ref_wav_path}。"
-                "请改用符合区间的音频作为 refer_wav_path，"
-                "长音频可放入 aux_refer_wav_paths 参与音色融合。"
+            logger.info(
+                "主参考音频不在历史 GPT-SoVITS 3~10 秒兼容区间内；"
+                f"交由当前本地后端判定: duration={duration:.2f}s"
             )
-            return False
 
         return True
 
@@ -467,6 +465,16 @@ class TTSService(BaseService):
         if await self._is_server_alive(base_url):
             return True
 
+        async with self._server_start_lock:
+            # Another synthesis request may have started the shared backend
+            # while this request was waiting for the single-flight lock.
+            if await self._is_server_alive(base_url):
+                return True
+            return await self._start_server(base_url)
+
+    async def _start_server(self, base_url: str) -> bool:
+        """Start one configured backend after the single-flight recheck."""
+
         cfg = self._config.tts
         if not cfg.auto_start:
             logger.error(f"TTS 服务 {base_url} 未运行，且 auto_start 已禁用。")
@@ -549,11 +557,10 @@ class TTSService(BaseService):
         """
         ref_wav_path = kwargs.get("refer_wav_path")
         if not ref_wav_path:
-            logger.error(f"API 调用失败：缺少 refer_wav_path。当前风格配置: {server_config}")
+            logger.error("TTS API 调用失败：当前风格缺少 refer_wav_path")
             return None
 
-        # GPT-SoVITS 只允许主参考音频落在 3~10 秒区间，超界会直接返回 400。
-        # 提前自检，把问题定位在配置上，而不是等服务端抛异常。
+        # 通用客户端只验证文件存在；IndexTTS2 与历史兼容后端各自判定时长能力。
         if not self._validate_main_ref_duration(ref_wav_path):
             return None
 
@@ -612,7 +619,11 @@ class TTSService(BaseService):
 
             # 步骤三：发送合成请求
             tts_url = base_url if base_url.endswith("/tts") else f"{base_url}/tts"
-            logger.info(f"发送到 TTS API 的数据: {data}")
+            logger.info(
+                "发送本地 TTS 请求: "
+                f"chars={len(text)}, language={text_language}, "
+                f"aux_refs={len(aux_ref_paths)}, media_type={data.get('media_type', 'wav')}"
+            )
 
             connector = aiohttp.TCPConnector(limit=100)
             timeout = aiohttp.ClientTimeout(total=self.timeout)
@@ -757,7 +768,8 @@ class TTSService(BaseService):
             logger.info(f"决策模型未指定语言，使用策略 '{language_policy}' -> 最终语言: {final_language}")
 
         logger.info(
-            f"开始TTS语音合成，文本：{clean_text[:50]}..., 风格：{style}, 最终语言: {final_language}"
+            "开始本地 TTS 语音合成: "
+            f"chars={len(clean_text)}, style={style}, language={final_language}"
         )
 
         audio_data = await self._call_tts_api(

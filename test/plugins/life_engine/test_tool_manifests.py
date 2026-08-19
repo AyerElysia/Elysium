@@ -6,10 +6,14 @@
 报"未知的工具"（tool-nucleus_grep_file / tool-nucleus_bash）。
 本契约：文案中出现的核心工具必须存在于 chat manifest。
 """
+
+import json
+from pathlib import Path
+
 import pytest
 
 from plugins.life_engine.service.tool_manifests import get_tool_manifest
-
+from plugins.life_engine.tools import ALL_TOOLS
 
 # 与 chatter.py `_build_primary_tool_guide` 核心工具文案对齐（注册名 = schema 名）
 _CHAT_GUIDE_TOOLS = {
@@ -20,6 +24,9 @@ _CHAT_GUIDE_TOOLS = {
     "tool-inspect_media",  # 把图片/视频/语音提升为原生多模态输入
     "action-life_send_text",  # 发送文字给用户
     "action-life_pass_and_wait",  # 结束本轮
+    "tool-nucleus_manage_initiative_seed",
+    "tool-nucleus_reachability",
+    "tool-nucleus_begin_outreach",
 }
 
 
@@ -51,3 +58,26 @@ def test_manifest_kind_declared(kind: str) -> None:
     manifest = get_tool_manifest(kind)
     assert isinstance(manifest, list)
     assert all(name.startswith(("tool-", "action-")) for name in manifest)
+
+
+@pytest.mark.parametrize("kind", ["chat", "minecraft", "livestream", "voice_live"])
+def test_consciousness_instances_share_subject_initiative_tools(kind: str) -> None:
+    manifest = set(get_tool_manifest(kind))
+    assert {
+        "tool-nucleus_manage_initiative_seed",
+        "tool-nucleus_reachability",
+        "tool-nucleus_begin_outreach",
+    } <= manifest
+    assert "tool-nucleus_schedule_autonomy_intent" not in manifest
+
+
+def test_stream_bound_wake_and_followup_are_not_registered() -> None:
+    assert "nucleus_tell_dfc" not in {tool.tool_name for tool in ALL_TOOLS}
+    manifest_path = Path("plugins/life_engine/manifest.json")
+    component_names = {
+        str(item.get("component_name") or "")
+        for item in json.loads(manifest_path.read_text(encoding="utf-8"))["include"]
+    }
+    assert "nucleus_tell_dfc" not in component_names
+    assert "schedule_followup_message" not in component_names
+    assert "nucleus_manage_autonomy_intent" not in component_names

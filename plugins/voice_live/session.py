@@ -9,7 +9,6 @@ import json
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
 from typing import Any
 
 from src.kernel.logger import get_logger
@@ -31,7 +30,6 @@ from .providers.base import (
     BaseRealtimeProvider,
     InterruptionEvent,
     ProviderMetrics,
-    RealtimeContextDeliveryReceipt,
     ToolCallEvent,
     TranscriptEvent,
 )
@@ -47,14 +45,6 @@ from .voice_conversion import (
 logger = get_logger("voice_live.session", display="Voice Call")
 ProviderFactory = Callable[[VoiceLiveConfig], BaseRealtimeProvider]
 VoiceConverterFactory = Callable[[VoiceLiveConfig], VoiceConverter | None]
-
-
-@dataclass(slots=True, frozen=True)
-class _PendingVoicePerception:
-    prepared: Any
-    prefix_utf8_bytes: int
-    prefix_sha256: str
-    provider_receipt: RealtimeContextDeliveryReceipt | None
 
 
 class CallSession:
@@ -111,10 +101,12 @@ class CallSession:
         self._interruptions = 0
         self._created_monotonic = time.monotonic()
         self._failure_reason = ""
-        self._perception_refresh_lock = asyncio.Lock()
-        self._pending_voice_perception: _PendingVoicePerception | None = None
+        self._dynamic_context_refresh_lock = asyncio.Lock()
+        self._dynamic_context_frontier = 0
+        self._dynamic_context_delivered_frontier: int | None = None
+        self._last_unverified_dynamic_context_signature = ""
+        self._dynamic_context_refresh_task: asyncio.Task[None] | None = None
         self._provider_starting = False
-        self._unverified_perception_signature: tuple[str, str] | None = None
         self._state_report_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=1)
         self._state_report_task: asyncio.Task[None] | None = None
         self._state_reports_enabled = False
@@ -296,13 +288,13 @@ class CallSession:
                     "context_layers": context_layers,
                 },
             )
-            perception_task: asyncio.Task[tuple[str, Any | None]] | None = None
+            dynamic_context_task: asyncio.Task[tuple[str, Any | None]] | None = None
             if self._config.session.cross_scene_awareness:
                 builder = getattr(self._bridge, "build_llm_context_prefix", None)
                 if callable(builder):
-                    perception_task = asyncio.create_task(
+                    dynamic_context_task = asyncio.create_task(
                         builder(),
-                        name=f"voice-perception-prepare-{self.session_id}",
+                        name=f"voice-subconscious-prepare-{self.session_id}",
                     )
             self._provider_starting = True
             try:
@@ -333,13 +325,21 @@ class CallSession:
                         }
                     )
                 except BaseException:
-                    if perception_task is not None and not perception_task.done():
-                        perception_task.cancel()
-                    if perception_task is not None:
-                        await asyncio.gather(perception_task, return_exceptions=True)
+                    if (
+                        dynamic_context_task is not None
+                        and not dynamic_context_task.done()
+                    ):
+                        dynamic_context_task.cancel()
+                    if dynamic_context_task is not None:
+                        await asyncio.gather(
+                            dynamic_context_task,
+                            return_exceptions=True,
+                        )
                     raise
-                if perception_task is not None:
-                    await self._deliver_voice_perception(*(await perception_task))
+                if dynamic_context_task is not None:
+                    await self._deliver_dynamic_context(
+                        *(await dynamic_context_task)
+                    )
             finally:
                 self._provider_starting = False
         except Exception as exc:
@@ -356,6 +356,7 @@ class CallSession:
                 except Exception as cleanup_exc:  # noqa: BLE001
                     logger.debug(f"Provider startup cleanup failed: {cleanup_exc}")
             await self._stop_state_reports()
+            await self._stop_dynamic_context_refresh()
             await self._stop_voice_conversion()
             await self._stop_audio_archive(reason="startup_failed")
             if self._consciousness.is_active:
@@ -402,6 +403,7 @@ class CallSession:
         self._state = SessionState.STOPPING
         errors: list[Exception] = []
         await self._stop_state_reports()
+        await self._stop_dynamic_context_refresh()
         provider = self._provider
         self._provider = None
         if provider is not None:
@@ -543,7 +545,7 @@ class CallSession:
         if state is ProviderState.LISTENING:
             await self._queue_conversion_control("flush")
             if not self._provider_starting:
-                await self._refresh_voice_perception()
+                self._schedule_dynamic_context_refresh()
         await self._send_json_safe({"type": "state", "state": state.value})
         await self._store.append_async("provider.state", {"state": state.value})
         if self._consciousness.is_active:
@@ -603,8 +605,8 @@ class CallSession:
             except asyncio.QueueEmpty:
                 break
 
-    async def _refresh_voice_perception(self) -> None:
-        """Deliver current world context once per provider listening frontier."""
+    async def _refresh_dynamic_context(self) -> None:
+        """Refresh the read-only subconscious prefix for the current frontier."""
 
         if not self._config.session.cross_scene_awareness:
             return
@@ -612,122 +614,166 @@ class CallSession:
         builder = getattr(self._bridge, "build_llm_context_prefix", None)
         if provider is None or not callable(builder):
             return
-        prefix, prepared = await builder()
-        await self._deliver_voice_perception(prefix, prepared)
+        try:
+            async with self._dynamic_context_refresh_lock:
+                if (
+                    self._dynamic_context_delivered_frontier
+                    == self._dynamic_context_frontier
+                ):
+                    return
+                prefix, projection = await builder()
+                await self._deliver_dynamic_context_locked(prefix, projection)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - transient provider boundary
+            await self._store.append_async(
+                "subconscious_context.refresh_failed",
+                {
+                    "provider": self.provider_name,
+                    "frontier": self._dynamic_context_frontier,
+                    "error_type": type(exc).__name__,
+                },
+            )
+            logger.warning(
+                "Voice recent subconscious context refresh failed: %s",
+                type(exc).__name__,
+            )
 
-    async def _deliver_voice_perception(
+    def _schedule_dynamic_context_refresh(self) -> None:
+        """Refresh outside provider callbacks so receipt events can be consumed."""
+
+        if self._state in {
+            SessionState.STOPPING,
+            SessionState.ENDED,
+            SessionState.FAILED,
+        }:
+            return
+        task = self._dynamic_context_refresh_task
+        if task is not None and not task.done():
+            return
+        self._dynamic_context_refresh_task = asyncio.create_task(
+            self._refresh_dynamic_context(),
+            name=f"voice-subconscious-refresh-{self.session_id}",
+        )
+
+    async def _stop_dynamic_context_refresh(self) -> None:
+        """Cancel the session-owned refresh task during failure or shutdown."""
+
+        task = self._dynamic_context_refresh_task
+        self._dynamic_context_refresh_task = None
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # noqa: BLE001 - task cleanup boundary
+            logger.debug(
+                "Voice subconscious refresh cleanup observed: %s",
+                type(exc).__name__,
+            )
+
+    async def _deliver_dynamic_context(
         self,
         prefix: str,
-        prepared: Any | None,
+        projection: Any | None,
     ) -> None:
-        """Inject one already prepared projection and retain its exact receipt."""
+        """Strictly deliver one startup projection before exposing readiness."""
 
-        if not prefix or prepared is None:
+        async with self._dynamic_context_refresh_lock:
+            await self._deliver_dynamic_context_locked(prefix, projection)
+
+    async def _deliver_dynamic_context_locked(
+        self,
+        prefix: str,
+        projection: Any | None,
+    ) -> None:
+        """Inject one projection without mutating any Life Engine cursor."""
+
+        if not prefix or projection is None:
             return
-        async with self._perception_refresh_lock:
-            if self._pending_voice_perception is not None:
-                return
-            signature = (
-                str(getattr(prepared, "delivery_id", "") or ""),
-                str(getattr(prepared, "projection_sha256", "") or ""),
+        if self._dynamic_context_delivered_frontier == self._dynamic_context_frontier:
+            return
+        provider = self._provider
+        if provider is None:
+            return
+
+        provider_receipt = await provider.inject_context(prefix)
+        prefix_encoded = prefix.encode("utf-8")
+        prefix_bytes = len(prefix_encoded)
+        prefix_sha256 = hashlib.sha256(prefix_encoded).hexdigest()
+        projection_sha256 = str(
+            getattr(projection, "projection_sha256", "") or ""
+        )
+        exact = bool(
+            provider_receipt is not None
+            and provider_receipt.exact
+            and provider_receipt.expected_utf8_bytes == prefix_bytes
+            and provider_receipt.accepted_utf8_bytes == prefix_bytes
+            and provider_receipt.expected_sha256 == prefix_sha256
+            and provider_receipt.accepted_sha256 == prefix_sha256
+        )
+        self._dynamic_context_delivered_frontier = self._dynamic_context_frontier
+
+        stats_builder = getattr(
+            self._bridge,
+            "dynamic_context_projection_stats",
+            None,
+        )
+        if callable(stats_builder):
+            stats = stats_builder()
+            if stats:
+                await self._store.append_async(
+                    "subconscious_context.projected",
+                    {**stats, "frontier": self._dynamic_context_frontier},
+                )
+
+        audit = {
+            "provider": self.provider_name,
+            "frontier": self._dynamic_context_frontier,
+            "projection_sha256": projection_sha256,
+            "source_delivered_bytes": int(
+                getattr(projection, "delivered_bytes", 0) or 0
+            ),
+            "transport_bytes": prefix_bytes,
+            "through_sequence": int(
+                getattr(projection, "through_sequence", 0) or 0
+            ),
+        }
+        if exact:
+            self._last_unverified_dynamic_context_signature = ""
+            await self._store.append_async(
+                "subconscious_context.delivered",
+                {
+                    **audit,
+                    "transport_event_count": len(
+                        provider_receipt.transport_event_ids
+                    ),
+                },
             )
-            if signature == self._unverified_perception_signature:
-                return
-            provider = self._provider
-            if provider is None:
-                return
-            provider_receipt = await provider.inject_context(prefix)
-            prefix_encoded = prefix.encode("utf-8")
-            self._pending_voice_perception = _PendingVoicePerception(
-                prepared=prepared,
-                prefix_utf8_bytes=len(prefix_encoded),
-                prefix_sha256=hashlib.sha256(prefix_encoded).hexdigest(),
-                provider_receipt=provider_receipt,
+            return
+
+        await self._store.append_async(
+            "subconscious_context.delivery_unverified",
+            {
+                **audit,
+                "reason": "provider_exact_context_receipt_absent",
+            },
+        )
+        if projection_sha256 != self._last_unverified_dynamic_context_signature:
+            logger.warning(
+                "Voice recent subconscious context was not proven exactly accepted"
             )
-            stats_builder = getattr(
-                self._bridge,
-                "perception_projection_stats",
-                None,
-            )
-            if callable(stats_builder):
-                stats = stats_builder()
-                if stats:
-                    await self._store.append_async(
-                        "perception.projected",
-                        stats,
-                    )
+        self._last_unverified_dynamic_context_signature = projection_sha256
 
     async def _on_response_done(self, success: bool) -> None:
-        """Commit only after exact upstream storage and a successful model turn."""
+        """Open the next turn frontier after transient context has expired."""
 
-        async with self._perception_refresh_lock:
-            pending = self._pending_voice_perception
-            self._pending_voice_perception = None
-            if success and pending is not None:
-                provider_receipt = pending.provider_receipt
-                exact = bool(
-                    provider_receipt is not None
-                    and provider_receipt.exact
-                    and provider_receipt.expected_utf8_bytes
-                    == pending.prefix_utf8_bytes
-                    and provider_receipt.accepted_utf8_bytes
-                    == pending.prefix_utf8_bytes
-                    and provider_receipt.expected_sha256 == pending.prefix_sha256
-                    and provider_receipt.accepted_sha256 == pending.prefix_sha256
-                )
-                if not exact:
-                    self._unverified_perception_signature = (
-                        str(getattr(pending.prepared, "delivery_id", "") or ""),
-                        str(
-                            getattr(pending.prepared, "projection_sha256", "") or ""
-                        ),
-                    )
-                    await self._store.append_async(
-                        "perception.delivery_unverified",
-                        {
-                            "reason": "provider_exact_context_receipt_absent",
-                            "provider": self.provider_name,
-                            "prepared_delivery_id": str(
-                                getattr(pending.prepared, "delivery_id", "") or ""
-                            ),
-                        },
-                    )
-                    logger.warning(
-                        "Voice World perception remained pending because the "
-                        "provider did not prove exact context acceptance"
-                    )
-                else:
-                    self._unverified_perception_signature = None
-                    commit = getattr(
-                        self._consciousness,
-                        "commit_perception",
-                        None,
-                    )
-                    if not callable(commit):
-                        raise RuntimeError(
-                            "voice consciousness cannot acknowledge world perception"
-                        )
-                    from plugins.life_engine.service.perception_gateway import (
-                        PerceptionDeliveryReceipt,
-                    )
-
-                    await commit(
-                        pending.prepared,
-                        PerceptionDeliveryReceipt(
-                            delivery_id=str(pending.prepared.delivery_id),
-                            projection_sha256=str(
-                                pending.prepared.projection_sha256
-                            ),
-                            delivered_bytes=int(
-                                pending.prepared.delivered_bytes
-                            ),
-                            exact=True,
-                            transport_request_id=",".join(
-                                provider_receipt.transport_event_ids
-                            ),
-                        ),
-                    )
-        await self._refresh_voice_perception()
+        del success
+        self._dynamic_context_frontier += 1
+        self._schedule_dynamic_context_refresh()
 
     async def _on_transcript(self, event: TranscriptEvent) -> None:
         await self._send_json_safe(

@@ -80,29 +80,41 @@ def _subject_snapshot(
     }
 
 
+def _subconscious_projection(
+    content: str = "【潜意识近期上下文】\n最近想到要继续理解这件事",
+) -> SimpleNamespace:
+    encoded = content.encode("utf-8")
+    return SimpleNamespace(
+        content=content,
+        event_ids=("heartbeat-41",),
+        from_sequence=41,
+        through_sequence=41,
+        group_count=1,
+        source_group_count=1,
+        omitted_group_count=0,
+        delivered_bytes=len(encoded),
+        projection_sha256=hashlib.sha256(encoded).hexdigest(),
+        algorithm_version="subconscious-recent-causal-groups-v1",
+        truncated=False,
+    )
+
+
 class FakeConsciousness:
     instance_id = "voice_live_episode"
     stream_id = "voice_live_episode"
 
-    def __init__(self) -> None:
-        self.perception_calls: list[dict[str, Any]] = []
-
-    async def prepare_perception(self, **kwargs: Any) -> Any:
-        self.perception_calls.append(dict(kwargs))
-        content = 'world-perception:voice-test\n{"scene":"voice"}'
-        encoded = content.encode("utf-8")
-        return SimpleNamespace(
-            content=content,
-            delivered_bytes=len(encoded),
-            projection_sha256=hashlib.sha256(encoded).hexdigest(),
-        )
-
 
 class FakeLifeService:
-    def __init__(self, snapshot: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        snapshot: dict[str, Any] | None = None,
+        subconscious: SimpleNamespace | None = None,
+    ) -> None:
         self.messages: list[tuple[Any, str]] = []
         self.snapshot = snapshot
+        self.subconscious = subconscious or _subconscious_projection()
         self.projection_calls: list[dict[str, Any]] = []
+        self.subconscious_calls: list[dict[str, Any]] = []
 
     async def get_subject_context_projection_snapshot(
         self, **kwargs: Any
@@ -112,12 +124,16 @@ class FakeLifeService:
             raise RuntimeError("subject projection unavailable")
         return self.snapshot
 
+    async def get_recent_subconscious_context(self, **kwargs: Any) -> Any:
+        self.subconscious_calls.append(dict(kwargs))
+        return self.subconscious
+
     async def record_message(self, message: Any, *, direction: str) -> None:
         self.messages.append((message, direction))
 
 
 @pytest.mark.asyncio
-async def test_context_bridge_separates_stable_identity_and_transient_world(
+async def test_context_bridge_separates_identity_and_recent_subconscious_context(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = VoiceLiveConfig()
@@ -150,7 +166,7 @@ async def test_context_bridge_separates_stable_identity_and_transient_world(
         )
     )
     assert "完整背景" not in prompt
-    assert "scene" not in prompt
+    assert "最近想到要继续理解这件事" not in prompt
     bound = [
         record for record in store.read_all() if record.event == "subject_context.bound"
     ][-1]
@@ -160,13 +176,18 @@ async def test_context_bridge_separates_stable_identity_and_transient_world(
         "USER.md",
         "MEMORY.md",
     ]
-    transient, prepared = await bridge.build_llm_context_prefix()
-    assert "scene" in transient
-    assert prepared is not None
-    assert consciousness.perception_calls[-1]["projection_kind"] == "voice_live"
-    assert consciousness.perception_calls[-1]["max_bytes"] < (
+    transient, projection = await bridge.build_llm_context_prefix()
+    assert "recent_subconscious_context" in transient
+    assert "最近想到要继续理解这件事" in transient
+    assert "transient_world_perception" not in transient
+    assert projection is service.subconscious
+    assert service.subconscious_calls[-1]["max_bytes"] < (
         config.session.perception_context_max_bytes
     )
+    stats = bridge.dynamic_context_projection_stats()
+    assert stats["projection_kind"] == "recent_subconscious_context"
+    assert stats["through_sequence"] == 41
+    assert stats["event_count"] == 1
 
     await bridge.record_transcript("user", "你好", provider_event_id="u1")
     await bridge.record_transcript("assistant", "你好呀", provider_event_id="a1")
@@ -178,7 +199,70 @@ async def test_context_bridge_separates_stable_identity_and_transient_world(
         await bridge.record_transcript("system", "invalid")
 
 
-def test_realtime_perception_projection_is_bounded_and_traceable() -> None:
+@pytest.mark.asyncio
+async def test_context_bridge_rejects_changed_subconscious_projection_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = VoiceLiveConfig()
+    projection = _subconscious_projection()
+    projection.projection_sha256 = "0" * 64
+    service = FakeLifeService(
+        _subject_snapshot(max_bytes=config.session.subject_context_max_bytes),
+        projection,
+    )
+    monkeypatch.setattr(
+        "plugins.voice_live.context_bridge.get_running_life_service",
+        lambda: service,
+    )
+    bridge = ContextBridge(
+        config,
+        FakeConsciousness(),
+        VoiceEpisodeStore(tmp_path, "voice_invalid_recent", "episode"),
+    )
+
+    with pytest.raises(RuntimeError, match="哈希身份"):
+        await bridge.build_llm_context_prefix()
+
+
+@pytest.mark.asyncio
+async def test_context_bridge_accepts_empty_recent_subconscious_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = VoiceLiveConfig()
+    empty = SimpleNamespace(
+        content="",
+        event_ids=(),
+        from_sequence=0,
+        through_sequence=0,
+        group_count=0,
+        source_group_count=0,
+        omitted_group_count=0,
+        delivered_bytes=0,
+        projection_sha256=hashlib.sha256(b"").hexdigest(),
+        algorithm_version="subconscious-recent-causal-groups-v1",
+        truncated=False,
+    )
+    service = FakeLifeService(
+        _subject_snapshot(max_bytes=config.session.subject_context_max_bytes),
+        empty,
+    )
+    monkeypatch.setattr(
+        "plugins.voice_live.context_bridge.get_running_life_service",
+        lambda: service,
+    )
+    bridge = ContextBridge(
+        config,
+        FakeConsciousness(),
+        VoiceEpisodeStore(tmp_path, "voice_empty_recent", "episode"),
+    )
+
+    assert await bridge.build_llm_context_prefix() == ("", None)
+    assert bridge.dynamic_context_projection_stats()["delivered_bytes"] == 0
+
+
+def test_realtime_transport_projection_is_bounded_and_traceable() -> None:
     content = (
         "presence\n"
         + "\n".join(f"- assertion-{index}: {'世界' * 40}" for index in range(2_000))

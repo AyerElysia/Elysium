@@ -7,14 +7,14 @@ from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
 
-from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.core.chatter import (
     LifeChatter,
     consume_runtime_assistant_injections,
     push_runtime_assistant_injection,
 )
+from plugins.life_engine.core.config import LifeEngineConfig
 from src.core.models.message import Message, MessageType
-from src.kernel.llm import LLMPayload, ROLE, Text
+from src.kernel.llm import ROLE, LLMPayload, Text
 
 
 class _FakeResponse:
@@ -359,12 +359,14 @@ async def test_build_chatter_runtime_filters_tool_call_noise() -> None:
             event_type=EventType.TOOL_CALL,
             content="tool_args_blob",
             tool_name="search",
+            tool_args={"query": "tool_args_blob"},
             source_detail="tool",
         ),
     ]
     text, hw = await service.build_chatter_runtime_context(chat)
-    assert "### 新增 life 事件流" in text
+    assert "【潜意识近期上下文】" in text
     assert "HB_NOISE" in text
+    assert "TOOL_CALL search" in text
     assert "tool_args_blob" not in text
     assert "AGENT_DONE" in text
     assert hw == 3
@@ -440,7 +442,6 @@ async def test_build_chatter_runtime_includes_recent_file_trace(tmp_path) -> Non
     config = LifeEngineConfig()
     config.settings.workspace_path = str(tmp_path)
     config.runtime_sync.recent_chat_enabled = False
-    config.runtime_sync.send_targets_enabled = False
     config.runtime_sync.trace_recent_changes_enabled = True
     config.runtime_sync.trace_recent_changes_limit = 3
     service = LifeEngineService(SimpleNamespace(config=config))

@@ -1,388 +1,31 @@
 from __future__ import annotations
 
 import inspect
-import time
-from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import pytest
 
 from plugins.life_engine.core.chatter import LifeSendTextAction
-from plugins.life_engine.core.send_targets import (
-    format_send_targets_for_prompt,
-    list_recent_send_targets,
-)
 from src.core.models.stream import ChatStream
 
 
-class _FakeStreamManager:
-    def __init__(self, streams: list[object], info_by_stream: dict[str, dict]) -> None:
-        self._streams = {str(stream.stream_id): stream for stream in streams}
-        self._info_by_stream = info_by_stream
-
-    async def get_stream_info(self, stream_id: str) -> dict | None:
-        return self._info_by_stream.get(stream_id)
-
-
-class _FakePersonCrud:
-    async def get_by(self, person_id: str):
-        if person_id == "person_ayer":
-            return SimpleNamespace(user_id="2665253325", nickname="AyerElysia")
-        return None
-
-
-class _FakeUserQueryHelper:
-    person_crud = _FakePersonCrud()
-
-
 def _runtime_cfg() -> object:
-    return SimpleNamespace(
-        send_targets_limit=8,
-        send_targets_window_hours=24.0,
-    )
+    return SimpleNamespace()
 
 
-def _install_fake_streams(monkeypatch, streams: list[object], info_by_stream: dict[str, dict]) -> None:
-    fake_manager = _FakeStreamManager(streams, info_by_stream)
-    monkeypatch.setattr("src.core.managers.stream_manager.get_stream_manager", lambda: fake_manager)
-    monkeypatch.setattr("src.core.utils.user_query_helper.get_user_query_helper", lambda: _FakeUserQueryHelper())
-
-
-class _FakeEventStore:
-    def __init__(self, events: list[object]) -> None:
-        self._events = events
-
-    async def read_tail(self, limit: int = 100) -> list[object]:
-        del limit
-        return self._events
-
-
-class _FakeLifeService:
-    def __init__(self, events: list[object]) -> None:
-        self._store = _FakeEventStore(events)
-
-    def _get_life_event_store(self) -> _FakeEventStore:
-        return self._store
-
-
-def _chat_event(stream_id: str, source: str, timestamp: str, sender_id: str) -> object:
-    return SimpleNamespace(
-        stream_id=stream_id,
-        channel="chat",
-        source=source,
-        timestamp=timestamp,
-        metadata={"chat_type": "private", "sender_id": sender_id},
-    )
-
-
-async def test_send_targets_recover_from_event_ledger_after_restart(monkeypatch) -> None:
-    """进程重启后内存流为空时，从事件账本恢复最近私聊流（飞书/Ayla 都可达）。
-
-    真实缺陷（2026-08-12）：重启后飞书流未重建，心跳「你可以触达的人和地方」
-    只剩 ayla 流，爱莉想主动找飞书对话却找不到流。
-    """
-    _install_fake_streams(monkeypatch, [], {})  # 重启后内存流为空
-    monkeypatch.setattr("src.core.utils.user_query_helper.get_user_query_helper", lambda: _FakeUserQueryHelper())
-    from datetime import UTC, datetime, timedelta
-
-    recent = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
-    old = (datetime.now(UTC) - timedelta(hours=30)).isoformat()
-    events = [
-        _chat_event("f" * 64, "feishu", recent, "person_ayer"),
-        _chat_event("g" * 64, "feishu", old, "person_ayer"),  # 超窗：应被过滤
-    ]
-    monkeypatch.setattr(
-        "plugins.life_engine.service.registry.get_life_engine_service",
-        lambda: _FakeLifeService(events),
-    )
-
-    from plugins.life_engine.core.send_targets import list_recent_send_targets
-
-    targets = await list_recent_send_targets()
-    stream_ids = {target.stream_id for target in targets}
-    assert "f" * 64 in stream_ids, "重启后应从事件账本恢复最近飞书流"
-    assert "g" * 64 not in stream_ids, "超窗事件不应恢复"
-    feishu = [t for t in targets if t.stream_id == "f" * 64][0]
-    assert feishu.platform == "feishu"
-    assert feishu.chat_type == "private"
-    assert feishu.target_user_id == "2665253325"
-    assert feishu.display_name == "AyerElysia"
-
-
-async def test_send_targets_event_recovery_skips_when_memory_has_stream(monkeypatch) -> None:
-    """内存流已有时，事件兜底不重复添加同 stream。"""
-    now = time.time()
-    _install_fake_streams(
-        monkeypatch,
-        [
-            SimpleNamespace(
-                stream_id="b" * 64,
-                platform="qq",
-                chat_type="private",
-                stream_name="AyerElysia",
-                last_active_time=now,
-            )
-        ],
-        {"b" * 64: {"person_id": "person_ayer"}},
-    )
-    monkeypatch.setattr(
-        "plugins.life_engine.service.registry.get_life_engine_service",
-        lambda: _FakeLifeService([]),
-    )
-
-    from plugins.life_engine.core.send_targets import list_recent_send_targets
-
-    targets = await list_recent_send_targets()
-    assert len([t for t in targets if t.stream_id == "b" * 64]) == 1
-
-
-async def test_send_target_prompt_lists_recent_current_group_and_private(monkeypatch) -> None:
-    now = time.time()
-    group_stream = SimpleNamespace(
-        stream_id="a" * 64,
-        platform="qq",
-        chat_type="group",
-        stream_name="始源之地",
-        last_active_time=now,
-    )
-    private_stream = SimpleNamespace(
-        stream_id="b" * 64,
-        platform="qq",
-        chat_type="private",
-        stream_name="AyerElysia",
-        last_active_time=now - 10,
-    )
-    old_stream = SimpleNamespace(
-        stream_id="c" * 64,
-        platform="qq",
-        chat_type="group",
-        stream_name="旧群",
-        last_active_time=now - 48 * 3600,
-    )
-    _install_fake_streams(
-        monkeypatch,
-        [old_stream, private_stream, group_stream],
-        {
-            group_stream.stream_id: {
-                "stream_id": group_stream.stream_id,
-                "platform": "qq",
-                "chat_type": "group",
-                "group_id": "100",
-                "group_name": "始源之地",
-                "last_active_time": group_stream.last_active_time,
-            },
-            private_stream.stream_id: {
-                "stream_id": private_stream.stream_id,
-                "platform": "qq",
-                "chat_type": "private",
-                "person_id": "person_ayer",
-                "last_active_time": private_stream.last_active_time,
-            },
-            old_stream.stream_id: {
-                "stream_id": old_stream.stream_id,
-                "platform": "qq",
-                "chat_type": "group",
-                "group_id": "200",
-                "group_name": "旧群",
-                "last_active_time": old_stream.last_active_time,
-            },
-        },
-    )
-
-    targets = await list_recent_send_targets(
-        current_stream_id=group_stream.stream_id,
-        limit=8,
-        active_window_hours=24.0,
-    )
-    prompt = format_send_targets_for_prompt(targets)
-
-    assert "target_key=g-aaaaaaaa" in prompt
-    assert "target_key=p-bbbbbbbb" in prompt
-    assert "始源之地 | 当前聊天" in prompt
-    assert "AyerElysia" in prompt
-    assert "旧群" not in prompt
-
-
-async def test_send_targets_include_stream_table_persisted_targets(monkeypatch) -> None:
-    """chat_streams 持久化表里的真实流（ayla/飞书，即使今天无新消息）必须进入可触达列表。
-
-    真实缺陷（2026-08-13）：ayla 私聊「汐汐的私聊」当天有消息、飞书「赩汐的私聊」
-    都在 chat_streams 表里，但内存 stream_manager 未重建导致心跳列表为空。
-    """
-    rows = [
-        SimpleNamespace(
-            stream_id="20403fdb0e6df94137c9071e62c44c09eb8090b534279ef5695c4b4aa5fae7bc",
-            platform="ayla",
-            chat_type="private",
-            person_id="person_xixi",
-            group_id=None,
-            group_name="汐汐的私聊",
-            last_active_time=time.time(),
-        ),
-        SimpleNamespace(
-            stream_id="644b65d976c9db473e181e9abc6735da3728afb929f86737eff1ffe4396460ac",
-            platform="feishu",
-            chat_type="private",
-            person_id="person_xixi",
-            group_id=None,
-            group_name="赩汐的私聊",
-            last_active_time=time.time() - 7200,
-        ),
-    ]
-
-    class _Result:
-        def __init__(self, rows: list[object]) -> None:
-            self._rows = rows
-
-        def all(self) -> list[object]:
-            return self._rows
-
-    class _Session:
-        def __init__(self, rows: list[object]) -> None:
-            self._rows = rows
-
-        async def execute(self, _statement: object) -> _Result:
-            return _Result(self._rows)
-
-    @asynccontextmanager
-    async def _session() -> object:
-        yield _Session(rows)
-
-    monkeypatch.setattr(
-        "src.kernel.db.get_db_session", _session
-    )
-    monkeypatch.setattr(
-        "src.core.managers.stream_manager.get_stream_manager",
-        lambda: _FakeStreamManager([], {}),
-    )
-    monkeypatch.setattr(
-        "src.core.utils.user_query_helper.get_user_query_helper",
-        lambda: _FakeUserQueryHelper(),
-    )
-    monkeypatch.setattr(
-        "plugins.life_engine.service.registry.get_life_engine_service",
-        lambda: _FakeLifeService([]),
-    )
-
-    targets = await list_recent_send_targets(limit=8, active_window_hours=24.0)
-    stream_ids = {target.stream_id for target in targets}
-    assert "20403fdb0e6df94137c9071e62c44c09eb8090b534279ef5695c4b4aa5fae7bc" in stream_ids
-    assert "644b65d976c9db473e181e9abc6735da3728afb929f86737eff1ffe4396460ac" in stream_ids
-    by_stream = {target.stream_id: target for target in targets}
-    ayla = by_stream["20403fdb0e6df94137c9071e62c44c09eb8090b534279ef5695c4b4aa5fae7bc"]
-    assert ayla.platform == "ayla"
-    assert ayla.display_name == "汐汐的私聊"
-
-
-async def test_send_targets_stream_table_dedupes_memory_streams(monkeypatch) -> None:
-    """表源与内存源同一流只出现一次。"""
-    now = time.time()
-    rows = [
-        SimpleNamespace(
-            stream_id="b" * 64,
-            platform="qq",
-            chat_type="private",
-            person_id="person_ayer",
-            group_id=None,
-            group_name="AyerElysia",
-            last_active_time=now,
-        )
-    ]
-
-    class _Result:
-        def __init__(self, rows: list[object]) -> None:
-            self._rows = rows
-
-        def all(self) -> list[object]:
-            return self._rows
-
-    class _Session:
-        def __init__(self, rows: list[object]) -> None:
-            self._rows = rows
-
-        async def execute(self, _statement: object) -> _Result:
-            return _Result(self._rows)
-
-    @asynccontextmanager
-    async def _session() -> object:
-        yield _Session(rows)
-
-    monkeypatch.setattr(
-        "src.kernel.db.get_db_session", _session
-    )
-    # 内存里也有同一流
-    monkeypatch.setattr(
-        "src.core.managers.stream_manager.get_stream_manager",
-        lambda: _FakeStreamManager(
-            [
-                SimpleNamespace(
-                    stream_id="b" * 64,
-                    platform="qq",
-                    chat_type="private",
-                    stream_name="AyerElysia",
-                    last_active_time=now,
-                )
-            ],
-            {"b" * 64: {"person_id": "person_ayer"}},
-        ),
-    )
-    monkeypatch.setattr(
-        "src.core.utils.user_query_helper.get_user_query_helper",
-        lambda: _FakeUserQueryHelper(),
-    )
-    monkeypatch.setattr(
-        "plugins.life_engine.service.registry.get_life_engine_service",
-        lambda: _FakeLifeService([]),
-    )
-
-    targets = await list_recent_send_targets()
-    assert len([t for t in targets if t.stream_id == "b" * 64]) == 1
-
-
-async def test_life_send_text_can_send_to_target_key(monkeypatch) -> None:
-    now = time.time()
+async def test_life_send_text_rejects_retired_target_key_without_sending(
+    monkeypatch,
+) -> None:
     current_stream = ChatStream(stream_id="1" * 64, platform="qq", chat_type="private")
-    target_stream = SimpleNamespace(
-        stream_id="d" * 64,
-        platform="qq",
-        chat_type="group",
-        stream_name="始源之地",
-        last_active_time=now,
-    )
-    _install_fake_streams(
-        monkeypatch,
-        [target_stream],
-        {
-            target_stream.stream_id: {
-                "stream_id": target_stream.stream_id,
-                "platform": "qq",
-                "chat_type": "group",
-                "group_id": "100",
-                "group_name": "始源之地",
-                "last_active_time": now,
-            }
-        },
-    )
-
-    class _AdapterManager:
-        async def get_bot_info_by_platform(self, platform: str):
-            return {"bot_id": "bot", "bot_name": "爱莉"}
-
-    monkeypatch.setattr("src.core.managers.adapter_manager.get_adapter_manager", lambda: _AdapterManager())
-
-    sent_messages = []
-
-    class _Sender:
-        async def send_message(self, message):
-            sent_messages.append(message)
-            return True
-
-    monkeypatch.setattr("src.core.transport.message_send.get_message_sender", lambda: _Sender())
-
     action = LifeSendTextAction(
         current_stream,
         SimpleNamespace(config=SimpleNamespace(runtime_sync=_runtime_cfg())),
     )
+
+    async def forbidden_send(_content: str):
+        raise AssertionError("retired cross-surface target must fail before send")
+
+    monkeypatch.setattr(action, "_send_to_stream", forbidden_send)
 
     ok, result = await action.execute(
         "你好\n第二段",
@@ -390,13 +33,8 @@ async def test_life_send_text_can_send_to_target_key(monkeypatch) -> None:
         target_key="g-dddddddd",
     )
 
-    assert ok is True
-    assert "已发送1条消息" in result
-    assert len(sent_messages) == 1
-    assert sent_messages[0].content == "你好\n第二段"
-    assert all(message.stream_id == target_stream.stream_id for message in sent_messages)
-    assert all(message.chat_type == "group" for message in sent_messages)
-    assert all(message.extra["target_group_id"] == "100" for message in sent_messages)
+    assert ok is False
+    assert "target_key 已退役" in result
 
 
 async def test_life_send_text_accepts_legacy_mode_argument(monkeypatch) -> None:
@@ -423,7 +61,7 @@ async def test_life_send_text_accepts_legacy_mode_argument(monkeypatch) -> None:
     assert sent_contents == ["兼容旧模型参数"]
 
 
-async def test_life_send_text_without_target_key_uses_legacy_stream_send(monkeypatch) -> None:
+async def test_life_send_text_without_target_key_uses_current_surface(monkeypatch) -> None:
     current_stream = ChatStream(stream_id="1" * 64, platform="qq", chat_type="private")
     action = LifeSendTextAction(
         current_stream,
@@ -466,6 +104,8 @@ def test_life_send_text_schema_requires_atomic_persona_sample() -> None:
         "thought",
     } <= set(parameters["properties"])
     assert inspect.signature(LifeSendTextAction.execute).parameters["thought"].default == ""
+    assert "target_key" not in parameters["properties"]
+    assert "target_key" not in parameters["required"]
 
 
 async def test_life_send_text_rejects_empty_thought_before_send(monkeypatch) -> None:
@@ -609,9 +249,8 @@ async def test_life_send_text_snapshot_failure_does_not_block_send(monkeypatch) 
     assert sent_contents == ["我还在这里。"]
 
 
-async def test_life_send_text_rejects_invalid_target_key_and_cross_reply(monkeypatch) -> None:
+async def test_life_send_text_rejects_any_legacy_target_key(monkeypatch) -> None:
     current_stream = ChatStream(stream_id="1" * 64, platform="qq", chat_type="private")
-    _install_fake_streams(monkeypatch, [], {})
 
     action = LifeSendTextAction(
         current_stream,
@@ -624,7 +263,7 @@ async def test_life_send_text_rejects_invalid_target_key_and_cross_reply(monkeyp
         target_key="g-missing",
     )
     assert ok is False
-    assert "未知或不可用" in result
+    assert "target_key 已退役" in result
 
     ok, result = await action.execute(
         "你好",
@@ -633,62 +272,27 @@ async def test_life_send_text_rejects_invalid_target_key_and_cross_reply(monkeyp
         target_key="g-missing",
     )
     assert ok is False
-    assert "不能同时使用 reply_to" in result
+    assert "target_key 已退役" in result
 
 
 async def test_life_send_text_surfaces_delivery_unknown_as_technical_outcome(
     monkeypatch,
 ) -> None:
-    now = time.time()
     current_stream = ChatStream(stream_id="1" * 64, platform="qq", chat_type="private")
-    target_stream = SimpleNamespace(
-        stream_id="d" * 64,
-        platform="qq",
-        chat_type="group",
-        stream_name="始源之地",
-        last_active_time=now,
-    )
-    _install_fake_streams(
-        monkeypatch,
-        [target_stream],
-        {
-            target_stream.stream_id: {
-                "stream_id": target_stream.stream_id,
-                "platform": "qq",
-                "chat_type": "group",
-                "group_id": "100",
-                "group_name": "始源之地",
-                "last_active_time": now,
-            }
-        },
-    )
-
-    class _AdapterManager:
-        async def get_bot_info_by_platform(self, _platform: str):
-            return {"bot_id": "bot", "bot_name": "爱莉"}
-
-    class _UnknownSender:
-        async def send_message(self, message):
-            message.extra["delivery_status"] = "unknown"
-            return False
-
-    monkeypatch.setattr(
-        "src.core.managers.adapter_manager.get_adapter_manager",
-        lambda: _AdapterManager(),
-    )
-    monkeypatch.setattr(
-        "src.core.transport.message_send.get_message_sender",
-        lambda: _UnknownSender(),
-    )
     action = LifeSendTextAction(
         current_stream,
         SimpleNamespace(config=SimpleNamespace(runtime_sync=_runtime_cfg())),
     )
 
+    async def _unknown(*_args: object, **_kwargs: object) -> bool:
+        action._last_delivery_status = "unknown"
+        return False
+
+    monkeypatch.setattr(action, "_send_one_segment", _unknown)
+
     ok, result = await action.execute(
         "你好",
         thought="发送一次并如实保留未知回执。",
-        target_key="g-dddddddd",
     )
 
     assert ok is False

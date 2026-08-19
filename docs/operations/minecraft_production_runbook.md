@@ -153,9 +153,9 @@ data/life_engine_workspace/minecraft/traces/<session_id>.jsonl
 
 记录由 `previous_hash`/`record_hash` 串联，至少应包含 `body.selected`、`intent.issued`、`observation`、`command.issued`、`command.receipt` 和 `intent.conclusion`。
 
-`intent.issued` 的 trace 保存完整耐久意图与 content-free `minecraft.perception_reference.v1`，不会保存本轮 `transient_prompt_context` 正文。每条已落盘 trace 向 World 只投影 `minecraft.embodied_trace_projection.v1` 回执；规范 JSON 必须不超过 8192 UTF-8 字节，并且不得出现原始 payload、context、帧、facts、parameters 或世界投影正文。相同 trace record 的 projection ID 必须稳定并作为 World `occurrence_id`；World 写失败时当前意图显式失败，Perception cursor 不提交，随后按同一 record 重试会复用既有事件/断言/位置而不是重复落账。
+`intent.issued` 的 trace 保存完整耐久意图与 content-free `minecraft.recent_subconscious_reference.v1`，不会保存本轮 `recent_subconscious_context` 或其他 `transient_prompt_context` 正文。每条已落盘 trace 向 World 只投影 `minecraft.embodied_trace_projection.v1` 回执；规范 JSON 必须不超过 8192 UTF-8 字节，并且不得出现原始 payload、context、帧、facts、parameters 或潜意识正文。相同 trace record 的 projection ID 必须稳定并作为 World `occurrence_id`；World 写失败时当前意图显式失败，随后按同一 record 重试会复用既有事件/断言/位置而不是重复落账。
 
-Perception cursor 只在最终成功模型请求证明完整正文实际送达后提交：delivery ID、effective UTF-8 bytes 与 SHA-256 必须全部匹配 prepared reference。若模型预算裁剪、正文缺失/重复、请求无回执或只剩上一轮回执，本次意图必须失败并保留游标；不能通过重跑或空回执伪装已消费。
+每次意图从 Life Engine 读取一份有界、只读的近期潜意识因果组作为跨意识连续性上下文。正文只进入本轮模型请求；session 会先核对 UTF-8 bytes 与 SHA-256，再把 content-free 引用写入耐久意图。该读取没有 cursor、commit 或 drain 语义，也不会回写 Life Event。工具调用只携带 tool name/call ID，不携带原始参数。Bridge 的结构化观察和第一人称画面仍是游戏当前状态的权威证据。
 
 ## 独立真实烟雾测试
 
@@ -178,7 +178,7 @@ PYTHONPATH=. uv run --frozen --no-sync python \
 - 多个匹配窗口或 sidecar：由用户手动关闭多余实例；系统不会猜测、抢占或终止进程。
 - 游戏先断开：客户端清理会释放等待者并幂等结束；断线不能被写成动作成功。
 - 模组崩溃：以 crash report 的首个业务栈为准，只隔离有直接证据的模组，并保留可恢复副本。不要批量禁用模组。
-- life_chatter 后缀突然变大：检查 World 中 `domain=minecraft/predicate=embodied_trace` 的 value schema。新记录必须是 8 KiB 内的 `minecraft.embodied_trace_projection.v1`；若看到完整 `payload.context` 或 `transient_world_perception`，这是旧递归投影证据。不要删除或重写历史数据库；保留原文并交由 World owner 做有来源隔离、分页或 superseding projection。
+- life_chatter 后缀突然变大：检查 World 中 `domain=minecraft/predicate=embodied_trace` 的 value schema。新记录必须是 8 KiB 内的 `minecraft.embodied_trace_projection.v1`；若看到完整 `payload.context`、`transient_world_perception` 或 `recent_subconscious_context`，这是旧递归投影或新的边界违约证据。不要删除或重写历史数据库；保留原文并交由 World owner 做有来源隔离、分页或 superseding projection。
 
 2026-08-04 的真实启动发现 `InventoryProfilesNext 2.2.5`/`libIPN 6.6.3` 在渲染阶段自身空指针崩溃。已验证构建可用以下脚本做精确、可恢复隔离：
 

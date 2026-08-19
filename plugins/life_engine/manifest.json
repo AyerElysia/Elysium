@@ -52,12 +52,6 @@
     },
     {
       "component_type": "tool",
-      "component_name": "nucleus_tell_dfc",
-      "dependencies": [],
-      "enabled": true
-    },
-    {
-      "component_type": "tool",
       "component_name": "nucleus_run_agent",
       "dependencies": [],
       "enabled": true
@@ -130,13 +124,19 @@
     },
     {
       "component_type": "tool",
-      "component_name": "nucleus_schedule_autonomy_intent",
+      "component_name": "nucleus_manage_initiative_seed",
       "dependencies": [],
       "enabled": true
     },
     {
       "component_type": "tool",
-      "component_name": "nucleus_manage_autonomy_intent",
+      "component_name": "nucleus_reachability",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
+      "component_type": "tool",
+      "component_name": "nucleus_begin_outreach",
       "dependencies": [],
       "enabled": true
     },
@@ -172,6 +172,12 @@
     },
     {
       "component_type": "action",
+      "component_name": "life_send_file",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
+      "component_type": "action",
       "component_name": "life_send_image",
       "dependencies": [],
       "enabled": true
@@ -197,12 +203,6 @@
     {
       "component_type": "action",
       "component_name": "life_pass_and_wait",
-      "dependencies": [],
-      "enabled": true
-    },
-    {
-      "component_type": "action",
-      "component_name": "schedule_followup_message",
       "dependencies": [],
       "enabled": true
     }

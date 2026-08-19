@@ -41,7 +41,7 @@ class _ModelResponse:
 
     def __init__(
         self,
-        receipt: EffectiveContextReceipt,
+        receipt: EffectiveContextReceipt | None,
     ) -> None:
         self.message = '{"conclusion":{"statement":"observed","evidence_ids":[]}}'
         self.request_record_id = 47
@@ -59,7 +59,7 @@ class _ModelResponse:
     ) -> EffectiveContextReceipt | None:
         """Return the fake receipt only for its registered identity."""
 
-        if delivery_id != self._receipt.delivery_id:
+        if self._receipt is None or delivery_id != self._receipt.delivery_id:
             return None
         return self._receipt
 
@@ -92,7 +92,8 @@ class _ModelRequest:
         """Return an exact or deliberately failed effective receipt."""
 
         assert stream is False
-        assert self.expectation is not None
+        if self.expectation is None:
+            return _ModelResponse(None)
         delivery_id, expected_text, _marker = self.expectation
         encoded = expected_text.encode("utf-8")
         digest = sha256(encoded).hexdigest()
@@ -102,8 +103,12 @@ class _ModelRequest:
                 exact_present=self._exact,
                 expected_utf8_bytes=len(encoded),
                 expected_sha256=digest,
-                effective_utf8_bytes=(len(encoded) if self._exact else len(encoded) - 1),
-                effective_sha256=(digest if self._exact else sha256(encoded[:-1]).hexdigest()),
+                effective_utf8_bytes=(
+                    len(encoded) if self._exact else len(encoded) - 1
+                ),
+                effective_sha256=(
+                    digest if self._exact else sha256(encoded[:-1]).hexdigest()
+                ),
             )
         )
 
@@ -170,6 +175,7 @@ async def test_planner_preserves_open_operation_and_parameters() -> None:
                 }
             }
         )
+
     planner = JsonIntentPlanner(
         source,
         lambda: ("modded.executor.operation",),
@@ -249,9 +255,7 @@ async def test_model_source_proves_exact_transient_perception_delivery(
     assert expected_text == projection
     assert marker and projection.startswith(marker)
     user_texts = [
-        part.text
-        for part in request.payloads[-1].content
-        if isinstance(part, Text)
+        part.text for part in request.payloads[-1].content if isinstance(part, Text)
     ]
     assert user_texts.count(projection) == 1
     durable_document = json.loads(user_texts[0])
@@ -262,6 +266,55 @@ async def test_model_source_proves_exact_transient_perception_delivery(
     assert proof.projection_sha256 == sha256(projection.encode("utf-8")).hexdigest()
     assert proof.delivered_bytes == len(projection.encode("utf-8"))
     assert proof.transport_request_id == "47"
+
+
+async def test_model_source_sends_recent_subconscious_as_transient_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recent continuity reaches the current request but not durable JSON."""
+
+    request = _ModelRequest(exact=True)
+    monkeypatch.setattr(
+        model_planner_module,
+        "get_model_set_by_task",
+        lambda _name: [{"model_identifier": "test"}],
+    )
+    monkeypatch.setattr(
+        model_planner_module,
+        "create_llm_request",
+        lambda **_kwargs: request,
+    )
+    recent = "RECENT-SUBCONSCIOUS-UNIQUE\nheartbeat considered shelter"
+    intent = EmbodiedIntent(
+        text="continue playing",
+        body_name="agent",
+        durable_context={
+            "session_id": "session-test",
+            "recent_subconscious_reference": {
+                "schema": "minecraft.recent_subconscious_reference.v1",
+                "projection_sha256": sha256(recent.encode()).hexdigest(),
+                "delivered_bytes": len(recent.encode()),
+            },
+        },
+        transient_prompt_context={"recent_subconscious_context": recent},
+    )
+    source = ElysiumModelDecisionSource("minecraft")
+
+    await source(_decision_document(intent))
+
+    assert request.expectation is None
+    user_texts = [
+        part.text for part in request.payloads[-1].content if isinstance(part, Text)
+    ]
+    assert user_texts.count(recent) == 1
+    durable_document = json.loads(user_texts[0])
+    durable_intent = durable_document["intent"]
+    assert "transient_prompt_context" not in durable_intent
+    assert recent not in user_texts[0]
+    assert durable_intent["durable_context"]["recent_subconscious_reference"][
+        "delivered_bytes"
+    ] == len(recent.encode())
+    assert any("past context" in text for text in user_texts)
 
 
 async def test_model_source_rejects_trimmed_transient_perception(
@@ -286,6 +339,6 @@ async def test_model_source_rejects_trimmed_transient_perception(
     with pytest.raises(RuntimeError, match="absent, duplicated, or trimmed"):
         await source(_decision_document(intent))
 
-    assert source.consume_context_delivery(
-        intent.perception_reference.delivery_id
-    ) is None
+    assert (
+        source.consume_context_delivery(intent.perception_reference.delivery_id) is None
+    )

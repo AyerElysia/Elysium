@@ -271,8 +271,6 @@ class ImpulseSection(HeartbeatSectionProvider):
         # 判定待沉淀河流记忆
         has_pending_river_moments = False
         try:
-            from ..narrative.store import NarrativeStore
-            from ..trace.store import LifeTraceStore
             narrative_cfg = getattr(ctx.config, "narrative", None)
             if narrative_cfg and getattr(narrative_cfg, "enabled", True):
                 store = service.narrative_store()
@@ -311,60 +309,6 @@ class ImpulseSection(HeartbeatSectionProvider):
         )
 
 
-class SendTargetsSection(HeartbeatSectionProvider):
-    """她可以触达的人和地方——主动性的行动空间。
-
-    主动性因果链中"空间"一环：意图需要知道可以落向何处。
-    只呈现地图，不催促出发。
-    """
-
-    section_id = "send_targets"
-
-    def enabled(self, ctx: SectionContext) -> bool:
-        autonomy_cfg = getattr(ctx.config, "autonomy", None)
-        if autonomy_cfg is None:
-            return True
-        return bool(getattr(autonomy_cfg, "enabled", True)) and bool(
-            getattr(autonomy_cfg, "show_targets_in_heartbeat", True)
-        )
-
-    async def render(self, ctx: SectionContext) -> str | None:
-        from ..core.send_targets import list_recent_send_targets
-
-        runtime_cfg = getattr(ctx.config, "runtime_sync", None)
-        targets = await list_recent_send_targets(
-            current_stream_id="",
-            limit=int(getattr(runtime_cfg, "send_targets_limit", 8) or 8),
-            active_window_hours=float(
-                getattr(runtime_cfg, "send_targets_window_hours", 24.0) or 24.0
-            ),
-        )
-        if not targets:
-            return (
-                "### 你可以触达的人和地方\n"
-                "\n"
-                "当前没有近 24 小时内有消息的会话（列表为空是正常状态，"
-                "不是记忆缺失）。如果想主动开口，可以把 "
-                "`nucleus_schedule_autonomy_intent` 的 target_key / "
-                "target_stream_id 留空；到点后意向会浮现给你，由你重新判断。"
-            )
-        lines = ["### 你可以触达的人和地方", ""]
-        for target in targets:
-            chat_label = "群聊" if target.chat_type == "group" else "私聊"
-            lines.append(
-                f"- target_key={target.target_key} | {target.platform}{chat_label} | "
-                f"{target.display_name}"
-            )
-        lines.extend([
-            "",
-            "这些是你最近可以触达的会话。如果心里有想对谁说的话，"
-            "可以用 `nucleus_schedule_autonomy_intent`（kind=speak，填 target_key）"
-            "登记一个意向，到点交给表达层重新判断；"
-            "没有想说的话也很好——看见他们在那里，本身就够了。",
-        ])
-        return "\n".join(lines)
-
-
 class RiverReflectionSection(HeartbeatSectionProvider):
     """回望长河：到期时把未沉淀的转折点摆给她，由她决定是否讲述。
 
@@ -389,8 +333,7 @@ class RiverReflectionSection(HeartbeatSectionProvider):
     async def render(self, ctx: SectionContext) -> str | None:
         from datetime import datetime, timezone
 
-        from ..narrative.store import NarrativeStore, _parse_iso
-        from ..trace.store import LifeTraceStore
+        from ..narrative.store import _parse_iso
 
         cfg = ctx.config.narrative
         store = ctx.service.narrative_store()
@@ -604,8 +547,6 @@ class LeisureOpportunitySection(HeartbeatSectionProvider):
         
         # 4. 待沉淀河流记忆
         try:
-            from ..narrative.store import NarrativeStore
-            from ..trace.store import LifeTraceStore
             narrative_cfg = getattr(ctx.config, "narrative", None)
             if narrative_cfg and getattr(narrative_cfg, "enabled", True):
                 store = service.narrative_store()
@@ -660,7 +601,6 @@ class LeisureOpportunitySection(HeartbeatSectionProvider):
 
 DEFAULT_HEARTBEAT_SECTIONS: list[HeartbeatSectionProvider] = [
     AttentionOpportunitySection(),
-    SendTargetsSection(),
     RiverReflectionSection(),
     SelfKnowledgeSection(),
     SkillCatalogSection(),

@@ -30,7 +30,7 @@ logger = get_logger("NekoSurfaceAdapter", color="#F5A6C8")
 PLATFORM = "neko.surface"
 _SURFACE_TTS_TIMEOUT_SECONDS = 30.0
 _SURFACE_TTS_CONCURRENCY = 2
-# Higgs returns a complete audio object for each request.  Keep requests
+# The local message TTS returns a complete audio object for each request. Keep requests
 # short enough that the first utterance can start while later sentences are
 # still being synthesized, without splitting ordinary short replies.
 _SURFACE_TTS_SEGMENT_MAX_CHARS = 180
@@ -100,26 +100,14 @@ class NekoSurfaceAdapter(BaseAdapter):
 
     @staticmethod
     def _get_tts_service() -> Any | None:
-        """Resolve the loaded TTS service without making Surface depend on it."""
+        """Resolve the canonical local TTS service without making it mandatory."""
         try:
-            from src.core.managers import get_plugin_manager
+            from plugins.tts_voice_plugin.api import get_local_tts_service
 
-            plugin = get_plugin_manager().get_plugin("tts_voice_plugin")
-            service = getattr(plugin, "tts_service", None) if plugin is not None else None
-            if service is not None and callable(getattr(service, "generate_voice", None)):
-                return service
+            return get_local_tts_service()
         except Exception as exc:  # noqa: BLE001
-            logger.debug(f"Surface TTS plugin lookup failed: {exc}")
-
-        try:
-            from src.app.plugin_system.api.service_api import get_service
-
-            service = get_service("tts_voice_plugin:service:tts")
-            if service is not None and callable(getattr(service, "generate_voice", None)):
-                return service
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(f"Surface TTS service lookup failed: {exc}")
-        return None
+            logger.debug(f"Surface local TTS lookup failed: {type(exc).__name__}")
+            return None
 
     @staticmethod
     def _tts_mime_type(service: Any) -> str:
@@ -231,7 +219,7 @@ class NekoSurfaceAdapter(BaseAdapter):
         """Split a completed reply into speakable units for application streaming.
 
         The model currently hands the message sender a completed string rather
-        than token deltas.  Sentence-sized Higgs requests still improve
+        than token deltas. Sentence-sized local TTS requests still improve
         time-to-first-audio and preserve natural prosody better than character
         chunks.  A long punctuation-free run is capped as a final fallback.
         """
@@ -279,7 +267,7 @@ class NekoSurfaceAdapter(BaseAdapter):
         generation: int,
         service: Any,
     ) -> tuple[str, str] | None:
-        """Generate one automatic Higgs voice for a Surface text reply."""
+        """Generate one automatic local voice for a Surface text reply."""
         if not text.strip() or generation != self._tts_generation:
             return None
 
@@ -350,7 +338,7 @@ class NekoSurfaceAdapter(BaseAdapter):
     async def handle_surface_event(self, event: SurfaceEvent) -> None:
         """Dispatch an authenticated client event into the canonical message plane."""
         if event.type in {"user.text", "user.transcript.final", "user.audio", "user.screen"}:
-            # A new user turn invalidates any Higgs request still synthesizing
+            # A new user turn invalidates any local TTS request still synthesizing
             # the previous reply, so late audio cannot be played out of order.
             self._invalidate_surface_tts("new user turn")
             envelope = await self.from_platform_message(event)
@@ -606,7 +594,7 @@ class NekoSurfaceAdapter(BaseAdapter):
             )
 
         if text_parts and not voices and text_deliveries:
-            # Higgs is request/response rather than PCM-delta streaming.  Send
+            # Local message TTS is request/response rather than PCM-delta streaming. Send
             # sentence-sized requests concurrently and chain publication so
             # N.E.K.O receives one continuous, ordered speech stream.
             tts_text = "".join(text_parts)

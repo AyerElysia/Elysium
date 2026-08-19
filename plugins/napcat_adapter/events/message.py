@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -13,6 +15,10 @@ from typing import TYPE_CHECKING, Any
 import orjson
 
 from src.app.plugin_system.api.log_api import get_logger
+from src.core.transport.received_files import (
+    MAX_RECEIVED_FILE_BYTES,
+    persist_received_file,
+)
 from src.core.transport.wire import MessageBuilder, SegPayload, UserRole
 from src.core.utils.base64_helper import base64_encode_bytes
 from src.kernel.concurrency import get_task_manager
@@ -43,6 +49,7 @@ class MessageEventHandler:
     _VIDEO_EXTENSIONS = frozenset({
         ".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".flv", ".wmv", ".mpeg", ".mpg", ".3gp", ".ts", ".m2ts",
     })
+    _FILE_DOWNLOAD_TIMEOUT_SECONDS = 45.0
 
     def __init__(self, client: "NapCatClient", get_config: Any) -> None:
         self._client = client
@@ -639,11 +646,167 @@ class MessageEventHandler:
             if audio_result:
                 return audio_result
 
-        # 普通文件
+        # 普通文件需要先物化为受控本地引用；正文不进入提示词或普通日志。
+        materialized = await self._materialize_received_file(data, raw_message)
+        if materialized is not None:
+            return {"type": "file", "data": materialized}
+
+        # 获取失败时保留稳定元数据，让上层知道收到过附件，而不是伪装成已下载。
         return {
             "type": "file",
-            "data": {"name": file_name, "size": file_size, "id": file_id},
+            "data": {
+                "name": file_name,
+                "size": file_size,
+                "id": file_id,
+                "materialized": False,
+            },
         }
+
+    async def _materialize_received_file(
+        self,
+        data: dict[str, Any],
+        raw_message: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        file_name = str(data.get("file") or data.get("name") or "file")
+        file_id = str(data.get("file_id") or data.get("id") or "")
+        declared_size = self._coerce_file_size(
+            data.get("file_size")
+            if data.get("file_size") is not None
+            else data.get("size")
+        )
+        if declared_size is not None and declared_size > MAX_RECEIVED_FILE_BYTES:
+            logger.warning(
+                "NapCat 入站文件超过物化上限，保留元数据: "
+                f"file_id={file_id or 'unknown'} size_bytes={declared_size}"
+            )
+            return None
+
+        try:
+            async with asyncio.timeout(self._FILE_DOWNLOAD_TIMEOUT_SECONDS):
+                source = dict(data)
+                file_bytes = await self._file_bytes_from_source(source)
+
+                if file_bytes is None and file_id and self._client is not None:
+                    resolved = await self._client.get_file(file_id=file_id)
+                    if isinstance(resolved, dict):
+                        source.update(resolved)
+                        file_bytes = await self._file_bytes_from_source(source)
+
+                if file_bytes is None and file_id and self._client is not None:
+                    group_id = (raw_message or {}).get("group_id")
+                    if group_id:
+                        busid = self._coerce_file_size(data.get("busid")) or 0
+                        resolved = await self._client.get_group_file_url(
+                            int(group_id),
+                            file_id,
+                            busid,
+                        )
+                        if isinstance(resolved, dict):
+                            source.update(resolved)
+                            file_bytes = await self._file_bytes_from_source(source)
+
+                if file_bytes is None:
+                    return None
+                if declared_size is not None and declared_size != len(file_bytes):
+                    logger.warning(
+                        "NapCat 入站文件声明大小与实际不一致，按实际内容保存: "
+                        f"file_id={file_id or 'unknown'} declared={declared_size} "
+                        f"actual={len(file_bytes)}"
+                    )
+                reference = await persist_received_file(
+                    file_bytes,
+                    filename=file_name,
+                    platform="qq",
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "NapCat 入站文件物化失败，保留元数据: "
+                f"file_id={file_id or 'unknown'} error_type={type(exc).__name__}"
+            )
+            return None
+
+        return {
+            "name": reference.filename,
+            "size": reference.size_bytes,
+            "id": file_id or None,
+            "path": str(reference.path),
+            "sha256": reference.sha256,
+            "storage_key": reference.storage_key,
+            "materialized": True,
+        }
+
+    async def _file_bytes_from_source(self, data: dict[str, Any]) -> bytes | None:
+        encoded = self._extract_media_base64(data)
+        if encoded:
+            return self._decode_file_base64(encoded)
+
+        local_path = self._extract_media_path(data)
+        if local_path:
+            path = Path(local_path)
+            try:
+                stat = await asyncio.to_thread(path.stat)
+            except OSError:
+                pass
+            else:
+                if path.is_file() and stat.st_size <= MAX_RECEIVED_FILE_BYTES:
+                    return await asyncio.to_thread(path.read_bytes)
+
+        url = self._extract_media_url(data)
+        if not url:
+            return None
+        return await self._download_file_bytes(url)
+
+    @staticmethod
+    def _decode_file_base64(value: str) -> bytes:
+        encoded = str(value or "").strip()
+        if encoded.startswith("data:"):
+            _, separator, encoded = encoded.partition(",")
+            if not separator:
+                raise ValueError("invalid data URL")
+        if encoded.startswith("base64://"):
+            encoded = encoded.removeprefix("base64://")
+        elif encoded.startswith("base64|"):
+            encoded = encoded.removeprefix("base64|")
+        if len(encoded) > ((MAX_RECEIVED_FILE_BYTES + 2) // 3) * 4 + 4:
+            raise ValueError("received file exceeds configured byte limit")
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise ValueError("invalid received file base64") from exc
+        if len(raw) > MAX_RECEIVED_FILE_BYTES:
+            raise ValueError("received file exceeds configured byte limit")
+        return raw
+
+    @staticmethod
+    async def _download_file_bytes(url: str) -> bytes:
+        import httpx
+
+        chunks: list[bytes] = []
+        total = 0
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+            async with client.stream("GET", url) as response:
+                response.raise_for_status()
+                content_length = response.headers.get("content-length")
+                if content_length and int(content_length) > MAX_RECEIVED_FILE_BYTES:
+                    raise ValueError("received file exceeds configured byte limit")
+                async for chunk in response.aiter_bytes():
+                    total += len(chunk)
+                    if total > MAX_RECEIVED_FILE_BYTES:
+                        raise ValueError("received file exceeds configured byte limit")
+                    chunks.append(chunk)
+        return b"".join(chunks)
+
+    @staticmethod
+    def _coerce_file_size(value: Any) -> int | None:
+        if isinstance(value, bool) or value is None:
+            return None
+        try:
+            size = int(value)
+        except (TypeError, ValueError):
+            return None
+        return size if size >= 0 else None
 
     # ------------------------------------------------------------------
     # 文件类型辅助
@@ -736,6 +899,7 @@ class MessageEventHandler:
         if url:
             try:
                 import httpx
+
                 async with httpx.AsyncClient(timeout=30) as client:
                     r = await client.get(url)
                     if r.status_code == 200:

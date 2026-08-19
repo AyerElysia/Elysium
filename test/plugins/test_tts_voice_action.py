@@ -4,20 +4,23 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import pytest
-
 from plugins.tts_voice_plugin.actions.tts_action import TTSVoiceAction
 from plugins.tts_voice_plugin.config import TTSVoiceConfig
 from plugins.tts_voice_plugin.plugin import TTSVoicePlugin
 
 
 def test_disabled_tts_voice_plugin_registers_no_components() -> None:
-    """plugin.enable=false 必须阻止旧 GPT-SoVITS 服务与 Action 注册。"""
+    """plugin.enable=false 必须阻止本地 TTS 服务与 Action 注册。"""
     cfg = TTSVoiceConfig()
     cfg.plugin.enable = False
 
     assert TTSVoicePlugin(config=cfg).get_components() == []
     assert TTSVoicePlugin(config=None).get_components() == []
+
+
+def test_tts_voice_action_does_not_duplicate_life_chatter_voice_action() -> None:
+    """Life Chatter 只使用 life_send_voice，旧通用 Action 不应成为第二入口。"""
+    assert TTSVoiceAction.chatter_allow == ["default_chatter"]
 
 
 def _build_action(*, always_available: bool, platform: str = "") -> TTSVoiceAction:
@@ -120,8 +123,29 @@ async def test_execute_persists_tts_text_as_voice_plain_text(monkeypatch) -> Non
     assert sent == {
         "voice_data": "VOICE_BASE64",
         "stream_id": "s1",
+        "platform": "",
         "processed_plain_text": "[语音:今晚我想认真说一会儿。]",
     }
+
+
+async def test_execute_reports_platform_send_failure(monkeypatch) -> None:
+    action = _build_action(always_available=True, platform="qq")
+
+    async def generate_voice(**_kwargs):  # type: ignore[no-untyped-def]
+        return "VOICE_BASE64"
+
+    async def fake_send_voice(**_kwargs):  # type: ignore[no-untyped-def]
+        return False
+
+    action.tts_service = SimpleNamespace(generate_voice=generate_voice)
+    monkeypatch.setattr(
+        "plugins.tts_voice_plugin.actions.tts_action.send_voice", fake_send_voice
+    )
+
+    success, message = await action.execute(tts_voice_text="这条平台发送会失败。")
+
+    assert success is False
+    assert "平台发送失败" in message
 
 
 async def test_surface_execute_is_suppressed_when_adapter_owns_tts() -> None:

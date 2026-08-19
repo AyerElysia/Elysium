@@ -29,7 +29,6 @@ from .file_tools import (
     LifeEngineMakeDirectoryTool,
     LifeEngineReadFileTool,
     LifeEngineRunAgentTool,
-    LifeEngineWakeDFCTool,
     LifeEngineWriteFileTool,
 )
 from .grep_tools import GREP_TOOLS
@@ -83,7 +82,6 @@ __all__ = [
     "LifeEngineEditFileTool",
     "LifeEngineListFilesTool",
     "LifeEngineMakeDirectoryTool",
-    "LifeEngineWakeDFCTool",
     "LifeEngineRunAgentTool",
     "FetchLifeMemoryTool",
     "PlatformActionTool",

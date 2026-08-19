@@ -37,12 +37,12 @@ from src.core.components.base.action import ActionResultDetail
 from src.core.config import get_core_config
 from src.core.models.message import Message, MessageType
 from src.kernel.llm import (
+    ROLE,
     Audio,
     Content,
     Image,
     LLMPayload,
     ReasoningText,
-    ROLE,
     Text,
     ToolCall,
     ToolRegistry,
@@ -51,35 +51,42 @@ from src.kernel.llm import (
     Video,
 )
 from src.kernel.llm.media_capabilities import normalize_media_capabilities
-from .context_compaction import (
-    DEFAULT_MAX_GROUPS as _CONTEXT_COMPRESSION_MAX_GROUPS,
-    DEFAULT_MAX_PART_CHARS as _CONTEXT_COMPRESSION_MAX_PART_CHARS,
-    DEFAULT_SNAPSHOT_CHAR_BUDGET as _ROLLING_CONTEXT_SNAPSHOT_CHAR_BUDGET,
-    compact_payloads,
-    compress_dropped_payload_groups,
-    hierarchical_compact_payloads,
-)
-from src.kernel.logger import get_logger, COLOR
+from src.kernel.logger import COLOR, get_logger
 from src.kernel.storage import canonical_json_sha256
-from ..memory.prompting import analyze_memory_text, render_memory_prompt
+
 from ..constants import LIFE_CHATTER_GLOBAL_CURSOR_KEY
+from ..memory.prompting import analyze_memory_text, render_memory_prompt
 from .chat_history import (
     build_chat_history_text,
     build_global_chat_history_text_from_db,
     message_flag,
 )
 from .context_assembly import LifeChatterContextAssembler
+from .context_compaction import (
+    DEFAULT_MAX_GROUPS as _CONTEXT_COMPRESSION_MAX_GROUPS,
+)
+from .context_compaction import (
+    DEFAULT_MAX_PART_CHARS as _CONTEXT_COMPRESSION_MAX_PART_CHARS,
+)
+from .context_compaction import (
+    DEFAULT_SNAPSHOT_CHAR_BUDGET as _ROLLING_CONTEXT_SNAPSHOT_CHAR_BUDGET,
+)
+from .context_compaction import (
+    compact_payloads,
+    compress_dropped_payload_groups,
+    hierarchical_compact_payloads,
+)
 from .multimodal import (
     MediaBudget,
     MediaItem,
     build_multimodal_content,
     extract_media_from_messages,
 )
-from .send_targets import SendTarget, resolve_send_target_key
 from .tool_parallel import is_life_tool_call_parallel_safe
 
 if TYPE_CHECKING:
     from src.core.models.stream import ChatStream
+
     from ..service.core import LifeEngineService
 
 logger = get_logger("life_chatter", display="生命对话器", color=COLOR.MAGENTA)
@@ -320,8 +327,8 @@ class LifeSendTextAction(BaseAction):
         "content 中只能包含要发给用户的纯文本正文。"
         "严禁把 reason/thought/expected_reaction 等元信息写进 content。"
         "私聊场景下 reply_to 默认不要使用，除非确实需要引用某条历史消息来避免歧义。"
-        "target_key 通常留空，表示回复当前聊天；只有明确要发到后缀提示词"
-        "“可发送目标”列表中的其他聊天时，才填写列表给出的 target_key。"
+        "本动作只在当前意识实例的物理表面发送；跨表面主动外联必须先由主体通过"
+        "nucleus_reachability 与 nucleus_begin_outreach 显式选择对象和表面。"
     )
 
     chatter_allow: list[str] = ["life_chatter"]
@@ -349,6 +356,11 @@ class LifeSendTextAction(BaseAction):
         for field_name in cls._ATOMIC_RESPONSE_FIELDS:
             if field_name not in required:
                 required.append(field_name)
+        # Historical direct Python callers may still pass target_key, but it is
+        # no longer a model capability. A visible expression action must not
+        # also choose a different consciousness surface.
+        parameters.get("properties", {}).pop("target_key", None)
+        required = [name for name in required if name != "target_key"]
         parameters["required"] = required
         return schema
 
@@ -468,79 +480,12 @@ class LifeSendTextAction(BaseAction):
         base_delay = len(content) / chars_per_sec
         return max(min_delay, min(base_delay, max_delay))
 
-    def _send_target_options(self) -> tuple[int, float]:
-        cfg = getattr(self.plugin, "config", None)
-        runtime_cfg = getattr(cfg, "runtime_sync", None)
-        limit = int(getattr(runtime_cfg, "send_targets_limit", 8) or 8)
-        window_hours = float(
-            getattr(runtime_cfg, "send_targets_window_hours", 24.0) or 24.0
-        )
-        return max(1, limit), max(0.1, window_hours)
-
-    async def _resolve_send_target(self, target_key: str) -> SendTarget | None:
-        limit, window_hours = self._send_target_options()
-        return await resolve_send_target_key(
-            target_key,
-            current_stream_id=str(getattr(self.chat_stream, "stream_id", "") or ""),
-            limit=limit,
-            active_window_hours=window_hours,
-        )
-
-    async def _send_one_segment_to_target(
-        self,
-        content: str,
-        target: SendTarget,
-        segment_index: int = 0,
-    ) -> bool:
-        from src.core.managers.adapter_manager import get_adapter_manager
-        from src.core.transport.message_send import get_message_sender
-
-        bot_info = await get_adapter_manager().get_bot_info_by_platform(target.platform)
-
-        extra: dict[str, str] = {}
-        if target.chat_type == "group":
-            if target.group_id:
-                extra["target_group_id"] = target.group_id
-            if target.group_name:
-                extra["target_group_name"] = target.group_name
-        else:
-            if target.target_user_id:
-                extra["target_user_id"] = target.target_user_id
-            if target.target_user_name:
-                extra["target_user_name"] = target.target_user_name
-        extra.update(self._action_origin_extra())
-
-        message = Message(
-            message_id=self._action_message_id(target.stream_id, segment_index),
-            content=content,
-            processed_plain_text=content,
-            message_type=MessageType.TEXT,
-            sender_id=bot_info.get("bot_id", "") if bot_info else "",
-            sender_name=bot_info.get("bot_name", "Bot") if bot_info else "Bot",
-            platform=target.platform,
-            chat_type=target.chat_type,
-            stream_id=target.stream_id,
-        )
-        message.extra.update(extra)
-
-        success = await get_message_sender().send_message(message)
-        self._last_delivery_status = str(message.extra.get("delivery_status") or "")
-        return success
-
     async def _send_one_segment(
         self,
         content: str,
         reply_to: str | None = None,
-        target: SendTarget | None = None,
         segment_index: int = 0,
     ) -> bool:
-        if target is not None:
-            return await self._send_one_segment_to_target(
-                content,
-                target,
-                segment_index=segment_index,
-            )
-
         if reply_to:
             target_stream_id = self.chat_stream.stream_id
             platform = self.chat_stream.platform
@@ -656,9 +601,7 @@ class LifeSendTextAction(BaseAction):
         ] = None,
         target_key: Annotated[
             str,
-            "可选发送目标。通常留空表示按旧逻辑回复当前聊天；"
-            "只有明确要发到后缀提示词“可发送目标”列表中的某个聊天时，"
-            "才填写列表里的 target_key，禁止凭空编写。",
+            "退役兼容参数；模型不可见，非空值会 fail closed。",
         ] = "",
     ) -> tuple[bool, str]:
         self._last_delivery_status = ""
@@ -683,21 +626,14 @@ class LifeSendTextAction(BaseAction):
         if not cleaned_segments:
             return False, "发送内容不能只是省略号或占位符"
 
-        # 参数和目标必须先校验；失败的发送不能污染重复消息缓存。
-        resolved_target: SendTarget | None = None
+        # 发送动作不能同时承担对象/表面选择。旧参数保留只为让历史
+        # Python 调用明确失败，而不是静默回退到当前或近期聊天。
         normalized_target_key = str(target_key or "").strip()
         if normalized_target_key:
-            if reply_to:
-                return (
-                    False,
-                    "跨聊天发送不能同时使用 reply_to；请去掉 reply_to 或不填 target_key",
-                )
-            resolved_target = await self._resolve_send_target(normalized_target_key)
-            if resolved_target is None:
-                return (
-                    False,
-                    f"未知或不可用的发送目标 target_key: {normalized_target_key}",
-                )
+            return False, (
+                "target_key 已退役；请由主体先调用 nucleus_reachability，"
+                "再用 nucleus_begin_outreach 明确选择对象与可达表面"
+            )
 
         structured_context = {
             "mood": str(mood or mode or "").strip(),
@@ -732,7 +668,6 @@ class LifeSendTextAction(BaseAction):
             success = await self._send_one_segment(
                 segment,
                 segment_reply_to,
-                target=resolved_target,
                 segment_index=index,
             )
             if not success:
@@ -745,8 +680,7 @@ class LifeSendTextAction(BaseAction):
             sent_count += 1
 
         preview = cleaned_segments[0][:80] if cleaned_segments else ""
-        target_desc = f" -> {resolved_target.display_name}" if resolved_target else ""
-        return True, f"已发送{sent_count}条消息{target_desc}: {preview}"
+        return True, f"已发送{sent_count}条消息: {preview}"
 
 
 class _LifeSendMediaAction(BaseAction):
@@ -843,7 +777,8 @@ class LifeSendVoiceAction(_LifeSendMediaAction):
     action_name = "life_send_voice"
     action_description = (
         "向当前聊天发送语音。已有音频文件时填写 path；需要把文字合成为语音时填写 text。"
-        "path 与 text 二选一。合成使用 model_tasks.tts 配置的模型，主体自行决定是否使用。"
+        "path 与 text 二选一。文字合成使用已启用的本地消息 TTS 服务，主体自行决定是否使用。"
+        "N.E.K.O Surface 的文字回复由该场景自己的自动语音链处理，不要重复调用本动作。"
     )
     chatter_allow: list[str] = ["life_chatter"]
     media_type = MessageType.VOICE
@@ -863,14 +798,14 @@ class LifeSendVoiceAction(_LifeSendMediaAction):
             str,
             "需要由 TTS 合成并发送的口语文本；与 path 二选一。",
         ] = "",
-        voice: Annotated[
+        voice_style: Annotated[
             str,
-            "MiMo 预置音色，默认 mimo_default；只有明确想选其他可用音色时再填写。",
-        ] = "mimo_default",
-        instructions: Annotated[
-            str,
-            "可选的自然语言声音表演指令，如温柔、轻声、语速稍慢；不需要时留空。",
-        ] = "",
+            "本地 TTS 风格名称；不确定时使用 default。",
+        ] = "default",
+        text_language: Annotated[
+            str | None,
+            "可选语言代码，如 zh、en、ja；不填写时由本地 TTS 自动判断。",
+        ] = None,
     ) -> tuple[bool, str]:
         normalized_path = str(path or "").strip()
         normalized_text = str(text or "").strip()
@@ -879,43 +814,38 @@ class LifeSendVoiceAction(_LifeSendMediaAction):
         if normalized_path:
             return await self._send_path(normalized_path)
 
+        platform = str(getattr(self.chat_stream, "platform", "") or "").strip().lower()
+        if platform == "neko.surface":
+            return False, "N.E.K.O Surface 已由本地自动语音链接管"
+
         try:
-            from src.app.plugin_system.api.llm_api import get_model_set_by_task
+            from plugins.tts_voice_plugin.api import get_local_tts_service
             from src.app.plugin_system.api.send_api import send_voice
-            from src.kernel.llm.model_client.registry import (
-                get_default_model_client_registry,
-            )
 
-            model_set = get_model_set_by_task("tts")
-            if not isinstance(model_set, list) or not model_set:
-                return False, "未配置 model_tasks.tts，无法合成语音"
-            model_entry = model_set[0]
-            client = get_default_model_client_registry().get_speech_client_for_model(
-                model_entry
-            )
-            audio_bytes = await client.create_speech(
-                model_name=str(model_entry.get("model_identifier") or ""),
+            service = get_local_tts_service()
+            generate_voice = getattr(service, "generate_voice", None)
+            if not callable(generate_voice):
+                return False, "本地消息 TTS 服务未启用或尚未就绪"
+
+            encoded = await generate_voice(
                 text=normalized_text,
-                request_name="life_send_voice",
-                model_set=model_entry,
-                voice=str(voice or "mimo_default").strip() or "mimo_default",
-                instructions=str(instructions or "").strip(),
-                output_format="wav",
+                style_hint=str(voice_style or "default").strip() or "default",
+                language_hint=(str(text_language).strip() if text_language else None),
             )
-            import base64
+            if not isinstance(encoded, str) or not encoded.strip():
+                return False, "本地消息 TTS 未返回音频"
 
-            encoded = base64.b64encode(audio_bytes).decode("ascii")
             success = await send_voice(
-                encoded,
-                self.chat_stream.stream_id,
+                voice_data=encoded,
+                stream_id=self.chat_stream.stream_id,
                 platform=self.chat_stream.platform,
                 processed_plain_text=f"[语音:{normalized_text}]",
             )
             if not success:
                 return False, "语音已合成，但平台发送失败"
-            return True, f"已合成并发送语音: {normalized_text[:80]}"
+            return True, f"已合成并发送语音（{len(normalized_text)} 字）"
         except Exception as exc:  # noqa: BLE001
-            logger.error(f"MiMo TTS 合成或发送失败: {exc}", exc_info=True)
+            logger.error(f"本地消息 TTS 合成或发送失败: {exc}", exc_info=True)
             return False, f"语音合成或发送失败: {exc}"
 
 
@@ -992,9 +922,10 @@ class LifeSendFileAction(BaseAction):
         target_stream_id = self.chat_stream.stream_id
         context = self.chat_stream.context
 
+        from uuid import uuid4
+
         from src.core.managers.adapter_manager import get_adapter_manager
         from src.core.transport.message_send import get_message_sender
-        from uuid import uuid4
 
         bot_info = await get_adapter_manager().get_bot_info_by_platform(platform)
         last_msg = self._get_context_message_for_target()
@@ -1569,21 +1500,130 @@ class LifeRecognizeVoiceTool(LifeInspectMediaTool):
 
 
 class LifeSaveMediaTool(LifeInspectMediaTool):
-    """把收到的图片/媒体存到 workspace，供后续处理或分析使用。"""
+    """把收到的媒体或普通附件存到 workspace。"""
 
     tool_name = "nucleus_save_media"
     tool_description = (
-        "把用户发来的图片、语音或视频保存到 workspace 目录，持久化到磁盘。\n\n"
+        "把用户发来的图片、语音、视频或普通文件保存到 workspace，持久化到磁盘。\n\n"
         "**与 inspect_media 的区别：**\n"
         "- inspect_media：让你「看」媒体，只进 LLM 上下文，不落盘\n"
-        "- nucleus_save_media：把媒体存到 workspace 文件里，可持久保留、二次使用\n\n"
+        "- nucleus_save_media：保存收到的媒体/附件，可持久保留、读取或再次发送\n\n"
         "**save_path 说明：**\n"
-        "- 留空 → 自动存到 workspace/received/<时间戳>.<扩展名>\n"
+        "- 留空 → 自动存到 workspace/received/，普通文件保留安全化后的原文件名\n"
         "- 相对路径（如 'vibes/ref.png'）→ workspace/<路径>\n"
         "- 必须在 workspace 内\n\n"
-        "**返回：** 保存路径、文件大小、媒体类型"
+        "**返回：** 保存路径、文件大小、SHA-256、附件类型；文件正文不会进入工具结果"
     )
     chatter_allow: list[str] = ["life_chatter"]
+    _SAVEABLE_MEDIA_TYPES = {"auto", "image", "video", "audio", "file"}
+    MAX_SAVABLE_BYTES = 200 * 1024 * 1024
+
+    def _select_saveable_media(
+        self,
+        target: str,
+        media_type: str,
+    ) -> _SelectedMedia | None:
+        expected_message_id = (
+            "" if target.lower() in {"", "latest", "recent"} else target
+        )
+        seen_messages: set[str] = set()
+        for message in self._iter_candidate_messages():
+            message_id = str(getattr(message, "message_id", "") or "")
+            if message_id and message_id in seen_messages:
+                continue
+            if message_id:
+                seen_messages.add(message_id)
+            if expected_message_id and message_id != expected_message_id:
+                continue
+            for media in reversed(self._get_message_media(message)):
+                original_type = str(media.get("type", "") or "").strip().lower()
+                if original_type == "file":
+                    kind = "file"
+                    data = self._extract_media_data(media, kind)
+                    raw = data if isinstance(data, dict) else {}
+                    source = ""
+                    if isinstance(data, str):
+                        source = data.strip()
+                    else:
+                        for key in (
+                            "base64",
+                            "data",
+                            "path",
+                            "file_path",
+                            "local_path",
+                            "file",
+                            "url",
+                            "storage_key",
+                        ):
+                            value = raw.get(key)
+                            if (
+                                not isinstance(value, str)
+                                or not value.strip()
+                                or value.strip() == "[removed]"
+                            ):
+                                continue
+                            if key == "storage_key":
+                                source = str(
+                                    Path.cwd()
+                                    / "data"
+                                    / "received_files"
+                                    / value.strip()
+                                )
+                            else:
+                                source = value.strip()
+                            break
+                    filename = str(
+                        raw.get("name")
+                        or raw.get("filename")
+                        or raw.get("file_name")
+                        or media.get("filename")
+                        or media.get("name")
+                        or "attachment.bin"
+                    )
+                    mime_type = str(
+                        raw.get("mime_type")
+                        or media.get("mime_type")
+                        or "application/octet-stream"
+                    )
+                    selected = _SelectedMedia(
+                        message=message,
+                        media=media,
+                        kind=kind,
+                        original_type=original_type,
+                        data={**raw, "filename": filename},
+                        data_for_native=source,
+                        mime_type=mime_type,
+                    )
+                else:
+                    selected = self._normalize_media_item(message, media)
+                if selected is None:
+                    continue
+                if media_type != "auto" and selected.kind != media_type:
+                    continue
+                return selected
+        return None
+
+    @staticmethod
+    def _managed_received_path(raw: str) -> Path | None:
+        if not raw or raw.startswith(("data:", "base64|", "base64://")):
+            return None
+        if raw.startswith(("http://", "https://")):
+            return None
+        try:
+            source = Path(raw).expanduser().resolve(strict=True)
+            managed_root = (Path.cwd() / "data" / "received_files").resolve()
+            source.relative_to(managed_root)
+        except (OSError, ValueError):
+            return None
+        return source if source.is_file() else None
+
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
 
     async def execute(
         self,
@@ -1593,7 +1633,7 @@ class LifeSaveMediaTool(LifeInspectMediaTool):
         ] = "latest",
         media_type: Annotated[
             str,
-            "媒体类型过滤：auto/image/video/audio",
+            "附件类型过滤：auto/image/video/audio/file",
         ] = "auto",
         save_path: Annotated[
             str,
@@ -1601,27 +1641,56 @@ class LifeSaveMediaTool(LifeInspectMediaTool):
         ] = "",
     ) -> tuple[bool, str | dict]:
         import base64
+        import binascii
         import mimetypes
+        import shutil
+        import tempfile
         import time as _time
+
         from ..tools._utils import _get_workspace
 
-        selected = self._select_media(target, media_type)
+        normalized_type = self._normalize_choice(
+            media_type,
+            self._SAVEABLE_MEDIA_TYPES,
+            "auto",
+        )
+        selected = self._select_saveable_media(target, normalized_type)
         if selected is None:
-            return False, "当前会话没有找到可保存的媒体，或指定 message_id 不存在"
+            return False, "当前会话没有找到可保存的媒体/附件，或指定 message_id 不存在"
 
         raw = selected.data_for_native
         if not raw:
             return False, "找到了媒体记录，但原始数据不在当前运行态，无法保存"
 
-        # 解码 base64
-        try:
-            if raw.startswith("data:") and ";base64," in raw:
-                raw = raw.split(";base64,", 1)[1]
-            elif raw.startswith("base64|"):
-                raw = raw.split("|", 1)[1]
-            image_bytes = base64.b64decode(raw)
-        except Exception as exc:
-            return False, f"媒体数据解码失败: {exc}"
+        source_path = self._managed_received_path(raw)
+        decoded_bytes: bytes | None = None
+        if source_path is None:
+            if raw.startswith(("http://", "https://")):
+                return (
+                    False,
+                    "远程 URL 尚未物化；请先使用 nucleus_download 下载到 workspace",
+                )
+            encoded = raw
+            if encoded.startswith("data:"):
+                _, separator, encoded = encoded.partition(",")
+                if not separator:
+                    return False, "附件 data URL 不合法"
+            if encoded.startswith("base64|"):
+                encoded = encoded.removeprefix("base64|")
+            elif encoded.startswith("base64://"):
+                encoded = encoded.removeprefix("base64://")
+            if len(encoded) > ((self.MAX_SAVABLE_BYTES + 2) // 3) * 4 + 4:
+                return False, "附件超过保存字节上限"
+            try:
+                decoded_bytes = base64.b64decode(encoded, validate=True)
+            except (ValueError, binascii.Error):
+                return False, "附件既不是受管本地文件，也不是合法 base64 数据"
+            if len(decoded_bytes) > self.MAX_SAVABLE_BYTES:
+                return False, "附件超过保存字节上限"
+        else:
+            source_size = await asyncio.to_thread(lambda: source_path.stat().st_size)
+            if source_size > self.MAX_SAVABLE_BYTES:
+                return False, "附件超过保存字节上限"
 
         # 推断扩展名
         mime = selected.mime_type or ""
@@ -1630,29 +1699,66 @@ class LifeSaveMediaTool(LifeInspectMediaTool):
             ext = {"image": ".png", "video": ".mp4", "audio": ".mp3"}.get(
                 selected.kind, ".bin"
             )
+        selected_data = selected.data if isinstance(selected.data, dict) else {}
+        original_name = Path(
+            str(selected_data.get("filename") or f"attachment{ext}")
+        ).name
+        original_name = original_name.strip().replace("\x00", "") or f"attachment{ext}"
 
-        workspace = _get_workspace(self.plugin)
+        workspace = _get_workspace(self.plugin).resolve()
 
         # 解析保存路径
         raw_path = str(save_path or "").strip()
         if not raw_path:
             ts = int(_time.time())
-            filename = f"{ts}{ext}"
+            filename = (
+                f"{ts}_{original_name}" if selected.kind == "file" else f"{ts}{ext}"
+            )
             dest = workspace / "received" / filename
         else:
             candidate = Path(raw_path)
             dest = candidate if candidate.is_absolute() else workspace / candidate
             try:
-                dest.resolve().relative_to(workspace)
+                dest.resolve().relative_to(workspace.resolve())
             except ValueError:
                 return False, f"保存路径超出 workspace 范围: {dest}"
             if dest.is_dir():
-                dest = dest / f"{int(_time.time())}{ext}"
+                filename = (
+                    f"{int(_time.time())}_{original_name}"
+                    if selected.kind == "file"
+                    else f"{int(_time.time())}{ext}"
+                )
+                dest = dest / filename
 
         await asyncio.to_thread(dest.parent.mkdir, parents=True, exist_ok=True)
-        await asyncio.to_thread(dest.write_bytes, image_bytes)
 
-        size = len(image_bytes)
+        def _write_atomically() -> None:
+            descriptor = tempfile.NamedTemporaryFile(
+                mode="wb",
+                prefix=".save-media-",
+                suffix=".tmp",
+                dir=dest.parent,
+                delete=False,
+            )
+            temp_path = Path(descriptor.name)
+            try:
+                with descriptor:
+                    if source_path is not None:
+                        with source_path.open("rb") as source:
+                            shutil.copyfileobj(source, descriptor, 1024 * 1024)
+                    else:
+                        assert decoded_bytes is not None
+                        descriptor.write(decoded_bytes)
+                    descriptor.flush()
+                    os.fsync(descriptor.fileno())
+                os.replace(temp_path, dest)
+            finally:
+                temp_path.unlink(missing_ok=True)
+
+        await asyncio.to_thread(_write_atomically)
+
+        size = await asyncio.to_thread(lambda: dest.stat().st_size)
+        digest = await asyncio.to_thread(self._sha256_file, dest)
         size_str = (
             f"{size / 1024:.1f} KB"
             if size < 1024 * 1024
@@ -1665,6 +1771,7 @@ class LifeSaveMediaTool(LifeInspectMediaTool):
             "workspace_relative": rel,
             "size": size_str,
             "size_bytes": size,
+            "sha256": digest,
             "kind": selected.kind,
             "mime_type": mime or "unknown",
         }
@@ -3353,7 +3460,7 @@ class LifeChatter(BaseChatter):
             "`think`、`record_inner_monologue` 或 TTS 工具。\n"
             "- 只有确实需要查询或操作时才先调用其他工具；拿到结果后立即回复。\n"
             "- 回复保持口语化、适合直接朗读，尽量一次发成一个完整短段。\n"
-            "- 语音由 Surface 自动用 Neo TTS 合成，不要主动调用 `tts_voice_action`。"
+            "- 语音由 Surface 本地自动语音链合成，不要主动调用任何 TTS/语音发送工具。"
         )
 
     @classmethod
@@ -3393,7 +3500,10 @@ class LifeChatter(BaseChatter):
             "- 普通问题直接在同轮调用 `life_send_text` 回复；多个独立查询也应同轮发出，不要逐个等待。\n"
             "- 只有后一个动作必须依赖前一个工具的未知结果时才分轮；例如先 `nucleus_view_screen`，看到结果后再 `life_send_text`。\n"
             "### 核心工具\n"
-            "- `life_send_text`：**发送文字给用户**（用户唯一能看到的途径）。`content` 只写纯文本正文，长内容用 `\\n` 分段。`target_key` 通常留空。\n"
+            "- `life_send_text`：**在当前意识实例表面发送文字**。`content` 只写纯文本正文，长内容用 `\\n` 分段；它不负责选择其他聊天。\n"
+            "- `nucleus_manage_initiative_seed`：显式保存、改写、再次遇见或释放主体主动线索。\n"
+            "- `nucleus_reachability`：只读查看已登记对象和物理表面；不按最近活跃替你排序。\n"
+            "- `nucleus_begin_outreach`：明确选择对象与表面，启动一次新的表达判断。\n"
             "- `life_send_file`：发送本地文件给用户。\n"
             "- `action-life_pass_and_wait`：结束本轮，等待用户新消息。\n"
             "- `nucleus_bash`：查看或操作电脑终端。\n"
@@ -3567,13 +3677,23 @@ class LifeChatter(BaseChatter):
     ) -> dict[str, Any]:
         """路由：是否把这批消息交给表达层继续处理。"""
 
-        # 内部主动机会/自主意向 → 交给主模型重新判断。
-        # 这不是强制回复，只是让表达层看到这个机会。
+        if unread_msgs and all(
+            self._message_flag(msg, "is_proactive_followup_trigger")
+            for msg in unread_msgs
+        ):
+            return {
+                "reason": "旧延迟续话触发已退役，不进入表达决策",
+                "should_respond": False,
+                "force_reply": False,
+            }
+
+        # 外部机会或主体显式外联决定 → 交给主模型重新判断。
+        # 这不是强制回复，只是让表达层看到新的真实上下文。
         if unread_msgs and all(
             self._is_proactive_trigger_message(msg) for msg in unread_msgs
         ):
             return {
-                "reason": "内部主动机会或自主意向浮现，交给表达层判断",
+                "reason": "外部机会或主体显式外联进入当前表面，交给表达层判断",
                 "should_respond": True,
                 "force_reply": False,
             }
@@ -4719,8 +4839,7 @@ class LifeChatter(BaseChatter):
     def _is_proactive_trigger_message(cls, message: Message) -> bool:
         return bool(
             cls._message_flag(message, "is_proactive_opportunity_trigger")
-            or cls._message_flag(message, "is_proactive_followup_trigger")
-            or cls._message_flag(message, "is_autonomy_intent_trigger")
+            or cls._message_flag(message, "is_initiative_outreach_trigger")
         )
 
     @classmethod
@@ -4729,33 +4848,10 @@ class LifeChatter(BaseChatter):
         unread_msgs: list[Message],
         stream_id: str,
     ) -> list[dict[str, str]]:
-        """Collect causally active autonomy occurrences for the current turn."""
+        """Ignore retired scheduler triggers in the active expression runtime."""
 
-        occurrences: list[dict[str, str]] = []
-        seen: set[tuple[str, str]] = set()
-        for message in unread_msgs:
-            if not cls._message_flag(message, "is_autonomy_intent_trigger"):
-                continue
-            extra = getattr(message, "extra", {}) or {}
-            intent_id = str(extra.get("autonomy_intent_id") or "").strip()
-            occurrence_id = str(extra.get("autonomy_occurrence_id") or "").strip()
-            authorized_stream_id = str(
-                extra.get("autonomy_authorized_stream_id")
-                or getattr(message, "stream_id", "")
-                or stream_id
-            ).strip()
-            key = (intent_id, occurrence_id)
-            if not intent_id or not occurrence_id or key in seen:
-                continue
-            seen.add(key)
-            occurrences.append(
-                {
-                    "intent_id": intent_id,
-                    "occurrence_id": occurrence_id,
-                    "authorized_stream_id": authorized_stream_id,
-                }
-            )
-        return occurrences
+        del cls, unread_msgs, stream_id
+        return []
 
     async def _validate_autonomy_action_target(
         self,
@@ -4781,23 +4877,7 @@ class LifeChatter(BaseChatter):
         )
         if not target_key:
             return True, ""
-        runtime_cfg = getattr(
-            getattr(self.plugin, "config", None), "runtime_sync", None
-        )
-        target = await resolve_send_target_key(
-            target_key,
-            current_stream_id=stream_id,
-            limit=max(1, int(getattr(runtime_cfg, "send_targets_limit", 8) or 8)),
-            active_window_hours=max(
-                0.1,
-                float(getattr(runtime_cfg, "send_targets_window_hours", 24.0) or 24.0),
-            ),
-        )
-        if target is None:
-            return False, "unknown_target_key"
-        if str(target.stream_id or "").strip() != str(stream_id or "").strip():
-            return False, "cross_stream_not_authorized"
-        return True, ""
+        return False, "target_key_retired"
 
     @staticmethod
     def _unread_turn_key(unread_msgs: list[Message], stream_id: str) -> str:
@@ -4934,9 +5014,8 @@ class LifeChatter(BaseChatter):
         cleaned = [segment for segment in cleaned if segment]
         if not cleaned:
             return None
-        target_key = str(args.get("target_key", "") or "").strip()
         reply_to = str(args.get("reply_to", "") or "").strip()
-        scope = f"{stream_id}|{target_key}|{reply_to}"
+        scope = f"{stream_id}|{reply_to}"
         return str(turn_key or ""), scope, "\n".join(cleaned)
 
     @staticmethod

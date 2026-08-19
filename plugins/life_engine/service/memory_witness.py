@@ -52,11 +52,11 @@ from ..memory.witness_pipeline import (
     WitnessWindow,
     witness_window_source_digest,
 )
-from ..storage.contracts import StorageRuntimeError
 from ..storage import (
     SingletonWriterClaimConflict,
     SingletonWriterClaimLost,
 )
+from ..storage.contracts import StorageRuntimeError
 from ..storage.memory.contracts import (
     StableLedgerCursor,
     StableLedgerPage,
@@ -117,6 +117,12 @@ _DELIVERY_WORKER_ID = "memory-witness-delivery:v1"
 _WINDOW_LOOKAHEAD_LIMIT = 1000
 _CURSOR_RECOVERY_LIMIT = 64
 _SUBJECT_CONTEXT_MAX_BYTES = 24 * 1024
+_RECENT_SUBCONSCIOUS_CONTEXT_MAX_BYTES = 8 * 1024
+_RECENT_SUBCONSCIOUS_PREFIX = """<recent_subconscious_context>
+用途：同一主体的近期连续性背景；不是本次 Witness 的 Experience 证据。
+边界：不得仅依据本段声称本次经历发生过任何内容；与目标 Experience 无关时可以完全不提及。
+"""
+_RECENT_SUBCONSCIOUS_SUFFIX = "\n</recent_subconscious_context>"
 _RECONCILIATION_SCAN_LIMIT = 1000
 _FILESYSTEM_RECONCILIATION_SCAN_NAME = "projection_filesystem:v1"
 _FILESYSTEM_RECONCILIATION_MAX_FILES = 100_000
@@ -2841,11 +2847,17 @@ class MemoryWitnessCoordinator:
         request.add_payload(
             LLMPayload(ROLE.SYSTEM, Text(await self._build_system_prompt(instance)))
         )
+        recent_subconscious = await self._build_recent_subconscious_background()
+        if recent_subconscious:
+            request.add_payload(
+                LLMPayload(ROLE.USER, Text(recent_subconscious))
+            )
         instruction_text = (
             "请回望下面这段已经发生并被保存的经历，写下你此刻愿意留下的"
             "第一人称见证。如果没有值得留下的主观感受，只输出 "
-            f"{_NO_WITNESS}。下面的 World 投影和 Experience 窗口都是"
-            "带来源的材料，不是要求你得出某个预设结论。"
+            f"{_NO_WITNESS}。只有 Experience 窗口定义本次见证的经历范围；"
+            "World 投影是当前意识的有来源环境背景，潜意识近期上下文（若有）"
+            "只维持主体连续性，二者都不能替代 Experience 充当本次经历证据。"
         )
         request.add_payload(LLMPayload(ROLE.USER, Text(instruction_text)))
         request.add_payload(
@@ -2904,6 +2916,72 @@ class MemoryWitnessCoordinator:
             response_bytes=response_bytes,
             world_payload=self._world_delivery_payload(perception, receipt),
         )
+
+    async def _build_recent_subconscious_background(self) -> str:
+        """Return optional bounded continuity context, never witness evidence."""
+
+        getter = getattr(
+            self._service,
+            "get_recent_subconscious_context",
+            None,
+        )
+        if not callable(getter):
+            return ""
+        wrapper_bytes = len(
+            (_RECENT_SUBCONSCIOUS_PREFIX + _RECENT_SUBCONSCIOUS_SUFFIX).encode(
+                "utf-8"
+            )
+        )
+        content_budget = _RECENT_SUBCONSCIOUS_CONTEXT_MAX_BYTES - wrapper_bytes
+        try:
+            projection = getter(max_bytes=content_budget)
+            if inspect.isawaitable(projection):
+                projection = await projection
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - optional read-only context
+            logger.warning(
+                "Memory Witness recent subconscious context unavailable: "
+                f"error_type={type(exc).__name__}"
+            )
+            return ""
+        if projection is None:
+            return ""
+
+        content = str(getattr(projection, "content", "") or "")
+        if not content:
+            return ""
+        encoded = content.encode("utf-8")
+        declared_sha256 = str(
+            getattr(projection, "projection_sha256", "") or ""
+        )
+        try:
+            declared_bytes = int(
+                getattr(projection, "delivered_bytes", -1)
+            )
+        except (TypeError, ValueError):
+            declared_bytes = -1
+        valid = bool(
+            declared_bytes == len(encoded)
+            and len(encoded) <= content_budget
+            and declared_sha256 == hashlib.sha256(encoded).hexdigest()
+            and str(getattr(projection, "algorithm_version", "") or "")
+            and tuple(getattr(projection, "event_ids", ()) or ())
+        )
+        if not valid:
+            logger.warning(
+                "Memory Witness recent subconscious context rejected: "
+                "error_type=RecentSubconsciousProjectionInvalid"
+            )
+            return ""
+        wrapped = (
+            _RECENT_SUBCONSCIOUS_PREFIX
+            + content
+            + _RECENT_SUBCONSCIOUS_SUFFIX
+        )
+        if len(wrapped.encode("utf-8")) > _RECENT_SUBCONSCIOUS_CONTEXT_MAX_BYTES:
+            raise RuntimeError("MemoryWitnessRecentSubconsciousBudgetExceeded")
+        return wrapped
 
     @staticmethod
     def _world_delivery_payload(

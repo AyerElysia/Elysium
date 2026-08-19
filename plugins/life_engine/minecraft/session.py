@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import time
@@ -12,7 +13,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from ..service.perception_gateway import PerceptionDeliveryReceipt
+from ..service.subconscious_context import RecentSubconsciousContext
 from .bot_launcher import MinecraftBotLauncher
 from .bridge_body import BridgeBody
 from .bridge_client import (
@@ -24,7 +25,6 @@ from .capture import WindowCapture
 from .embodiment_contracts import (
     EmbodiedIntent,
     ExecutionResult,
-    PerceptionReference,
     WorldObservation,
 )
 from .embodiment_runtime import EmbodimentRuntime
@@ -129,8 +129,7 @@ class MinecraftSession:
         llm_helper: Any | None = None,
         consciousness_registry: Any | None = None,
         save_consciousness_registry: Any | None = None,
-        prepare_perception: Any | None = None,
-        commit_perception: Any | None = None,
+        get_recent_subconscious_context: Any | None = None,
         report_world_observation: Any | None = None,
     ) -> None:
         """Create an inactive session with optional shared-world integrations."""
@@ -142,8 +141,7 @@ class MinecraftSession:
         self._capture = WindowCapture()
         self._registry = consciousness_registry
         self._save_registry = save_consciousness_registry
-        self._prepare_perception = prepare_perception
-        self._commit_perception = commit_perception
+        self._get_recent_subconscious_context = get_recent_subconscious_context
         self._report_world_observation = report_world_observation
         self._state = SessionState()
         self._runtime: EmbodimentRuntime | None = None
@@ -702,31 +700,54 @@ class MinecraftSession:
         except Exception as exception:  # noqa: BLE001 - Presence is part of success
             self._state.last_error = str(exception)
             return {"success": False, "error": str(exception)}
-        perception = None
         durable_context: dict[str, Any] = {
             "session_id": self._state.session_id,
             "session_goal": self._state.session_goal,
             "stream_id": self._state.stream_id,
         }
         transient_prompt_context: dict[str, Any] = {}
-        perception_reference = None
         try:
-            if self._prepare_perception is not None:
-                perception = await _invoke_callback(
-                    self._prepare_perception,
-                    self._state.consciousness_instance_id,
+            if self._get_recent_subconscious_context is not None:
+                recent_subconscious = await _invoke_callback(
+                    self._get_recent_subconscious_context,
                 )
-                perception_reference = PerceptionReference.from_prepared(perception)
-                transient_prompt_context["world_perception"] = perception.content
+                if not isinstance(recent_subconscious, RecentSubconsciousContext):
+                    raise TypeError(
+                        "Minecraft recent subconscious callback must return "
+                        "RecentSubconsciousContext"
+                    )
+                encoded = recent_subconscious.content.encode("utf-8")
+                if (
+                    len(encoded) != recent_subconscious.delivered_bytes
+                    or hashlib.sha256(encoded).hexdigest()
+                    != recent_subconscious.projection_sha256
+                ):
+                    raise RuntimeError(
+                        "Minecraft recent subconscious content does not match "
+                        "its projection metadata"
+                    )
+                if recent_subconscious.content:
+                    transient_prompt_context["recent_subconscious_context"] = (
+                        recent_subconscious.content
+                    )
+                    durable_context["recent_subconscious_reference"] = {
+                        "schema": "minecraft.recent_subconscious_reference.v1",
+                        "algorithm_version": recent_subconscious.algorithm_version,
+                        "projection_sha256": recent_subconscious.projection_sha256,
+                        "delivered_bytes": recent_subconscious.delivered_bytes,
+                        "from_sequence": recent_subconscious.from_sequence,
+                        "through_sequence": recent_subconscious.through_sequence,
+                        "group_count": recent_subconscious.group_count,
+                        "source_group_count": recent_subconscious.source_group_count,
+                        "omitted_group_count": recent_subconscious.omitted_group_count,
+                        "truncated": recent_subconscious.truncated,
+                    }
             embodied_intent = EmbodiedIntent(
                 text=intent,
                 body_name=self._state.body_name,
                 durable_context=durable_context,
                 transient_prompt_context=transient_prompt_context,
-                perception_reference=perception_reference,
             )
-            if perception_reference is not None:
-                self._planner.reset_perception_delivery(perception_reference)
         except Exception as exception:  # noqa: BLE001 - public intent boundary
             self._state.last_error = str(exception)
             return {"success": False, "error": str(exception)}
@@ -747,22 +768,6 @@ class MinecraftSession:
             )
             self._execution_task = task
             result = await task
-            if perception is not None and perception_reference is not None:
-                delivery = self._planner.consume_perception_delivery(
-                    perception_reference
-                )
-                if self._commit_perception is not None:
-                    await _invoke_callback(
-                        self._commit_perception,
-                        perception,
-                        PerceptionDeliveryReceipt(
-                            delivery_id=delivery.delivery_id,
-                            projection_sha256=delivery.projection_sha256,
-                            delivered_bytes=delivery.delivered_bytes,
-                            exact=True,
-                            transport_request_id=delivery.transport_request_id,
-                        ),
-                    )
         except Exception as exception:  # noqa: BLE001 - report planner/bridge evidence failure
             self._state.last_error = str(exception)
             return {

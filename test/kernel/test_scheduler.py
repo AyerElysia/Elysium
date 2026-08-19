@@ -19,6 +19,27 @@ from src.kernel.scheduler import (
 from src.kernel.scheduler.time_utils import next_after
 
 
+async def _wait_until(predicate, *, timeout: float = 20.0) -> None:
+    async with asyncio.timeout(timeout):
+        while not predicate():
+            await asyncio.sleep(0.01)
+
+
+async def _wait_until_task_removed(schedule_id: str) -> None:
+    async with asyncio.timeout(2.0):
+        while await get_unified_scheduler().get_task_info(schedule_id) is not None:
+            await asyncio.sleep(0.01)
+
+
+async def _wait_until_task_not_running(schedule_id: str) -> None:
+    async with asyncio.timeout(2.0):
+        while True:
+            task_info = await get_unified_scheduler().get_task_info(schedule_id)
+            if task_info is None or not task_info["is_running"]:
+                return
+            await asyncio.sleep(0.01)
+
+
 class TestScheduler:
     """测试统一调度器"""
 
@@ -48,7 +69,8 @@ class TestScheduler:
         )
 
         # 等待任务执行（避免依赖调度器 tick 抖动导致的偶发超时）
-        await asyncio.wait_for(done.wait(), timeout=3)
+        await asyncio.wait_for(done.wait(), timeout=10.0)
+        await _wait_until_task_removed(schedule_id)
 
         # 验证任务已执行
         assert len(executed) == 1
@@ -60,9 +82,12 @@ class TestScheduler:
     async def test_recurring_task(self):
         """测试循环任务"""
         executed = []
+        twice = asyncio.Event()
 
         async def recurring_task():
             executed.append(1)
+            if len(executed) >= 2:
+                twice.set()
 
         # 创建每0.5秒执行一次的循环任务
         schedule_id = await get_unified_scheduler().create_schedule(
@@ -73,8 +98,7 @@ class TestScheduler:
             task_name="test_recurring",
         )
 
-        # 等待任务执行多次（优化后）
-        await asyncio.sleep(3.5)
+        await asyncio.wait_for(twice.wait(), timeout=20.0)
 
         # 验证任务已执行多次（考虑到调度器1秒的检查间隔）
         assert len(executed) >= 2
@@ -86,9 +110,11 @@ class TestScheduler:
         """测试自定义条件触发"""
         executed = []
         trigger_condition = False
+        completed = asyncio.Event()
 
         async def custom_task():
             executed.append(1)
+            completed.set()
 
         async def check_condition():
             return trigger_condition
@@ -107,7 +133,7 @@ class TestScheduler:
 
         # 激活条件
         trigger_condition = True
-        await asyncio.sleep(2)
+        await asyncio.wait_for(completed.wait(), timeout=10.0)
         assert len(executed) >= 1
 
         # 清理
@@ -116,9 +142,11 @@ class TestScheduler:
     async def test_task_with_params(self):
         """测试带参数的任务"""
         executed = []
+        completed = asyncio.Event()
 
         async def task_with_params(a, b, c=None):
             executed.append((a, b, c))
+            completed.set()
 
         # 创建带参数的任务
         schedule_id = await get_unified_scheduler().create_schedule(
@@ -130,7 +158,7 @@ class TestScheduler:
             task_name="test_params",
         )
 
-        await asyncio.sleep(1.5)
+        await asyncio.wait_for(completed.wait(), timeout=10.0)
 
         # 验证参数正确传递
         assert len(executed) == 1
@@ -162,9 +190,16 @@ class TestScheduler:
     async def test_pause_resume_task(self):
         """测试暂停和恢复任务"""
         executed = []
+        first_execution = asyncio.Event()
+        resumed_execution = asyncio.Event()
+        resumed = False
 
         async def test_task():
             executed.append(1)
+            if resumed:
+                resumed_execution.set()
+            else:
+                first_execution.set()
 
         # 创建循环任务
         schedule_id = await get_unified_scheduler().create_schedule(
@@ -175,20 +210,21 @@ class TestScheduler:
             task_name="test_pause",
         )
 
-        # 等待执行几次
-        await asyncio.sleep(1.5)
+        await asyncio.wait_for(first_execution.wait(), timeout=20.0)
+        await _wait_until_task_not_running(schedule_id)
         count_before_pause = len(executed)
 
         # 暂停任务
-        await get_unified_scheduler().pause_schedule(schedule_id)
+        assert await get_unified_scheduler().pause_schedule(schedule_id) is True
         await asyncio.sleep(1.5)
 
         # 验证任务未继续执行
         assert len(executed) == count_before_pause
 
         # 恢复任务
-        await get_unified_scheduler().resume_schedule(schedule_id)
-        await asyncio.sleep(1.5)
+        resumed = True
+        assert await get_unified_scheduler().resume_schedule(schedule_id) is True
+        await asyncio.wait_for(resumed_execution.wait(), timeout=20.0)
 
         # 验证任务继续执行
         assert len(executed) > count_before_pause
@@ -253,17 +289,21 @@ class TestScheduler:
 
     async def test_statistics(self):
         """测试统计信息"""
+        completed = asyncio.Event()
+
+        async def stats_task():
+            completed.set()
+
         # 创建循环任务（这样不会自动移除）
         schedule_id = await get_unified_scheduler().create_schedule(
-            callback=lambda: None,
+            callback=stats_task,
             trigger_type=TriggerType.TIME,
             trigger_config={"delay_seconds": 0.5},
             is_recurring=True,  # 循环任务不会自动移除
             task_name="test_stats",
         )
 
-        # 等待任务执行
-        await asyncio.sleep(1.5)
+        await asyncio.wait_for(completed.wait(), timeout=20.0)
 
         # 获取统计信息
         stats = get_unified_scheduler().get_statistics()
@@ -350,11 +390,7 @@ class TestSchedulerTimeUtils:
         await asyncio.wait_for(callback_started.wait(), timeout=5.0)
         await asyncio.wait_for(callback_cancelled.wait(), timeout=3.0)
 
-        async def _wait_until_removed() -> None:
-            while await get_unified_scheduler().get_task_info(schedule_id) is not None:
-                await asyncio.sleep(0)
-
-        await asyncio.wait_for(_wait_until_removed(), timeout=2.0)
+        await _wait_until_task_removed(schedule_id)
 
         # 验证任务已移除（超时失败）
         task_info = await get_unified_scheduler().get_task_info(schedule_id)
@@ -366,8 +402,13 @@ class TestSchedulerTimeUtils:
 
     async def test_task_failure(self):
         """测试任务失败"""
+        attempted = asyncio.Event()
+
         async def failing_task():
-            raise ValueError("Task failed!")
+            try:
+                raise ValueError("Task failed!")
+            finally:
+                attempted.set()
 
         # 创建会失败的任务
         schedule_id = await get_unified_scheduler().create_schedule(
@@ -377,8 +418,8 @@ class TestSchedulerTimeUtils:
             task_name="test_failure",
         )
 
-        # 等待任务执行
-        await asyncio.sleep(1.5)
+        await asyncio.wait_for(attempted.wait(), timeout=10.0)
+        await _wait_until_task_removed(schedule_id)
 
         # 验证任务已失败并被移除（一次性任务）
         task_info = await get_unified_scheduler().get_task_info(schedule_id)
@@ -391,12 +432,14 @@ class TestSchedulerTimeUtils:
     async def test_task_retry(self):
         """测试任务重试"""
         attempt_count = 0
+        completed = asyncio.Event()
 
         async def retry_task():
             nonlocal attempt_count
             attempt_count += 1
             if attempt_count < 3:
                 raise ValueError(f"Not yet! Attempt {attempt_count}")
+            completed.set()
 
         # 创建带重试的任务
         schedule_id = await get_unified_scheduler().create_schedule(
@@ -407,9 +450,14 @@ class TestSchedulerTimeUtils:
             task_name="test_retry",
         )
 
-        # 等待任务执行和重试（需要考虑重试延迟）
-        # 第一次执行立即失败 + 5秒后第一次重试 + 5秒后第二次重试
-        await asyncio.sleep(12)
+        # 等待真实完成事件，不用固定 sleep 猜测调度 tick 与全仓负载。
+        await asyncio.wait_for(completed.wait(), timeout=15.0)
+
+        async def _wait_until_removed() -> None:
+            while await get_unified_scheduler().get_task_info(schedule_id) is not None:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(_wait_until_removed(), timeout=2.0)
 
         # 验证任务重试了3次后最终成功
         assert attempt_count == 3
@@ -422,12 +470,14 @@ class TestSchedulerTimeUtils:
         """测试强制覆盖同名任务"""
         executed1 = []
         executed2 = []
+        completed = asyncio.Event()
 
         async def task1():
             executed1.append(1)
 
         async def task2():
             executed2.append(1)
+            completed.set()
 
         # 创建第一个任务
         await get_unified_scheduler().create_schedule(
@@ -455,8 +505,7 @@ class TestSchedulerTimeUtils:
             force_overwrite=True,
         )
 
-        # 等待新任务执行
-        await asyncio.sleep(1.5)
+        await asyncio.wait_for(completed.wait(), timeout=10.0)
 
         # 验证新任务执行了
         assert len(executed2) == 1
@@ -561,9 +610,11 @@ class TestSchedulerTimeUtils:
     async def test_trigger_at_specified_time(self):
         """测试在指定时间触发任务"""
         executed = []
+        completed = asyncio.Event()
 
         async def timed_task():
             executed.append(1)
+            completed.set()
 
         # 设置触发时间为1秒后
         trigger_time = datetime.now() + timedelta(seconds=1)
@@ -576,19 +627,25 @@ class TestSchedulerTimeUtils:
         )
 
         # 等待任务执行
-        await asyncio.sleep(2.5)
+        # Wait for the scheduler contract, not a fixed wall-clock margin that
+        # can be consumed by an overloaded full-suite worker.
+        await asyncio.wait_for(completed.wait(), timeout=5.0)
 
         assert len(executed) == 1
         # 一次性任务完成后会被移除
+        await _wait_until_task_removed(schedule_id)
         task_info = await get_unified_scheduler().get_task_info(schedule_id)
         assert task_info is None
 
     async def test_recurring_task_with_interval_seconds(self):
         """测试使用interval_seconds的循环任务"""
         executed = []
+        twice = asyncio.Event()
 
         async def interval_task():
             executed.append(1)
+            if len(executed) >= 2:
+                twice.set()
 
         # 使用 interval_seconds 而非 delay_seconds
         schedule_id = await get_unified_scheduler().create_schedule(
@@ -599,7 +656,7 @@ class TestSchedulerTimeUtils:
             task_name="test_interval",
         )
 
-        await asyncio.sleep(2.5)
+        await asyncio.wait_for(twice.wait(), timeout=20.0)
         assert len(executed) >= 2
 
         await get_unified_scheduler().remove_schedule(schedule_id)
@@ -633,9 +690,11 @@ class TestSchedulerTimeUtils:
     async def test_event_trigger(self):
         """测试事件触发"""
         executed = []
+        completed = asyncio.Event()
 
         async def event_handler(**kwargs):
             executed.append(kwargs)
+            completed.set()
 
         # 创建事件触发的任务
         schedule_id = await get_unified_scheduler().create_schedule(
@@ -646,14 +705,10 @@ class TestSchedulerTimeUtils:
             is_recurring=True,
         )
 
-        # 等待一下确保任务创建完成
-        await asyncio.sleep(0.5)
-
         # 触发事件
         await get_unified_scheduler().trigger_event("test_event", event_params={"key": "value"})
 
-        # 等待事件处理
-        await asyncio.sleep(1)
+        await asyncio.wait_for(completed.wait(), timeout=10.0)
 
         assert len(executed) >= 1
         assert executed[0] == {"key": "value"}
@@ -709,7 +764,7 @@ class TestSchedulerTimeUtils:
             task_name="test_sync_callback",
         )
 
-        await asyncio.sleep(1.5)
+        await _wait_until(lambda: len(executed) == 1)
 
         assert len(executed) == 1
 
@@ -957,8 +1012,14 @@ class TestSchedulerTimeUtils:
 
     async def test_task_execution_history_limit(self):
         """测试执行历史记录限制"""
+        executions = 0
+        twice = asyncio.Event()
+
         async def quick_task():
-            pass
+            nonlocal executions
+            executions += 1
+            if executions >= 2:
+                twice.set()
 
         # 创建会执行多次的循环任务（使用较短的间隔）
         schedule_id = await get_unified_scheduler().create_schedule(
@@ -969,8 +1030,7 @@ class TestSchedulerTimeUtils:
             task_name="test_history_limit",
         )
 
-        # 等待足够时间让任务执行多次（考虑调度器1秒的检查间隔）
-        await asyncio.sleep(4)
+        await asyncio.wait_for(twice.wait(), timeout=20.0)
 
         task_info = await get_unified_scheduler().get_task_info(schedule_id)
         assert task_info is not None
@@ -982,10 +1042,13 @@ class TestSchedulerTimeUtils:
     async def test_remove_running_task(self):
         """测试移除正在运行的任务"""
         executed = []
+        started = asyncio.Event()
+        release = asyncio.Event()
 
         async def long_task():
             executed.append(1)
-            await asyncio.sleep(0.2)
+            started.set()
+            await release.wait()
 
         schedule_id = await get_unified_scheduler().create_schedule(
             callback=long_task,
@@ -994,11 +1057,13 @@ class TestSchedulerTimeUtils:
             task_name="test_remove_running",
         )
 
-        # 等待任务开始运行
-        await asyncio.sleep(1)
+        await asyncio.wait_for(started.wait(), timeout=10.0)
 
         # 移除正在运行的任务
-        result = await get_unified_scheduler().remove_schedule(schedule_id)
+        try:
+            result = await get_unified_scheduler().remove_schedule(schedule_id)
+        finally:
+            release.set()
         assert result is True
 
         # 验证任务已从列表中移除
@@ -1041,8 +1106,12 @@ class TestSchedulerTimeUtils:
 
     async def test_statistics_with_running_tasks(self):
         """测试统计信息中包含运行中的任务"""
+        started = asyncio.Event()
+        release = asyncio.Event()
+
         async def long_task():
-            await asyncio.sleep(2)
+            started.set()
+            await release.wait()
 
         schedule_id = await get_unified_scheduler().create_schedule(
             callback=long_task,
@@ -1051,22 +1120,27 @@ class TestSchedulerTimeUtils:
             task_name="test_stats_running",
         )
 
-        # 等待任务开始运行
-        await asyncio.sleep(1.5)
+        try:
+            await asyncio.wait_for(started.wait(), timeout=10.0)
 
-        stats = get_unified_scheduler().get_statistics()
-        assert stats["is_running"] is True
-        assert stats["running_tasks"] >= 1
-        assert len(stats["running_tasks_info"]) >= 1
-        assert any(t["task_name"] == "test_stats_running" for t in stats["running_tasks_info"])
-
-        # 清理
-        await get_unified_scheduler().remove_schedule(schedule_id)
+            stats = get_unified_scheduler().get_statistics()
+            assert stats["is_running"] is True
+            assert stats["running_tasks"] >= 1
+            assert len(stats["running_tasks_info"]) >= 1
+            assert any(
+                task["task_name"] == "test_stats_running"
+                for task in stats["running_tasks_info"]
+            )
+        finally:
+            release.set()
+            await get_unified_scheduler().remove_schedule(schedule_id)
 
     async def test_force_overwrite_non_active_task(self):
         """测试覆盖非活跃任务"""
+        completed = asyncio.Event()
+
         async def dummy_task():
-            pass
+            completed.set()
 
         # 创建一个任务
         schedule_id1 = await get_unified_scheduler().create_schedule(
@@ -1076,8 +1150,10 @@ class TestSchedulerTimeUtils:
             task_name="test_overwrite_non_active",
         )
 
-        # 等待任务完成（一次性任务）
-        await asyncio.sleep(2)
+        # Wait for execution and removal instead of guessing both with one
+        # wall-clock sleep under a loaded full-suite worker.
+        await asyncio.wait_for(completed.wait(), timeout=10.0)
+        await _wait_until_task_removed(schedule_id1)
 
         # 现在创建同名任务，不应该报错（因为旧任务已完成/被移除）
         schedule_id2 = await get_unified_scheduler().create_schedule(
@@ -1186,10 +1262,12 @@ class TestSchedulerTimeUtils:
     async def test_recurring_task_failure_with_max_retries(self):
         """测试循环任务失败但达到最大重试次数"""
         attempt_count = 0
+        attempted = asyncio.Event()
 
         async def always_failing_task():
             nonlocal attempt_count
             attempt_count += 1
+            attempted.set()
             raise ValueError("Always fails")
 
         schedule_id = await get_unified_scheduler().create_schedule(
@@ -1201,7 +1279,7 @@ class TestSchedulerTimeUtils:
             task_name="test_recurring_fail",
         )
 
-        await asyncio.sleep(4)
+        await asyncio.wait_for(attempted.wait(), timeout=10.0)
 
         # 应该尝试执行并重试
         assert attempt_count >= 1
@@ -1210,8 +1288,15 @@ class TestSchedulerTimeUtils:
 
     async def test_event_task_timeout(self):
         """测试事件任务超时"""
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
         async def timeout_handler(**kwargs):
-            await asyncio.sleep(100)
+            started.set()
+            try:
+                await asyncio.sleep(100)
+            finally:
+                cancelled.set()
 
         schedule_id = await get_unified_scheduler().create_schedule(
             callback=timeout_handler,
@@ -1221,13 +1306,11 @@ class TestSchedulerTimeUtils:
             timeout=1.0,
         )
 
-        await asyncio.sleep(0.5)
-
         # 触发事件
         await get_unified_scheduler().trigger_event("timeout_test_event")
 
-        # 等待超时
-        await asyncio.sleep(2)
+        await asyncio.wait_for(started.wait(), timeout=5.0)
+        await asyncio.wait_for(cancelled.wait(), timeout=5.0)
 
         # 任务应该已超时
         stats = get_unified_scheduler().get_statistics()
@@ -1235,8 +1318,13 @@ class TestSchedulerTimeUtils:
 
     async def test_event_task_failure(self):
         """测试事件任务失败"""
+        attempted = asyncio.Event()
+
         async def failing_handler(**kwargs):
-            raise ValueError("Event handler failed")
+            try:
+                raise ValueError("Event handler failed")
+            finally:
+                attempted.set()
 
         schedule_id = await get_unified_scheduler().create_schedule(
             callback=failing_handler,
@@ -1246,12 +1334,13 @@ class TestSchedulerTimeUtils:
             is_recurring=True,
         )
 
-        await asyncio.sleep(0.5)
-
         # 触发事件
         await get_unified_scheduler().trigger_event("fail_test_event")
 
-        await asyncio.sleep(1)
+        await asyncio.wait_for(attempted.wait(), timeout=5.0)
+        await _wait_until(
+            lambda: get_unified_scheduler().get_statistics()["total_failures"] >= 1
+        )
 
         # 应该有失败记录
         stats = get_unified_scheduler().get_statistics()
@@ -1335,9 +1424,11 @@ class TestSchedulerTimeUtils:
         await scheduler.start()
 
         executed = []
+        completed = asyncio.Event()
 
         async def quick_task():
             executed.append(1)
+            completed.set()
 
         # 创建任务
         schedule_id = await scheduler.create_schedule(
@@ -1347,7 +1438,7 @@ class TestSchedulerTimeUtils:
             task_name="test_custom_config",
         )
 
-        await asyncio.sleep(1)
+        await asyncio.wait_for(completed.wait(), timeout=5.0)
 
         assert len(executed) == 1
 
@@ -1369,12 +1460,10 @@ class TestSchedulerTimeUtils:
             is_recurring=True,
         )
 
-        await asyncio.sleep(0.5)
-
         # 触发事件
         await get_unified_scheduler().trigger_event("sync_test_event", event_params={"test": "data"})
 
-        await asyncio.sleep(1)
+        await _wait_until(lambda: len(executed) >= 1)
 
         assert len(executed) >= 1
         assert executed[0] == {"test": "data"}

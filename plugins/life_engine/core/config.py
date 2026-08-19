@@ -187,9 +187,6 @@ class LifeEngineConfig(BaseConfig):
             "recent_chat_messages",
             "trace_recent_changes_enabled",
             "trace_recent_changes_limit",
-            "send_targets_enabled",
-            "send_targets_limit",
-            "send_targets_window_hours",
             "salient_tail_enabled",
         },
         "learning": {
@@ -629,28 +626,28 @@ class LifeEngineConfig(BaseConfig):
 
     @config_section("autonomy")
     class AutonomySection(SectionBase):
-        """自主意向循环配置。"""
+        """退役 AutonomyIntent 的只读配置兼容面。"""
 
         enabled: bool = Field(
             default=True,
-            description="是否启用 life_engine 自主意向登记与到点浮现。",
+            description="退役兼容字段；不再启用旧意向登记、调度或发送。",
         )
 
         min_delay_minutes: int = Field(
             default=1,
             ge=1,
-            description="自主意向允许的最小延迟分钟数。",
+            description="退役兼容字段；只用于读取旧配置，不参与新 InitiativeSeed。",
         )
 
         max_delay_minutes: int = Field(
             default=1440,
             ge=1,
-            description="自主意向允许的最大延迟分钟数。",
+            description="退役兼容字段；只用于读取旧配置，不参与新 InitiativeSeed。",
         )
 
         show_targets_in_heartbeat: bool = Field(
             default=True,
-            description="是否在心跳 prompt 中呈现可触达的发送目标列表（主动性的行动空间）。",
+            description="退役兼容字段；心跳不再注入近期聊天流目标列表。",
         )
 
     @config_section("narrative")
@@ -1632,25 +1629,6 @@ class LifeEngineConfig(BaseConfig):
             ge=0,
             le=10,
             description="最近文件修改追溯最多展示多少条。设为 0 表示关闭该块。",
-        )
-
-        send_targets_enabled: bool = Field(
-            default=True,
-            description="是否在 chatter suffix 中注入近期可发送目标列表。",
-        )
-
-        send_targets_limit: int = Field(
-            default=8,
-            ge=1,
-            le=20,
-            description="近期可发送目标列表最多展示多少个聊天流。",
-        )
-
-        send_targets_window_hours: float = Field(
-            default=24.0,
-            ge=0.1,
-            le=168.0,
-            description="近期可发送目标列表的活跃窗口，单位小时。",
         )
 
         salient_tail_enabled: bool = Field(

@@ -32,7 +32,6 @@ _DEFAULT_LIMIT = 20
 _MAX_LIMIT = 100
 _MIN_RESULT_BYTES = 2 * 1024
 _DEFAULT_RESULT_BYTES = 8 * 1024
-_TARGET_KEY_RE = re.compile(r"^[pg]-[0-9a-fA-F]{6,64}$")
 _TASK_DEFAULT_BYTES = {
     "core": 8 * 1024,
     "chat": 16 * 1024,
@@ -207,80 +206,37 @@ class LifeEngineConversationEvidenceTool(BaseTool):
         desired = configured if int(requested or 0) <= 0 else int(requested)
         return task, max(_MIN_RESULT_BYTES, min(desired, configured))
 
-    def _log_resolution_failure(self, ref: str, exc: Exception) -> None:
+    def _log_resolution_failure(self, exc: Exception) -> None:
         logger = getattr(self.plugin, "logger", None)
         if logger is None:
             import logging
 
             logger = logging.getLogger("life_engine.tools")
         logger.debug(
-            "conversation_evidence target_key resolution failed; "
-            "falling back to prefix scan: ref=%s error=%s",
-            ref,
-            type(exc).__name__,
+            "conversation_evidence surface resolution failed: "
+            f"error_type={type(exc).__name__}"
         )
 
-    async def _resolve_target_key(self, ref: str) -> str | None:
-        """把「你可以触达的人和地方」里的 target_key（如 p-20403fdb）解析回完整 stream_id。
+    async def _resolve_surface_ref(self, ref: str) -> str | None:
+        """Resolve only an exact opaque surface ref; never guess by prefix/name."""
 
-        非 target_key 格式（完整 stream_id 等）原样返回；解析失败返回 None。
-        兼容模型脑补出的 UUID 形式（如 20403fdb-6f1a-441c-9596-4d7e4f85e3c8）：
-        去掉连字符后按 hex 前缀做模糊匹配，避免 stream_not_found。
-        """
         if not ref:
             return ref
-        if not _TARGET_KEY_RE.match(ref):
-            # 可能是模型脑补的 UUID 形式流 ID：去连字符后按前缀匹配真实流。
-            compact = re.sub(r"[-]", "", ref)
-            if re.fullmatch(r"[0-9a-fA-F]{6,64}", compact):
-                resolved = await self._resolve_stream_prefix(compact)
-                if resolved is not None:
-                    return resolved
+        if not ref.startswith("surface:"):
             return ref
         try:
-            from ..core.send_targets import resolve_send_target_key
+            from ..initiative.reachability import load_reachable_surfaces
 
-            target = await resolve_send_target_key(ref)
-            if target is not None and getattr(target, "stream_id", ""):
-                return str(target.stream_id)
-        except Exception as exc:  # noqa: BLE001 - resolution is best-effort
-            self._log_resolution_failure(ref, exc)
-        # 兜底：按 stream_id 前缀匹配 chat_streams，优先 platform 非空的真实流。
-        prefix = ref.split("-", 1)[1]
-        resolved = await self._resolve_stream_prefix(prefix)
-        if resolved is not None:
-            return resolved
-        return None
-
-    async def _resolve_stream_prefix(self, prefix: str) -> str | None:
-        """按 stream_id hex 前缀匹配 ChatStreams；仅一个唯一真实流时返回完整 stream_id。"""
-        try:
-            async with get_db_session() as session:
-                result = await session.execute(
-                    select(
-                        ChatStreams.stream_id,
-                        ChatStreams.platform,
-                    ).where(ChatStreams.stream_id.like(f"{prefix}%"))
-                )
-                matches = [
-                    (str(stream_id), str(platform or ""))
-                    for stream_id, platform in result.all()
-                ]
-            real = [
-                stream_id
-                for stream_id, platform in matches
-                if platform
-                and not stream_id.startswith(f"{prefix}-")
-                and stream_id != prefix
+            matches = [
+                item.stream_id
+                for item in await load_reachable_surfaces()
+                if item.surface_ref == ref
             ]
-            if len(real) == 1:
-                return real[0]
-            if not real and len(matches) == 1:
-                return matches[0][0]
-            return None
-        except Exception as exc:  # noqa: BLE001 - best-effort fallback
-            self._log_resolution_failure(prefix, exc)
-            return None
+            if len(matches) == 1:
+                return matches[0]
+        except Exception as exc:  # noqa: BLE001 - retrieval reports unavailable ref
+            self._log_resolution_failure(exc)
+        return None
 
     async def _resolve_streams(
         self,
@@ -295,12 +251,11 @@ class LifeEngineConversationEvidenceTool(BaseTool):
                 if str(item or "").strip()
             )
         )
-        # 「你可以触达的人和地方」里展示的是 target_key（如 p-20403fdb），
-        # 不是完整 stream_id；这里把 target_key 解析回完整 stream_id，
-        # 让爱莉在心跳里直接复用提示里的 key 就能读取对话证据。
+        # Public reachability exposes opaque surface refs, never stream IDs.
+        # Evidence retrieval resolves an exact ref at this embodiment boundary.
         explicit: tuple[str, ...] = ()
         for item in raw:
-            full = await self._resolve_target_key(item)
+            full = await self._resolve_surface_ref(item)
             explicit = explicit + ((full or item),)
         explicit = tuple(dict.fromkeys(explicit))
         current = self.get_current_stream_id()
@@ -331,7 +286,7 @@ class LifeEngineConversationEvidenceTool(BaseTool):
                 raise ConversationEvidenceError(
                     "stream_required",
                     "an internal call without a current conversation must provide "
-                    "stream_ids (or a target_key from the reachable list) explicitly",
+                    "stream_ids (or a surface_ref from nucleus_reachability) explicitly",
                 )
             explicit = (current,)
         max_streams = int(getattr(self._cfg(), "max_candidate_streams", 12) or 12)

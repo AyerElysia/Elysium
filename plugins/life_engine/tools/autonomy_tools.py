@@ -10,27 +10,14 @@ from .bounded_projection import project_bounded_items, sha256_json
 
 
 class LifeEngineScheduleAutonomyIntentTool(BaseTool):
-    """Register a delayed autonomy intent."""
+    """Historical schema retained only for explicit retirement diagnostics."""
 
     tool_name = "nucleus_schedule_autonomy_intent"
     tool_description = (
-        "登记一个由 life_engine 自己形成的延迟自主意向。"
-        "这不是命令表达层立刻行动，也不是规则触发；只是让某个意向在 delay_minutes 后重新浮现。"
-        "如果 repeat=true，则到点后会在上一 occurrence 完整结束后按 interval_minutes 再次浮现；"
-        "interval_minutes 留空时使用 delay_minutes，并且必须提供 max_occurrences 或 lease_minutes。"
-        "\n\n"
-        "kind 支持：speak / reflect / silence。"
-        "\n- speak：到点后把意向交给 life_chatter 重新判断是否开口。"
-        "\n- reflect：到点后回到 life_engine 事件流，供后续心跳继续思考。"
-        "\n- silence：到点后只记录选择沉默，不打扰任何聊天。"
-        "\n\n"
-        "只能填写 delay_minutes，不要填写绝对时间。"
-        "周期意向也只是反复浮现，不代表必须行动或必须开口。"
-        "speak 只能写 motivation、target_hint 和 constraints，不能写最终回复话术。"
-        "speak 的目标可填心跳里看到的 target_key，或精确 target_stream_id；"
-        "如果当前心跳没有渲染「你可以触达的人和地方」列表（近 24 小时无消息会话），"
-        "把 target_key 和 target_stream_id 留空就是正确选择——"
-        "到点意向会浮现给你，由你重新判断是否开口；不要猜测列表之外的目标。"
+        "旧 AutonomyIntent 创建入口已退役且不再注册给模型。历史直接调用只返回"
+        "只读错误，不创建任务、不选择聊天流、不产生周期调度。请改用"
+        "nucleus_manage_initiative_seed；需要行动时再分别使用"
+        "nucleus_reachability 与 nucleus_begin_outreach。"
     )
     chatter_allow: list[str] = ["life_engine_internal"]
 
@@ -48,36 +35,22 @@ class LifeEngineScheduleAutonomyIntentTool(BaseTool):
         max_occurrences: Annotated[int | None, "repeat=true 时最多浮现多少次；与 lease_minutes 至少填写一个"] = None,
         lease_minutes: Annotated[int | None, "repeat=true 时执行租约持续多少分钟；与 max_occurrences 至少填写一个"] = None,
     ) -> tuple[bool, str | dict]:
-        service = getattr(self.plugin, "service", None)
-        if service is None:
-            return False, "life_engine 服务不可用"
-        try:
-            result = await service.schedule_autonomy_intent(
-                kind=kind,
-                motivation=motivation,
-                delay_minutes=delay_minutes,
-                target_hint=target_hint,
-                target_stream_id=target_stream_id,
-                target_key=target_key,
-                constraints=constraints or [],
-                repeat=repeat,
-                interval_minutes=interval_minutes,
-                max_occurrences=max_occurrences,
-                lease_minutes=lease_minutes,
-            )
-        except Exception as exc:  # noqa: BLE001
-            return False, str(exc)
-        return True, result
+        return False, {
+            "error": "LegacyAutonomyReadOnly",
+            "mutated": False,
+            "replacement": "nucleus_manage_initiative_seed",
+        }
 
 
 class LifeEngineManageAutonomyIntentTool(BaseTool):
-    """Let the subject explicitly inspect or change intent execution lifecycle."""
+    """Read the retired stream-bound intent ledger without mutating it."""
 
     tool_name = "nucleus_manage_autonomy_intent"
     tool_description = (
-        "管理由你自己形成的自主意向。list 只读列出意向；pause 暂停后续浮现；"
-        "cancel 明确取消；renew 为周期意向增加次数租约或时间租约。"
-        "这些操作只改变执行生命周期，不改写原始动机、约束或历史。"
+        "只读查看旧 AutonomyIntent 归档。旧系统把主体意向绑定到聊天流、最近活跃"
+        "目标和周期调度，现已退役；pause/cancel/renew 均明确失败且不会改写旧数据。"
+        "新的主体主动性请使用 nucleus_manage_initiative_seed、"
+        "nucleus_reachability 和 nucleus_begin_outreach。"
     )
     chatter_allow: list[str] = ["life_engine_internal"]
 
@@ -99,6 +72,13 @@ class LifeEngineManageAutonomyIntentTool(BaseTool):
         service = getattr(self.plugin, "service", None)
         if service is None:
             return False, "life_engine 服务不可用"
+        normalized_action = str(action or "").strip().lower()
+        if normalized_action != "list":
+            return False, {
+                "error": "LegacyAutonomyReadOnly",
+                "mutated": False,
+                "replacement": "nucleus_manage_initiative_seed",
+            }
         try:
             result = await service.manage_autonomy_intent(
                 action=action,
@@ -140,10 +120,9 @@ class LifeEngineManageAutonomyIntentTool(BaseTool):
         return True, result
 
 
-AUTONOMY_TOOLS = [
-    LifeEngineScheduleAutonomyIntentTool,
-    LifeEngineManageAutonomyIntentTool,
-]
+# Historical classes remain importable for deterministic replay diagnostics,
+# but no AutonomyIntent tool is exposed to a live consciousness instance.
+AUTONOMY_TOOLS: list[type[BaseTool]] = []
 
 __all__ = [
     "AUTONOMY_TOOLS",

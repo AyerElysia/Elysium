@@ -128,6 +128,107 @@ def test_memory_service_property_aliases_private_field(tmp_path: Path) -> None:
     assert service.memory_service is sentinel
 
 
+async def test_recent_subconscious_context_is_read_only_and_repeatable(
+    tmp_path: Path,
+) -> None:
+    service = _make_service(tmp_path)
+    service._event_history = [
+        LifeEngineEvent(
+            event_id="heartbeat-7",
+            event_type=EventType.HEARTBEAT,
+            timestamp="2026-08-18T00:00:00+08:00",
+            sequence=7,
+            source="life_engine",
+            source_detail="test",
+            content="最近形成的想法",
+            content_type="heartbeat_reply",
+            heartbeat_context_consumed=True,
+        )
+    ]
+    service._state.heartbeat_context_cursor = 6
+    service._state.chatter_context_cursors = {"stream-a": 4}
+    before_history = list(service._event_history)
+
+    first = await service.get_recent_subconscious_context(
+        group_limit=1,
+        max_bytes=1024,
+    )
+    second = await service.get_recent_subconscious_context(
+        group_limit=1,
+        max_bytes=1024,
+    )
+
+    assert first == second
+    assert "最近形成的想法" in first.content
+    assert first.event_ids == ("heartbeat-7",)
+    assert service._event_history == before_history
+    assert service._state.heartbeat_context_cursor == 6
+    assert service._state.chatter_context_cursors == {"stream-a": 4}
+    assert service._pending_events == []
+
+
+async def test_chatter_runtime_context_appends_recent_subconscious_once(
+    tmp_path: Path,
+) -> None:
+    service = _make_service(tmp_path)
+    service._event_history = [
+        LifeEngineEvent(
+            event_id="heartbeat-8",
+            event_type=EventType.HEARTBEAT,
+            timestamp="2026-08-18T00:01:00+08:00",
+            sequence=8,
+            source="life_engine",
+            source_detail="test",
+            content="跨场景仍然记得刚才在做什么",
+            content_type="heartbeat_reply",
+            heartbeat_run_id="run-8",
+            heartbeat_context_consumed=True,
+        ),
+        LifeEngineEvent(
+            event_id="tool-call-9",
+            event_type=EventType.TOOL_CALL,
+            timestamp="2026-08-18T00:01:01+08:00",
+            sequence=9,
+            source="life_engine",
+            source_detail="test",
+            content="调用工具: inspect",
+            content_type="tool_call",
+            heartbeat_run_id="run-8",
+            call_id="call-8",
+            parent_event_id="heartbeat-8",
+            tool_name="inspect",
+            tool_args={"path": "notes.txt"},
+            heartbeat_context_consumed=True,
+        ),
+        LifeEngineEvent(
+            event_id="tool-result-10",
+            event_type=EventType.TOOL_RESULT,
+            timestamp="2026-08-18T00:01:02+08:00",
+            sequence=10,
+            source="life_engine",
+            source_detail="test",
+            content="完成",
+            content_type="tool_result",
+            heartbeat_run_id="run-8",
+            call_id="call-8",
+            parent_event_id="tool-call-9",
+            tool_name="inspect",
+            tool_success=True,
+            heartbeat_context_consumed=True,
+        ),
+    ]
+
+    context, _ = await service.build_chatter_runtime_context(
+        SimpleNamespace(stream_id="stream-a"),
+    )
+
+    assert "【潜意识近期上下文】" in context
+    assert "跨场景仍然记得刚才在做什么" in context
+    assert context.count("TOOL_CALL inspect") == 1
+    assert context.count("TOOL_RESULT inspect success") == 1
+    assert "当前环境感知（World，仅表示有来源的环境事实，不承担跨意识同步）" in context
+
+
 async def test_memory_behavior_health_combines_witness_and_continuity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -18,41 +18,31 @@ from plugins.life_engine.minecraft.embodiment_contracts import (
     utc_now,
 )
 from plugins.life_engine.minecraft.launcher import LaunchResult, MCConfig
-from plugins.life_engine.minecraft.model_planner import VerifiedPerceptionDelivery
 from plugins.life_engine.minecraft.session import MinecraftSession
 from plugins.life_engine.minecraft.trace_projection import (
     WORLD_TRACE_RECEIPT_MAX_BYTES,
     world_trace_receipt_size,
 )
 from plugins.life_engine.service.consciousness import ConsciousnessRegistry
-from plugins.life_engine.service.perception_gateway import PerceptionDeliveryReceipt
+from plugins.life_engine.service.subconscious_context import RecentSubconsciousContext
 
 
-def _prepared_perception(instance_id: str, content: str) -> SimpleNamespace:
-    """Create a complete content/reference pair used by Minecraft consumers."""
+def _recent_subconscious(content: str) -> RecentSubconsciousContext:
+    """Create one bounded recent-subconscious projection for session tests."""
 
     encoded = content.encode("utf-8")
     digest = sha256(encoded).hexdigest()
-    return SimpleNamespace(
-        instance_id=instance_id,
-        projection_kind="world_perception",
-        from_position=2,
-        through_position=5,
-        source_frontier=7,
-        cursor_revision=1,
+    return RecentSubconsciousContext(
         content=content,
-        assertion_ids=("assertion-a", "assertion-b"),
-        change_positions=(3, 5),
-        delivery_id=f"delivery-{digest[:24]}",
-        projection_sha256=digest,
-        algorithm_version="world-perception-page-v2",
+        event_ids=("heartbeat-4", "tool-call-5", "tool-result-6"),
+        from_sequence=4,
+        through_sequence=6,
+        group_count=2,
+        source_group_count=3,
+        omitted_group_count=1,
         delivered_bytes=len(encoded),
-        source_payload_bytes=len(encoded),
-        omitted_assertion_count=0,
-        omitted_change_count=0,
-        omitted_source_bytes=0,
-        snapshot_continuation_token="",
-        has_more_changes=True,
+        projection_sha256=digest,
+        truncated=True,
     )
 
 
@@ -223,28 +213,8 @@ class _BrokenWindowLauncher(_Launcher):
 class _Planner:
     """Issue one operation and then make an evidence-backed conclusion."""
 
-    def __init__(self, *, prove_delivery: bool = True) -> None:
+    def __init__(self) -> None:
         self.contexts: list[dict[str, Any]] = []
-        self._prove_delivery = prove_delivery
-        self._deliveries: dict[str, VerifiedPerceptionDelivery] = {}
-
-    def reset_perception_delivery(self, reference: Any) -> None:
-        """Discard a prior intent's proof for the same prepared projection."""
-
-        self._deliveries.pop(reference.delivery_id, None)
-
-    def consume_perception_delivery(
-        self,
-        reference: Any,
-    ) -> VerifiedPerceptionDelivery:
-        """Return the proof created by the final fake planning turn."""
-
-        delivery = self._deliveries.pop(reference.delivery_id, None)
-        if delivery is None:
-            raise RuntimeError(
-                "Minecraft planner produced no exact Perception delivery proof"
-            )
-        return delivery
 
     async def decide(
         self,
@@ -255,14 +225,6 @@ class _Planner:
         """Act once, then cite both receipt and post-action observation."""
 
         self.contexts.append(dict(intent.context))
-        reference = intent.perception_reference
-        if self._prove_delivery and reference is not None:
-            self._deliveries[reference.delivery_id] = VerifiedPerceptionDelivery(
-                delivery_id=reference.delivery_id,
-                projection_sha256=reference.content_sha256,
-                delivered_bytes=reference.content_bytes,
-                transport_request_id="fake-request",
-            )
 
         if not receipts:
             return PlannerTurn(
@@ -330,16 +292,8 @@ async def _started_session(
         observations.append({"report": report, **kwargs})
         return {"assertion_id": f"assertion-{len(observations)}"}
 
-    def prepare_perception(instance_id: str) -> Any:
-        return _prepared_perception(instance_id, "shared-presence")
-
-    def commit_perception(
-        prepared: Any,
-        receipt: PerceptionDeliveryReceipt,
-    ) -> None:
-        observations.append(
-            {"perception_commit": prepared, "delivery_receipt": receipt}
-        )
+    async def get_recent_subconscious_context() -> RecentSubconsciousContext:
+        return _recent_subconscious("shared-subconscious")
 
     bridge = _Bridge()
     config = MCConfig(mc_home=tmp_path, bridge_ready_timeout_seconds=1)
@@ -347,8 +301,7 @@ async def _started_session(
         workspace=tmp_path,
         mc_config=config,
         consciousness_registry=registry,
-        prepare_perception=prepare_perception,
-        commit_perception=commit_perception,
+        get_recent_subconscious_context=get_recent_subconscious_context,
         report_world_observation=report_world_observation,
     )
     session._launcher = _Launcher()
@@ -401,7 +354,10 @@ async def test_session_returns_full_intention_evidence(tmp_path: Path) -> None:
     assert len(result["receipts"]) == 1
     assert len(result["observations"]) == 2
     assert session.state.conclusions == [result["conclusion"]]
-    assert planner.contexts[0]["world_perception"] == "shared-presence"
+    assert planner.contexts[0]["recent_subconscious_context"] == "shared-subconscious"
+    reference = planner.contexts[0]["recent_subconscious_reference"]
+    assert reference["through_sequence"] == 6
+    assert reference["delivered_bytes"] == len(b"shared-subconscious")
 
 
 async def test_session_awaits_async_presence_lifecycle_callbacks(
@@ -547,32 +503,22 @@ async def test_session_cleans_up_when_async_presence_save_fails(
     assert bridge.closed is True
 
 
-async def test_session_awaits_async_perception_prepare_and_commit(
+async def test_session_awaits_async_recent_subconscious_context(
     tmp_path: Path,
 ) -> None:
-    """Async perception preparation is consumed and its cursor is committed."""
+    """Each intent consumes the bounded async subconscious projection once."""
 
     calls: list[str] = []
 
-    async def prepare_perception(instance_id: str) -> Any:
-        calls.append(f"prepare:{instance_id}")
-        return _prepared_perception(instance_id, "async shared perception")
-
-    receipts: list[PerceptionDeliveryReceipt] = []
-
-    async def commit_perception(
-        value: Any,
-        receipt: PerceptionDeliveryReceipt,
-    ) -> None:
-        receipts.append(receipt)
-        calls.append("commit")
+    async def get_recent_subconscious_context() -> RecentSubconsciousContext:
+        calls.append("recent")
+        return _recent_subconscious("async recent activity")
 
     bridge = _Bridge()
     session = MinecraftSession(
         workspace=tmp_path,
         mc_config=MCConfig(mc_home=tmp_path, bridge_ready_timeout_seconds=1),
-        prepare_perception=prepare_perception,
-        commit_perception=commit_perception,
+        get_recent_subconscious_context=get_recent_subconscious_context,
     )
     session._launcher = _Launcher()
 
@@ -588,37 +534,27 @@ async def test_session_awaits_async_perception_prepare_and_commit(
     result = await session.do_intent("walk to x=3")
 
     assert result["success"] is True
-    assert planner.contexts[0]["world_perception"] == "async shared perception"
-    assert calls == [
-        f"prepare:{session.state.consciousness_instance_id}",
-        "commit",
-    ]
-    assert len(receipts) == 1
-    assert receipts[0].exact is True
-    assert receipts[0].transport_request_id == "fake-request"
+    assert planner.contexts[0]["recent_subconscious_context"] == "async recent activity"
+    assert calls == ["recent"]
+    reference = planner.contexts[0]["recent_subconscious_reference"]
+    assert reference["schema"] == "minecraft.recent_subconscious_reference.v1"
+    assert reference["delivered_bytes"] == len(b"async recent activity")
     await session.stop()
 
 
-async def test_session_reports_async_perception_commit_failure(
+async def test_session_reports_recent_subconscious_failure(
     tmp_path: Path,
 ) -> None:
-    """A failed async cursor commit cannot be reported as intent success."""
+    """A failed continuity read cannot be reported as intent success."""
 
-    async def prepare_perception(instance_id: str) -> Any:
-        return _prepared_perception(instance_id, f"prepared:{instance_id}")
-
-    async def commit_perception(
-        value: Any,
-        receipt: PerceptionDeliveryReceipt,
-    ) -> None:
-        raise RuntimeError("async perception commit failed")
+    async def get_recent_subconscious_context() -> RecentSubconsciousContext:
+        raise RuntimeError("recent subconscious unavailable")
 
     bridge = _Bridge()
     session = MinecraftSession(
         workspace=tmp_path,
         mc_config=MCConfig(mc_home=tmp_path, bridge_ready_timeout_seconds=1),
-        prepare_perception=prepare_perception,
-        commit_perception=commit_perception,
+        get_recent_subconscious_context=get_recent_subconscious_context,
     )
     session._launcher = _Launcher()
 
@@ -628,37 +564,29 @@ async def test_session_reports_async_perception_commit_failure(
     session._wait_for_bridge = wait_for_bridge
     started = await session.start(body_name="agent")
     assert started["success"] is True
-    session._planner = _Planner()
+    planner = _Planner()
+    session._planner = planner
 
     result = await session.do_intent("walk to x=3")
 
     assert result["success"] is False
-    assert result["error"] == "async perception commit failed"
+    assert result["error"] == "recent subconscious unavailable"
     await session.stop()
 
 
-async def test_session_keeps_cursor_without_exact_perception_delivery(
+async def test_session_rejects_invalid_recent_subconscious_contract(
     tmp_path: Path,
 ) -> None:
-    """Missing final-attempt proof fails closed before the cursor callback."""
+    """The session fails closed when a producer violates the typed contract."""
 
-    commits: list[PerceptionDeliveryReceipt] = []
-
-    async def prepare_perception(instance_id: str) -> Any:
-        return _prepared_perception(instance_id, "must reach the effective request")
-
-    async def commit_perception(
-        value: Any,
-        receipt: PerceptionDeliveryReceipt,
-    ) -> None:
-        commits.append(receipt)
+    async def get_recent_subconscious_context() -> Any:
+        return SimpleNamespace(content="untyped context")
 
     bridge = _Bridge()
     session = MinecraftSession(
         workspace=tmp_path,
         mc_config=MCConfig(mc_home=tmp_path, bridge_ready_timeout_seconds=1),
-        prepare_perception=prepare_perception,
-        commit_perception=commit_perception,
+        get_recent_subconscious_context=get_recent_subconscious_context,
     )
     session._launcher = _Launcher()
 
@@ -667,13 +595,14 @@ async def test_session_keeps_cursor_without_exact_perception_delivery(
 
     session._wait_for_bridge = wait_for_bridge
     assert (await session.start(body_name="agent"))["success"] is True
-    session._planner = _Planner(prove_delivery=False)
+    planner = _Planner()
+    session._planner = planner
 
-    result = await session.do_intent("inspect without a false cursor commit")
+    result = await session.do_intent("inspect with a typed continuity snapshot")
 
     assert result["success"] is False
-    assert "no exact Perception delivery proof" in result["error"]
-    assert commits == []
+    assert "RecentSubconsciousContext" in result["error"]
+    assert planner.contexts == []
     await session.stop()
 
 
@@ -902,36 +831,21 @@ async def test_failed_body_release_remains_retryable(tmp_path: Path) -> None:
     assert bridge.close_attempts == 2
 
 
-async def test_large_perception_cannot_recurse_through_world_receipts(
+async def test_large_recent_context_cannot_recurse_through_world_receipts(
     tmp_path: Path,
 ) -> None:
-    """Repeated 1.5 MB prompt deliveries produce bounded non-growing receipts."""
+    """Repeated 1.5 MB continuity prompts produce bounded non-growing receipts."""
 
     session, _, _, world_events = await _started_session(tmp_path)
-    base_content = "瞬态世界投影" * 150_000
-    prepared_values: list[SimpleNamespace] = []
+    base_content = "潜意识近期上下文" * 100_000
+    contexts: list[RecentSubconsciousContext] = []
 
-    async def prepare_perception(instance_id: str) -> Any:
-        prior_receipts = [
-            item["value"]
-            for item in world_events
-            if item.get("predicate") == "embodied_trace"
-        ]
-        feedback = json.dumps(prior_receipts, ensure_ascii=False, sort_keys=True)
-        prepared = _prepared_perception(instance_id, base_content + feedback)
-        prepared_values.append(prepared)
-        return prepared
+    async def get_recent_subconscious_context() -> RecentSubconsciousContext:
+        context = _recent_subconscious(base_content)
+        contexts.append(context)
+        return context
 
-    committed: list[tuple[SimpleNamespace, PerceptionDeliveryReceipt]] = []
-
-    async def commit_perception(
-        prepared: SimpleNamespace,
-        receipt: PerceptionDeliveryReceipt,
-    ) -> None:
-        committed.append((prepared, receipt))
-
-    session._prepare_perception = prepare_perception
-    session._commit_perception = commit_perception
+    session._get_recent_subconscious_context = get_recent_subconscious_context
     session._planner = _Planner()
 
     for index in range(3):
@@ -944,37 +858,33 @@ async def test_large_perception_cannot_recurse_through_world_receipts(
     receipts = [item["value"] for item in trace_events]
     assert receipts
     assert all(
-        item["occurrence_id"] == item["value"]["projection_id"]
-        for item in trace_events
+        item["occurrence_id"] == item["value"]["projection_id"] for item in trace_events
     )
     by_kind: dict[str, list[int]] = {}
     for receipt in receipts:
         encoded = json.dumps(receipt, ensure_ascii=False, sort_keys=True)
         assert "transient_prompt_context" not in encoded
         assert "transient_world_perception" not in encoded
+        assert "recent_subconscious_context" not in encoded
         assert base_content not in encoded
         size = world_trace_receipt_size(receipt)
         assert size <= WORLD_TRACE_RECEIPT_MAX_BYTES
         by_kind.setdefault(receipt["trace_kind"], []).append(size)
     assert all(max(sizes) - min(sizes) < 128 for sizes in by_kind.values())
-    assert [prepared for prepared, _receipt in committed] == prepared_values
-    assert all(receipt.exact for _prepared, receipt in committed)
-    assert all(
-        receipt.projection_sha256 == prepared.projection_sha256
-        and receipt.delivered_bytes == prepared.delivered_bytes
-        for prepared, receipt in committed
-    )
+    assert len(contexts) == 3
 
     assert session._trace is not None
     records = await session._trace.verify()
     intent_records = [record for record in records if record.kind == "intent.issued"]
     assert len(intent_records) == 3
-    for record, prepared in zip(intent_records, prepared_values, strict=True):
+    for record, context in zip(intent_records, contexts, strict=True):
         serialized = json.dumps(record.to_wire(), ensure_ascii=False)
-        assert prepared.content not in serialized
+        assert context.content not in serialized
         assert "transient_prompt_context" not in record.payload
-        reference = record.payload["perception_reference"]
-        assert reference["bytes"] == len(prepared.content.encode("utf-8"))
+        assert record.payload["perception_reference"] is None
+        reference = record.payload["durable_context"]["recent_subconscious_reference"]
+        assert reference["delivered_bytes"] == context.delivered_bytes
+        assert reference["projection_sha256"] == context.projection_sha256
     await session.stop()
 
 
@@ -983,8 +893,7 @@ async def test_failed_world_receipt_remains_retryable_and_uncommitted(
 ) -> None:
     """A World write failure is not cached, committed, or reported as success."""
 
-    session, _, _, world_events = await _started_session(tmp_path)
-    prior_commits = sum("perception_commit" in item for item in world_events)
+    session, _, _, _ = await _started_session(tmp_path)
 
     async def fail_world(report: str, **kwargs: Any) -> None:
         raise RuntimeError("World receipt unavailable")
@@ -995,7 +904,6 @@ async def test_failed_world_receipt_remains_retryable_and_uncommitted(
 
     assert result["success"] is False
     assert "World receipt unavailable" in result["error"]
-    assert sum("perception_commit" in item for item in world_events) == prior_commits
     assert session._trace is not None
     record = (await session._trace.verify())[-1]
     assert record.kind == "intent.issued"
@@ -1011,10 +919,7 @@ async def test_failed_world_receipt_remains_retryable_and_uncommitted(
 
     assert len(delivered) == 1
     assert delivered[0]["value"]["schema"].endswith("projection.v1")
-    assert (
-        delivered[0]["occurrence_id"]
-        == delivered[0]["value"]["projection_id"]
-    )
+    assert delivered[0]["occurrence_id"] == delivered[0]["value"]["projection_id"]
     assert world_trace_receipt_size(delivered[0]["value"]) <= 8 * 1024
     await session.stop()
 
