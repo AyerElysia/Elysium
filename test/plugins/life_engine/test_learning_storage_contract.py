@@ -76,6 +76,7 @@ from plugins.life_engine.storage.learning_schema import (
     MYSQL_LEARNING_CLAIM_GUARD_TRIGGERS,
     MYSQL_LEARNING_PROJECTOR_CLAIM_GUARD_MIGRATION,
     MYSQL_LEARNING_PROJECTOR_CLAIM_GUARD_TRIGGERS,
+    MYSQL_LEARNING_SNAPSHOT_CLEANUP_MIGRATION,
 )
 from plugins.life_engine.storage.models import (
     BackendGeneration,
@@ -1011,8 +1012,10 @@ async def test_selected_scheduler_uses_only_sql_and_survives_restart(
         ]
         assert "learning_insights.insight_created" in event_kinds
         assert "learning_skills.skill_created" in event_kinds
-        assert "learning_insights.snapshot" in event_kinds
-        assert "learning_skills.snapshot" in event_kinds
+        # Snapshot events are no longer written to learning_events table
+        # to prevent unbounded growth. State is preserved in learning_projections.
+        assert "learning_insights.snapshot" not in event_kinds
+        assert "learning_skills.snapshot" not in event_kinds
 
 
 async def test_legacy_learning_snapshot_import_is_lossless_idempotent_and_exportable(
@@ -1377,10 +1380,11 @@ async def test_claimed_mysql_learning_startup_requires_trigger_guard(
 def test_learning_mysql_claim_guard_is_projection_only_after_retirement() -> None:
     """All writers append evidence; one fenced owner mutates projections."""
 
-    assert LEARNING_SCHEMA_VERSION == 4
+    assert LEARNING_SCHEMA_VERSION == 5
     assert MYSQL_LEARNING_CLAIM_GUARD_MIGRATION.version == 2
     assert MYSQL_LEARNING_CLAIM_GUARD_RETIREMENT.version == 3
     assert MYSQL_LEARNING_PROJECTOR_CLAIM_GUARD_MIGRATION.version == 4
+    assert MYSQL_LEARNING_SNAPSHOT_CLEANUP_MIGRATION.version == 5
     assert {
         (trigger.table, trigger.manipulation)
         for trigger in MYSQL_LEARNING_PROJECTOR_CLAIM_GUARD_TRIGGERS

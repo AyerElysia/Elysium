@@ -304,7 +304,15 @@ class SelectedLearningPersistence:
         return self.skill_store.snapshot_payload()
 
     async def flush(self) -> None:
-        """Atomically commit buffered evidence and every dirty projection."""
+        """Atomically commit buffered evidence and every dirty projection.
+
+        Snapshot projections are written to learning_projections table only.
+        Full-state snapshot events are no longer written to learning_events
+        table to prevent unbounded growth (each snapshot was 1+ MB, accumulating
+        to 15+ GB over time). The current state is preserved in learning_projections,
+        and incremental events (insight_created, insight_reinforced, etc.) remain
+        in learning_events as the authoritative audit trail.
+        """
 
         async with self._flush_lock:
             self._require_writable()
@@ -319,29 +327,10 @@ class SelectedLearningPersistence:
             self._pending_events.clear()
             self._dirty.clear()
             writes: list[LearningProjectionWrite] = []
-            snapshot_events: list[LearningEventDraft] = []
-            context = _MUTATION_CONTEXT.get()
             now = datetime.now(UTC).isoformat()
             for projection_name in sorted(dirty):
                 projection = self._projections[projection_name]
                 payload = self._snapshot_payload(projection_name)
-                snapshot_event = LearningEventDraft(
-                    occurrence_id=f"learning_snapshot_{uuid4().hex}",
-                    event_kind=f"{projection_name}.snapshot",
-                    occurred_at=now,
-                    source="learning.projector",
-                    actor_consciousness_instance_id="",
-                    subject_revision=context.subject_revision,
-                    provenance={
-                        "projection": projection_name,
-                        "projector_version": _STATE_PROJECTOR_VERSION,
-                        "trigger_source": context.source,
-                        **dict(context.provenance or {}),
-                        "writer_instance_id": self.writer_instance_id,
-                    },
-                    payload=payload,
-                )
-                snapshot_events.append(snapshot_event)
                 writes.append(
                     LearningProjectionWrite(
                         projection_name=projection_name,
@@ -355,10 +344,9 @@ class SelectedLearningPersistence:
                         payload=payload,
                     )
                 )
-            events = [*pending_events, *snapshot_events]
             try:
                 result = await self.store.commit(
-                    events=events,
+                    events=pending_events,
                     projections=writes,
                 )
             except LearningProjectionConflict as exc:
@@ -369,7 +357,7 @@ class SelectedLearningPersistence:
                     exc,
                     writer_instance_id=self.writer_instance_id,
                     writes=writes,
-                    buffered_event_count=len(events),
+                    buffered_event_count=len(pending_events),
                     dirty_projections=dirty,
                 )
                 # 双实例共享 MySQL 时学习持久化投影的 CAS 冲突是合法竞争，
