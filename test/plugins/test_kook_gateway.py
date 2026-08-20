@@ -47,9 +47,11 @@ async def test_gateway_start_is_idempotent_and_stop_awaits_listener() -> None:
 
     assert connect_calls == 1
     assert listener.done() is False
+    assert gateway.alive is True
 
     await gateway.stop()
 
     assert listener.done() is True
     assert gateway._listen_task_info is None
     assert gateway.connected is False
+    assert gateway.alive is False

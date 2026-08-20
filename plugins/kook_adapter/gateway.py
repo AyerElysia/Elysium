@@ -62,6 +62,14 @@ class KookGateway:
     def connected(self) -> bool:
         return self._ws is not None and self._running
 
+    @property
+    def alive(self) -> bool:
+        """Return whether the gateway manager is still running its retry loop."""
+
+        task_info = self._listen_task_info
+        task = task_info.task if task_info is not None else None
+        return self._running and task is not None and not task.done()
+
     async def start(self) -> None:
         """启动 Gateway 连接。"""
         async with self._lifecycle_lock:

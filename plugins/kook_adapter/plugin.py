@@ -133,13 +133,15 @@ class KookAdapter(BaseAdapter):
         }
 
     async def health_check(self) -> bool:
-        """健康检查：返回 KOOK Gateway 的真实连接状态。
+        """健康检查：确认 Gateway 的生命周期任务仍在运行。
 
         本适配器未使用 Elysium wire 内置传输层，基类默认的 is_connected()
         恒为 False，会导致框架每 30 秒误判"不健康"并触发 reconnect，
-        进而把适配器停掉。此处以 Gateway 实际连接状态为准。
+        进而把适配器停掉。Gateway 自己拥有断线退避重连循环，因此在
+        重连窗口内不能因为暂时没有 WebSocket 而再次 stop；只有管理任务
+        已经结束时才需要适配器级重启。
         """
-        return self._gateway is not None and self._gateway.connected
+        return self._gateway is not None and self._gateway.alive
 
     # ─── 内部 ───────────────────────────────────────────────
 
