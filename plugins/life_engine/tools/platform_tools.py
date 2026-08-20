@@ -111,10 +111,15 @@ class PlatformActionTool(BaseTool):
         parsed_params: dict[str, Any] = {}
         if params is not None:
             if isinstance(params, str):
-                try:
-                    parsed_params = json.loads(params)
-                except (json.JSONDecodeError, TypeError):
-                    return False, f"params 不是有效的 JSON: {params[:200]}"
+                if not params.strip():
+                    # 空串视为无参数：放行 help/docs/list 等免参动作，
+                    # 避免自救查询被参数校验挡死（真实事故 2026-08-20）。
+                    parsed_params = {}
+                else:
+                    try:
+                        parsed_params = json.loads(params)
+                    except (json.JSONDecodeError, TypeError):
+                        return False, f"params 不是有效的 JSON: {params[:200]}"
             elif isinstance(params, dict):
                 parsed_params = params
             else:
