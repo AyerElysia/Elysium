@@ -9,18 +9,22 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import math
 import os
 import re
 import shlex
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import aiohttp
+import numpy as np
 import soundfile as sf
 from pedalboard import Convolution, Pedalboard, Reverb
 from pedalboard.io import AudioFile
 
 from src.app.plugin_system.api.log_api import get_logger
 from src.core.components.base.service import BaseService
+from src.core.utils.audio_transcode import transcode_audio_bytes
 
 if TYPE_CHECKING:
     from src.core.components.base.plugin import BasePlugin
@@ -30,12 +34,29 @@ if TYPE_CHECKING:
 logger = get_logger("tts_voice_plugin.service")
 
 
+@dataclass(frozen=True, slots=True)
+class _SynthesisSegment:
+    """One internal transport segment of a single outward expression."""
+
+    text: str
+    boundary: str
+    units: int
+
+
+_SEMANTIC_BOUNDARY_RE = re.compile(
+    r"(?:\r?\n){1,}|"
+    r"[。！？!?]+[”’」』】）》)\]\"']*|"
+    r"(?<!\d)\.(?!\d)[”’」』】）》)\]\"']*|"
+    r"[；;：:]|[，,、]"
+)
+
+
 class TTSService(BaseService):
     """本地 TTS 核心服务。"""
 
     service_name: str = "tts"
     service_description: str = "本地消息语音合成服务（当前部署 IndexTTS2）"
-    version: str = "3.2.0"
+    version: str = "3.3.0"
 
     def __init__(self, plugin: "BasePlugin") -> None:
         """初始化 TTS 服务。
@@ -49,6 +70,9 @@ class TTSService(BaseService):
         self.max_text_length: int = 500
         self._server_process: asyncio.subprocess.Process | None = None
         self._server_start_lock = asyncio.Lock()
+        # IndexTTS2 keeps mutable inference caches. A complete outward expression,
+        # including every internal sentence, therefore owns one sequential lane.
+        self._synthesis_lock = asyncio.Lock()
         self._load_config()
 
     # ------------------------------------------------------------------
@@ -423,22 +447,281 @@ class TTSService(BaseService):
         if text and not text.endswith(tuple("，。！？、；：,.!?;:")):
             text += "。"
 
-        # 5. 智能截断
-        if len(text) > self.max_text_length:
-            cut_text = text[: self.max_text_length]
-            punctuation = "。！？.…"
-            last_punc_pos = max(cut_text.rfind(p) for p in punctuation)
-
-            if last_punc_pos != -1:
-                text = cut_text[: last_punc_pos + 1]
-            else:
-                last_comma_pos = max(cut_text.rfind(p) for p in "，、；,;")
-                if last_comma_pos != -1:
-                    text = cut_text[: last_comma_pos + 1]
-                else:
-                    text = cut_text
-
         return text.strip()
+
+    @staticmethod
+    def _estimate_synthesis_units(text: str) -> int:
+        """Estimate model pressure without pretending this is a tokenizer.
+
+        CJK/Kana/Hangul characters count individually. Consecutive Latin letters
+        and digits count at roughly four characters per unit. Punctuation counts
+        as one unit, while whitespace only separates runs.
+        """
+        units = 0
+        latin_run = 0
+
+        def flush_latin() -> None:
+            nonlocal latin_run, units
+            if latin_run:
+                units += math.ceil(latin_run / 4)
+                latin_run = 0
+
+        for character in text:
+            if character.isascii() and character.isalnum():
+                latin_run += 1
+                continue
+            flush_latin()
+            if not character.isspace():
+                units += 1
+        flush_latin()
+        return units
+
+    @staticmethod
+    def _boundary_kind(marker: str) -> str:
+        """Map visible punctuation to a technical pause class."""
+        if "\n" in marker or "\r" in marker:
+            return "paragraph"
+        if any(character in marker for character in "。！？!?。."):
+            return "sentence"
+        if any(character in marker for character in "；;：:"):
+            return "clause"
+        return "phrase"
+
+    @staticmethod
+    def _join_spoken_text(left: str, right: str) -> str:
+        """Join two spoken fragments without fusing Latin words."""
+        if not left:
+            return right
+        if not right:
+            return left
+        needs_space = left[-1].isascii() and left[-1].isalnum()
+        needs_space = needs_space and right[0].isascii() and right[0].isalnum()
+        return f"{left} {right}" if needs_space else f"{left}{right}"
+
+    def _scan_semantic_parts(self, text: str) -> list[tuple[str, str]]:
+        """Split at authored punctuation while retaining its spoken order."""
+        parts: list[tuple[str, str]] = []
+        cursor = 0
+        for match in _SEMANTIC_BOUNDARY_RE.finditer(text):
+            raw = text[cursor : match.end()]
+            boundary = self._boundary_kind(match.group(0))
+            spoken = re.sub(r"\s*\r?\n+\s*", " ", raw).strip()
+            if spoken:
+                parts.append((spoken, boundary))
+            elif boundary == "paragraph" and parts:
+                previous_text, _previous_boundary = parts[-1]
+                parts[-1] = (previous_text, "paragraph")
+            cursor = match.end()
+
+        tail = text[cursor:].strip()
+        if tail:
+            parts.append((tail, "sentence"))
+        return parts
+
+    def _split_oversized_part(
+        self,
+        text: str,
+        boundary: str,
+        max_units: int,
+    ) -> list[tuple[str, str]]:
+        """Split one punctuation-free oversized part on a stable UTF-8 boundary."""
+        source = text.strip()
+        result: list[tuple[str, str]] = []
+        start = 0
+        while start < len(source):
+            units = 0
+            latin_run = 0
+            last_soft_break = start
+            overflow_at: int | None = None
+            for index in range(start, len(source)):
+                character = source[index]
+                if character.isascii() and character.isalnum():
+                    latin_run += 1
+                    if latin_run % 4 == 1:
+                        units += 1
+                else:
+                    latin_run = 0
+                    if not character.isspace():
+                        units += 1
+                if character.isspace() and units <= max_units:
+                    last_soft_break = index + 1
+                if units > max_units:
+                    overflow_at = index
+                    break
+
+            if overflow_at is None:
+                tail = source[start:].strip()
+                if tail:
+                    result.append((tail, boundary))
+                break
+
+            hard_limit = max(start + 1, overflow_at)
+            minimum_soft_break = start + max(1, (hard_limit - start) // 2)
+            cut = (
+                last_soft_break
+                if minimum_soft_break <= last_soft_break <= hard_limit
+                else hard_limit
+            )
+            fragment = source[start:cut].strip()
+            if not fragment:
+                fragment = source[start:hard_limit]
+                cut = hard_limit
+            result.append((fragment, "hard"))
+            start = cut
+            while start < len(source) and source[start].isspace():
+                start += 1
+        return result
+
+    def _split_text_for_synthesis(self, text: str) -> list[_SynthesisSegment]:
+        """Build a bounded, ordered transport plan for one expression."""
+        max_units = int(self._config.tts.segment_max_units)
+        total_units = self._estimate_synthesis_units(text)
+        if (
+            not self._config.tts.long_text_split_enabled
+            or total_units <= max_units
+        ):
+            return [_SynthesisSegment(text=text, boundary="sentence", units=total_units)]
+
+        atomic_parts: list[tuple[str, str]] = []
+        for part_text, boundary in self._scan_semantic_parts(text):
+            atomic_parts.extend(
+                self._split_oversized_part(part_text, boundary, max_units)
+            )
+
+        planned: list[_SynthesisSegment] = []
+        current_text = ""
+        current_boundary = "phrase"
+        flush_threshold = max(1, math.floor(max_units * 0.75))
+
+        def flush() -> None:
+            nonlocal current_text, current_boundary
+            if not current_text:
+                return
+            planned.append(
+                _SynthesisSegment(
+                    text=current_text,
+                    boundary=current_boundary,
+                    units=self._estimate_synthesis_units(current_text),
+                )
+            )
+            current_text = ""
+            current_boundary = "phrase"
+
+        for part_text, boundary in atomic_parts:
+            candidate = self._join_spoken_text(current_text, part_text)
+            if current_text and self._estimate_synthesis_units(candidate) > max_units:
+                flush()
+                candidate = part_text
+            current_text = candidate
+            current_boundary = boundary
+            current_units = self._estimate_synthesis_units(current_text)
+            if boundary in {"sentence", "paragraph", "hard"} or current_units >= flush_threshold:
+                flush()
+        flush()
+
+        # Very short adjacent pieces may share one bounded backend call. Paragraphs
+        # remain independent; punctuation and authored order stay in the text.
+        minimum_units = min(int(self._config.tts.segment_min_units), max_units)
+        merged: list[_SynthesisSegment] = []
+        for segment in planned:
+            if (
+                merged
+                and merged[-1].boundary != "paragraph"
+                and min(merged[-1].units, segment.units) < minimum_units
+            ):
+                combined_text = self._join_spoken_text(merged[-1].text, segment.text)
+                combined_units = self._estimate_synthesis_units(combined_text)
+                if combined_units <= max_units:
+                    merged[-1] = _SynthesisSegment(
+                        text=combined_text,
+                        boundary=segment.boundary,
+                        units=combined_units,
+                    )
+                    continue
+            merged.append(segment)
+
+        if not merged:
+            return [_SynthesisSegment(text=text, boundary="sentence", units=total_units)]
+        return merged
+
+    def _pause_after_segment_ms(self, boundary: str) -> int:
+        """Return configured silence for one internal boundary."""
+        cfg = self._config.tts
+        return {
+            "phrase": cfg.phrase_pause_ms,
+            "hard": cfg.phrase_pause_ms,
+            "clause": cfg.clause_pause_ms,
+            "sentence": cfg.sentence_pause_ms,
+            "paragraph": cfg.paragraph_pause_ms,
+        }.get(boundary, cfg.phrase_pause_ms)
+
+    def _join_wav_segments(
+        self,
+        audio_segments: list[bytes],
+        synthesis_segments: list[_SynthesisSegment],
+    ) -> bytes:
+        """Join complete WAV segments with authored-boundary pauses."""
+        if not audio_segments or len(audio_segments) != len(synthesis_segments):
+            raise ValueError("TTS segment/audio count mismatch")
+
+        sample_rate: int | None = None
+        timeline: list[np.ndarray] = []
+        for index, audio_data in enumerate(audio_segments):
+            samples, current_rate = sf.read(
+                io.BytesIO(audio_data),
+                dtype="float32",
+                always_2d=True,
+            )
+            if not len(samples):
+                raise ValueError(f"TTS segment {index + 1} decoded to empty audio")
+            if sample_rate is None:
+                sample_rate = int(current_rate)
+            elif int(current_rate) != sample_rate:
+                raise ValueError("TTS segment sample rates do not match")
+
+            mono = np.mean(samples, axis=1, dtype=np.float32).reshape(-1, 1)
+            timeline.append(mono)
+            if index < len(audio_segments) - 1:
+                pause_ms = self._pause_after_segment_ms(synthesis_segments[index].boundary)
+                pause_frames = round(sample_rate * pause_ms / 1000)
+                if pause_frames:
+                    timeline.append(np.zeros((pause_frames, 1), dtype=np.float32))
+
+        if sample_rate is None:
+            raise ValueError("TTS segments did not provide a sample rate")
+        combined = np.concatenate(timeline, axis=0)
+        with io.BytesIO() as output:
+            sf.write(output, combined, sample_rate, format="WAV", subtype="PCM_16")
+            return output.getvalue()
+
+    async def _encode_audio(self, wav_audio: bytes, media_type: str) -> bytes:
+        """Encode one joined WAV exactly once for the configured platform format."""
+        normalized = (media_type or "wav").strip().lower()
+        if normalized in {"wav", "wave"}:
+            return wav_audio
+
+        transcode_options: dict[str, tuple[str, list[str]]] = {
+            "ogg": (
+                ".ogg",
+                ["-c:a", "libopus", "-b:a", "64k", "-ac", "1", "-ar", "48000"],
+            ),
+            "opus": (
+                ".opus",
+                ["-c:a", "libopus", "-b:a", "64k", "-ac", "1", "-ar", "48000"],
+            ),
+            "mp3": (".mp3", ["-c:a", "libmp3lame", "-b:a", "128k", "-ac", "1"]),
+            "aac": (".m4a", ["-c:a", "aac", "-b:a", "128k", "-ac", "1"]),
+            "flac": (".flac", ["-c:a", "flac", "-ac", "1"]),
+        }
+        if normalized not in transcode_options:
+            raise ValueError(f"unsupported joined TTS media type: {normalized}")
+        output_suffix, codec_args = transcode_options[normalized]
+        return await asyncio.to_thread(
+            transcode_audio_bytes,
+            wav_audio,
+            output_suffix=output_suffix,
+            codec_args=codec_args,
+        )
 
     # ------------------------------------------------------------------
     # 服务生命周期（健康检查 + 自动拉起）
@@ -612,6 +895,11 @@ class TTSService(BaseService):
             cfg = self._config
             advanced_dict = cfg.tts_advanced.model_dump()
             data.update({k: v for k, v in advanced_dict.items() if v is not None})
+            request_media_type = kwargs.get("request_media_type")
+            if request_media_type:
+                # Multi-segment synthesis always obtains lossless WAV chunks.
+                # The joined expression is encoded once after all chunks succeed.
+                data["media_type"] = request_media_type
 
             # 优先使用风格特定的语速
             if server_config.get("speed_factor") is not None:
@@ -622,6 +910,7 @@ class TTSService(BaseService):
             logger.info(
                 "发送本地 TTS 请求: "
                 f"chars={len(text)}, language={text_language}, "
+                f"segment={kwargs.get('segment_index', 1)}/{kwargs.get('segment_count', 1)}, "
                 f"aux_refs={len(aux_ref_paths)}, media_type={data.get('media_type', 'wav')}"
             )
 
@@ -756,6 +1045,15 @@ class TTSService(BaseService):
         clean_text = self._clean_text_for_tts(text)
         if not clean_text:
             return None
+        if len(clean_text) > self.max_text_length:
+            logger.error(
+                "TTS完整表达超过配置上限，拒绝静默截断: "
+                f"chars={len(clean_text)}, max_chars={self.max_text_length}"
+            )
+            raise ValueError(
+                "TTS expression exceeds max_text_length: "
+                f"chars={len(clean_text)}, max_chars={self.max_text_length}"
+            )
 
         # 语言决策：优先 language_hint → 风格配置策略 → 自动检测
         sanitized_hint = self._sanitize_language_hint(language_hint)
@@ -771,30 +1069,86 @@ class TTSService(BaseService):
             "开始本地 TTS 语音合成: "
             f"chars={len(clean_text)}, style={style}, language={final_language}"
         )
-
-        audio_data = await self._call_tts_api(
-            server_config=server_config,
-            text=clean_text,
-            text_language=final_language,
-            refer_wav_path=server_config.get("refer_wav_path"),
-            prompt_text=server_config.get("prompt_text"),
-            prompt_language=server_config.get("prompt_language"),
-            aux_refer_wav_paths=server_config.get("aux_refer_wav_paths"),
-            gpt_weights=server_config.get("gpt_weights"),
-            sovits_weights=server_config.get("sovits_weights"),
+        synthesis_segments = self._split_text_for_synthesis(clean_text)
+        logger.info(
+            "TTS内部合成计划已建立: "
+            f"segments={len(synthesis_segments)}, total_units="
+            f"{sum(segment.units for segment in synthesis_segments)}, "
+            f"max_segment_units={max(segment.units for segment in synthesis_segments)}"
         )
 
-        if audio_data:
-            # 空间音效处理
-            spatial_cfg = self._config.spatial_effects
-            if spatial_cfg.enabled:
-                logger.info("检测到已启用空间音频效果，开始处理...")
-                processed_audio = await self._apply_spatial_audio_effect(audio_data)
-                if processed_audio:
-                    logger.info("空间音频效果应用成功！")
-                    audio_data = processed_audio
-                else:
-                    logger.warning("空间音频效果应用失败，将使用原始音频。")
+        call_kwargs = {
+            "refer_wav_path": server_config.get("refer_wav_path"),
+            "prompt_text": server_config.get("prompt_text"),
+            "prompt_language": server_config.get("prompt_language"),
+            "aux_refer_wav_paths": server_config.get("aux_refer_wav_paths"),
+            "gpt_weights": server_config.get("gpt_weights"),
+            "sovits_weights": server_config.get("sovits_weights"),
+        }
+        final_media_type = self._config.tts_advanced.media_type
+        spatial_enabled = self._config.spatial_effects.enabled
 
-            return base64.b64encode(audio_data).decode("utf-8")
-        return None
+        # One lock covers the complete outward expression. Other callers cannot
+        # interleave model-cache mutations between its internal sentences.
+        async with self._synthesis_lock:
+            if len(synthesis_segments) == 1 and not spatial_enabled:
+                audio_data = await self._call_tts_api(
+                    server_config=server_config,
+                    text=synthesis_segments[0].text,
+                    text_language=final_language,
+                    segment_index=1,
+                    segment_count=1,
+                    **call_kwargs,
+                )
+                if not audio_data:
+                    return None
+                return base64.b64encode(audio_data).decode("utf-8")
+
+            wav_segments: list[bytes] = []
+            for index, segment in enumerate(synthesis_segments, start=1):
+                segment_audio = await self._call_tts_api(
+                    server_config=server_config,
+                    text=segment.text,
+                    text_language=final_language,
+                    request_media_type="wav",
+                    segment_index=index,
+                    segment_count=len(synthesis_segments),
+                    **call_kwargs,
+                )
+                if not segment_audio:
+                    logger.error(
+                        "TTS内部片段合成失败，完整表达未交付: "
+                        f"failed_segment={index}, segment_count={len(synthesis_segments)}"
+                    )
+                    return None
+                wav_segments.append(segment_audio)
+
+            try:
+                if len(wav_segments) == 1:
+                    joined_audio = wav_segments[0]
+                else:
+                    joined_audio = await asyncio.to_thread(
+                        self._join_wav_segments,
+                        wav_segments,
+                        synthesis_segments,
+                    )
+
+                if spatial_enabled:
+                    logger.info("检测到已启用空间音频效果，开始处理完整表达...")
+                    processed_audio = await self._apply_spatial_audio_effect(joined_audio)
+                    if processed_audio:
+                        joined_audio = processed_audio
+                    else:
+                        logger.warning("空间音频效果应用失败，将使用未处理的完整表达音频。")
+
+                final_audio = await self._encode_audio(joined_audio, final_media_type)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "TTS完整表达拼接或编码失败，未交付音频: "
+                    f"error_type={type(exc).__name__}"
+                )
+                return None
+
+            return base64.b64encode(final_audio).decode("utf-8")

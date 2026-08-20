@@ -49,9 +49,17 @@ def _audio_metadata(data: bytes) -> dict[str, object]:
     }
 
 
-async def _verify(config_path: Path, text: str, style: str, language: str | None) -> dict[str, object]:
+async def _verify(
+    config_path: Path,
+    text: str,
+    style: str,
+    language: str | None,
+    output_path: Path | None = None,
+) -> dict[str, object]:
     config = TTSVoiceConfig.load(config_path, auto_update=False)
     service = TTSService(SimpleNamespace(config=config))  # type: ignore[arg-type]
+    cleaned_text = service._clean_text_for_tts(text)
+    segments = service._split_text_for_synthesis(cleaned_text)
     encoded = await service.generate_voice(
         text,
         style_hint=style,
@@ -65,6 +73,11 @@ async def _verify(config_path: Path, text: str, style: str, language: str | None
         raise RuntimeError("local TTS returned invalid Base64 audio") from exc
     if not audio:
         raise RuntimeError("local TTS decoded to empty audio")
+    resolved_output: str | None = None
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(audio)
+        resolved_output = str(output_path.resolve())
     return {
         "status": "ok",
         "server": config.tts.server,
@@ -74,6 +87,11 @@ async def _verify(config_path: Path, text: str, style: str, language: str | None
         "audio_format": _audio_format(audio),
         "audio_bytes": len(audio),
         "audio_sha256": hashlib.sha256(audio).hexdigest(),
+        "synthesis_segments": len(segments),
+        "segment_chars": [len(segment.text) for segment in segments],
+        "segment_units": [segment.units for segment in segments],
+        "segment_boundaries": [segment.boundary for segment in segments],
+        "output_path": resolved_output,
         **_audio_metadata(audio),
     }
 
@@ -88,6 +106,11 @@ def main() -> int:
     parser.add_argument("--text", default="晚安，愿你有个好梦。")
     parser.add_argument("--style", default="default")
     parser.add_argument("--language", default="zh")
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="可选：把生成的单一完整音频写到此路径，便于试听",
+    )
     args = parser.parse_args()
     result = asyncio.run(
         _verify(
@@ -95,6 +118,7 @@ def main() -> int:
             str(args.text),
             str(args.style),
             str(args.language).strip() or None,
+            args.output,
         )
     )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))

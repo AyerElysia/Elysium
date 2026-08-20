@@ -28,7 +28,12 @@ from src.core.transport.message_receive.utils import (
     normalize_base64,
     safe_json_loads,
 )
-from src.core.transport.wire import MessageEnvelope, MessageInfoPayload, SegPayload
+from src.core.transport.wire import (
+    MessageEnvelope,
+    MessageInfoPayload,
+    SegPayload,
+    UserRole,
+)
 from src.kernel.logger import get_logger
 
 logger = get_logger("message_converter")
@@ -258,7 +263,17 @@ class MessageConverter:
         raw_role = user_info.get("role")
         sender_role: str | None = None
         if raw_role is not None:
-            sender_role = raw_role.value
+            # JSON adapters (including NapCat) carry the enum as its wire
+            # string, while in-process builders may still pass UserRole.
+            # Accept both forms without making an inbound message fail before
+            # it reaches the unified message bus.
+            if isinstance(raw_role, UserRole):
+                sender_role = raw_role.value
+            elif isinstance(raw_role, str):
+                sender_role = raw_role.strip() or None
+            else:
+                value = getattr(raw_role, "value", None)
+                sender_role = value if isinstance(value, str) else str(raw_role)
 
         # 显式合并 extra，避免 canonical 字段与 legacy 兼容字段成为重复关键字。
         extra_data = self._sanitize_extra_data(message_info.get("extra") or {})

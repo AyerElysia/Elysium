@@ -26,7 +26,7 @@ class TTSVoicePlugin(BasePlugin):
     plugin_description: str = (
         "本地消息文本转语音插件；当前部署使用 IndexTTS2 兼容服务"
     )
-    plugin_version: str = "3.2.0"
+    plugin_version: str = "3.3.0"
 
     configs = [TTSVoiceConfig]
 
