@@ -65,7 +65,55 @@ class TTSSection(SectionBase):
 
     server: str = Field(default="http://127.0.0.1:9880", description="本地 TTS 服务地址")
     timeout: int = Field(default=180, description="TTS 请求超时秒数")
-    max_text_length: int = Field(default=1000, description="最大合成文本长度")
+    max_text_length: int = Field(
+        default=1000,
+        ge=1,
+        le=100_000,
+        description="单次表达允许合成的完整文本上限；超限显式失败，禁止静默截断",
+    )
+    long_text_split_enabled: bool = Field(
+        default=True,
+        description="长文本是否在 TTS 内部按自然句与有界片段顺序合成，再拼成一条音频",
+    )
+    segment_max_units: int = Field(
+        default=48,
+        ge=16,
+        le=200,
+        description=(
+            "单个 TTS 片段的近似语音单位硬上限；中日韩字符按一单位、"
+            "连续拉丁数字按约四字符一单位估算"
+        ),
+    )
+    segment_min_units: int = Field(
+        default=8,
+        ge=1,
+        le=64,
+        description="允许与相邻片段合并的短片段阈值，不改变正文与句子顺序",
+    )
+    phrase_pause_ms: int = Field(
+        default=120,
+        ge=0,
+        le=2_000,
+        description="逗号、顿号或工程硬切片之间追加的停顿毫秒数",
+    )
+    clause_pause_ms: int = Field(
+        default=200,
+        ge=0,
+        le=2_000,
+        description="分号、冒号后追加的停顿毫秒数",
+    )
+    sentence_pause_ms: int = Field(
+        default=320,
+        ge=0,
+        le=2_000,
+        description="句号、问号、感叹号后追加的停顿毫秒数",
+    )
+    paragraph_pause_ms: int = Field(
+        default=520,
+        ge=0,
+        le=3_000,
+        description="段落边界后追加的停顿毫秒数",
+    )
     auto_start: bool = Field(
         default=True,
         description="调用前若服务未运行，是否自动拉起 TTS 服务进程",
