@@ -20,7 +20,6 @@ from src.app.plugin_system.base import BaseTool
 
 from ._utils import _get_workspace
 
-
 logger = log_api.get_logger("life_engine.platform_tools")
 
 # lark-cli 二进制路径
@@ -91,6 +90,8 @@ class PlatformActionTool(BaseTool):
         "- `platform`: 目标平台（'qq' 或 'feishu'，默认 'qq'）\n"
         "- `action`: API 动作名（必填，参见 help 返回的清单）\n"
         "- `params`: 参数字典（JSON 对象，按操作要求填写）\n\n"
+        "语音能力边界：`life_send_voice` 才是把本地爱莉音色发送到当前私聊或群聊；"
+        "QQ 的 `send_group_ai_record` 只调用 QQ 内置角色语音，不能冒充本地 TTS。\n\n"
         "举例：\n"
         "- 查看QQ能力: action='help', platform='qq'\n"
         "- QQ 群签到: platform='qq', action='set_group_sign', params={'group_id': 123}\n"

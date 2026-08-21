@@ -84,12 +84,14 @@
 | `send_like` | 点赞（名片赞） | `{user_id, times?}` |
 | `set_msg_emoji_like` | 消息表情回应 | `{message_id, emoji_id, set?}` |
 
-## AI 语音
+## QQ 内置角色语音
+
+这里的接口属于 QQ 平台自带角色音色，不是爱莉自己的本地 IndexTTS 音色。发送爱莉自己的普通语音到当前 QQ 私聊或群聊，应使用 `life_send_voice`；它会走本地 TTS 或已有音频，再由 OneBot `record` 消息发送。只有主体明确选择 QQ 内置角色音色时，才使用下列接口，且 `character` 必须来自当前群真实返回的角色列表。
 
 | action | 说明 | params |
 |--------|------|--------|
-| `get_ai_characters` | AI语音角色列表 | `{group_id?}` |
-| `send_group_ai_record` | 群聊发AI语音 | `{group_id, character, text}` |
+| `get_ai_characters` | 查询 QQ 内置语音角色列表 | `{group_id?}` |
+| `send_group_ai_record` | 使用 QQ 内置角色向群聊发语音；不是本地 TTS | `{group_id, character, text}` |
 
 ## 好友与账号
 

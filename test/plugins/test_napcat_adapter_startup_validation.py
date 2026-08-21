@@ -324,6 +324,53 @@ def test_send_platform_message_propagates_sender_error() -> None:
         asyncio.run(adapter._send_platform_message(envelope))
 
 
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"status": "ok", "retcode": 0, "data": [{"character_id": "native-1"}]},
+        {"status": "failed", "retcode": 1200, "message": "unsupported character"},
+    ],
+)
+async def test_adapter_command_response_uses_late_bound_core_sink(
+    response: dict[str, Any],
+) -> None:
+    """命令回执必须进入 Manager 后绑定的 live sink，成功失败都不能丢。"""
+    adapter = NapcatAdapter(
+        core_sink=cast(Any, None),
+        plugin=_build_napcat_plugin(),
+    )
+    late_sink = SimpleNamespace(send=AsyncMock())
+    adapter.core_sink = cast(Any, late_sink)
+    adapter._client.call = AsyncMock(return_value=response)
+    envelope = {
+        "message_info": {},
+        "message_segment": {
+            "type": "adapter_command",
+            "data": {
+                "action": "get_ai_characters",
+                "params": {"group_id": 123456},
+                "request_id": "request-voice-character",
+                "timeout": 30.0,
+            },
+        },
+    }
+
+    await adapter._send_platform_message(envelope)
+
+    assert adapter._command_handler._core_sink is late_sink
+    adapter._client.call.assert_awaited_once_with(
+        "get_ai_characters",
+        {"group_id": 123456},
+        timeout=30.0,
+    )
+    late_sink.send.assert_awaited_once()
+    response_envelope = late_sink.send.await_args.args[0]
+    assert response_envelope["message_segment"]["data"] == {
+        "request_id": "request-voice-character",
+        "response": response,
+    }
+
+
 def test_watchdog_uses_managed_task_contract_for_shutdown() -> None:
     """Watchdog cleanup must cancel TaskInfo through TaskManager."""
 

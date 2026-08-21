@@ -571,6 +571,9 @@ def test_life_send_voice_schema_contains_only_local_tts_parameters() -> None:
     assert "instructions" not in properties
     assert "model_tasks.tts" not in schema["description"]
     assert "MiMo" not in schema["description"]
+    assert "当前私聊或群聊" in schema["description"]
+    assert "send_group_ai_record" in schema["description"]
+    assert "QQ 内置角色语音" in schema["description"]
 
 
 def test_life_media_capabilities_are_registered_for_enabled_chatter() -> None:

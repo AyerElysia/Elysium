@@ -291,6 +291,11 @@ class NapcatAdapter(BaseAdapter):
 
         try:
             if seg_type in ("command", "adapter_command", "adapter_response"):
+                # AdapterManager constructs adapters before SinkManager supplies
+                # the live CoreSink. CommandHandler must use the current sink,
+                # not the constructor-time placeholder, so API results can
+                # complete the caller's request future.
+                self._command_handler.set_core_sink(self.core_sink)
                 await self._command_handler.handle(envelope)
                 return None
             return await self._sender.send(envelope)

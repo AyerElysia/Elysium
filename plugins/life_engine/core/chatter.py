@@ -776,8 +776,10 @@ class LifeSendVoiceAction(_LifeSendMediaAction):
 
     action_name = "life_send_voice"
     action_description = (
-        "向当前聊天发送语音。已有音频文件时填写 path；需要把文字合成为语音时填写 text。"
+        "向当前私聊或群聊发送爱莉自己的普通语音。已有音频文件时填写 path；"
+        "需要把文字合成为语音时填写 text。"
         "path 与 text 二选一。文字合成使用已启用的本地消息 TTS 服务，主体自行决定是否使用。"
+        "QQ platform_action 的 send_group_ai_record 是 QQ 内置角色语音，不是本地爱莉音色。"
         "N.E.K.O Surface 的文字回复由该场景自己的自动语音链处理，不要重复调用本动作。"
     )
     chatter_allow: list[str] = ["life_chatter"]
