@@ -1,7 +1,7 @@
 """本地消息 TTS 核心服务。
 
-封装风格管理、文本清洗、兼容 HTTP API 调用和空间音效处理。当前部署由
-IndexTTS2 的兼容层提供 ``/tts``；历史 GPT-SoVITS 部署仍可复用同一协议。
+封装风格管理、文本清洗、HTTP 后端调用和空间音效处理。当前生产部署使用
+IndexTTS2.5 + vLLM-Omni；历史 ``/tts`` 协议仍可显式选择以便回滚。
 """
 
 from __future__ import annotations
@@ -10,9 +10,11 @@ import asyncio
 import base64
 import io
 import math
+import mimetypes
 import os
 import re
 import shlex
+import signal
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -55,8 +57,8 @@ class TTSService(BaseService):
     """本地 TTS 核心服务。"""
 
     service_name: str = "tts"
-    service_description: str = "本地消息语音合成服务（当前部署 IndexTTS2）"
-    version: str = "3.3.0"
+    service_description: str = "本地消息语音合成服务（IndexTTS2.5 / vLLM-Omni）"
+    version: str = "4.0.0"
 
     def __init__(self, plugin: "BasePlugin") -> None:
         """初始化 TTS 服务。
@@ -70,10 +72,62 @@ class TTSService(BaseService):
         self.max_text_length: int = 500
         self._server_process: asyncio.subprocess.Process | None = None
         self._server_start_lock = asyncio.Lock()
-        # IndexTTS2 keeps mutable inference caches. A complete outward expression,
-        # including every internal sentence, therefore owns one sequential lane.
+        # A complete outward expression owns one lane so two user-visible voices
+        # cannot interleave. vLLM-Omni may still batch bounded internal segments.
         self._synthesis_lock = asyncio.Lock()
         self._load_config()
+
+    async def stop(self) -> None:
+        """Stop only the TTS server process group started by this service.
+
+        An already-running external server is never adopted into
+        ``_server_process`` and is therefore left untouched.  Processes created
+        by :meth:`_start_server` own a new session so their two-stage vLLM
+        workers can be reclaimed as one process group.
+        """
+        process = self._server_process
+        self._server_process = None
+        if process is None or process.returncode is not None:
+            return
+
+        try:
+            self._signal_server_process(process, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+
+        try:
+            await asyncio.wait_for(process.wait(), timeout=20.0)
+            logger.info("TTS 服务子进程已停止")
+            return
+        except asyncio.CancelledError:
+            try:
+                self._signal_server_process(process, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            await asyncio.shield(process.wait())
+            raise
+        except TimeoutError:
+            logger.warning("TTS 服务子进程未在 20 秒内退出，清理已拥有的进程组")
+
+        try:
+            self._signal_server_process(process, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        await process.wait()
+
+    @staticmethod
+    def _signal_server_process(
+        process: asyncio.subprocess.Process,
+        sig: signal.Signals,
+    ) -> None:
+        """Signal one process that this service started, including its workers."""
+        if os.name == "posix":
+            os.killpg(process.pid, sig)
+            return
+        if sig == signal.SIGTERM:
+            process.terminate()
+        else:
+            process.kill()
 
     # ------------------------------------------------------------------
     # 配置加载
@@ -133,6 +187,7 @@ class TTSService(BaseService):
                 "url": global_server,
                 "name": style_cfg.name or style_name,
                 "refer_wav_path": style_cfg.refer_wav_path or default_refer_wav,
+                "voice": style_cfg.voice,
                 "aux_refer_wav_paths": list(getattr(style_cfg, "aux_refer_wav_paths", None) or []),
                 "prompt_text": style_cfg.prompt_text or default_prompt_text,
                 "prompt_language": style_cfg.prompt_language or "zh",
@@ -196,6 +251,14 @@ class TTSService(BaseService):
             )
 
         return True
+
+    @staticmethod
+    def _audio_file_to_data_url(path: str) -> str:
+        """Read one immutable request reference as a base64 data URL."""
+        mime_type = mimetypes.guess_type(path)[0] or "audio/wav"
+        with open(path, "rb") as audio_file:
+            encoded = base64.b64encode(audio_file.read()).decode("ascii")
+        return f"data:{mime_type};base64,{encoded}"
 
     def _resolve_aux_ref_paths(self, aux_paths: list[str] | None) -> list[str]:
         """筛选出真实存在的辅助参考音频路径。
@@ -727,14 +790,93 @@ class TTSService(BaseService):
     # 服务生命周期（健康检查 + 自动拉起）
     # ------------------------------------------------------------------
 
+    def _backend_name(self) -> str:
+        """Return the configured transport without guessing from a URL."""
+        return str(self._config.tts.backend)
+
+    def _vllm_request_headers(self) -> dict[str, str]:
+        """Resolve optional local auth without copying secrets into config/logs."""
+        headers: dict[str, str] = {}
+        api_key_env = str(self._config.tts.api_key_env or "").strip()
+        if not api_key_env:
+            return headers
+        api_key = os.getenv(api_key_env)
+        if not api_key:
+            raise RuntimeError("vLLM-Omni TTS auth environment is missing")
+        headers["Authorization"] = f"Bearer {api_key}"
+        return headers
+
+    @staticmethod
+    def _vllm_language_code(text: str, text_language: str) -> str:
+        """Map the stable Elysium language choice to IndexTTS2.5 codes."""
+        normalized = (text_language or "zh").strip().lower()
+        if normalized == "auto_yue":
+            return "yue"
+        if normalized == "auto":
+            return "zh"
+        if normalized == "zh":
+            has_cjk = bool(re.search(r"[\u4e00-\u9fff]", text))
+            has_latin = bool(re.search(r"[A-Za-z]", text))
+            if has_cjk and has_latin:
+                return "zhen"
+        return normalized
+
+    def _build_vllm_omni_payload(
+        self,
+        *,
+        server_config: dict[str, Any],
+        text: str,
+        text_language: str,
+        response_format: str,
+        reference_audio_data_url: str | None,
+    ) -> dict[str, Any]:
+        """Build one official IndexTTS2.5 OpenAI-compatible request."""
+        model = str(self._config.tts.model or "").strip()
+        if not model:
+            raise ValueError("vLLM-Omni TTS model is not configured")
+
+        payload: dict[str, Any] = {
+            "model": model,
+            "input": text,
+            "response_format": response_format,
+            "speed": float(server_config.get("speed_factor", 1.0)),
+            "extra_params": {
+                "lang": self._vllm_language_code(text, text_language),
+                "text_normalization": bool(
+                    self._config.tts_advanced.text_normalization
+                ),
+            },
+        }
+        voice = str(server_config.get("voice") or "").strip()
+        if voice:
+            payload["voice"] = voice
+        elif reference_audio_data_url:
+            payload["ref_audio"] = reference_audio_data_url
+        else:
+            raise ValueError("vLLM-Omni requires a named voice or reference audio")
+        return payload
+
     async def _is_server_alive(self, base_url: str) -> bool:
         """快速探测 TTS 服务是否存活。"""
+        normalized_base = base_url.rstrip("/")
+        health_url = (
+            f"{normalized_base}/v1/models"
+            if self._backend_name() == "vllm_omni"
+            else normalized_base
+        )
         try:
+            headers = (
+                self._vllm_request_headers()
+                if self._backend_name() == "vllm_omni"
+                else {}
+            )
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=5)
             ) as session:
-                async with session.get(base_url) as resp:
-                    # 任何 HTTP 响应都说明服务在监听
+                async with session.get(health_url, headers=headers) as resp:
+                    if self._backend_name() == "vllm_omni":
+                        return resp.status == 200
+                    # 历史后端没有统一 health path；任何非 5xx 响应都说明在监听。
                     return resp.status < 500
         except Exception:
             return False
@@ -790,28 +932,33 @@ class TTSService(BaseService):
         startup_timeout = cfg.startup_timeout
         poll_interval = 2.0
         elapsed = 0.0
-        while elapsed < startup_timeout:
-            await asyncio.sleep(poll_interval)
-            elapsed += poll_interval
+        try:
+            while elapsed < startup_timeout:
+                await asyncio.sleep(poll_interval)
+                elapsed += poll_interval
 
-            # 进程已崩溃
-            if self._server_process.returncode is not None:
-                stderr_tail = ""
-                if self._server_process.stderr:
-                    stderr_bytes = await self._server_process.stderr.read(2048)
-                    stderr_tail = stderr_bytes.decode(errors="replace").strip()
-                logger.error(
-                    f"TTS 服务进程已退出 (code={self._server_process.returncode})"
-                    f"{f': {stderr_tail}' if stderr_tail else ''}"
-                )
-                self._server_process = None
-                return False
+                # 进程已崩溃
+                if self._server_process.returncode is not None:
+                    stderr_tail = ""
+                    if self._server_process.stderr:
+                        stderr_bytes = await self._server_process.stderr.read(2048)
+                        stderr_tail = stderr_bytes.decode(errors="replace").strip()
+                    logger.error(
+                        f"TTS 服务进程已退出 (code={self._server_process.returncode})"
+                        f"{f': {stderr_tail}' if stderr_tail else ''}"
+                    )
+                    self._server_process = None
+                    return False
 
-            if await self._is_server_alive(base_url):
-                logger.info(f"TTS 服务已就绪（耗时 ~{elapsed:.0f}s）")
-                return True
+                if await self._is_server_alive(base_url):
+                    logger.info(f"TTS 服务已就绪（耗时 ~{elapsed:.0f}s）")
+                    return True
+        except asyncio.CancelledError:
+            await self.stop()
+            raise
 
         logger.error(f"TTS 服务在 {startup_timeout}s 内未就绪，放弃等待。")
+        await self.stop()
         return False
 
     # ------------------------------------------------------------------
@@ -819,6 +966,142 @@ class TTSService(BaseService):
     # ------------------------------------------------------------------
 
     async def _call_tts_api(
+        self,
+        server_config: dict[str, Any],
+        text: str,
+        text_language: str,
+        **kwargs: Any,
+    ) -> bytes | None:
+        """Dispatch one bounded transport segment to the configured backend."""
+        if self._backend_name() == "vllm_omni":
+            return await self._call_vllm_omni_api(
+                server_config,
+                text,
+                text_language,
+                **kwargs,
+            )
+        return await self._call_legacy_tts_api(
+            server_config,
+            text,
+            text_language,
+            **kwargs,
+        )
+
+    async def _call_vllm_omni_api(
+        self,
+        server_config: dict[str, Any],
+        text: str,
+        text_language: str,
+        **kwargs: Any,
+    ) -> bytes | None:
+        """Call IndexTTS2.5 through vLLM-Omni's speech endpoint."""
+        base_url = str(server_config["url"]).rstrip("/")
+        if not kwargs.get("_server_ready") and not await self._ensure_server_alive(
+            base_url
+        ):
+            return None
+
+        voice = str(server_config.get("voice") or "").strip()
+        reference_audio_data_url = kwargs.get("reference_audio_data_url")
+        if not voice and not reference_audio_data_url:
+            ref_wav_path = str(kwargs.get("refer_wav_path") or "").strip()
+            if not ref_wav_path:
+                logger.error("vLLM-Omni TTS 调用失败：当前风格缺少命名音色或参考音频")
+                return None
+            if not self._validate_main_ref_duration(ref_wav_path):
+                return None
+            try:
+                reference_audio_data_url = await asyncio.to_thread(
+                    self._audio_file_to_data_url,
+                    ref_wav_path,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "读取 vLLM-Omni 参考音频失败: "
+                    f"error_type={type(exc).__name__}"
+                )
+                return None
+
+        response_format = str(kwargs.get("request_media_type") or "wav").lower()
+        try:
+            payload = self._build_vllm_omni_payload(
+                server_config=server_config,
+                text=text,
+                text_language=text_language,
+                response_format=response_format,
+                reference_audio_data_url=reference_audio_data_url,
+            )
+        except ValueError as exc:
+            logger.error(f"vLLM-Omni TTS 请求配置无效: error_type={type(exc).__name__}")
+            return None
+
+        try:
+            headers = {
+                "Content-Type": "application/json",
+                **self._vllm_request_headers(),
+            }
+        except RuntimeError:
+            logger.error("vLLM-Omni TTS 鉴权环境变量未设置")
+            return None
+
+        logger.info(
+            "发送 vLLM-Omni TTS 请求: "
+            f"chars={len(text)}, language={payload['extra_params']['lang']}, "
+            f"segment={kwargs.get('segment_index', 1)}/{kwargs.get('segment_count', 1)}, "
+            f"voice_mode={'named' if voice else 'reference'}, media_type={response_format}"
+        )
+
+        async def receive_audio(session: aiohttp.ClientSession) -> bytes | None:
+            async with session.post(
+                f"{base_url}/v1/audio/speech",
+                json=payload,
+                headers=headers,
+            ) as response:
+                if response.status != 200:
+                    error_body = await response.read()
+                    logger.error(
+                        "vLLM-Omni TTS 请求失败: "
+                        f"status={response.status}, response_bytes={len(error_body)}"
+                    )
+                    return None
+                audio_data = bytearray()
+                async for chunk in response.content.iter_chunked(1024 * 1024):
+                    audio_data.extend(chunk)
+                if not audio_data:
+                    logger.error("vLLM-Omni TTS 返回空音频")
+                    return None
+                logger.info(f"成功接收 vLLM-Omni 音频，大小: {len(audio_data)} 字节")
+                return bytes(audio_data)
+
+        try:
+            shared_session = kwargs.get("_http_session")
+            if shared_session is not None:
+                return await receive_audio(shared_session)
+
+            connector = aiohttp.TCPConnector(
+                limit=max(1, int(self._config.tts.segment_concurrency))
+            )
+            timeout = aiohttp.ClientTimeout(total=self.timeout)
+            async with aiohttp.ClientSession(
+                connector=connector,
+                timeout=timeout,
+            ) as session:
+                return await receive_audio(session)
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            logger.error("vLLM-Omni TTS 请求超时")
+            return None
+        except Exception as exc:
+            logger.error(
+                "vLLM-Omni TTS 调用异常: "
+                f"error_type={type(exc).__name__}"
+            )
+            return None
+
+    async def _call_legacy_tts_api(
         self,
         server_config: dict[str, Any],
         text: str,
@@ -894,7 +1177,13 @@ class TTSService(BaseService):
             # 合并高级配置
             cfg = self._config
             advanced_dict = cfg.tts_advanced.model_dump()
-            data.update({k: v for k, v in advanced_dict.items() if v is not None})
+            data.update(
+                {
+                    k: v
+                    for k, v in advanced_dict.items()
+                    if v is not None and k != "text_normalization"
+                }
+            )
             request_media_type = kwargs.get("request_media_type")
             if request_media_type:
                 # Multi-segment synthesis always obtains lossless WAV chunks.
@@ -1087,11 +1376,36 @@ class TTSService(BaseService):
         }
         final_media_type = self._config.tts_advanced.media_type
         spatial_enabled = self._config.spatial_effects.enabled
+        backend = self._backend_name()
 
-        # One lock covers the complete outward expression. Other callers cannot
-        # interleave model-cache mutations between its internal sentences.
+        # Reference audio is immutable for one outward expression. Encode it
+        # once before bounded parallel segment requests instead of once per part.
+        if backend == "vllm_omni" and not str(server_config.get("voice") or "").strip():
+            ref_wav_path = str(server_config.get("refer_wav_path") or "").strip()
+            if not ref_wav_path or not self._validate_main_ref_duration(ref_wav_path):
+                return None
+            try:
+                call_kwargs["reference_audio_data_url"] = await asyncio.to_thread(
+                    self._audio_file_to_data_url,
+                    ref_wav_path,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "读取 vLLM-Omni 参考音频失败: "
+                    f"error_type={type(exc).__name__}"
+                )
+                return None
+
+        # One lock covers the complete outward expression. vLLM-Omni may batch
+        # its internal transport segments, but two visible expressions never mix.
         async with self._synthesis_lock:
-            if len(synthesis_segments) == 1 and not spatial_enabled:
+            if (
+                backend == "legacy_compat"
+                and len(synthesis_segments) == 1
+                and not spatial_enabled
+            ):
                 audio_data = await self._call_tts_api(
                     server_config=server_config,
                     text=synthesis_segments[0].text,
@@ -1104,18 +1418,92 @@ class TTSService(BaseService):
                     return None
                 return base64.b64encode(audio_data).decode("utf-8")
 
-            wav_segments: list[bytes] = []
-            for index, segment in enumerate(synthesis_segments, start=1):
-                segment_audio = await self._call_tts_api(
-                    server_config=server_config,
-                    text=segment.text,
-                    text_language=final_language,
-                    request_media_type="wav",
-                    segment_index=index,
-                    segment_count=len(synthesis_segments),
-                    **call_kwargs,
+            async def synthesize_segment(
+                index: int,
+                segment: _SynthesisSegment,
+                request_kwargs: dict[str, Any],
+                slots: asyncio.Semaphore | None = None,
+            ) -> bytes | None:
+                if slots is None:
+                    return await self._call_tts_api(
+                        server_config=server_config,
+                        text=segment.text,
+                        text_language=final_language,
+                        request_media_type="wav",
+                        segment_index=index,
+                        segment_count=len(synthesis_segments),
+                        **request_kwargs,
+                    )
+                async with slots:
+                    return await self._call_tts_api(
+                        server_config=server_config,
+                        text=segment.text,
+                        text_language=final_language,
+                        request_media_type="wav",
+                        segment_index=index,
+                        segment_count=len(synthesis_segments),
+                        **request_kwargs,
+                    )
+
+            async def synthesize_all(
+                request_kwargs: dict[str, Any],
+            ) -> list[bytes | None]:
+                if backend == "vllm_omni" and len(synthesis_segments) > 1:
+                    slots = asyncio.Semaphore(
+                        min(
+                            len(synthesis_segments),
+                            int(self._config.tts.segment_concurrency),
+                        )
+                    )
+                    return list(
+                        await asyncio.gather(
+                            *(
+                                synthesize_segment(
+                                    index,
+                                    segment,
+                                    request_kwargs,
+                                    slots,
+                                )
+                                for index, segment in enumerate(
+                                    synthesis_segments,
+                                    start=1,
+                                )
+                            )
+                        )
+                    )
+
+                results: list[bytes | None] = []
+                for index, segment in enumerate(synthesis_segments, start=1):
+                    results.append(
+                        await synthesize_segment(index, segment, request_kwargs)
+                    )
+                return results
+
+            if backend == "vllm_omni":
+                base_url = str(server_config["url"]).rstrip("/")
+                if not await self._ensure_server_alive(base_url):
+                    return None
+                connector = aiohttp.TCPConnector(
+                    limit=max(1, int(self._config.tts.segment_concurrency))
                 )
-                if not segment_audio:
+                timeout = aiohttp.ClientTimeout(total=self.timeout)
+                async with aiohttp.ClientSession(
+                    connector=connector,
+                    timeout=timeout,
+                ) as session:
+                    segment_results = await synthesize_all(
+                        {
+                            **call_kwargs,
+                            "_server_ready": True,
+                            "_http_session": session,
+                        }
+                    )
+            else:
+                segment_results = await synthesize_all(call_kwargs)
+
+            wav_segments: list[bytes] = []
+            for index, segment_audio in enumerate(segment_results, start=1):
+                if segment_audio is None:
                     logger.error(
                         "TTS内部片段合成失败，完整表达未交付: "
                         f"failed_segment={index}, segment_count={len(synthesis_segments)}"

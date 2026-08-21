@@ -1,7 +1,7 @@
 {
   "name": "tts_voice_plugin",
   "version": "3.3.0",
-  "description": "本地消息文本转语音插件；当前部署使用 IndexTTS2 兼容服务",
+  "description": "本地消息文本转语音插件；当前部署使用 IndexTTS2.5 + vLLM-Omni",
   "author": "Elysium",
   "license": "AGPL-v3.0",
   "dependencies": {

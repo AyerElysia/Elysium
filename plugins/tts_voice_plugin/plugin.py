@@ -24,7 +24,7 @@ class TTSVoicePlugin(BasePlugin):
 
     plugin_name: str = "tts_voice_plugin"
     plugin_description: str = (
-        "本地消息文本转语音插件；当前部署使用 IndexTTS2 兼容服务"
+        "本地消息文本转语音插件；当前部署使用 IndexTTS2.5 + vLLM-Omni"
     )
     plugin_version: str = "3.3.0"
 
@@ -67,6 +67,13 @@ class TTSVoicePlugin(BasePlugin):
                 except Exception as e:
                     logger.warning(f"清理 tts_voice_action schema 缓存失败: {e}")
                 logger.debug("已将自定义场景说明追加到 tts_voice_action 描述")
+
+    async def on_plugin_unloaded(self) -> None:
+        """Release only a TTS backend process started by this plugin instance."""
+        service = self.tts_service
+        self.tts_service = None
+        if service is not None:
+            await service.stop()
 
     def get_components(self) -> list[type]:
         """返回插件内所有组件类。
