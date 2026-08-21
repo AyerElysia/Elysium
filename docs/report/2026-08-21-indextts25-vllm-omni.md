@@ -1,6 +1,6 @@
 # IndexTTS2.5 / vLLM-Omni 消息 TTS 接入报告
 
-> 状态：代码合同、独立服务真实模型加载、Elysium TTSService 长文本链、并发基准及完整 Life Engine 风险回归均已通过；本机 ignored 配置已切换并完成解析验证。仍待用户手工启动 Elysium 后完成私聊/群聊平台回执，因此尚不能表述为最终生产验收通过，也尚未推送。
+> 状态：代码合同、独立服务真实模型加载、Elysium TTSService 长文本链、并发基准、空闲释放→再次按需唤醒闭环及完整 Life Engine 风险回归均已通过；本机 ignored 配置已切换并完成解析验证。仍待用户手工启动 Elysium 后完成私聊/群聊平台回执，因此尚不能表述为最终生产验收通过，也尚未推送。
 
 ## 1. 目标
 
@@ -24,6 +24,7 @@
 - 一条完整表达持有一个合成锁，不允许两条外发语音互相穿插；片段并行只发生在锁内部。
 - 每段都请求无损 WAV，全部成功后统一加入边界停顿、拼接、空间处理与最终编码。任何一段失败都不返回部分音频。
 - 日志不记录正文、参考音频、完整请求或凭据，只记录字符数、片段序号、音频字节和 content-free 错误类型。
+- 插件自有后端默认在最后一条完整表达结束 1800 秒后关闭两阶段进程组；新活动取消旧计时，到期前必须取得合成锁并复核同一 process identity。外部服务不建立 timer；关闭后下一次请求通过原有 single-flight 自动拉起。
 
 ## 4. 为什么采用有界并行
 
@@ -46,9 +47,11 @@ Stage 0 在每个请求内仍需先得到完整语义序列，Stage 1 才生成�
 - 九批并发基准均无 HTTP 错误、OOM 或 worker 泄漏；服务加载后静态显存约 15.8 GiB，基准中未继续抬升。
 - 使用本次真实 Elysium `TTSService` 而非裸客户端完成集成验证：103 字表达稳定切为 4 段，以并发 2 合成后按原顺序拼为一条 24.8185 秒 WAV；墙钟 2.6442 秒、RTF 0.1065、输出 SHA-256 `bb8465046dcf2a72513157c9016fc394fbf5bbc083f5c3cfd436a1024e9a6186`。
 - WSL 扩容后的完全冷态复验中，两阶段服务约 93 秒就绪，仍低于 300 秒启动门；首次实际 Elysium 长文本请求包含 JIT 冷热身，墙钟 38.87 秒。紧接着相同 103 字/4 段/并发 2 暖态复验墙钟 4.92 秒，输出 24.4586 秒、22.05 kHz 单声道 WAV，RTF 0.2010。由此明确区分“冷启动/首批编译”与稳定服务态，不用暖态数字掩盖首次使用成本。
+- 在隔离端口 8093 完成两轮真实 owner 生命周期：第一次请求自动启动 PID 667265，合成 221740 字节 WAV；表达结束后 3 秒开始回收，连同 worker 完全退出并确认 health 不可达共 10.0469 秒。第二次请求自动启动新 PID 669165，合成 207404 字节 WAV；测试收尾再次完整退出。两轮后 8093 无监听、无 vLLM/StageEngineCore 进程、GPU compute-app 列表为空，证明闲置释放与下次自动唤醒均成立，且不会在旧进程退出期间并发拉起替代进程。
+- 上述逐轮完全冷启动的端到端墙钟分别为 191.1972 秒与 133.9492 秒，其中服务就绪约 100 秒/94 秒；首次生成阶段还包含冷编译波动。因此生产默认 1800 秒闲置才释放，避免短时停顿导致频繁冷启动。关闭只换取长期闲置时的显存回收，下一次语音不会“无感秒醒”。
 - 中英混合文本以 `lang=zhen` 真实生成 4.9459 秒 WAV；同一句中文在 speed=0.9 时为 5.0503 秒、speed=1.1 时为 3.9126 秒，证明模型原生语速参数方向正确。
 - vLLM 0.26 与该 IndexTTS2.5 源码存在已证实 API 不兼容；0.27 解决该问题。RTX 5090 上 FlashInfer 0.6.16 的 JIT capability guard 会误判 SM 12.0，因此部署显式设置 `VLLM_USE_FLASHINFER_SAMPLER=0`，只切换到 vLLM 原生 top-k/top-p sampler；两阶段与连续批处理保持启用。当前 Stage 0 启用 CUDA Graph，Stage 1 按本机显存稳定性配置为 eager，并保留 S2Mel DIT torch.compile。
-- TTS、NapCat 群语音、Chatter 与平台工具专项共 116 项通过；Life Engine 串行风险回归 1770 passed / 15 skipped。并行全套中一次 Minecraft 50 ms deadline 测试受负载影响少收一条 observation，隔离连续 5/5 通过，串行全套也通过；该时序项与本轮文件无交集，未以重跑掩盖。
+- TTS、NapCat 群语音、Chatter 与平台工具文件级风险回归共 141 项通过，其中 TTS 服务生命周期专项 31 项通过；Life Engine 串行风险回归 1770 passed / 15 skipped。首次在隔离工作树运行时，唯一 Memory Witness 用例因 Git 忽略的本机 `config/models.toml` 不存在而失败；从主仓只读提供同一运行配置后，该用例及完整串行套件均通过，未把环境缺项伪装成产品回归。此前并行全套中一次 Minecraft 50 ms deadline 测试受负载影响少收一条 observation，隔离连续 5/5 通过，串行全套也通过；该时序项与本轮文件无交集，未以重跑掩盖。
 
 ## 6. 剩余生产验收门
 
@@ -56,6 +59,6 @@ Stage 0 在每个请求内仍需先得到完整语义序列，Stage 1 才生成�
 2. 完成一次私聊与一次群聊真实语音发送回执，确认平台各只收到一条完整语音，且长文本没有拆成多条平台消息。
 3. 取消与单段失败的 all-or-nothing 合同已由专项测试覆盖；命名音色上传属于可选优化，不阻断参考音频模式上线。
 
-本机 ignored 配置已解析确认为 `backend=vllm_omni`、`server=http://127.0.0.1:8092`、`model=indextts25-timbre`、`segment_concurrency=2`、`startup_timeout=300`，并保留 `legacy_compat` 代码回退能力。
+本机 ignored 配置已解析确认为 `backend=vllm_omni`、`server=http://127.0.0.1:8092`、`model=indextts25-timbre`、`segment_concurrency=2`、`startup_timeout=300`、`idle_shutdown_seconds=1800`，并保留 `legacy_compat` 代码回退能力。
 
 未完成上述步骤前，旧服务不得删除，配置不得被描述为最终正式切换；遵循“真实启动验证完成后才允许 push”的仓库规范。

@@ -70,9 +70,11 @@ IndexTTS2.5 的标准 vLLM-Omni 配置不是即时音频分块流式：Stage 0 �
 - `default` 风格与参考音频；
 - 请求、启动等待与文本长度上限；
 - 长文本片段预算、并发上限与标点停顿；
-- 空闲卸载策略由 vLLM-Omni 部署自身负责。
+- 插件自有后端的 `idle_shutdown_seconds`，默认 1800 秒，0 表示常驻。
 
-TTS 后端只在真正请求语音且端口未就绪时按配置启动。它可以独立按需拉起和空闲释放模型，但不得启动、停止或重启 Elysium、NapCat，也不得注册操作系统自启动。
+TTS 后端只在真正请求语音且端口未就绪时按配置启动。插件只持有自己通过 `start_command` 创建的新进程组；若端口上已有外部服务，插件只消费、不接管。最后一条完整表达结束后，插件为自有进程建立单调时钟闲置计时；新请求会取消旧计时。计时到期后必须先取得完整表达合成锁，并复核进程 identity 与 owner 未变化，才关闭两阶段进程组并释放显存。下一次请求继续通过现有 single-flight 自动拉起。这个生命周期不得启动、停止或重启 Elysium、NapCat，也不得注册操作系统自启动。
+
+闲置关闭使用完整进程退出，而不是依赖当前 IndexTTS2.5 Stage 1 未启用的 vLLM sleep mode。代价是下一次语音承担冷启动；本机 `startup_timeout` 必须覆盖实测最慢冷启动。长合成正在执行、计时已被新活动取消、进程已被替换或服务并非插件所有时，旧计时一律 no-op。
 
 仓库中的 Service 保留 `legacy_compat`，只用于显式回退；生产 `vllm_omni` 不调用权重切换端点，不发送本地文件路径，而是使用 `model/input/response_format/speed/ref_audio/extra_params`。参考音频在一条表达内只编码一次，各片段共享同一不可变 data URL；配置命名音色后可避免重复上传。后端身份以 `/v1/models`、模型 bundle revision 和输出验证为准。
 
@@ -119,5 +121,6 @@ TTS 工程证据应记录模型/声音 revision、输入文本 hash、输出音�
 11. 两个并发完整表达不会在同一消息 TTS Service 内交错调用 IndexTTS。
 12. vLLM-Omni 使用 `/v1/models` 健康检查和 `/v1/audio/speech` 合成，请求中不存在调用端本地路径；
 13. 并发 1/2/4 分别记录端到端耗时、RTF、显存峰值和段间一致性，只有 2 或 4 在质量不退化且无 OOM 时才可成为生产值。
+14. 闲置关闭只命中同一插件自有进程；新活动重置期限，长合成不被中断，陈旧 timer 不关闭 replacement，插件卸载不遗留 timer；关闭后下一次请求可重新拉起。
 
 部署步骤见[部署、配置、测试与使用说明](../operations/deployment_and_usage.md)。

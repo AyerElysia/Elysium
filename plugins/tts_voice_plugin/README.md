@@ -20,7 +20,7 @@ TTS 不决定正文、情绪或是否表达。Service 缺失、合成失败、�
 - 长表达按自然句和有界片段顺序合成，再以标点停顿拼成一条音频；
 - 可选空间音效；
 - Action 与 `/tts` Command；
-- IndexTTS2.5/vLLM-Omni 的空闲释放由后端服务自身负责。
+- 插件自有后端按最后一条完整表达结束时间做闲置释放，下一次语音按需重启；外部服务永不被接管或关闭。
 
 ## 配置
 
@@ -32,6 +32,7 @@ TTS 不决定正文、情绪或是否表达。Service 缺失、合成失败、�
 - `[tts].backend`：`vllm_omni` 或 `legacy_compat`，不根据 URL 猜测；
 - `[tts].server`、`model`、`api_key_env`：vLLM-Omni 地址、served model name 与可选鉴权环境变量；
 - `[tts].auto_start`、`server_dir`、`start_command`、`startup_timeout`：后端按需启动合同；
+- `[tts].idle_shutdown_seconds`：插件自有后端的闲置关闭时限，默认 1800 秒；设为 0 可保持常驻；
 - `[tts].timeout`：每个内部合成请求的时限；
 - `[tts].max_text_length`：一条完整表达的文本上限，超限显式失败，绝不静默截断；
 - `[tts].long_text_split_enabled`、`segment_max_units`、`segment_min_units`：长文本内部切句开关和片段预算；
@@ -54,6 +55,8 @@ vLLM-Omni 模式发送官方字段 `model/input/response_format/speed/ref_audio/
 
 禁止在 Elysium 启动事务中临时安装依赖。vLLM-Omni 应在独立 Linux/WSL 环境中预装并完成模型验收；TTS 后端可以由一次真实合成请求按配置启动，但不得启动、停止或重启 Elysium/NapCat，也不得建立操作系统自启动。
 
+闲置计时使用单调时钟并由项目任务管理器持有。新合成会取消旧计时；到期任务必须取得完整表达的合成锁，并复核仍是同一插件自有进程后才可关闭。关闭后下一次合成沿用按需启动 single-flight。Elysium 卸载时取消计时并回收自有进程；连接到已经存在的外部 TTS 时不建立闲置关闭任务。
+
 ## 验收
 
 至少验证：
@@ -67,6 +70,7 @@ vLLM-Omni 模式发送官方字段 `model/input/response_format/speed/ref_audio/
 7. 长表达的清洗后正文顺序不变、每段不越过配置预算，且只返回一份完整音频；
 8. 任一内部片段失败时不返回半截音频，完整文本超限时不发生网络请求。
 9. vLLM-Omni 的片段并发不超过配置上限，完成顺序变化也不改变最终正文顺序。
+10. 闲置到期只关闭插件自有进程；新合成、长合成和替换后的进程不会被旧计时误杀，关闭后下一次请求可按需重启。
 
 完整架构见 [TTS 语音合成](../../docs/architecture/TTS语音合成.md)。
 

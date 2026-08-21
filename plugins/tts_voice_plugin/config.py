@@ -116,6 +116,15 @@ class TTSSection(SectionBase):
             "所有结果仍按原顺序拼接"
         ),
     )
+    idle_shutdown_seconds: float = Field(
+        default=1800.0,
+        ge=0.0,
+        le=86_400.0,
+        description=(
+            "插件自有 TTS 服务在最后一条完整表达结束后的闲置关闭秒数；"
+            "0 表示保持常驻。外部运行的服务永不由插件关闭"
+        ),
+    )
     phrase_pause_ms: int = Field(
         default=120,
         ge=0,

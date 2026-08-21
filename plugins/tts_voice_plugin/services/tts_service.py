@@ -15,6 +15,8 @@ import os
 import re
 import shlex
 import signal
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -27,9 +29,11 @@ from pedalboard.io import AudioFile
 from src.app.plugin_system.api.log_api import get_logger
 from src.core.components.base.service import BaseService
 from src.core.utils.audio_transcode import transcode_audio_bytes
+from src.kernel.concurrency import get_task_manager
 
 if TYPE_CHECKING:
     from src.core.components.base.plugin import BasePlugin
+    from src.kernel.concurrency import TaskInfo
 
     from ..config import TTSVoiceConfig
 
@@ -72,6 +76,8 @@ class TTSService(BaseService):
         self.max_text_length: int = 500
         self._server_process: asyncio.subprocess.Process | None = None
         self._server_start_lock = asyncio.Lock()
+        self._idle_shutdown_task: TaskInfo | None = None
+        self._idle_generation = 0
         # A complete outward expression owns one lane so two user-visible voices
         # cannot interleave. vLLM-Omni may still batch bounded internal segments.
         self._synthesis_lock = asyncio.Lock()
@@ -85,35 +91,162 @@ class TTSService(BaseService):
         by :meth:`_start_server` own a new session so their two-stage vLLM
         workers can be reclaimed as one process group.
         """
+        await self._cancel_idle_shutdown_task()
+        await self._stop_owned_server_process(reason="plugin_stop")
+
+    async def _stop_owned_server_process(
+        self,
+        *,
+        reason: str,
+        expected_process: asyncio.subprocess.Process | None = None,
+    ) -> bool:
+        """Stop one process group only while its local ownership is still exact."""
         process = self._server_process
-        self._server_process = None
-        if process is None or process.returncode is not None:
-            return
-
+        if expected_process is not None and process is not expected_process:
+            return False
+        if process is None:
+            return False
+        stopped = False
         try:
-            self._signal_server_process(process, signal.SIGTERM)
-        except ProcessLookupError:
-            return
+            if process.returncode is not None:
+                return False
+            try:
+                self._signal_server_process(process, signal.SIGTERM)
+            except ProcessLookupError:
+                stopped = True
+                return False
 
-        try:
-            await asyncio.wait_for(process.wait(), timeout=20.0)
-            logger.info("TTS 服务子进程已停止")
-            return
-        except asyncio.CancelledError:
+            try:
+                await asyncio.wait_for(process.wait(), timeout=20.0)
+                stopped = True
+                logger.info(f"TTS 服务子进程已停止: reason={reason}")
+                return True
+            except asyncio.CancelledError:
+                try:
+                    self._signal_server_process(process, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                await asyncio.shield(process.wait())
+                stopped = True
+                raise
+            except TimeoutError:
+                logger.warning(
+                    "TTS 服务子进程未在 20 秒内退出，清理已拥有的进程组"
+                )
+
             try:
                 self._signal_server_process(process, signal.SIGKILL)
             except ProcessLookupError:
-                pass
-            await asyncio.shield(process.wait())
-            raise
-        except TimeoutError:
-            logger.warning("TTS 服务子进程未在 20 秒内退出，清理已拥有的进程组")
+                stopped = True
+                return False
+            await process.wait()
+            stopped = True
+            return True
+        finally:
+            # Ownership remains visible until the exact process has exited.
+            # This prevents a new request from spawning a duplicate while the
+            # old process still owns the listening port or GPU workers.
+            if self._server_process is process and (
+                stopped or process.returncode is not None
+            ):
+                self._server_process = None
 
-        try:
-            self._signal_server_process(process, signal.SIGKILL)
-        except ProcessLookupError:
+    async def _cancel_idle_shutdown_task(self) -> None:
+        """Cancel and collect the currently owned idle timer, if any."""
+        self._idle_generation += 1
+        task_info = self._idle_shutdown_task
+        self._idle_shutdown_task = None
+        if task_info is None or task_info.task is None:
             return
-        await process.wait()
+        task = task_info.task
+        if task is asyncio.current_task() or task.done():
+            return
+        task_info.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    def _arm_idle_shutdown(self) -> None:
+        """Arm one content-free idle timer for the current owned process."""
+        previous = self._idle_shutdown_task
+        if previous is not None and not previous.is_done():
+            previous.cancel()
+        self._idle_shutdown_task = None
+        self._idle_generation += 1
+
+        idle_seconds = float(self._config.tts.idle_shutdown_seconds)
+        process = self._server_process
+        if (
+            idle_seconds <= 0.0
+            or process is None
+            or process.returncode is not None
+        ):
+            return
+
+        generation = self._idle_generation
+        deadline = asyncio.get_running_loop().time() + idle_seconds
+        self._idle_shutdown_task = get_task_manager().create_task(
+            self._idle_shutdown_after(
+                process=process,
+                generation=generation,
+                deadline=deadline,
+                idle_seconds=idle_seconds,
+            ),
+            name="tts_voice_idle_shutdown",
+            daemon=True,
+            metadata={"idle_seconds": idle_seconds},
+        )
+
+    async def _idle_shutdown_after(
+        self,
+        *,
+        process: asyncio.subprocess.Process,
+        generation: int,
+        deadline: float,
+        idle_seconds: float,
+    ) -> None:
+        """Release an unchanged owned process after a monotonic idle deadline."""
+        try:
+            while True:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining > 0.0:
+                    await asyncio.sleep(remaining)
+
+                async with self._synthesis_lock:
+                    if generation != self._idle_generation:
+                        return
+                    if (
+                        self._server_process is not process
+                        or process.returncode is not None
+                    ):
+                        return
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining > 0.0:
+                        continue
+                    logger.info(
+                        "TTS 插件自有服务闲置到期，释放模型资源: "
+                        f"idle_seconds={idle_seconds:.1f}"
+                    )
+                    await self._stop_owned_server_process(
+                        reason="idle_timeout",
+                        expected_process=process,
+                    )
+                    return
+        except asyncio.CancelledError:
+            raise
+        finally:
+            current = asyncio.current_task()
+            task_info = self._idle_shutdown_task
+            if task_info is not None and task_info.task is current:
+                self._idle_shutdown_task = None
+
+    @asynccontextmanager
+    async def _synthesis_activity(self) -> AsyncIterator[None]:
+        """Serialize one expression and reset its owned-process idle deadline."""
+        await self._cancel_idle_shutdown_task()
+        async with self._synthesis_lock:
+            try:
+                yield
+            finally:
+                self._arm_idle_shutdown()
 
     @staticmethod
     def _signal_server_process(
@@ -1400,7 +1533,7 @@ class TTSService(BaseService):
 
         # One lock covers the complete outward expression. vLLM-Omni may batch
         # its internal transport segments, but two visible expressions never mix.
-        async with self._synthesis_lock:
+        async with self._synthesis_activity():
             if (
                 backend == "legacy_compat"
                 and len(synthesis_segments) == 1

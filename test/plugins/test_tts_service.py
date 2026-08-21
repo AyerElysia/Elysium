@@ -90,6 +90,7 @@ def test_long_text_config_defaults_and_bounds() -> None:
     assert config.tts.segment_max_units == 48
     assert config.tts.segment_min_units == 8
     assert config.tts.segment_concurrency == 2
+    assert config.tts.idle_shutdown_seconds == 1800.0
     assert config.tts.sentence_pause_ms == 320
     assert config.tts.paragraph_pause_ms == 520
 
@@ -101,6 +102,10 @@ def test_long_text_config_defaults_and_bounds() -> None:
         TTSVoiceConfig.model_validate({"tts": {"segment_concurrency": 5}})
     with pytest.raises(ValueError):
         TTSVoiceConfig.model_validate({"tts": {"backend": "guessed"}})
+    with pytest.raises(ValueError):
+        TTSVoiceConfig.model_validate({"tts": {"idle_shutdown_seconds": -0.1}})
+    with pytest.raises(ValueError):
+        TTSVoiceConfig.model_validate({"tts": {"idle_shutdown_seconds": 86_401}})
 
 
 def test_vllm_omni_payload_uses_official_indextts25_contract(
@@ -583,6 +588,230 @@ async def test_stop_leaves_an_external_server_unaffected(tmp_path: Path) -> None
         await service.stop()
 
     killpg.assert_not_called()
+
+
+async def test_owned_server_idle_timeout_releases_then_auto_start_is_available(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"RIFF")
+    service = _service_with_reference(reference)
+    service._config.tts.idle_shutdown_seconds = 0.01
+    process = SimpleNamespace(
+        pid=741,
+        returncode=None,
+        wait=AsyncMock(return_value=0),
+    )
+    service._server_process = process  # type: ignore[assignment]
+
+    with patch.object(tts_service_module.os, "killpg") as killpg:
+        service._arm_idle_shutdown()
+        task_info = service._idle_shutdown_task
+        assert task_info is not None and task_info.task is not None
+        await asyncio.wait_for(asyncio.shield(task_info.task), timeout=1.0)
+
+    killpg.assert_called_once_with(741, signal.SIGTERM)
+    process.wait.assert_awaited_once()
+    assert service._server_process is None
+    assert service._idle_shutdown_task is None
+
+    monkeypatch.setattr(service, "_is_server_alive", AsyncMock(return_value=False))
+    start = AsyncMock(return_value=True)
+    monkeypatch.setattr(service, "_start_server", start)
+
+    assert await service._ensure_server_alive(service._config.tts.server) is True
+    start.assert_awaited_once_with(service._config.tts.server)
+
+
+async def test_owned_process_identity_remains_until_exit_is_confirmed(
+    tmp_path: Path,
+) -> None:
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"RIFF")
+    service = _service_with_reference(reference)
+    wait_started = asyncio.Event()
+    allow_exit = asyncio.Event()
+
+    async def wait_for_exit() -> int:
+        wait_started.set()
+        await allow_exit.wait()
+        return 0
+
+    process = SimpleNamespace(
+        pid=748,
+        returncode=None,
+        wait=AsyncMock(side_effect=wait_for_exit),
+    )
+    service._server_process = process  # type: ignore[assignment]
+
+    with patch.object(tts_service_module.os, "killpg") as killpg:
+        stop_task = asyncio.create_task(
+            service._stop_owned_server_process(reason="test")
+        )
+        await asyncio.wait_for(wait_started.wait(), timeout=1.0)
+        assert service._server_process is process
+        allow_exit.set()
+        assert await asyncio.wait_for(stop_task, timeout=1.0) is True
+
+    killpg.assert_called_once_with(748, signal.SIGTERM)
+    assert service._server_process is None
+
+
+async def test_owned_process_identity_is_released_when_process_is_already_gone(
+    tmp_path: Path,
+) -> None:
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"RIFF")
+    service = _service_with_reference(reference)
+    process = SimpleNamespace(
+        pid=749,
+        returncode=None,
+        wait=AsyncMock(),
+    )
+    service._server_process = process  # type: ignore[assignment]
+
+    with patch.object(
+        service,
+        "_signal_server_process",
+        side_effect=ProcessLookupError,
+    ):
+        assert await service._stop_owned_server_process(reason="test") is False
+
+    process.wait.assert_not_awaited()
+    assert service._server_process is None
+
+
+async def test_synthesis_activity_cancels_old_idle_timer_and_rearms_afterward(
+    tmp_path: Path,
+) -> None:
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"RIFF")
+    service = _service_with_reference(reference)
+    service._config.tts.idle_shutdown_seconds = 0.02
+    process = SimpleNamespace(
+        pid=742,
+        returncode=None,
+        wait=AsyncMock(return_value=0),
+    )
+    service._server_process = process  # type: ignore[assignment]
+
+    with patch.object(tts_service_module.os, "killpg") as killpg:
+        service._arm_idle_shutdown()
+        old_task_info = service._idle_shutdown_task
+        assert old_task_info is not None and old_task_info.task is not None
+
+        async with service._synthesis_activity():
+            assert old_task_info.task.cancelled()
+            await asyncio.sleep(0.04)
+            killpg.assert_not_called()
+
+        new_task_info = service._idle_shutdown_task
+        assert new_task_info is not None and new_task_info is not old_task_info
+        assert new_task_info.task is not None
+        await asyncio.wait_for(asyncio.shield(new_task_info.task), timeout=1.0)
+
+    killpg.assert_called_once_with(742, signal.SIGTERM)
+    assert service._server_process is None
+
+
+async def test_successful_generate_voice_arms_owned_process_idle_timer(
+    tmp_path: Path,
+) -> None:
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"RIFF")
+    service = _service_with_reference(reference)
+    service._config.tts.idle_shutdown_seconds = 60.0
+    process = SimpleNamespace(
+        pid=747,
+        returncode=None,
+        wait=AsyncMock(return_value=0),
+    )
+    service._server_process = process  # type: ignore[assignment]
+    service._call_tts_api = AsyncMock(return_value=_silent_wav())  # type: ignore[method-assign]
+
+    assert await service.generate_voice("完整表达结束后才开始闲置计时。")
+    task_info = service._idle_shutdown_task
+    assert task_info is not None and task_info.task is not None
+    assert not task_info.task.done()
+
+    with patch.object(tts_service_module.os, "killpg") as killpg:
+        await service.stop()
+
+    assert task_info.task.cancelled()
+    killpg.assert_called_once_with(747, signal.SIGTERM)
+
+
+async def test_stale_idle_timer_never_stops_a_replacement_process(
+    tmp_path: Path,
+) -> None:
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"RIFF")
+    service = _service_with_reference(reference)
+    service._config.tts.idle_shutdown_seconds = 0.01
+    original = SimpleNamespace(pid=743, returncode=None, wait=AsyncMock())
+    replacement = SimpleNamespace(pid=744, returncode=None, wait=AsyncMock())
+    service._server_process = original  # type: ignore[assignment]
+
+    with patch.object(tts_service_module.os, "killpg") as killpg:
+        service._arm_idle_shutdown()
+        task_info = service._idle_shutdown_task
+        assert task_info is not None and task_info.task is not None
+        service._server_process = replacement  # type: ignore[assignment]
+        await asyncio.wait_for(asyncio.shield(task_info.task), timeout=1.0)
+
+    killpg.assert_not_called()
+    original.wait.assert_not_awaited()
+    replacement.wait.assert_not_awaited()
+    assert service._server_process is replacement
+    service._server_process = None
+
+
+async def test_idle_shutdown_is_disabled_or_external_process_is_unowned(
+    tmp_path: Path,
+) -> None:
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"RIFF")
+    service = _service_with_reference(reference)
+
+    service._arm_idle_shutdown()
+    assert service._idle_shutdown_task is None
+
+    service._config.tts.idle_shutdown_seconds = 0.0
+    service._server_process = SimpleNamespace(  # type: ignore[assignment]
+        pid=745,
+        returncode=None,
+        wait=AsyncMock(),
+    )
+    service._arm_idle_shutdown()
+    assert service._idle_shutdown_task is None
+    service._server_process = None
+
+
+async def test_plugin_stop_cancels_idle_timer_before_reclaiming_process(
+    tmp_path: Path,
+) -> None:
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"RIFF")
+    service = _service_with_reference(reference)
+    service._config.tts.idle_shutdown_seconds = 60.0
+    process = SimpleNamespace(
+        pid=746,
+        returncode=None,
+        wait=AsyncMock(return_value=0),
+    )
+    service._server_process = process  # type: ignore[assignment]
+    service._arm_idle_shutdown()
+    task_info = service._idle_shutdown_task
+    assert task_info is not None and task_info.task is not None
+
+    with patch.object(tts_service_module.os, "killpg") as killpg:
+        await service.stop()
+
+    assert task_info.task.cancelled()
+    assert service._idle_shutdown_task is None
+    killpg.assert_called_once_with(746, signal.SIGTERM)
+    assert service._server_process is None
 
 
 async def test_stop_cancellation_force_reclaims_owned_process_group(
