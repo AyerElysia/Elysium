@@ -72,6 +72,59 @@ async def test_retry_is_driven_by_policy_switch_or_retry():
     assert dummy.calls == ["a", "b"]
 
 
+async def test_empty_content_fails_over_to_next_model():
+    """HTTP 成功但助手正文为空（上游截断流）必须触发模型切换。"""
+
+    model_set = [_model("a", max_retry=0), _model("b", max_retry=0)]
+
+    class EmptyThenOkClient:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def create(
+            self, *, model_name, payloads, tools, request_name, model_set, stream
+        ):
+            self.calls.append(model_name)
+            if model_name == "a":
+                # 上游截断的典型形态：200 + 空正文 + 无工具调用
+                return "", [], None
+            return "ok", [], None
+
+    client = EmptyThenOkClient()
+    req = LLMRequest(
+        model_set, request_name="req", clients=ModelClientRegistry(openai=client)
+    )
+
+    resp = await req.send(stream=False)
+    assert resp.message == "ok"
+    assert client.calls == ["a", "b"]
+
+
+async def test_tool_call_response_with_blank_content_is_not_treated_as_empty():
+    """带工具调用的响应即使正文为空白也必须原样返回，不得误判失败。"""
+
+    model_set = [_model("a", max_retry=0), _model("b", max_retry=0)]
+
+    class ToolCallClient:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def create(
+            self, *, model_name, payloads, tools, request_name, model_set, stream
+        ):
+            self.calls.append(model_name)
+            return "  ", [{"id": "t1", "name": "lookup", "args": "{}"}], None
+
+    client = ToolCallClient()
+    req = LLMRequest(
+        model_set, request_name="req", clients=ModelClientRegistry(openai=client)
+    )
+
+    resp = await req.send(stream=False)
+    assert client.calls == ["a"]
+    assert resp.call_list and resp.call_list[0].name == "lookup"
+
+
 async def test_transient_failure_cools_model_for_matching_future_requests():
     """Repeated heartbeat rounds should bypass a recently failed primary."""
 

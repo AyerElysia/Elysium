@@ -30,6 +30,7 @@ from .context_delivery import (
 from .exceptions import (
     LLMAPIError,
     LLMConfigurationError,
+    LLMEmptyResponseError,
     LLMRateLimitError,
     LLMTimeoutError,
     UnsupportedModalityError,
@@ -943,6 +944,15 @@ class LLMRequest:
 
                 if resp._stream is None:
                     # Non-stream (or pre-collected) responses are already complete here.
+                    # 空正文软失败：HTTP 成功但助手正文为空且无工具调用，是上游
+                    # 流式响应被中途截断（如 reason=eof）的典型症状。把它当作
+                    # 本次尝试失败抛出，交由重试链切换下一个模型，而不是把空
+                    # 文本当成功返回给调用方。
+                    if not tool_calls and not str(resp.message or "").strip():
+                        raise LLMEmptyResponseError(
+                            f"empty assistant content from model={model_identifier}",
+                            model=model_identifier,
+                        )
                     _record_success(resp)
                 else:
                     resp._on_complete = _record_success
