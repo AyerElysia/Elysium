@@ -1,10 +1,10 @@
 """TTS Voice 插件配置。
 
 定义本地语音合成插件的配置项，包括基础设置、风格列表、高级参数和空间音效。
-当前 IndexTTS2 部署通过历史兼容 HTTP 协议接入；具体地址与启动命令由本机配置决定。
+当前生产部署使用 IndexTTS2.5 + vLLM-Omni；历史兼容 HTTP 协议仍可显式选择。
 """
 
-from typing import ClassVar
+from typing import ClassVar, Literal
 
 from src.core.components.base.config import (
     BaseConfig,
@@ -63,7 +63,24 @@ class PromptSection(SectionBase):
 class TTSSection(SectionBase):
     """TTS 语音合成基础配置。"""
 
+    backend: Literal["legacy_compat", "vllm_omni"] = Field(
+        default="legacy_compat",
+        description=(
+            "TTS HTTP 后端协议；legacy_compat 使用历史 /tts，"
+            "vllm_omni 使用 OpenAI-compatible /v1/audio/speech"
+        ),
+    )
     server: str = Field(default="http://127.0.0.1:9880", description="本地 TTS 服务地址")
+    model: str = Field(
+        default="indextts25-timbre",
+        description="vLLM-Omni 对外暴露的 IndexTTS2.5 served model name",
+    )
+    api_key_env: str = Field(
+        default="",
+        description=(
+            "可选的 vLLM-Omni Bearer token 环境变量名；为空时不发送 Authorization"
+        ),
+    )
     timeout: int = Field(default=180, description="TTS 请求超时秒数")
     max_text_length: int = Field(
         default=1000,
@@ -89,6 +106,24 @@ class TTSSection(SectionBase):
         ge=1,
         le=64,
         description="允许与相邻片段合并的短片段阈值，不改变正文与句子顺序",
+    )
+    segment_concurrency: int = Field(
+        default=2,
+        ge=1,
+        le=4,
+        description=(
+            "vLLM-Omni 单条长表达的片段并发上限；legacy_compat 始终串行，"
+            "所有结果仍按原顺序拼接"
+        ),
+    )
+    idle_shutdown_seconds: float = Field(
+        default=1800.0,
+        ge=0.0,
+        le=86_400.0,
+        description=(
+            "插件自有 TTS 服务在最后一条完整表达结束后的闲置关闭秒数；"
+            "0 表示保持常驻。外部运行的服务永不由插件关闭"
+        ),
     )
     phrase_pause_ms: int = Field(
         default=120,
@@ -153,6 +188,12 @@ class TTSStyle(SectionBase):
         default="C:/path/to/your/reference.wav",
         description="主参考音频路径；允许时长由当前本地 TTS 后端决定",
     )
+    voice: str = Field(
+        default="",
+        description=(
+            "可选的 vLLM-Omni 已上传命名音色；设置后优先于每次传输参考音频"
+        ),
+    )
     aux_refer_wav_paths: list[str] = Field(
         default_factory=list,
         description=(
@@ -167,7 +208,14 @@ class TTSStyle(SectionBase):
     prompt_language: str = Field(default="zh", description="参考音频语言")
     gpt_weights: str = Field(default="C:/path/to/your/gpt_weights.ckpt", description="GPT 模型路径")
     sovits_weights: str = Field(default="C:/path/to/your/sovits_weights.pth", description="SoVITS 模型路径")
-    speed_factor: float = Field(default=1.0, description="语速因子")
+    speed_factor: float = Field(
+        default=1.0,
+        ge=0.5,
+        le=2.0,
+        description=(
+            "语速因子；vLLM-Omni 中数值越大越快，legacy_compat 沿用后端既有语义"
+        ),
+    )
     text_language: str = Field(default="auto", description="文本语言模式 (zh/ja/en/auto 等)")
 
 
@@ -185,6 +233,10 @@ class TTSAdvancedSection(SectionBase):
     repetition_penalty: float = Field(default=1.4, description="重复惩罚因子")
     sample_steps: int = Field(default=150, description="采样步数")
     super_sampling: bool = Field(default=True, description="是否启用超采样")
+    text_normalization: bool = Field(
+        default=True,
+        description="是否启用 IndexTTS2.5 文本规范化；仅 vLLM-Omni 消费",
+    )
 
 
 @config_section("spatial_effects")

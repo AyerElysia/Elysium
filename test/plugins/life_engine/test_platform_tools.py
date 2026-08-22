@@ -18,6 +18,15 @@ class _FakeProcess:
         return b"", self._stderr
 
 
+def test_platform_tool_distinguishes_local_voice_from_qq_native_voice() -> None:
+    description = PlatformActionTool.to_schema()["function"]["description"]
+
+    assert "life_send_voice" in description
+    assert "send_group_ai_record" in description
+    assert "QQ 内置角色语音" in description
+    assert "不能冒充本地 TTS" in description
+
+
 @pytest.mark.parametrize(
     ("error", "expected_outcome"),
     [

@@ -1,6 +1,6 @@
 # TTS Voice Plugin (`tts_voice_plugin`)
 
-Elysium 的本地消息 TTS Service。当前本机部署连接 IndexTTS2 包装器；该包装器暴露历史 GPT-SoVITS `api_v2` 兼容端点，因此插件中的部分字段继续保留协议兼容名称。协议名称不代表当前模型仍是 GPT-SoVITS，更不代表使用 MiMo。
+Elysium 的本地消息 TTS Service。当前生产目标是微调 **IndexTTS2.5 + vLLM-Omni** 的 OpenAI-compatible `/v1/audio/speech`；历史 `/tts` 包装器只作为显式回退，不再代表主部署。
 
 ## 责任边界
 
@@ -14,12 +14,13 @@ TTS 不决定正文、情绪或是否表达。Service 缺失、合成失败、�
 
 ## 功能
 
-- 本地 `/tts` HTTP 合成与按需启动；
+- vLLM-Omni `/v1/audio/speech` 合成、健康检查与按需启动；
+- 可显式回退历史 `/tts` 协议；
 - 参考音频、多风格、语言检测与文本清洗；
 - 长表达按自然句和有界片段顺序合成，再以标点停顿拼成一条音频；
 - 可选空间音效；
 - Action 与 `/tts` Command；
-- IndexTTS2 空闲卸载由后端服务自身负责。
+- 插件自有后端按最后一条完整表达结束时间做闲置释放，下一次语音按需重启；外部服务永不被接管或关闭。
 
 ## 配置
 
@@ -28,18 +29,21 @@ TTS 不决定正文、情绪或是否表达。Service 缺失、合成失败、�
 关键字段：
 
 - `[plugin].enable`：是否注册 Service/Action/Command；
-- `[tts].server`：本地 TTS HTTP 地址；
+- `[tts].backend`：`vllm_omni` 或 `legacy_compat`，不根据 URL 猜测；
+- `[tts].server`、`model`、`api_key_env`：vLLM-Omni 地址、served model name 与可选鉴权环境变量；
 - `[tts].auto_start`、`server_dir`、`start_command`、`startup_timeout`：后端按需启动合同；
+- `[tts].idle_shutdown_seconds`：插件自有后端的闲置关闭时限，默认 1800 秒；设为 0 可保持常驻；
 - `[tts].timeout`：每个内部合成请求的时限；
 - `[tts].max_text_length`：一条完整表达的文本上限，超限显式失败，绝不静默截断；
 - `[tts].long_text_split_enabled`、`segment_max_units`、`segment_min_units`：长文本内部切句开关和片段预算；
+- `[tts].segment_concurrency`：同一长表达在 vLLM-Omni 中的有界并发，默认 2、硬上限 4；历史后端仍串行；
 - `[tts].phrase_pause_ms`、`clause_pause_ms`、`sentence_pause_ms`、`paragraph_pause_ms`：拼接时按原标点追加的停顿；
 - `[[tts_styles]]`：必须至少有 `default`，包含参考音频、提示文本、语言与可选历史兼容权重字段；
 - `[spatial_effects]`：可选混响与卷积。
 
-当前 IndexTTS2 包装器接受兼容请求但使用自己的调优 preset；客户端不会把历史 GPT-SoVITS 的 3～10 秒参考音频限制强加给 IndexTTS2。参考文件仍必须存在，真实能力由当前本地后端判断。
+vLLM-Omni 模式发送官方字段 `model/input/response_format/speed/ref_audio/extra_params`，不会发送历史 `text_lang/ref_audio_path`。参考音频在一条表达开始时读取并编码一次，各并发片段共享同一不可变 data URL；也可配置预先上传的命名音色，避免每次传输参考音频。客户端不会把历史 GPT-SoVITS 的 3～10 秒限制强加给 IndexTTS2.5。
 
-长文本拆分只是合成运输细节。对上游意识实例、trajectory、平台与记忆而言，输入仍是一条完整表达，输出仍是一条语音消息；内部片段不形成多条人格样本，也不允许分段发送。所有片段必须依次成功，随后才会统一拼接、施加一次空间效果并编码一次；任何一段失败都会使整条语音显式失败。
+长文本拆分只是合成运输细节。对上游意识实例、trajectory、平台与记忆而言，输入仍是一条完整表达，输出仍是一条语音消息；内部片段不形成多条人格样本，也不允许分段发送。vLLM-Omni 可对片段做有限并行批处理，但结果必须按原序号归位，随后统一拼接、施加一次空间效果并编码一次；任何一段失败都会使整条语音显式失败。
 
 ## 依赖与部署
 
@@ -49,7 +53,9 @@ TTS 不决定正文、情绪或是否表达。Service 缺失、合成失败、�
 ./deploy.sh bootstrap
 ```
 
-禁止在生产启动期间临时安装依赖。TTS 后端可以由一次真实合成请求按配置启动，但不得启动、停止或重启 Elysium/NapCat，也不得建立操作系统自启动。
+禁止在 Elysium 启动事务中临时安装依赖。vLLM-Omni 应在独立 Linux/WSL 环境中预装并完成模型验收；TTS 后端可以由一次真实合成请求按配置启动，但不得启动、停止或重启 Elysium/NapCat，也不得建立操作系统自启动。
+
+闲置计时使用单调时钟并由项目任务管理器持有。新合成会取消旧计时；到期任务必须取得完整表达的合成锁，并复核仍是同一插件自有进程后才可关闭。关闭后下一次合成沿用按需启动 single-flight。Elysium 卸载时取消计时并回收自有进程；连接到已经存在的外部 TTS 时不建立闲置关闭任务。
 
 ## 验收
 
@@ -63,6 +69,8 @@ TTS 不决定正文、情绪或是否表达。Service 缺失、合成失败、�
 6. 日志不包含合成正文、完整请求体或凭据。
 7. 长表达的清洗后正文顺序不变、每段不越过配置预算，且只返回一份完整音频；
 8. 任一内部片段失败时不返回半截音频，完整文本超限时不发生网络请求。
+9. vLLM-Omni 的片段并发不超过配置上限，完成顺序变化也不改变最终正文顺序。
+10. 闲置到期只关闭插件自有进程；新合成、长合成和替换后的进程不会被旧计时误杀，关闭后下一次请求可按需重启。
 
 完整架构见 [TTS 语音合成](../../docs/architecture/TTS语音合成.md)。
 

@@ -108,6 +108,14 @@ class LLMAPIError(LLMError):
         self.retry_after = retry_after
 
 
+class LLMEmptyResponseError(LLMAPIError):
+    """HTTP 成功但助手正文为空（流式响应被中途截断的典型症状）。
+
+    上游可能在思维链阶段耗尽连接后返回 200 与空正文（如 reason=eof）。
+    按可重试的软失败处理，交由重试链切换下一个模型。
+    """
+
+
 class LLMModelsCoolingDownError(LLMError):
     """所有候选模型均处于临时故障冷却期。"""
 

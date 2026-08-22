@@ -23,6 +23,19 @@ def _private_text_envelope() -> dict:
     }
 
 
+def _group_voice_envelope() -> dict:
+    return {
+        "message_info": {
+            "group_info": {"group_id": "654321"},
+            "user_info": {"user_id": "123456"},
+        },
+        "message_segment": {
+            "type": "voice",
+            "data": "UklGRg==",
+        },
+    }
+
+
 def _config(timeout_seconds: float = 20.0) -> SimpleNamespace:
     return SimpleNamespace(
         features=SimpleNamespace(
@@ -58,6 +71,38 @@ async def test_napcat_sender_passes_bounded_nt_receipt_timeout() -> None:
             "timeout": 18_000,
         },
         timeout=23.0,
+    )
+
+
+async def test_napcat_sender_sends_local_voice_to_group_as_onebot_record() -> None:
+    client = SimpleNamespace(
+        call=AsyncMock(
+            return_value={
+                "status": "ok",
+                "retcode": 0,
+                "data": {"message_id": "group-voice-1"},
+            }
+        )
+    )
+    sender = OutgoingSender(client, lambda: _config())
+
+    receipt = await sender.send(_group_voice_envelope())
+
+    assert receipt == {
+        "status": "ok",
+        "retcode": 0,
+        "data": {"message_id": "group-voice-1"},
+    }
+    client.call.assert_awaited_once_with(
+        "send_group_msg",
+        {
+            "group_id": 654321,
+            "message": [
+                {"type": "record", "data": {"file": "base64://UklGRg=="}}
+            ],
+            "timeout": 20_000,
+        },
+        timeout=25.0,
     )
 
 
