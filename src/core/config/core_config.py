@@ -234,8 +234,20 @@ class CoreConfig(ConfigBase):
         backend_generation: str = Field(
             default="",
             description=(
-                "预配置的 MySQL verified generation ID；仅在 backend=mysql 时使用，"
-                "backend=local 时自动忽略，切换模式不需要修改该字段。"
+                "预配置的 verified generation ID；backend=mysql 时指向 MySQL "
+                "generation，backend=local 且 local_selectable_enabled=true 时"
+                "指向本地文件权威注册表中的本地 generation，其余情况自动忽略。"
+            ),
+        )
+        local_selectable_enabled: bool = Field(
+            default=False,
+            description=(
+                "是否在 backend=local 时启用生命域 selectable 存储 runtime"
+                "（本地 SQLite + 文件权威）。默认关闭：关闭时 local 保持原本地"
+                "行为。开启前必须先用 scripts/bootstrap_local_selectable.py "
+                "完成 schema 建立与既有数据导入，并把 backend_generation 指向"
+                "导入产生的本地 verified generation；缺表或缺 generation 时"
+                "启动失败关闭，不回退。Core 存储不受该开关影响。"
             ),
         )
         schema_version: int = Field(

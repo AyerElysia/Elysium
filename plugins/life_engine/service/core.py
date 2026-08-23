@@ -277,6 +277,7 @@ logger = get_logger("life_engine", display="life_engine")
 LIFE_CHATTER_WORLD_MAX_BYTES = 32 * 1024
 LIFE_CHATTER_PROJECTED_SUFFIX_MAX_BYTES = 60 * 1024
 LIFE_CHATTER_EFFECTIVE_TEXT_MAX_BYTES = 64 * 1024
+_LIFE_LOCAL_FENCING_ENV = "ELYSIUM_LIFE_LOCAL_FENCING_TOKEN"
 
 
 def _stable_text_digest(text: str) -> str:
@@ -2017,9 +2018,93 @@ class LifeEngineService(BaseService):
             return
         from ..storage.factory import open_storage_backend
 
-        self._storage_runtime = await open_storage_backend(
-            self._storage_factory_settings
+        environment: dict[str, str] | None = None
+        settings = self._storage_factory_settings
+        if settings.authority_provider == "file":
+            settings, environment = await self._activate_local_file_authority(
+                settings
+            )
+            self._storage_factory_settings = settings
+        if environment is None:
+            self._storage_runtime = await open_storage_backend(settings)
+        else:
+            self._storage_runtime = await open_storage_backend(
+                settings,
+                environment=environment,
+            )
+
+    async def _activate_local_file_authority(
+        self,
+        settings: Any,
+    ) -> tuple[Any, dict[str, str]]:
+        """Activate the local file authority for this single writer process.
+
+        本地 selectable 模式沿用 LocalProactiveRuntime 的生产模式：generation
+        由 bootstrap 预先注册并验证，这里只以进程唯一 owner 激活。入口级
+        ``data/runtime/elysium.lock`` 已由 main 持有，同机不存在第二个主写
+        者；注册表中残留的活动租约只可能属于已崩溃的前任，confirm 接管
+        推进 epoch 后旧 token 立即失效。
+        """
+
+        from ..storage.authority import (
+            AuthorityConflict,
+            FileAuthorityRegistry,
+            GenerationNotVerified,
         )
+
+        registry = FileAuthorityRegistry(
+            settings.local.authority_state_path,
+            registry_id=settings.registry_id,
+        )
+        generation = await registry.get_generation(settings.backend_generation)
+        if generation is None:
+            raise RuntimeError(
+                "LocalSelectableGenerationNotRegistered: "
+                f"{settings.backend_generation} is not in the local authority "
+                "registry; run scripts/bootstrap_local_selectable.py first"
+            )
+        if generation.backend.value != settings.authoritative_backend.value:
+            raise RuntimeError(
+                "LocalSelectableGenerationBackendMismatch: "
+                f"{settings.backend_generation}"
+            )
+        owner_id = f"{settings.authority_owner_id}:pid-{os.getpid()}"
+        lease_seconds = int(settings.authority_lease_seconds)
+        deadline = time.monotonic() + lease_seconds + 5.0
+        while True:
+            health = await registry.health()
+            if str(health.get("status") or "") == "failed":
+                raise RuntimeError(
+                    "LocalSelectableAuthorityRegistryUnavailable"
+                )
+            active = str(health.get("active_generation") or "")
+            try:
+                token = await registry.activate_generation(
+                    settings.backend_generation,
+                    expected_epoch=int(health.get("authority_epoch") or 0),
+                    owner_id=owner_id,
+                    lease_seconds=lease_seconds,
+                    confirm_previous_writers_stopped=bool(active),
+                )
+                break
+            except asyncio.CancelledError:
+                raise
+            except (AuthorityConflict, GenerationNotVerified) as exc:
+                # epoch 竞态（并发启动已被实例锁排除，这里是注册表读写竞态）
+                # 或验证状态变化：有界重试读取最新状态，不删除、不抢写。
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        "LocalSelectableAuthorityActivationTimeout"
+                    ) from exc
+                await asyncio.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+        activated = replace(
+            settings,
+            authority_epoch=int(token.authority_epoch),
+            authority_owner_id=owner_id,
+        )
+        return activated, {
+            _LIFE_LOCAL_FENCING_ENV: str(token.fencing_token)
+        }
 
     async def _start_local_proactive_authority(self) -> None:
         """Open canonical proactive storage without enabling other life domains."""

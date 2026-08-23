@@ -1931,3 +1931,94 @@ async def test_async_registry_get_for_stream_falls_back_to_chat_global() -> None
     heartbeat = registry.get_for_stream(CHAT_GLOBAL_INSTANCE_ID)
     assert heartbeat is not None
     assert heartbeat.instance_id == CHAT_GLOBAL_INSTANCE_ID
+
+
+async def test_local_file_authority_activation_takes_over_crashed_lease(
+    tmp_path,
+) -> None:
+    """本地文件权威激活：接管崩溃残留租约并推进 epoch。
+
+    bootstrap 只注册 generation；service 以进程唯一 owner 激活。前任的
+    活动租约（同机实例锁已排除活写者）被 confirm 接管，epoch 单调推进，
+    旧 owner 失效。未注册 generation 时显式失败，不静默回退。
+    """
+
+    from plugins.life_engine.service.core import _LIFE_LOCAL_FENCING_ENV
+    from plugins.life_engine.storage.authority import FileAuthorityRegistry
+    from plugins.life_engine.storage.factory import (
+        settings_from_life_engine_config,
+    )
+    from plugins.life_engine.storage.models import (
+        BackendGeneration,
+        BackendKind as StorageBackendKind,
+        GenerationStatus,
+    )
+
+    service = _selected_service(tmp_path, StorageBackendKind.LOCAL)
+    global_config = CoreConfig(
+        storage=CoreConfig.StorageSection(
+            backend="local",
+            backend_generation="local-activation-v1",
+            local_selectable_enabled=True,
+            authority_owner_id="activation-contract",
+        )
+    )
+    config = LifeEngineConfig()
+    config.settings.workspace_path = str(tmp_path)
+    from dataclasses import replace as dc_replace
+
+    settings = settings_from_life_engine_config(
+        config,
+        global_config=global_config,
+    )
+    settings = dc_replace(
+        settings,
+        local=dc_replace(
+            settings.local,
+            authority_state_path=tmp_path / "authority.json",
+        ),
+    )
+
+    registry = FileAuthorityRegistry(
+        settings.local.authority_state_path,
+        registry_id=settings.registry_id,
+    )
+    generation = BackendGeneration(
+        generation_id="local-activation-v1",
+        backend=StorageBackendKind.LOCAL,
+        schema_version=int(settings.schema_version),
+        source_snapshot_sha256="0" * 64,
+        root_hashes={},
+        frontiers={},
+        created_at="2026-08-23T00:00:00+00:00",
+        verified_at="2026-08-23T00:01:00+00:00",
+        status=GenerationStatus.VERIFIED,
+    )
+    await registry.register_generation(generation)
+
+    activated_settings, env = await service._activate_local_file_authority(
+        settings
+    )
+
+    assert activated_settings.authority_epoch >= 1
+    assert activated_settings.authority_owner_id.startswith(
+        "activation-contract:pid-"
+    )
+    assert _LIFE_LOCAL_FENCING_ENV in env and env[_LIFE_LOCAL_FENCING_ENV]
+
+    health = await registry.health()
+    assert health["active_generation"] == "local-activation-v1"
+    first_epoch = int(health["authority_epoch"])
+
+    # 模拟崩溃后重启：新进程 owner 直接 confirm 接管，epoch 推进。
+    restarted_settings, _ = await service._activate_local_file_authority(
+        activated_settings
+    )
+    health_after = await registry.health()
+    assert int(health_after["authority_epoch"]) == first_epoch + 1
+    assert restarted_settings.authority_epoch == first_epoch + 1
+
+    # 未注册的 generation 显式失败，不回退 legacy。
+    missing = dc_replace(settings, backend_generation="not-registered")
+    with pytest.raises(RuntimeError, match="LocalSelectableGenerationNotRegistered"):
+        await service._activate_local_file_authority(missing)

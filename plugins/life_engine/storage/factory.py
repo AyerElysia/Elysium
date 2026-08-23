@@ -114,11 +114,20 @@ def settings_from_life_engine_config(
         raise StorageConfigurationError(
             "global storage.backend must be local or mysql"
         ) from exc
+    if backend == BackendKind.MYSQL:
+        selectable_enabled = True
+    elif bool(getattr(storage, "local_selectable_enabled", False)):
+        # 显式 opt-in：local 后端也可以运行 selectable runtime（本地 SQLite +
+        # 文件权威）。legacy local 行为保持不变；缺 generation/缺表在打开
+        # runtime 时失败关闭，不静默回退。
+        selectable_enabled = True
+    else:
+        selectable_enabled = False
     return StorageFactorySettings(
-        enabled=backend == BackendKind.MYSQL,
+        enabled=selectable_enabled,
         authoritative_backend=backend,
         backend_generation=(
-            str(storage.backend_generation) if backend == BackendKind.MYSQL else ""
+            str(storage.backend_generation) if selectable_enabled else ""
         ),
         schema_version=int(storage.schema_version),
         multi_writer_enabled=bool(storage.multi_writer_enabled),

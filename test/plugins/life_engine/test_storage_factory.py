@@ -464,3 +464,64 @@ async def test_factory_rejects_generation_schema_mismatch(tmp_path: Path) -> Non
             settings,
             environment={"TEST_FENCING_TOKEN": token.fencing_token},
         )
+
+
+def test_local_selectable_opt_in_enables_runtime_and_generation() -> None:
+    """显式 opt-in 后，local 后端也运行 selectable runtime。
+
+    未开启时 legacy 行为不变（上方两例）；开启时 backend_generation 必须
+    透传本地 generation，缺 generation 会在打开 runtime 时失败关闭。
+    """
+
+    settings = settings_from_life_engine_config(
+        LifeEngineConfig(),
+        global_config=CoreConfig(
+            storage=CoreConfig.StorageSection(
+                backend="local",
+                backend_generation="local-selectable-20260823-v1",
+                local_selectable_enabled=True,
+            )
+        ),
+    )
+
+    assert settings.enabled is True
+    assert settings.authoritative_backend == BackendKind.LOCAL
+    assert settings.backend_generation == "local-selectable-20260823-v1"
+    assert settings.authority_provider == "file"
+
+
+def test_local_selectable_disabled_by_default_keeps_generation_empty() -> None:
+    """不开启 opt-in 时，预配置的 generation 字段在 local 下仍被忽略。"""
+
+    settings = settings_from_life_engine_config(
+        LifeEngineConfig(),
+        global_config=CoreConfig(
+            storage=CoreConfig.StorageSection(
+                backend="local",
+                backend_generation="local-selectable-20260823-v1",
+            )
+        ),
+    )
+
+    assert settings.enabled is False
+    assert settings.backend_generation == ""
+
+
+def test_mysql_mode_ignores_local_selectable_flag() -> None:
+    """mysql 后端不受 local_selectable_enabled 影响。"""
+
+    settings = settings_from_life_engine_config(
+        LifeEngineConfig(),
+        global_config=CoreConfig(
+            storage=CoreConfig.StorageSection(
+                backend="mysql",
+                backend_generation="remote-adopted-v1",
+                local_selectable_enabled=True,
+                authority_owner_id="primary-writer",
+            )
+        ),
+    )
+
+    assert settings.enabled is True
+    assert settings.backend_generation == "remote-adopted-v1"
+    assert settings.authority_provider == "mysql"
