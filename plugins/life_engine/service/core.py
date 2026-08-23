@@ -15,7 +15,8 @@ import time
 import traceback
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime, time as dtime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
+from datetime import time as dtime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -25,6 +26,8 @@ from sqlalchemy.exc import (
     DisconnectionError,
     InterfaceError,
     OperationalError,
+)
+from sqlalchemy.exc import (
     TimeoutError as SQLAlchemyTimeoutError,
 )
 
@@ -34,7 +37,7 @@ from src.app.plugin_system.base import BaseService
 from src.core.components.utils import should_strip_auto_reason_argument
 from src.core.models.message import Message, MessageType
 from src.kernel.concurrency import get_task_manager
-from src.kernel.llm import LLMPayload, ROLE, Text, ToolRegistry, ToolResult
+from src.kernel.llm import ROLE, LLMPayload, Text, ToolRegistry, ToolResult
 
 _STORAGE_RENEWAL_BACKOFF_BASE_SECONDS = 1.0
 _STORAGE_RENEWAL_BACKOFF_MAX_SECONDS = 30.0
@@ -129,19 +132,19 @@ if TYPE_CHECKING:
         AttentionThreadCommit,
         AttentionThreadPage,
         AttentionThreadPageQuery,
-        AttentionThreadService,
         InstanceFocus,
     )
     from ..memory.service import LifeMemoryService
 
-from .audit import (
-    get_life_log_file,
-    log_error,
-    log_heartbeat as log_heartbeat_event,
-    log_heartbeat_model_response,
-    log_lifecycle,
-    log_message_received,
-    log_wake_context_injected,
+from ..autonomy import (
+    AsyncLocalAutonomyIntentStore,
+    SelectedAutonomyIntentStore,
+    cleanup_autonomy_schedules,
+)
+from ..constants import (
+    HEARTBEAT_IDLE_CRITICAL_THRESHOLD,
+    HEARTBEAT_IDLE_WARNING_THRESHOLD,
+    LIFE_CHATTER_GLOBAL_CURSOR_KEY,
 )
 from ..core.chat_history import (
     build_chat_history_text,
@@ -167,37 +170,45 @@ from ..core.tool_parallel import (
     is_life_tool_call_parallel_safe,
     iter_life_tool_call_batches,
 )
-from ..autonomy import (
-    AsyncLocalAutonomyIntentStore,
-    SelectedAutonomyIntentStore,
-    cleanup_autonomy_schedules,
-)
+from ..curiosity import CuriosityEngine
 from ..initiative.contracts import (
     InitiativeOutreachCommand,
+    InitiativeOutreachOutcome,
     InitiativeSeedCommand,
     InitiativeSeedCommit,
     InitiativeSeedView,
-)
-from ..streams.manager import ThoughtStreamManager
-from ..drives.impulse import ImpulseEngine
-from ..drives.rules import DEFAULT_RULES
-from ..curiosity import CuriosityEngine
-from ..prompts.sections import (
-    DEFAULT_HEARTBEAT_SECTIONS,
-    SectionContext,
-    render_heartbeat_sections,
-)
-from ..constants import (
-    HEARTBEAT_IDLE_CRITICAL_THRESHOLD,
-    HEARTBEAT_IDLE_WARNING_THRESHOLD,
-    LIFE_CHATTER_GLOBAL_CURSOR_KEY,
 )
 from ..memory.prompting import (
     analyze_memory_text,
     render_memory_prompt,
     should_emit_memory_maintenance_prompt,
 )
+from ..proactive import ProactiveAuthority
+from ..proactive.actor_gate import ProactiveActorDecisionGate
+from ..prompts.sections import (
+    DEFAULT_HEARTBEAT_SECTIONS,
+    SectionContext,
+    render_heartbeat_sections,
+)
 from ..trace.store import LifeTraceRecord
+from .async_presence import (
+    AsyncConsciousnessRegistry,
+    flush_presence_lifecycle_events,
+)
+from .attention import AttentionRouter
+from .audit import (
+    get_life_log_file,
+    log_error,
+    log_heartbeat_model_response,
+    log_lifecycle,
+    log_message_received,
+    log_wake_context_injected,
+)
+from .audit import (
+    log_heartbeat as log_heartbeat_event,
+)
+from .chat_events import build_chat_message_event, build_chat_provider_notice_event
+from .consciousness import ConsciousnessInstance, ConsciousnessRegistry
 from .event_builder import (
     EventBuilder,
     EventType,
@@ -209,25 +220,6 @@ from .event_builder import (
     _parse_hhmm,
     _shorten_text,
 )
-from .state_manager import (
-    StatePersistence,
-    get_file_metadata,
-    minutes_since_time,
-)
-from .attention import AttentionRouter
-from .subconscious_context import (
-    PreparedHeartbeatContext,
-    RecentSubconsciousContext,
-    SubconsciousContextManager,
-    SubconsciousSummary,
-)
-from .chat_events import build_chat_message_event, build_chat_provider_notice_event
-from .world_state import WorldState
-from .async_presence import (
-    AsyncConsciousnessRegistry,
-    flush_presence_lifecycle_events,
-)
-from .consciousness import ConsciousnessInstance, ConsciousnessRegistry
 from .event_bus import (
     LifeEvent,
     LifeEventBus,
@@ -236,14 +228,35 @@ from .event_bus import (
     RawEventStore,
     life_event_from_legacy,
 )
+from .integrations import (
+    DFCIntegration,
+    MemoryIntegration,
+)
 from .perception_gateway import (
-    AsyncPerceptionGateway,
     DEFAULT_PERCEPTION_MAX_BYTES,
+    AsyncPerceptionGateway,
     PerceptionCommitCheckpoint,
     PerceptionDeliveryReceipt,
     PerceptionDeliveryUnverified,
     PerceptionGateway,
     PreparedPerception,
+)
+from .self_pause import (
+    apply_self_pause,
+    build_self_pause_status,
+    clear_self_pause_state,
+    self_pause_status,
+)
+from .state_manager import (
+    StatePersistence,
+    get_file_metadata,
+    minutes_since_time,
+)
+from .subconscious_context import (
+    PreparedHeartbeatContext,
+    RecentSubconsciousContext,
+    SubconsciousContextManager,
+    SubconsciousSummary,
 )
 from .world_projection import (
     WORLD_LEGACY_IMPORT_EVENT,
@@ -254,16 +267,7 @@ from .world_projection import (
     legacy_snapshot_assertions,
     reject_prompt_projection_persistence,
 )
-from .integrations import (
-    DFCIntegration,
-    MemoryIntegration,
-)
-from .self_pause import (
-    apply_self_pause,
-    build_self_pause_status,
-    clear_self_pause_state,
-    self_pause_status,
-)
+from .world_state import WorldState
 
 if TYPE_CHECKING:
     from ..memory.service import LifeMemoryService
@@ -667,6 +671,7 @@ class LifeEngineService(BaseService):
         self._event_history: list[LifeEngineEvent] = []
         self._lock: asyncio.Lock | None = None
         self._heartbeat_run_lock = asyncio.Lock()
+        self._proactive_actor_gate = ProactiveActorDecisionGate()
         settings = getattr(getattr(plugin, "config", None), "settings", None)
         configured_budget = getattr(settings, "subconscious_context_max_chars", None)
         if configured_budget is None:
@@ -737,8 +742,17 @@ class LifeEngineService(BaseService):
         self._life_event_store: Any | None = None
         self._learning_stores: Any | None = None
         self._learning_event_store: Any | None = None
-        self._attention_thread_service: Any | None = None
-        self._initiative_authority: Any | None = None
+        self._proactive_authority: ProactiveAuthority | None = None
+        self._local_proactive_runtime: Any | None = None
+        self._proactive_delivery_proof_hook: Any | None = None
+        from ..storage.instance_identity import generate_boot_id
+
+        self._proactive_claim_owner = generate_boot_id()
+        self._active_initiative_expression_claims: set[str] = set()
+        self._pending_initiative_expression_resolutions: dict[
+            str,
+            tuple[InitiativeOutreachOutcome, str, str, str, str],
+        ] = {}
         self._subject_document_store: Any | None = None
         self._runtime_state_store: Any | None = None
         self._runtime_context_writer_claim: Any | None = None
@@ -753,6 +767,11 @@ class LifeEngineService(BaseService):
             "consecutive_failures": 0,
         }
         self._lost_singleton_health: dict[tuple[str, str], dict[str, Any]] = {}
+        self._proactive_health_cache: dict[str, Any] = {
+            "component": "proactive_authority",
+            "status": "initializing",
+            "authority_count": 0,
+        }
         self._learning_storage_health: dict[str, Any] = {
             "status": (
                 "initializing" if self._selectable_storage_enabled else "disabled"
@@ -817,12 +836,6 @@ class LifeEngineService(BaseService):
 
         # 事件构建器
         self._event_builder = EventBuilder(self._next_sequence)
-
-        # 思考流系统
-        self._thought_manager: ThoughtStreamManager | None = None
-
-        # 冲动引擎
-        self._impulse_engine: ImpulseEngine | None = None
 
         # 异步好奇层
         self._curiosity_engine: CuriosityEngine | None = None
@@ -1317,13 +1330,14 @@ class LifeEngineService(BaseService):
     ) -> ConsciousnessInstance:
         """Register one runtime window and durably publish its lifecycle."""
 
-        registry = self.consciousness_registry
-        if isinstance(registry, AsyncConsciousnessRegistry):
-            result = await registry.register(instance)
-        else:
-            result = await asyncio.to_thread(registry.register, instance)
-        await self.save_consciousness_registry_async()
-        return result
+        async with self._proactive_actor_gate.hold(instance.instance_id):
+            registry = self.consciousness_registry
+            if isinstance(registry, AsyncConsciousnessRegistry):
+                result = await registry.register(instance)
+            else:
+                result = await asyncio.to_thread(registry.register, instance)
+            await self.save_consciousness_registry_async()
+            return result
 
     async def touch_consciousness_instance(
         self,
@@ -1334,21 +1348,22 @@ class LifeEngineService(BaseService):
     ) -> None:
         """Commit liveness before returning to the current runtime."""
 
-        registry = self.consciousness_registry
-        if isinstance(registry, AsyncConsciousnessRegistry):
-            await registry.touch(
-                instance_id,
-                timestamp=timestamp,
-                reason=reason,
-            )
-        else:
-            await asyncio.to_thread(
-                registry.touch,
-                instance_id,
-                timestamp=timestamp,
-                reason=reason,
-            )
-        await self.save_consciousness_registry_async()
+        async with self._proactive_actor_gate.hold(instance_id):
+            registry = self.consciousness_registry
+            if isinstance(registry, AsyncConsciousnessRegistry):
+                await registry.touch(
+                    instance_id,
+                    timestamp=timestamp,
+                    reason=reason,
+                )
+            else:
+                await asyncio.to_thread(
+                    registry.touch,
+                    instance_id,
+                    timestamp=timestamp,
+                    reason=reason,
+                )
+            await self.save_consciousness_registry_async()
 
     async def resume_consciousness_instance(
         self,
@@ -1359,23 +1374,24 @@ class LifeEngineService(BaseService):
     ) -> bool:
         """Resume one suspended runtime and durably reclaim its streams."""
 
-        registry = self.consciousness_registry
-        if isinstance(registry, AsyncConsciousnessRegistry):
-            changed = await registry.resume(
-                instance_id,
-                timestamp=timestamp,
-                reason=reason,
-            )
-        else:
-            changed = await asyncio.to_thread(
-                registry.resume,
-                instance_id,
-                timestamp=timestamp,
-                reason=reason,
-            )
-        if changed:
-            await self.save_consciousness_registry_async()
-        return changed
+        async with self._proactive_actor_gate.hold(instance_id):
+            registry = self.consciousness_registry
+            if isinstance(registry, AsyncConsciousnessRegistry):
+                changed = await registry.resume(
+                    instance_id,
+                    timestamp=timestamp,
+                    reason=reason,
+                )
+            else:
+                changed = await asyncio.to_thread(
+                    registry.resume,
+                    instance_id,
+                    timestamp=timestamp,
+                    reason=reason,
+                )
+            if changed:
+                await self.save_consciousness_registry_async()
+            return changed
 
     async def suspend_consciousness_instance(
         self,
@@ -1386,24 +1402,25 @@ class LifeEngineService(BaseService):
     ) -> bool:
         """Suspend one runtime and durably release its stream claims."""
 
-        registry = self.consciousness_registry
-        if isinstance(registry, AsyncConsciousnessRegistry):
-            changed = await registry.suspend(
-                instance_id,
-                timestamp=timestamp,
-                reason=reason,
-            )
-        else:
-            changed = await asyncio.to_thread(
-                registry.suspend,
-                instance_id,
-                timestamp=timestamp,
-                reason=reason,
-            )
-        if changed:
-            await self.save_consciousness_registry_async()
-            await self._clear_instance_attention_focus(instance_id)
-        return changed
+        async with self._proactive_actor_gate.hold(instance_id):
+            registry = self.consciousness_registry
+            if isinstance(registry, AsyncConsciousnessRegistry):
+                changed = await registry.suspend(
+                    instance_id,
+                    timestamp=timestamp,
+                    reason=reason,
+                )
+            else:
+                changed = await asyncio.to_thread(
+                    registry.suspend,
+                    instance_id,
+                    timestamp=timestamp,
+                    reason=reason,
+                )
+            if changed:
+                await self.save_consciousness_registry_async()
+                await self._clear_instance_attention_focus(instance_id)
+            return changed
 
     async def terminate_consciousness_instance(
         self,
@@ -1414,35 +1431,36 @@ class LifeEngineService(BaseService):
     ) -> bool:
         """Commit termination and release stream ownership before returning."""
 
-        registry = self.consciousness_registry
-        if isinstance(registry, AsyncConsciousnessRegistry):
-            changed = await registry.terminate(
-                instance_id,
-                timestamp=timestamp,
-                reason=reason,
-            )
-        else:
-            changed = await asyncio.to_thread(
-                registry.terminate,
-                instance_id,
-                timestamp=timestamp,
-                reason=reason,
-            )
-        if changed:
-            await self.save_consciousness_registry_async()
-            await self._clear_instance_attention_focus(instance_id)
-        return changed
+        async with self._proactive_actor_gate.hold(instance_id):
+            registry = self.consciousness_registry
+            if isinstance(registry, AsyncConsciousnessRegistry):
+                changed = await registry.terminate(
+                    instance_id,
+                    timestamp=timestamp,
+                    reason=reason,
+                )
+            else:
+                changed = await asyncio.to_thread(
+                    registry.terminate,
+                    instance_id,
+                    timestamp=timestamp,
+                    reason=reason,
+                )
+            if changed:
+                await self.save_consciousness_registry_async()
+                await self._clear_instance_attention_focus(instance_id)
+            return changed
 
     async def _clear_instance_attention_focus(self, instance_id: str) -> None:
         """Release ephemeral focus without mutating subject thread authority."""
 
-        attention = self._attention_thread_service
-        if attention is None:
+        proactive = getattr(self, "_proactive_authority", None)
+        if proactive is None:
             return
         try:
-            focus = await attention.get_focus(instance_id)
+            focus = await proactive.get_attention_focus(instance_id)
             if focus is not None:
-                await attention.clear_focus(
+                await proactive.clear_attention_focus(
                     instance_id,
                     expected_revision=focus.revision,
                 )
@@ -1472,27 +1490,12 @@ class LifeEngineService(BaseService):
         return self._storage_runtime
 
     @property
-    def attention_thread_service(self) -> AttentionThreadService:
-        """Return the selected subject-attention authority or fail closed."""
+    def proactive_authority(self) -> ProactiveAuthority:
+        """Return the one live proactive authority or fail closed."""
 
-        service = self._attention_thread_service
-        if service is None:
-            raise RuntimeError(
-                "AttentionThreadAuthorityNotStarted: persistent subject attention "
-                "requires the selected storage runtime"
-            )
-        return service
-
-    @property
-    def initiative_authority(self) -> Any:
-        """Return the subject initiative authority or fail closed."""
-
-        authority = self._initiative_authority
+        authority = self._proactive_authority
         if authority is None:
-            raise RuntimeError(
-                "InitiativeAuthorityNotStarted: subject initiative requires "
-                "the service-owned runtime event store"
-            )
+            raise RuntimeError("ProactiveAuthorityNotStarted")
         return authority
 
     async def decide_initiative_seed(
@@ -1501,7 +1504,7 @@ class LifeEngineService(BaseService):
     ) -> InitiativeSeedCommit:
         """Commit one explicit subject decision without choosing a route."""
 
-        return await self.initiative_authority.decide_seed(command)
+        return await self.proactive_authority.decide_initiative(command)
 
     async def _initiative_life_event_exists(self, event_id: str) -> bool:
         """Check one immutable occurrence without materializing event content."""
@@ -1559,7 +1562,7 @@ class LifeEngineService(BaseService):
                 raw_content=content,
             )
             await self._queue_pending_event(event)
-        await self.initiative_authority.record_reencounter_delivery(
+        await self.proactive_authority.record_reencounter_delivery(
             seed_id=seed.seed_id,
             seed_revision=seed.reencounter_revision,
             life_event_id=event_id,
@@ -1567,13 +1570,54 @@ class LifeEngineService(BaseService):
         )
 
     async def _initiative_reencounter_loop(self) -> None:
-        """Deliver due seeds once in ledger order; never infer salience or action."""
+        """Replay pending initiative deliveries without inferring subject intent."""
 
         while self._stop_event is not None and not self._stop_event.is_set():
             try:
-                due = await self.initiative_authority.due_reencounters(
-                    now=_now_iso()
+                proactive = self.proactive_authority
+                await self._flush_pending_initiative_expression_resolutions()
+                pending = await proactive.pending_outreach(limit=1)
+                for item in pending:
+                    await self._deliver_pending_initiative_outreach(item.command)
+                expression_pending = await proactive.pending_expression_outreach(
+                    limit=1
                 )
+                for item in expression_pending:
+                    occurrence_id = item.command.occurrence_id
+                    active_claims = getattr(
+                        self,
+                        "_active_initiative_expression_claims",
+                        set(),
+                    )
+                    deferred = getattr(
+                        self,
+                        "_pending_initiative_expression_resolutions",
+                        {},
+                    )
+                    if occurrence_id in deferred or occurrence_id in active_claims:
+                        continue
+                    if item.status == "processing":
+                        # The immutable claim owns a DB-clock lease.  A scan can
+                        # observe the committed claim before the caller adds it
+                        # to the process-local active set, so absence from that
+                        # set is never sufficient recovery proof.  Only an
+                        # expired lease may become delivery_unknown.
+                        if not item.claim_expired:
+                            continue
+                        await self.resolve_initiative_outreach_expressions(
+                            [occurrence_id],
+                            outcome="delivery_unknown",
+                            action_id=item.claimed_action_id,
+                        )
+                        continue
+                    await self._wake_stream_for_initiative(
+                        stream_id=item.stream_id,
+                        platform=item.platform,
+                        command=item.command,
+                        trigger_message_id=item.trigger_message_id,
+                        turn_id=item.turn_id,
+                    )
+                due = await proactive.due_reencounters(now=_now_iso())
                 # Technical delivery order is stable ledger order, never a
                 # salience judgment. One event per pass prevents a recovered
                 # backlog from flooding the next heartbeat context.
@@ -1601,7 +1645,7 @@ class LifeEngineService(BaseService):
     ) -> tuple[InitiativeSeedView, ...]:
         """Read initiatives in immutable event order, never salience order."""
 
-        return await self.initiative_authority.list_seeds(
+        return await self.proactive_authority.list_initiatives(
             include_released=include_released
         )
 
@@ -1611,7 +1655,218 @@ class LifeEngineService(BaseService):
     ) -> InitiativeSeedView | None:
         """Read one exact initiative view without inferring an audience."""
 
-        return await self.initiative_authority.get_seed(seed_id)
+        return await self.proactive_authority.get_initiative(seed_id)
+
+    @staticmethod
+    def _initiative_outreach_trigger_message_id(
+        outreach_occurrence_id: str,
+    ) -> str:
+        digest = hashlib.sha256(
+            str(outreach_occurrence_id or "").strip().encode("utf-8")
+        ).hexdigest()
+        return f"initiative_outreach_{digest}"
+
+    async def claim_initiative_outreach_expressions(
+        self,
+        outreach_occurrence_ids: list[str] | tuple[str, ...],
+        *,
+        action_id: str,
+    ) -> dict[str, Any]:
+        """Fence visible expression actions before any platform side effect.
+
+        This is a technical at-most-once gate.  It never creates an initiative
+        or decides what to say.  Losing a successful claim return intentionally
+        becomes ``delivery_unknown`` instead of authorizing a duplicate send.
+        """
+
+        occurrences = tuple(
+            dict.fromkeys(
+                str(item or "").strip()
+                for item in outreach_occurrence_ids
+                if str(item or "").strip()
+            )
+        )
+        exact_action_id = str(action_id or "").strip()
+        if not occurrences:
+            return {"claimed": True, "claim_count": 0, "execute_allowed": True}
+        if not exact_action_id:
+            raise ValueError("initiative outreach action_id is required")
+        active_claims = getattr(
+            self,
+            "_active_initiative_expression_claims",
+            None,
+        )
+        if active_claims is None:
+            active_claims = set()
+            self._active_initiative_expression_claims = active_claims
+
+        claimed: list[str] = []
+        claim_epochs: dict[str, int] = {}
+        try:
+            for occurrence_id in occurrences:
+                receipt = await self.proactive_authority.claim_outreach_expression(
+                    outreach_occurrence_id=occurrence_id,
+                    action_id=exact_action_id,
+                    claim_owner=self._proactive_claim_owner,
+                    lease_seconds=int(
+                        self._cfg().proactive.expression_claim_lease_seconds
+                    ),
+                    occurred_at=_now_iso(),
+                )
+                claim_epochs[occurrence_id] = receipt.claim_epoch
+                if not receipt.execute_allowed:
+                    if claimed:
+                        await self.resolve_initiative_outreach_expressions(
+                            claimed,
+                            outcome="failed",
+                            action_id=exact_action_id,
+                        )
+                    return {
+                        "claimed": False,
+                        "claim_count": len(claimed),
+                        "execute_allowed": False,
+                        "reason": "claim_replayed",
+                        "claim_epochs": claim_epochs,
+                    }
+                claimed.append(occurrence_id)
+                active_claims.add(occurrence_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if claimed:
+                await self.resolve_initiative_outreach_expressions(
+                    claimed,
+                    outcome="failed",
+                    action_id=exact_action_id,
+                )
+            raise
+        return {
+            "claimed": True,
+            "claim_count": len(claimed),
+            "execute_allowed": True,
+            "claim_epochs": claim_epochs,
+        }
+
+    async def resolve_initiative_outreach_expressions(
+        self,
+        outreach_occurrence_ids: list[str] | tuple[str, ...],
+        *,
+        outcome: InitiativeOutreachOutcome,
+        action_id: str = "",
+        delivery_receipt_sha256: str = "",
+        delivery_message_id: str = "",
+    ) -> dict[str, Any]:
+        """Persist terminal expression outcomes without fabricating success."""
+
+        occurrences = tuple(
+            dict.fromkeys(
+                str(item or "").strip()
+                for item in outreach_occurrence_ids
+                if str(item or "").strip()
+            )
+        )
+        exact_action_id = str(action_id or "").strip()
+        exact_delivery_receipt = str(delivery_receipt_sha256 or "").strip()
+        exact_delivery_message_id = str(delivery_message_id or "").strip()
+        active_claims = getattr(
+            self,
+            "_active_initiative_expression_claims",
+            None,
+        )
+        if active_claims is None:
+            active_claims = set()
+            self._active_initiative_expression_claims = active_claims
+        deferred = getattr(
+            self,
+            "_pending_initiative_expression_resolutions",
+            None,
+        )
+        if deferred is None:
+            deferred = {}
+            self._pending_initiative_expression_resolutions = deferred
+
+        resolved = 0
+        errors: dict[str, str] = {}
+        for occurrence_id in occurrences:
+            occurred_at = _now_iso()
+            try:
+                await self.proactive_authority.resolve_outreach_expression(
+                    outreach_occurrence_id=occurrence_id,
+                    outcome=outcome,
+                    action_id=exact_action_id,
+                    delivery_receipt_sha256=exact_delivery_receipt,
+                    delivery_message_id=exact_delivery_message_id,
+                    occurred_at=occurred_at,
+                )
+            except asyncio.CancelledError:
+                deferred[occurrence_id] = (
+                    outcome,
+                    exact_action_id,
+                    occurred_at,
+                    exact_delivery_receipt,
+                    exact_delivery_message_id,
+                )
+                active_claims.discard(occurrence_id)
+                raise
+            except Exception as exc:  # noqa: BLE001 - durable retry below
+                deferred[occurrence_id] = (
+                    outcome,
+                    exact_action_id,
+                    occurred_at,
+                    exact_delivery_receipt,
+                    exact_delivery_message_id,
+                )
+                errors[occurrence_id] = type(exc).__name__
+                logger.warning(
+                    "主体主动外联终态暂未落账，将后台重试: "
+                    f"error_type={type(exc).__name__}"
+                )
+            else:
+                deferred.pop(occurrence_id, None)
+                resolved += 1
+            finally:
+                active_claims.discard(occurrence_id)
+        return {
+            "resolved_count": resolved,
+            "pending_count": len(errors),
+            "error_types": tuple(sorted(set(errors.values()))),
+        }
+
+    async def _flush_pending_initiative_expression_resolutions(self) -> None:
+        deferred = getattr(
+            self,
+            "_pending_initiative_expression_resolutions",
+            None,
+        )
+        if not deferred:
+            return
+        for occurrence_id, (
+            outcome,
+            action_id,
+            occurred_at,
+            delivery_receipt_sha256,
+            delivery_message_id,
+        ) in tuple(
+            deferred.items()
+        )[:1]:
+            try:
+                await self.proactive_authority.resolve_outreach_expression(
+                    outreach_occurrence_id=occurrence_id,
+                    outcome=outcome,
+                    action_id=action_id,
+                    delivery_receipt_sha256=delivery_receipt_sha256,
+                    delivery_message_id=delivery_message_id,
+                    occurred_at=occurred_at,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - retried next pass
+                logger.debug(
+                    "主体主动外联终态后台重试未完成: "
+                    f"error_type={type(exc).__name__}"
+                )
+                return
+            deferred.pop(occurrence_id, None)
 
     async def begin_initiative_outreach(
         self,
@@ -1625,23 +1880,90 @@ class LifeEngineService(BaseService):
             audience_ref=command.audience_ref,
             surface_ref=command.surface_ref,
         )
-        receipt = await self.initiative_authority.begin_outreach(command)
-        # The stable synthetic message_id is de-duplicated across unread,
-        # current, and history messages. Replaying after an uncertain wake is
-        # therefore recoverable without duplicating the expression episode.
-        await self._wake_stream_for_initiative(
-            stream_id=surface.stream_id,
-            platform=surface.platform,
-            command=command,
+        receipt = await self.proactive_authority.begin_outreach(command)
+        trigger_message_id = self._initiative_outreach_trigger_message_id(
+            command.occurrence_id
         )
-        return {
-            "begun": True,
+        result: dict[str, Any] = {
+            "authority_committed": True,
+            "inbox_committed": False,
+            "expression_wake_enqueued": False,
+            "delivery_pending": True,
+            "expression_pending": True,
+            "message_sent": False,
             "event_id": receipt.event_id,
             "occurrence_id": receipt.occurrence_id,
             "audience_ref": receipt.audience_ref,
             "surface_ref": receipt.surface_ref,
             "idempotent_replay": receipt.idempotent_replay,
         }
+        try:
+            delivery = await self.proactive_authority.record_outreach_delivery(
+                outreach_occurrence_id=command.occurrence_id,
+                stream_id=surface.stream_id,
+                trigger_message_id=trigger_message_id,
+                occurred_at=_now_iso(),
+                platform=surface.platform,
+            )
+            result.update(
+                inbox_committed=True,
+                delivery_event_id=delivery.event_id,
+                delivery_idempotent_replay=delivery.idempotent_replay,
+                expression_pending=not delivery.expression_resolved,
+                delivery_pending=not delivery.expression_resolved,
+            )
+            if delivery.expression_resolved:
+                result["expression_outcome"] = delivery.expression_outcome
+                return result
+            await self._wake_stream_for_initiative(
+                stream_id=surface.stream_id,
+                platform=surface.platform,
+                command=command,
+                trigger_message_id=trigger_message_id,
+                turn_id=delivery.turn_id,
+            )
+            result["expression_wake_enqueued"] = True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - authority commit is durable
+            result["delivery_error_type"] = type(exc).__name__
+            logger.warning(
+                "主体主动外联已提交，表达层将在后台重放: "
+                f"error_type={type(exc).__name__}"
+            )
+        return result
+
+    async def _deliver_pending_initiative_outreach(
+        self,
+        command: InitiativeOutreachCommand,
+    ) -> None:
+        """Idempotently hand one committed outreach to the expression inbox."""
+
+        from ..initiative.reachability import resolve_reachable_surface
+
+        surface = await resolve_reachable_surface(
+            audience_ref=command.audience_ref,
+            surface_ref=command.surface_ref,
+        )
+        trigger_message_id = self._initiative_outreach_trigger_message_id(
+            command.occurrence_id
+        )
+        delivery = await self.proactive_authority.record_outreach_delivery(
+            outreach_occurrence_id=command.occurrence_id,
+            stream_id=surface.stream_id,
+            trigger_message_id=trigger_message_id,
+            occurred_at=_now_iso(),
+            platform=surface.platform,
+        )
+        if delivery.expression_resolved:
+            return
+        await self._wake_stream_for_initiative(
+            stream_id=surface.stream_id,
+            platform=surface.platform,
+            command=command,
+            trigger_message_id=trigger_message_id,
+            turn_id=delivery.turn_id,
+        )
 
     async def decide_attention_thread(
         self,
@@ -1649,7 +1971,7 @@ class LifeEngineService(BaseService):
     ) -> AttentionThreadCommit:
         """Submit one explicit subject decision to the canonical authority."""
 
-        commit = await self.attention_thread_service.decide(command)
+        commit = await self.proactive_authority.decide_attention(command)
         if (
             command.action == "close"
             and not commit.idempotent_replay
@@ -1678,7 +2000,7 @@ class LifeEngineService(BaseService):
     ) -> AttentionThreadPage:
         """Read a bounded traceable subject-attention projection."""
 
-        return await self.attention_thread_service.page(query)
+        return await self.proactive_authority.page_attention(query)
 
     async def set_instance_attention_focus(
         self,
@@ -1686,7 +2008,7 @@ class LifeEngineService(BaseService):
     ) -> InstanceFocus:
         """Set technical instance focus without changing a subject thread."""
 
-        return await self.attention_thread_service.set_focus(focus)
+        return await self.proactive_authority.set_attention_focus(focus)
 
     async def _open_selected_storage_runtime(self) -> None:
         """Open the selected runtime exactly once under service ownership."""
@@ -1698,6 +2020,137 @@ class LifeEngineService(BaseService):
         self._storage_runtime = await open_storage_backend(
             self._storage_factory_settings
         )
+
+    async def _start_local_proactive_authority(self) -> None:
+        """Open canonical proactive storage without enabling other life domains."""
+
+        if self._selectable_storage_enabled or self._proactive_authority is not None:
+            return
+        from ..proactive.runtime import open_local_proactive_runtime
+
+        owned = await open_local_proactive_runtime(
+            workspace_path=self._cfg().settings.workspace_path,
+            config=self._cfg().proactive,
+            validate_active_actor=self._validate_initiative_decision_actor,
+            actor_decision_guard=self._proactive_actor_gate.hold,
+        )
+        self._local_proactive_runtime = owned
+        self._proactive_authority = owned.authority
+        self._proactive_health_cache = await owned.health_snapshot()
+        logger.info(
+            "统一主动权威已启动: backend=local authority_count=1 "
+            "legacy_thought_stream=archive_only"
+        )
+
+    async def _record_proactive_delivery_proof(
+        self,
+        message: Any,
+        receipt: dict[str, Any],
+    ) -> bool:
+        """Persist exact platform acknowledgement for a claimed outreach.
+
+        Core transport owns the physical side effect and invokes this callback
+        only after the adapter acknowledgement (or virtual-history commit).
+        The proactive authority then checks the immutable inbox/turn/claim
+        chain before accepting the proof; callers cannot promote an arbitrary
+        64-character value into a spoken outcome.
+        """
+
+        extra = getattr(message, "extra", None)
+        if not isinstance(extra, dict):
+            raise RuntimeError("ProactiveDeliveryProofMetadataMissing")
+        raw_occurrences = extra.get("initiative_outreach_occurrences")
+        if not isinstance(raw_occurrences, list):
+            raise RuntimeError("ProactiveDeliveryProofOccurrencesMissing")
+        occurrences = tuple(
+            dict.fromkeys(
+                str(item or "").strip()
+                for item in raw_occurrences
+                if str(item or "").strip()
+            )
+        )
+        action_id = str(extra.get("tool_call_id") or "").strip()
+        if not occurrences or not action_id:
+            raise RuntimeError("ProactiveDeliveryProofIdentityIncomplete")
+        authority = self._proactive_authority
+        if authority is None:
+            raise RuntimeError("ProactiveAuthorityNotStarted")
+        occurred_at = _now_iso()
+        for occurrence_id in occurrences:
+            await authority.record_outreach_delivery_proof(
+                outreach_occurrence_id=occurrence_id,
+                action_id=action_id,
+                delivery_receipt=dict(receipt),
+                occurred_at=occurred_at,
+            )
+        return True
+
+    def _attach_proactive_delivery_proof_hook(self) -> None:
+        """Attach the one transport-to-authority delivery-proof bridge."""
+
+        if self._proactive_delivery_proof_hook is not None:
+            return
+        from src.core.transport.multi_writer_hooks import (
+            register_outbound_delivery_proof_hook,
+        )
+
+        hook = self._record_proactive_delivery_proof
+        register_outbound_delivery_proof_hook(hook)
+        self._proactive_delivery_proof_hook = hook
+
+    def _detach_proactive_delivery_proof_hook(self) -> None:
+        """Release only this service's exact registered callback."""
+
+        hook = self._proactive_delivery_proof_hook
+        if hook is None:
+            return
+        from src.core.transport.multi_writer_hooks import (
+            unregister_outbound_delivery_proof_hook,
+        )
+
+        unregister_outbound_delivery_proof_hook(hook)
+        self._proactive_delivery_proof_hook = None
+
+    async def _refresh_proactive_health(self) -> dict[str, Any]:
+        """Refresh the content-free health cache for either storage mode."""
+
+        owned = self._local_proactive_runtime
+        if owned is not None:
+            self._proactive_health_cache = await owned.health_snapshot()
+            return dict(self._proactive_health_cache)
+        authority = self._proactive_authority
+        if authority is not None:
+            self._proactive_health_cache = await authority.health_snapshot()
+            self._proactive_health_cache["backend"] = (
+                self._storage_factory_settings.authoritative_backend.value
+            )
+            return dict(self._proactive_health_cache)
+        self._proactive_health_cache = {
+            "component": "proactive_authority",
+            "status": "failed",
+            "authority_count": 0,
+            "reason": "authority_not_started",
+        }
+        return dict(self._proactive_health_cache)
+
+    async def _close_local_proactive_authority(self) -> None:
+        """Close the owned local authority after all proactive consumers stop."""
+
+        owned = self._local_proactive_runtime
+        if owned is None:
+            return
+        self._detach_proactive_delivery_proof_hook()
+        self._local_proactive_runtime = None
+        self._proactive_authority = None
+        try:
+            await owned.close()
+        finally:
+            self._proactive_health_cache = {
+                "component": "proactive_authority",
+                "status": "disabled",
+                "authority_count": 0,
+                "reason": "service_stopped",
+            }
 
     def _require_selected_memory_service(self) -> None:
         """Fail closed when selected storage could not attach the memory domain."""
@@ -1719,12 +2172,23 @@ class LifeEngineService(BaseService):
         from ..storage.attention_factory import open_attention_thread_stores
         from ..storage.domain_factory import open_presence_world_stores
         from ..storage.event_factory import open_life_event_store
+        from ..storage.initiative_factory import open_initiative_record_store
         from ..storage.learning_factory import open_learning_stores
+        from ..storage.proactive_decision_guard import (
+            reconcile_proactive_decision_guards,
+        )
         from ..storage.runtime_factory import open_runtime_state_store
         from ..storage.subject_factory import open_subject_document_store
 
         await self._open_selected_storage_runtime()
         runtime = self.storage_runtime
+        from ..proactive.backend_binding import ensure_proactive_backend_binding
+
+        await ensure_proactive_backend_binding(
+            workspace_path=self._cfg().settings.workspace_path,
+            binding_path=self._cfg().proactive.backend_binding_path,
+            runtime=runtime,
+        )
         multi_writer_enabled = bool(self._storage_factory_settings.multi_writer_enabled)
         claim_retry_interval_seconds = 1.0
         claim_deadline = (
@@ -1755,8 +2219,9 @@ class LifeEngineService(BaseService):
             plugin startup.
             """
 
-            from ..storage import SingletonWriterClaimConflict
             from sqlalchemy.exc import OperationalError as SAOperationalError
+
+            from ..storage import SingletonWriterClaimConflict
 
             def _is_lock_wait_timeout(exc: BaseException) -> bool:
                 """Detect MySQL 1205 row-lock wait timeout (transient contention)."""
@@ -1912,11 +2377,11 @@ class LifeEngineService(BaseService):
         else:
             learning_writer_claim = None
         registry = await AsyncConsciousnessRegistry.load(stores.presence)
-        from ..initiative import InitiativeAuthority
-
-        initiative_authority = InitiativeAuthority(
-            runtime_state_store,
-            validate_active_actor=self._validate_initiative_decision_actor,
+        initiative_records = await open_initiative_record_store(runtime)
+        await reconcile_proactive_decision_guards(runtime)
+        proactive_authority = ProactiveAuthority(
+            attention=attention_service,
+            initiative=initiative_records,
         )
         event_bus = LifeEventBus(ledger)
         gateway = AsyncPerceptionGateway(
@@ -1929,13 +2394,18 @@ class LifeEngineService(BaseService):
         self._life_event_store = ledger
         self._learning_stores = learning_stores
         self._learning_event_store = learning_event_store
-        self._attention_thread_service = attention_service
-        self._initiative_authority = initiative_authority
+        self._proactive_authority = proactive_authority
         self._presence_world_stores = stores
         self._subject_document_store = subject_store
         self._runtime_state_store = runtime_state_store
         self._runtime_context_writer_claim = runtime_context_writer_claim
         self._learning_writer_claim = learning_writer_claim
+        self._proactive_health_cache = {
+            "component": "proactive_authority",
+            "status": "healthy",
+            "authority_count": 1,
+            "backend": runtime.backend.value,
+        }
         self._storage_renewal_health = {
             "status": "healthy",
             "last_success_at": "",
@@ -2389,6 +2859,10 @@ class LifeEngineService(BaseService):
         if not self._selectable_storage_enabled:
             return
         errors: list[Exception] = []
+        try:
+            self._detach_proactive_delivery_proof_hook()
+        except Exception as exc:  # noqa: BLE001 - aggregate owned cleanup
+            errors.append(exc)
         if (
             self._presence_world_stores is not None
             and self._life_event_store is not None
@@ -2420,8 +2894,13 @@ class LifeEngineService(BaseService):
         self._learning_writer_claim = None
         self._learning_stores = None
         self._learning_event_store = None
-        self._attention_thread_service = None
-        self._initiative_authority = None
+        self._proactive_authority = None
+        self._proactive_health_cache = {
+            "component": "proactive_authority",
+            "status": "disabled",
+            "authority_count": 0,
+            "reason": "service_stopped",
+        }
         if self._multi_writer_bridge is not None:
             try:
                 from src.core.transport.multi_writer_hooks import (
@@ -2828,7 +3307,10 @@ class LifeEngineService(BaseService):
             workspace=self._workspace_dir(),
             mc_config=config,
             consciousness_registry=self.consciousness_registry,
-            save_consciousness_registry=self.save_consciousness_registry_async,
+            register_consciousness_instance=self.register_consciousness_instance,
+            touch_consciousness_instance=self.touch_consciousness_instance,
+            resume_consciousness_instance=self.resume_consciousness_instance,
+            terminate_consciousness_instance=self.terminate_consciousness_instance,
             get_recent_subconscious_context=self.get_recent_subconscious_context,
             report_world_observation=self.report_world_observation,
         )
@@ -4020,17 +4502,27 @@ class LifeEngineService(BaseService):
             or self._presence_world_stores is None
             or self._subject_document_store is None
             or self._runtime_state_store is None
-            or self._attention_thread_service is None
+            or self._proactive_authority is None
         ):
             return dict(self._storage_health_cache)
+        from ..proactive.backend_binding import verify_proactive_backend_binding
+
         component_checks: list[tuple[str, Any]] = [
             ("runtime", self._storage_runtime.health()),
+            (
+                "proactive_backend_binding",
+                verify_proactive_backend_binding(
+                    workspace_path=self._cfg().settings.workspace_path,
+                    binding_path=self._cfg().proactive.backend_binding_path,
+                    runtime=self._storage_runtime,
+                ),
+            ),
             ("life_event", self._life_event_store.health_snapshot()),
             ("presence", self._presence_world_stores.presence.health_snapshot()),
             ("world", self._presence_world_stores.world.health_snapshot()),
             ("subject_document", self._subject_document_store.health_snapshot()),
             ("runtime_state", self._runtime_state_store.health_snapshot()),
-            ("attention_threads", self._attention_thread_service.health_snapshot()),
+            ("proactive_authority", self._proactive_authority.health_snapshot()),
         ]
         learning_health_store = (
             self._learning_stores.store
@@ -4059,6 +4551,18 @@ class LifeEngineService(BaseService):
             name: normalized(name, result)
             for (name, _), result in zip(component_checks, results, strict=True)
         }
+        if "proactive_authority" in components:
+            self._proactive_health_cache = dict(components["proactive_authority"])
+            self._proactive_health_cache["backend"] = (
+                self._storage_factory_settings.authoritative_backend.value
+            )
+            # Compatibility read model only.  The live writer remains the one
+            # ProactiveAuthority above; this alias lets older health consumers
+            # observe the attention record family without reviving a second
+            # authority component.
+            attention_health = self._proactive_health_cache.get("attention")
+            if isinstance(attention_health, Mapping):
+                components["attention_threads"] = dict(attention_health)
         learning_component = components.get("learning")
         if learning_component is not None:
             store_status = str(learning_component.get("status") or "healthy")
@@ -4092,6 +4596,11 @@ class LifeEngineService(BaseService):
         """返回一个轻量健康信息。"""
         snapshot = self.snapshot()
         snapshot["storage_runtime"] = dict(self._storage_health_cache)
+        proactive_health = dict(self._proactive_health_cache)
+        local_proactive = self._local_proactive_runtime
+        if local_proactive is not None:
+            proactive_health = local_proactive.cached_health_snapshot()
+        snapshot["proactive_authority"] = proactive_health
         snapshot["learning"] = (
             self._learning_scheduler.get_state()
             if self._learning_scheduler is not None
@@ -4109,7 +4618,7 @@ class LifeEngineService(BaseService):
                 components.get("subject_document") or {}
             )
             snapshot["attention_threads"] = dict(
-                components.get("attention_threads") or {}
+                proactive_health.get("attention") or {}
             )
         else:
             if self._event_bus is not None:
@@ -4119,10 +4628,19 @@ class LifeEngineService(BaseService):
             )
             if self._world_projection is not None:
                 snapshot["world_projection"] = self._world_projection.health_snapshot()
-            snapshot["attention_threads"] = {
-                "status": "disabled",
-                "reason": "persistent attention requires selected storage",
-            }
+            authority_health = proactive_health.get("authority")
+            if isinstance(authority_health, Mapping):
+                attention_health = authority_health.get("attention")
+            else:
+                attention_health = proactive_health.get("attention")
+            snapshot["attention_threads"] = dict(
+                attention_health
+                if isinstance(attention_health, Mapping)
+                else {
+                    "status": "failed",
+                    "reason": "local proactive authority is not ready",
+                }
+            )
         if self._router_context_projection is not None:
             snapshot["router_context_projection"] = (
                 self._router_context_projection.health_snapshot()
@@ -5501,7 +6019,9 @@ class LifeEngineService(BaseService):
         stream_id: str,
         platform: str,
         command: InitiativeOutreachCommand,
-    ) -> None:
+        trigger_message_id: str = "",
+        turn_id: str = "",
+    ) -> str:
         """Wake one explicitly selected physical surface for fresh expression."""
 
         import time
@@ -5523,11 +6043,17 @@ class LifeEngineService(BaseService):
             f"对象引用：{command.audience_ref}\n"
             f"主体公开意向：{command.public_intention}"
         )
+        expected_trigger_message_id = self._initiative_outreach_trigger_message_id(
+            command.occurrence_id
+        )
+        exact_trigger_message_id = str(trigger_message_id or "").strip()
+        if exact_trigger_message_id and (
+            exact_trigger_message_id != expected_trigger_message_id
+        ):
+            raise RuntimeError("InitiativeTriggerIdentityMismatch")
+        exact_trigger_message_id = expected_trigger_message_id
         trigger_message = Message(
-            message_id=(
-                "initiative_outreach_"
-                + hashlib.sha256(command.occurrence_id.encode()).hexdigest()
-            ),
+            message_id=exact_trigger_message_id,
             platform=chat_stream.platform or platform or "unknown",
             stream_id=exact_stream_id,
             # This is an internal transport envelope, not a fabricated message
@@ -5542,6 +6068,7 @@ class LifeEngineService(BaseService):
             time=time.time(),
             is_initiative_outreach_trigger=True,
             initiative_outreach_occurrence_id=command.occurrence_id,
+            initiative_outreach_turn_id=str(turn_id or "").strip(),
             initiative_audience_ref=command.audience_ref,
             initiative_surface_ref=command.surface_ref,
             initiative_seed_id=command.seed_id,
@@ -5553,6 +6080,7 @@ class LifeEngineService(BaseService):
             logger.debug(
                 f"[{exact_stream_id[:8]}] 已清除等待锁，准备承接主体主动外联"
             )
+        return exact_trigger_message_id
 
     async def record_chatter_inner_monologue(
         self,
@@ -5726,8 +6254,8 @@ class LifeEngineService(BaseService):
     async def _collect_background_mission_results(self) -> None:
         """收集已完成的后台使命结果，注入为事件。"""
         try:
-            from ..agents.mission_tool import get_all_missions
             from ..agents.contracts import MissionStatus
+            from ..agents.mission_tool import get_all_missions
         except ImportError:
             return
 
@@ -5825,15 +6353,16 @@ class LifeEngineService(BaseService):
 
     async def _prepare_heartbeat_context(self) -> PreparedHeartbeatContext:
         """Drain pending events and prepare one fixed heartbeat snapshot."""
-        registry = self.consciousness_registry
-        if isinstance(registry, AsyncConsciousnessRegistry):
-            await registry.reconcile_expired()
-        else:
-            await asyncio.to_thread(
-                registry.reconcile_expired,
-                timestamp=_now_iso(),
-            )
-        await self.save_consciousness_registry_async()
+        async with self._proactive_actor_gate.hold("presence_reconcile"):
+            registry = self.consciousness_registry
+            if isinstance(registry, AsyncConsciousnessRegistry):
+                await registry.reconcile_expired()
+            else:
+                await asyncio.to_thread(
+                    registry.reconcile_expired,
+                    timestamp=_now_iso(),
+                )
+            await self.save_consciousness_registry_async()
 
         pending = await self.drain_pending_events()
         if pending:
@@ -6514,32 +7043,37 @@ class LifeEngineService(BaseService):
         detail = f"，原因：{reason}" if reason else ""
         return f"- {timestamp} {operation} {path}{detail}{trace_ref}"
 
-    def _format_chatter_thought_streams(
+    async def _format_chatter_attention_threads(
         self,
         *,
-        revision_cursor: int = 0,
-        focus_window_minutes: int = 30,
-        delta_marking: bool = True,
+        focus_instance_id: str,
         max_items: int = 5,
     ) -> tuple[str, int]:
-        """渲染思考流块（用于 chatter transient）。
+        """Render the canonical bounded attention projection for chatter.
 
         Returns:
-            (body_text_without_top_heading, current_max_revision)
+            (body_text_without_top_heading, source_frontier)
         """
-        if self._thought_manager is None:
+        if self._proactive_authority is None:
             return "", 0
         try:
-            body = self._thought_manager.format_for_prompt(
-                max_items=max_items,
-                focus_window_minutes=focus_window_minutes,
-                revision_cursor=revision_cursor,
-                mark_delta=delta_marking,
-                grouped=True,
+            from ..attention_threads import AttentionThreadPageQuery
+
+            page = await self.page_attention_threads(
+                AttentionThreadPageQuery(
+                    statuses=("open", "paused"),
+                    limit=max(1, min(int(max_items), 16)),
+                    max_bytes=16 * 1024,
+                    projection_kind="life_chatter_attention",
+                    focus_instance_id=focus_instance_id,
+                )
             )
-            return body, int(self._thought_manager.current_revision)
+            return page.content, int(page.source_frontier)
         except Exception as exc:  # noqa: BLE001
-            logger.debug(f"构建 chatter 思考流快照失败: {exc}")
+            logger.debug(
+                "构建 chatter 持续关注投影失败: "
+                f"error_type={type(exc).__name__}"
+            )
             return "", 0
 
     def _format_latest_chatter_think(
@@ -6793,7 +7327,7 @@ class LifeEngineService(BaseService):
         transient 注入；high_water_sequence 在 LLM 请求成功后持久化，避免重复注入。
 
         结构：
-          1. ### 当前思考流    （注意力脑区，分焦点/背景，带 🔄 delta 标记）
+          1. ### 主体持续关注  （统一主动权威的有界只读投影）
           3. ### 最近一次独白/思考快照
           4. ### 运行时内心独白（push_runtime_assistant_injection 队列）
           5. ### 最近聊天记录
@@ -6815,19 +7349,7 @@ class LifeEngineService(BaseService):
         _ = event_limit  # 兼容老签名；新逻辑用配置项控制条数
 
         cfg = self._cfg()
-        streams_cfg = getattr(cfg, "streams", None)
         runtime_cfg = getattr(cfg, "runtime_sync", None)
-        sync_streams = bool(
-            streams_cfg is None or getattr(streams_cfg, "sync_to_chatter", True)
-        )
-        focus_window = (
-            int(getattr(streams_cfg, "focus_window_minutes", 30) or 30)
-            if streams_cfg
-            else 30
-        )
-        delta_marking = bool(
-            streams_cfg is None or getattr(streams_cfg, "delta_marking", True)
-        )
         latest_think_enabled = bool(
             runtime_cfg is None
             or getattr(runtime_cfg, "latest_action_think_enabled", True)
@@ -6916,16 +7438,15 @@ class LifeEngineService(BaseService):
         )
 
         new_thought_revision = thought_cursor
-        if sync_streams:
-            thought_body, current_revision = self._format_chatter_thought_streams(
-                revision_cursor=thought_cursor,
-                focus_window_minutes=focus_window,
-                delta_marking=delta_marking,
+        attention_body, current_revision = (
+            await self._format_chatter_attention_threads(
+                focus_instance_id=instance_id,
                 max_items=5,
             )
-            if thought_body:
-                sections.append(f"### 当前思考流\n{thought_body}".rstrip())
-            new_thought_revision = max(thought_cursor, current_revision)
+        )
+        if attention_body:
+            sections.append(f"### 主体持续关注\n{attention_body}".rstrip())
+        new_thought_revision = max(thought_cursor, current_revision)
 
         if latest_think_enabled:
             latest_think_text = self._format_latest_chatter_think(
@@ -7216,7 +7737,7 @@ class LifeEngineService(BaseService):
         if idle_heartbeats >= critical_threshold:
             idle_warning = f"🌿 已经安静了 {idle_heartbeats} 次心跳了。如果有想做的事，现在是个好时机；如果没有，继续休息也很好。"
         elif idle_heartbeats >= warning_threshold:
-            idle_warning = f"💭 安静了 {idle_heartbeats} 次心跳——如果有想继续的思考流或想分享的事，随时可以；不想也没关系。"
+            idle_warning = f"💭 安静了 {idle_heartbeats} 次心跳——如果有明确想继续关注或分享的事，随时可以；不想也没关系。"
 
         lines: list[str] = self._build_prompt_header()
         lines.extend(self._build_prompt_context_section(wake_context))
@@ -7227,7 +7748,7 @@ class LifeEngineService(BaseService):
             )
         )
 
-        # 子系统注入段落（思考流/好奇牵引/冲动/可触达目标等）
+        # 子系统注入段落（统一关注投影/认知机会/复盘机会等）
         # 统一由 SectionProvider 协议渲染，见 prompts/sections.py
         for section_text in section_texts or []:
             lines.extend([section_text, ""])
@@ -7255,10 +7776,10 @@ class LifeEngineService(BaseService):
             "",
             "1. **观察** — 读取最近事件，判断是否真的出现了新线索。",
             "2. **联想** — 回忆相关记忆，理解情绪、关系和上下文来源。",
-            "3. **沉淀** — 把内在感受、梦后余韵、长期线索写入私有记忆或思考流。",
-            "4. **保留连续性** — 只有你明确愿意让未来的自己继续看见时，才保存 InitiativeSeed；共享事实仍由正式事件、世界与记忆投影承载。",
+            "3. **沉淀** — 把内在感受、梦后余韵写入私有记忆；把明确愿意持续看见的未竟线索交给统一主动系统。",
+            "4. **保留连续性** — `nucleus_proactive_command` 是唯一主动写入口；关注与未来意向都必须来自你此刻的明确决定。",
             "5. **安静结束** — 没有明确需要时，可以安静结束本轮；如果精力需要恢复，可以主动休息。",
-            "6. **尊重工具预算** — 心跳每轮最多 3 次工具调用：优先轻量动作（观察/沉淀/InitiativeSeed/TODO），不要在心跳里做长查询（如翻完整对话历史、多轮检索）；需要完整上下文时交给表达层在聊天流里处理。",
+            "6. **尊重工具预算** — 心跳每轮最多 3 次工具调用：优先轻量动作（观察/沉淀/统一主动系统/TODO），不要在心跳里做长查询（如翻完整对话历史、多轮检索）；需要完整上下文时交给表达层在聊天流里处理。",
             "",
             "### `nucleus_manage_todo` — 承诺记录",
             "",
@@ -7270,17 +7791,18 @@ class LifeEngineService(BaseService):
             "",
             "当事件流里出现 `inner_dialogue` 时，那是主意识（表达层）刚刚沉下来的话——",
             "不是外部用户，也不是另一个人在问你。那是你自己心里的嘀咕。",
-            "认真对待它：可以联想、沉淀；若你明确希望未来继续拥有这个行动可能性，可保存 InitiativeSeed。",
+            "认真对待它：可以联想、沉淀；若你明确希望未来继续看见，可通过统一主动系统保留。",
             "想完也可以什么都不说——人类也常想完不说话。",
             "事实、世界状态和记忆通过正式共享投影到达其他意识实例；不要另选一个最近聊天流去注入提示。",
             "",
             "### 主体主动性：意向、对象与表面分离",
             "",
-            "`nucleus_manage_initiative_seed` 只保存你明确愿意让未来意识实例继续看见的第一人称意向。",
-            "它不是任务、隐藏推理、重要性评分或自动回复规则；后台候选不会替你创建线索。",
-            "`reencounter` 只代表你选择以后再次遇见一次，不会自动循环，也不会预写回复。",
+            "`nucleus_proactive_query` 是唯一只读入口；读取本身不改变状态。",
+            "`nucleus_proactive_command` 是唯一写入口：attention.* 保留持续关注，initiative.* 保留未来行动可能性。",
+            "它们都不是任务、隐藏推理、重要性评分或自动回复规则；后台候选不会替你创建线索。",
+            "initiative.reencounter 只代表你选择以后再次遇见一次，不会自动循环，也不会预写回复。",
             "来源场景、相关对象、意向对象和最终发送表面是四件不同的事：Kook 中出现的材料不会把未来行动绑定到 Kook。",
-            "当你现在确实想发起一次外联时，先用 `nucleus_reachability` 读取已登记对象与物理表面，再用 `nucleus_begin_outreach` 明确选择完整 `audience_ref` 和 `surface_ref`。",
+            "当你现在确实想发起一次外联时，先用 `nucleus_proactive_query(resource=reachability)` 读取对象与物理表面，再用 `nucleus_proactive_command(action=outreach.begin)` 明确选择完整 `audience_ref` 和 `surface_ref`。",
             "可达列表按稳定技术标识排列，不按最近活跃、当前聊天或系统评分替你排序；同名账号不会被系统猜成同一个人。",
             "`public_intention` 只写这次你选择做什么，不写最终话术；目标表达实例会结合真实上下文重新决定如何表达或保持沉默。",
             "不查询、不保存、不行动都有效；基础设施不得把它们解释成冷淡、遗忘或低重要性。",
@@ -7303,7 +7825,6 @@ class LifeEngineService(BaseService):
             "- `nucleus_bash` 只用于诊断 life_engine 自己的工作区或工具链问题；不要拿它查项目配置、跑用户任务或处理外部操作",
             "- `nucleus_browser_fetch` / `nucleus_web_search` 只用于私有好奇心、记忆核验或长期主题整理，不用于替用户做即时检索任务",
             "- `nucleus_view_screen` 只在用户明确把屏幕上下文交给表达层时才应由表达层使用；心跳态不要为了好奇看屏幕",
-            "- `nucleus_manage_thought_stream` 是内心独白的核心——围绕你在意的事情深入思考",
             "",
             "### `nucleus_rest_heartbeat` — 主动休息一段时间",
             "",
@@ -7331,7 +7852,7 @@ class LifeEngineService(BaseService):
             "",
             "- 不要重复上一轮的想法",
             "- 先区分冲动类型：想办事、想画画、想查配置、想跑命令，通常都是表达层职责",
-            "- 思考流用于持续探索，TODO 用于记录承诺和提醒；不要把提醒误读成潜意识必须执行的任务",
+            "- 统一主动系统只保存你明确选择的关注/意向，TODO 只记录承诺和提醒；不要把任何投影误读成必须执行的任务",
             "- 看到需要复盘、逾期或卡住的 TODO，先把它当成内在提醒，不要自动替表达层推进",
             "- 安静结束本轮不需要调用任何工具",
             "",
@@ -7392,7 +7913,7 @@ class LifeEngineService(BaseService):
         elif 12 <= hour < 14:
             return "🍱 午后", "轻松休息、低强度整理、不过度行动"
         elif 14 <= hour < 18:
-            return "📝 下午", "梳理思考流、维护私有记忆、识别上下文缺口"
+            return "📝 下午", "梳理持续关注、维护私有记忆、识别上下文缺口"
         elif 18 <= hour < 21:
             return "🌆 傍晚", "整理关系线索、沉淀情绪、必要时补信息差"
         elif 21 <= hour < 24:
@@ -7525,15 +8046,12 @@ class LifeEngineService(BaseService):
         """获取中枢可用的工具类列表。"""
         from plugins.emoji.sender.collection_tools import EMOJI_COLLECTION_TOOLS
 
-        from ..attention_threads.tools import ATTENTION_THREAD_TOOLS
-        from ..initiative.tools import INITIATIVE_TOOLS
         from ..learning.tools import LEARNING_TOOLS
         from ..memory.boundary_tools import MEMORY_BOUNDARY_TOOLS
         from ..memory.continuity_tools import CONTINUITY_REVIEW_TOOLS
         from ..memory.tools import MEMORY_TOOLS
-        from ..streams.tools import STREAM_TOOLS
+        from ..proactive.tools import PROACTIVE_TOOLS
         from ..tools import ALL_TOOLS, TODO_TOOLS, WEB_TOOLS
-        from ..tools.autonomy_tools import AUTONOMY_TOOLS
         from ..tools.event_grep_tools import EVENT_GREP_TOOLS
         from ..tools.grep_tools import GREP_TOOLS
         from ..tools.schedule_tools import SCHEDULE_TOOLS
@@ -7551,14 +8069,11 @@ class LifeEngineService(BaseService):
             + CONTINUITY_REVIEW_TOOLS
             + GREP_TOOLS
             + WEB_TOOLS
-            + STREAM_TOOLS
             + SCHEDULE_TOOLS
-            + AUTONOMY_TOOLS
             + SKILL_TOOLS
             + EVENT_GREP_TOOLS
             + LEARNING_TOOLS
-            + ATTENTION_THREAD_TOOLS
-            + INITIATIVE_TOOLS
+            + PROACTIVE_TOOLS
             + EMOJI_COLLECTION_TOOLS
         )
 
@@ -7604,6 +8119,7 @@ class LifeEngineService(BaseService):
                 )
             tool_instance._life_source_occurrence_id = source_occurrence_id
             tool_instance._life_source_occurred_at = source_occurred_at
+            tool_instance._life_source_instance_id = "chat_global"
             call_args = dict(args)
             if should_strip_auto_reason_argument(tool_instance.execute, call_args):
                 call_args.pop("reason", None)
@@ -8047,8 +8563,8 @@ class LifeEngineService(BaseService):
         name = str(tool_name or "").strip()
         if not name or name == "nucleus_rest_heartbeat":
             return False
-        if name == "nucleus_manage_thought_stream":
-            return str(args.get("action") or "").strip() != "list"
+        if name == "nucleus_proactive_query":
+            return False
         return True
 
     def _update_heartbeat_idle_count(
@@ -8217,7 +8733,7 @@ class LifeEngineService(BaseService):
 
         max_rounds = max(1, int(cfg.settings.max_rounds_per_heartbeat))
         last_text = ""
-        tool_event_count = 0
+        final_response_observed = False
         heartbeat_tool_calls: list[tuple[str, dict[str, Any]]] = []
         previous_successful_round_fingerprint = ""
         previous_failure_fingerprint = ""
@@ -8279,16 +8795,23 @@ class LifeEngineService(BaseService):
                 logger.warning("life_engine heartbeat response read timeout")
                 raise TimeoutError("heartbeat response read timeout") from exc
 
-            last_text = str(response_text or "").strip()
+            turn_text = str(response_text or "").strip()
             call_list = list(getattr(response, "call_list", []) or [])
 
             logger.debug(
                 f"life_engine heartbeat turn: "
-                f"text_len={len(last_text)} call_count={len(call_list)}"
+                f"text_len={len(turn_text)} call_count={len(call_list)}"
             )
 
             if not call_list:
+                last_text = turn_text
+                final_response_observed = True
                 break
+
+            # Text attached to a tool-bearing response is non-terminal.  It
+            # may describe an intention before the tool actually fails, so it
+            # cannot be persisted as an observed completion statement.
+            last_text = ""
 
             logger.debug(
                 f"life_engine 心跳#{self._state.heartbeat_count} 本轮调用列表："
@@ -8308,7 +8831,7 @@ class LifeEngineService(BaseService):
                     )
 
                 if can_parallel and len(batch) > 1:
-                    tool_event_count += await self._execute_heartbeat_tool_call_batch(
+                    await self._execute_heartbeat_tool_call_batch(
                         batch,
                         response,
                         registry,
@@ -8323,7 +8846,6 @@ class LifeEngineService(BaseService):
                         registry,
                         heartbeat_run_id=heartbeat_run_id,
                     )
-                    tool_event_count += 2
 
             round_results = _heartbeat_tool_results(response)[result_count_before:]
             progress = _heartbeat_tool_round_progress(call_list, round_results)
@@ -8505,13 +9027,11 @@ class LifeEngineService(BaseService):
         except HeartbeatBudgetExhausted:
             logger.debug("life_engine 心跳剩余预算不足，跳过本轮学习维护")
 
-        if not last_text:
-            if tool_event_count > 0:
-                last_text = (
-                    f"我刚刚完成了 {tool_event_count // 2} 次工具操作，先记下这些变化。"
-                )
-            else:
-                last_text = "此刻很安静，但我仍在持续感受与观察。"
+        if not final_response_observed:
+            # Infrastructure must not author first-person meaning or claim
+            # completion on the subject's behalf.  Durable tool receipts stay
+            # in the event ledger; this heartbeat simply has no final text.
+            last_text = ""
 
         return HeartbeatModelResult(last_text, perception_receipt)
 
@@ -8692,6 +9212,7 @@ class LifeEngineService(BaseService):
         self._initialize_local_runtime_state()
         await self._open_selected_storage_runtime()
         self._start_storage_authority_renewal()
+        await self._start_local_proactive_authority()
 
         # 初始化集成管理器
         self._memory_integration = MemoryIntegration(self)
@@ -8700,46 +9221,9 @@ class LifeEngineService(BaseService):
 
         self._dfc_integration = DFCIntegration(self)
 
-        # 初始化思考流管理器
-        streams_cfg = getattr(cfg, "streams", None)
-        if streams_cfg is None or getattr(streams_cfg, "enabled", True):
-            max_active = (
-                getattr(streams_cfg, "max_active_streams", 5) if streams_cfg else 5
-            )
-            dormancy_hours = (
-                getattr(streams_cfg, "dormancy_threshold_hours", 24)
-                if streams_cfg
-                else 24
-            )
-            half_life = (
-                float(getattr(streams_cfg, "curiosity_decay_half_life_hours", 12.0))
-                if streams_cfg
-                else 12.0
-            )
-            curiosity_floor = (
-                float(getattr(streams_cfg, "curiosity_floor", 0.15))
-                if streams_cfg
-                else 0.15
-            )
-            self._thought_manager = ThoughtStreamManager(
-                workspace_path=cfg.settings.workspace_path,
-                max_active=max_active,
-                dormancy_hours=dormancy_hours,
-                curiosity_decay_half_life_hours=half_life,
-                curiosity_floor=curiosity_floor,
-            )
-            logger.info(
-                f"思考流系统已初始化: max_active={max_active}, "
-                f"half_life={half_life}h, floor={curiosity_floor}"
-            )
-
-        # 初始化冲动引擎
-        drives_cfg = getattr(cfg, "drives", None)
-        if drives_cfg is None or getattr(drives_cfg, "enabled", True):
-            self._impulse_engine = ImpulseEngine(list(DEFAULT_RULES))
-            logger.info("冲动引擎已初始化")
-
         await self._start_selected_storage()
+        await self._refresh_proactive_health()
+        self._attach_proactive_delivery_proof_hook()
         await self._load_runtime_context()
 
         # Minecraft is a scene capability owned by the service.  It must be
@@ -9042,7 +9526,7 @@ class LifeEngineService(BaseService):
             )
             self._learning_maintenance_task_id = learning_task.task_id
 
-        if self._initiative_authority is not None:
+        if self._proactive_authority is not None:
             initiative_task = get_task_manager().create_task(
                 self._initiative_reencounter_loop(),
                 name="life_engine_initiative_reencounter",
@@ -9267,6 +9751,14 @@ class LifeEngineService(BaseService):
                 shutdown_errors.append(exc)
                 logger.error(
                     "关闭 selected Presence/World storage 失败",
+                    exc_info=True,
+                )  # noqa: G201 - project Logger has no exception()
+            try:
+                await self._close_local_proactive_authority()
+            except Exception as exc:  # noqa: BLE001 - finish remaining shutdown
+                shutdown_errors.append(exc)
+                logger.error(
+                    "关闭本地统一主动权威失败",
                     exc_info=True,
                 )  # noqa: G201 - project Logger has no exception()
 

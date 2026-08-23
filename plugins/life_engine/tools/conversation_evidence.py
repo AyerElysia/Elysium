@@ -286,7 +286,7 @@ class LifeEngineConversationEvidenceTool(BaseTool):
                 raise ConversationEvidenceError(
                     "stream_required",
                     "an internal call without a current conversation must provide "
-                    "stream_ids (or a surface_ref from nucleus_reachability) explicitly",
+                    "stream_ids (or a surface_ref from nucleus_proactive_query) explicitly",
                 )
             explicit = (current,)
         max_streams = int(getattr(self._cfg(), "max_candidate_streams", 12) or 12)

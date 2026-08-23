@@ -1,11 +1,16 @@
-"""Subject-level initiative authority and delivery-boundary primitives."""
-
-from .authority import InitiativeAuthority
+"""Subject-level initiative records and delivery-boundary primitives."""
 from .contracts import (
     InitiativeActorInactive,
     InitiativeConflict,
+    InitiativeOutreachClaimReceipt,
     InitiativeOutreachCommand,
+    InitiativeOutreachDeliveryReceipt,
+    InitiativeOutreachOutcome,
     InitiativeOutreachReceipt,
+    InitiativeOutreachResolutionReceipt,
+    InitiativePendingExpression,
+    InitiativePendingOutreach,
+    InitiativePlatformDeliveryProofReceipt,
     InitiativeReencounterReceipt,
     InitiativeSeedCommand,
     InitiativeSeedCommit,
@@ -16,10 +21,16 @@ from .contracts import (
 
 __all__ = [
     "InitiativeActorInactive",
-    "InitiativeAuthority",
     "InitiativeConflict",
+    "InitiativeOutreachClaimReceipt",
     "InitiativeOutreachCommand",
+    "InitiativeOutreachDeliveryReceipt",
+    "InitiativeOutreachOutcome",
     "InitiativeOutreachReceipt",
+    "InitiativeOutreachResolutionReceipt",
+    "InitiativePendingExpression",
+    "InitiativePendingOutreach",
+    "InitiativePlatformDeliveryProofReceipt",
     "InitiativeReencounterReceipt",
     "InitiativeSeedCommand",
     "InitiativeSeedCommit",

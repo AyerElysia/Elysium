@@ -10,7 +10,6 @@ import pytest
 
 from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.curiosity import CuriositySignal
-from plugins.life_engine.drives.rules import DEFAULT_RULES
 from plugins.life_engine.prompts.sections import (
     DEFAULT_HEARTBEAT_SECTIONS,
     AttentionOpportunitySection,
@@ -19,7 +18,6 @@ from plugins.life_engine.prompts.sections import (
 )
 from plugins.life_engine.service import LifeEngineService
 from plugins.life_engine.service.event_builder import EventType, LifeEngineEvent
-from plugins.life_engine.streams.manager import ThoughtStreamManager
 
 
 def _service(tmp_path: Path) -> LifeEngineService:
@@ -31,20 +29,19 @@ def _service(tmp_path: Path) -> LifeEngineService:
 def test_open_clue_alone_does_not_reset_heartbeat_idle(tmp_path: Path) -> None:
     service = _service(tmp_path)
     service._state.idle_heartbeat_count = 4
-    service._thought_manager = SimpleNamespace(list_active=lambda: [object()])
 
     service._update_heartbeat_idle_count([])
 
     assert service._state.idle_heartbeat_count == 5
 
 
-def test_passive_thought_list_and_rest_do_not_reset_idle(tmp_path: Path) -> None:
+def test_passive_proactive_query_and_rest_do_not_reset_idle(tmp_path: Path) -> None:
     service = _service(tmp_path)
     service._state.idle_heartbeat_count = 2
 
     service._update_heartbeat_idle_count(
         [
-            ("nucleus_manage_thought_stream", {"action": "list"}),
+            ("nucleus_proactive_query", {"resource": "attention"}),
             ("nucleus_rest_heartbeat", {"duration_minutes": 30}),
         ]
     )
@@ -52,22 +49,22 @@ def test_passive_thought_list_and_rest_do_not_reset_idle(tmp_path: Path) -> None
     assert service._state.idle_heartbeat_count == 3
 
 
-def test_subject_chosen_thought_mutation_resets_idle(tmp_path: Path) -> None:
+def test_subject_chosen_proactive_command_resets_idle(tmp_path: Path) -> None:
     service = _service(tmp_path)
     service._state.idle_heartbeat_count = 7
 
     service._update_heartbeat_idle_count(
-        [("nucleus_manage_thought_stream", {"action": "advance"})]
+        [("nucleus_proactive_command", {"action": "attention.note"})]
     )
 
     assert service._state.idle_heartbeat_count == 0
 
 
-def test_active_clues_have_no_periodic_impulse_rule() -> None:
-    rule_names = {rule.name for rule in DEFAULT_RULES}
+def test_legacy_impulse_engine_has_no_runtime_surface(tmp_path: Path) -> None:
+    service = _service(tmp_path)
 
-    assert "thought_deepen" not in rule_names
-    assert "curiosity_engage" not in rule_names
+    assert service._cfg().drives.enabled is False
+    assert not hasattr(service, "_impulse_engine")
 
 
 def test_default_heartbeat_has_one_attention_opportunity_provider() -> None:
@@ -83,8 +80,20 @@ def test_attention_opportunity_merges_clues_without_action_choice(
     tmp_path: Path,
 ) -> None:
     service = _service(tmp_path)
-    service._thought_manager = ThoughtStreamManager(workspace_path=str(tmp_path))
-    service._thought_manager.create(title="那段旋律")
+    service._proactive_authority = object()
+
+    async def _page_attention(_query: object) -> object:
+        return SimpleNamespace(
+            items=(object(),),
+            content=(
+                '<attention_threads algorithm="attention-thread-ref-v1">\n'
+                '- thread_ref="attention:thread:melody" status="open" '
+                'statement_excerpt="那段旋律"\n'
+                "</attention_threads>"
+            ),
+        )
+
+    service.page_attention_threads = _page_attention
     curiosity = service._get_curiosity_engine()
     asyncio.run(
         curiosity.save_signal(

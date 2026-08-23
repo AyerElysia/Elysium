@@ -158,7 +158,7 @@ class _FakeHeartbeatResponse:
         *,
         text: str,
         calls: list[Any],
-        next_response: "_FakeHeartbeatResponse | None" = None,
+        next_response: _FakeHeartbeatResponse | None = None,
         request_record_id: str,
         send_timeouts_before_success: int = 0,
     ) -> None:
@@ -191,12 +191,12 @@ class _FakeHeartbeatResponse:
             effective_sha256="a" * 64,
         )
 
-    async def send(self, *, stream: bool = False) -> "_FakeHeartbeatResponse":
+    async def send(self, *, stream: bool = False) -> _FakeHeartbeatResponse:
         assert stream is False
         self.send_calls += 1
         if self.send_timeouts_before_success > 0:
             self.send_timeouts_before_success -= 1
-            raise asyncio.TimeoutError
+            raise TimeoutError
         assert self.next_response is not None
         return self.next_response
 
@@ -254,7 +254,7 @@ async def test_followup_retry_then_repeated_protocol_failure_stops_third_turn(
         args={"path": "notes/a.md", "continuation": "bad"},
     )
     second = _FakeHeartbeatResponse(
-        text="",
+        text="我已经完成了，但这句话和失败工具调用同轮，不能当成最终回执。",
         calls=[second_call],
         request_record_id="response-2",
     )
@@ -322,4 +322,5 @@ async def test_followup_retry_then_repeated_protocol_failure_stops_third_turn(
     assert second.send_calls == 0
     assert result.perception_receipt is not None
     assert result.perception_receipt.transport_request_id == "response-2"
+    assert result.text == ""
     assert any(row.get("stop_reason") == "consecutive_tool_stalls" for row in audit_rows)

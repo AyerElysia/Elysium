@@ -180,6 +180,40 @@ async def test_run_tool_call_preserves_technical_outcome_without_breaking_tuple_
     assert response.payloads[0].content[0].value == "执行失败: 投递状态未知"
 
 
+async def test_run_tool_call_propagates_exact_delivery_receipt() -> None:
+    class DeliveredTool(BaseTool):
+        tool_name = "delivered"
+        tool_description = "delivered"
+
+        async def execute(self) -> tuple[bool, str]:
+            return True, ActionResultDetail(
+                "已送达",
+                technical_outcome="delivered",
+                delivery_receipt_sha256="f" * 64,
+                delivery_message_id="message:tool-delivered",
+                delivery_proof_status="durable",
+            )
+
+    registry = ToolRegistry()
+    registry.register(DeliveredTool)
+    response = _FakeResponse()
+
+    results = await run_tool_call(
+        calls=[ToolCall(id="delivered-1", name="tool-delivered", args={})],
+        response=response,
+        usable_map=registry,
+        trigger_msg=SimpleNamespace(message_id="m1"),
+        plugin=MagicMock(),
+        stream_id="s1",
+    )
+
+    assert results == [(True, True)]
+    assert results[0].technical_outcome == "delivered"
+    assert results[0].delivery_receipt_sha256 == "f" * 64
+    assert results[0].delivery_message_id == "message:tool-delivered"
+    assert results[0].delivery_proof_status == "durable"
+
+
 async def test_tool_call_name_prefix_fallback_accepts_bare_name() -> None:
     """工具名前缀容错：模型用裸名调用（注册名是 tool-{name}）也能命中执行。
 

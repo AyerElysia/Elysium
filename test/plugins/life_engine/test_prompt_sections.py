@@ -17,11 +17,9 @@ from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.prompts.sections import (
     HeartbeatSectionProvider,
     SectionContext,
-    ThoughtStreamsSection,
     render_heartbeat_sections,
 )
 from plugins.life_engine.service import LifeEngineService
-from plugins.life_engine.streams.manager import ThoughtStreamManager
 
 
 @dataclass
@@ -97,19 +95,6 @@ def test_render_sections_isolates_provider_failure(tmp_path: Path) -> None:
     texts = asyncio.run(render_heartbeat_sections(providers, _ctx(service)))
 
     assert texts == ["段落A", "段落B"]
-
-
-def test_thought_streams_section_keeps_heading_format(tmp_path: Path) -> None:
-    """等价性：思考流段落保持 '### 当前思考流\\n正文' 的原有结构。"""
-    service = _make_service(tmp_path)
-    service._thought_manager = ThoughtStreamManager(workspace_path=str(tmp_path))
-    service._thought_manager.create(title="那段旋律")
-
-    text = asyncio.run(ThoughtStreamsSection().render(_ctx(service)))
-
-    assert text is not None
-    assert text.startswith("### 当前思考流\n")
-    assert "那段旋律" in text
 
 
 # ── 2. legacy stream-bound intent is read-only ─────────────

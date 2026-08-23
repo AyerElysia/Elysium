@@ -1,5 +1,12 @@
 """Copy-only snapshot, manifest and verification tools for storage migration."""
 
+from ..proactive_migration import (
+    PROACTIVE_SNAPSHOT_SOURCE,
+    ProactiveAuthorityCopyReport,
+    ProactiveAuthorityMigrationError,
+    copy_proactive_authority_from_snapshot,
+    verify_proactive_authority_copy,
+)
 from .manifest import (
     LifeSnapshotError,
     build_backend_generation,
@@ -20,17 +27,22 @@ from .subject_export import (
 from .verify import verify_local_snapshot
 
 __all__ = [
+    "PROACTIVE_SNAPSHOT_SOURCE",
     "LifeSnapshotError",
     "LifeStorageLayout",
+    "ProactiveAuthorityCopyReport",
+    "ProactiveAuthorityMigrationError",
     "SubjectDocumentCopyError",
     "SubjectDocumentCopyReport",
     "SubjectDocumentExportError",
     "SubjectDocumentExportReport",
     "build_backend_generation",
+    "copy_proactive_authority_from_snapshot",
     "copy_subject_documents_from_snapshot",
     "create_local_snapshot",
     "export_subject_documents",
     "load_snapshot_manifest",
     "snapshot_manifest_sha256",
     "verify_local_snapshot",
+    "verify_proactive_authority_copy",
 ]

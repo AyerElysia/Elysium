@@ -393,7 +393,9 @@ async def test_attention_event_rows_are_database_immutable_and_health_is_content
             "source_frontier": 1,
             "threads": {"open": 1, "paused": 0, "closed": 0},
             "instance_focus_count": 0,
-            "schema_version": 1,
+            "replayed_thread_count": 1,
+            "consistency_error_types": (),
+            "schema_version": 2,
         }
         assert "statement" not in str(health).lower()
 

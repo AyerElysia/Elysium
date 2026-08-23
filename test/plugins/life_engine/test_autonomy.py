@@ -3,23 +3,23 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from plugins.life_engine.autonomy import (
+    AsyncLocalAutonomyIntentStore,
     AutonomyIntentStore,
+    LegacyAutonomyReadOnly,
+    SelectedAutonomyIntentStore,
     build_intent,
     restore_autonomy_intents,
     schedule_autonomy_intent,
 )
 from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.service.core import LifeEngineService
-from plugins.life_engine.tools.autonomy_tools import (
-    LifeEngineManageAutonomyIntentTool,
-    LifeEngineScheduleAutonomyIntentTool,
-)
 from src.core.config.core_config import CoreConfig
 
 
@@ -108,7 +108,17 @@ async def test_legacy_restore_reads_bytes_without_rewrite_or_schedule(
         target_stream_id="legacy-stream",
     )
     store = AutonomyIntentStore(tmp_path)
-    store.upsert(intent)
+    store.path.write_text(
+        json.dumps(
+            {
+                "version": 3,
+                "updated_at": intent.updated_at,
+                "intents": [intent.to_dict()],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
     before = store.path.read_bytes()
     before_hash = hashlib.sha256(before).hexdigest()
 
@@ -125,6 +135,39 @@ async def test_legacy_restore_reads_bytes_without_rewrite_or_schedule(
 
 
 @pytest.mark.asyncio
+async def test_all_legacy_store_mutations_fail_closed(tmp_path: Path) -> None:
+    intent = build_intent(
+        kind="reflect",
+        motivation="只用于验证退役写入口",
+        delay_minutes=5,
+    )
+    local = AutonomyIntentStore(tmp_path)
+    with pytest.raises(LegacyAutonomyReadOnly):
+        local.save([intent])
+    with pytest.raises(LegacyAutonomyReadOnly):
+        local.upsert(intent)
+    with pytest.raises(LegacyAutonomyReadOnly):
+        local.append_event("triggered", intent)
+    assert not local.path.exists()
+
+    async_local = AsyncLocalAutonomyIntentStore(tmp_path)
+    with pytest.raises(LegacyAutonomyReadOnly):
+        await async_local.save([intent])
+    with pytest.raises(LegacyAutonomyReadOnly):
+        await async_local.upsert(intent)
+    with pytest.raises(LegacyAutonomyReadOnly):
+        await async_local.append_event("triggered", intent)
+
+    selected = SelectedAutonomyIntentStore(SimpleNamespace())
+    with pytest.raises(LegacyAutonomyReadOnly):
+        await selected.save([intent])
+    with pytest.raises(LegacyAutonomyReadOnly):
+        await selected.upsert(intent)
+    with pytest.raises(LegacyAutonomyReadOnly):
+        await selected.append_event("triggered", intent)
+
+
+@pytest.mark.asyncio
 async def test_service_rejects_legacy_creation_without_writing(tmp_path: Path) -> None:
     service = _make_service(tmp_path)
     with pytest.raises(RuntimeError, match="LegacyAutonomyReadOnly"):
@@ -135,38 +178,6 @@ async def test_service_rejects_legacy_creation_without_writing(tmp_path: Path) -
             target_key="p-legacy",
         )
     assert not AutonomyIntentStore(tmp_path).path.exists()
-
-
-@pytest.mark.asyncio
-async def test_legacy_tools_report_read_only_without_calling_service(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    service = _make_service(tmp_path)
-    called = False
-
-    async def _forbidden(**_kwargs: object) -> object:
-        nonlocal called
-        called = True
-        raise AssertionError("retired creation must not call the service")
-
-    monkeypatch.setattr(service, "schedule_autonomy_intent", _forbidden)
-    create_tool = LifeEngineScheduleAutonomyIntentTool(plugin=service.plugin)
-    ok, result = await create_tool.execute(
-        kind="silence",
-        motivation="旧调用",
-        delay_minutes=2,
-    )
-    assert ok is False
-    assert isinstance(result, dict)
-    assert result["error"] == "LegacyAutonomyReadOnly"
-    assert called is False
-
-    manage_tool = LifeEngineManageAutonomyIntentTool(plugin=service.plugin)
-    ok, result = await manage_tool.execute(action="cancel", intent_id="legacy")
-    assert ok is False
-    assert isinstance(result, dict)
-    assert result["error"] == "LegacyAutonomyReadOnly"
 
 
 @pytest.mark.asyncio

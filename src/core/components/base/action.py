@@ -29,9 +29,17 @@ class ActionResultDetail(str):
         value: str,
         *,
         technical_outcome: str = "",
+        delivery_receipt_sha256: str = "",
+        delivery_message_id: str = "",
+        delivery_proof_status: str = "",
     ) -> "ActionResultDetail":
         instance = super().__new__(cls, value)
         instance.technical_outcome = str(technical_outcome or "")
+        instance.delivery_receipt_sha256 = str(
+            delivery_receipt_sha256 or ""
+        )
+        instance.delivery_message_id = str(delivery_message_id or "")
+        instance.delivery_proof_status = str(delivery_proof_status or "")
         return instance
 
 
@@ -93,6 +101,9 @@ class BaseAction(ABC, LLMUsable):
         self._trigger_message: Message | None = None
         self._tool_call_id: str = ""
         self._last_delivery_status: str = ""
+        self._last_delivery_receipt_sha256: str = ""
+        self._last_delivery_message_id: str = ""
+        self._last_delivery_proof_status: str = ""
 
     def _action_origin_extra(self) -> dict[str, Any]:
         """Return trace metadata bound by the current chatter turn."""
@@ -109,6 +120,13 @@ class BaseAction(ABC, LLMUsable):
         }
         if isinstance(occurrences, list) and occurrences:
             origin["autonomy_occurrences"] = occurrences
+        outreach_occurrences = scope.get("initiative_outreach_occurrences")
+        if isinstance(outreach_occurrences, list) and outreach_occurrences:
+            origin["initiative_outreach_occurrences"] = [
+                str(item or "").strip()
+                for item in outreach_occurrences
+                if str(item or "").strip()
+            ]
         return origin
 
     def _action_message_id(self, target_stream_id: str, segment_index: int = 0) -> str:
@@ -116,12 +134,22 @@ class BaseAction(ABC, LLMUsable):
 
         origin = self._action_origin_extra()
         occurrences = origin.get("autonomy_occurrences")
-        if occurrences and self._tool_call_id:
+        outreach_occurrences = origin.get("initiative_outreach_occurrences")
+        if (occurrences or outreach_occurrences) and self._tool_call_id:
             occurrence_ids = sorted(
-                str(item.get("occurrence_id") or "")
+                "legacy:"
+                + str(item.get("occurrence_id") or "")
                 for item in occurrences
                 if isinstance(item, dict) and item.get("occurrence_id")
-            )
+            ) if isinstance(occurrences, list) else []
+            if isinstance(outreach_occurrences, list):
+                occurrence_ids.extend(
+                    sorted(
+                        "outreach:" + str(item)
+                        for item in outreach_occurrences
+                        if str(item or "").strip()
+                    )
+                )
             raw = "|".join(
                 [
                     *occurrence_ids,
@@ -640,6 +668,17 @@ class BaseAction(ABC, LLMUsable):
             sender = get_message_sender()
             success = await sender.send_message(message)
             self._last_delivery_status = str(message.extra.get("delivery_status") or "")
+            self._last_delivery_receipt_sha256 = str(
+                message.extra.get("delivery_receipt_sha256") or ""
+            )
+            self._last_delivery_message_id = str(
+                message.extra.get("delivery_message_id")
+                or getattr(message, "message_id", "")
+                or ""
+            )
+            self._last_delivery_proof_status = str(
+                message.extra.get("delivery_proof_status") or ""
+            )
             return success
 
         except Exception as e:

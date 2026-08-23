@@ -59,6 +59,7 @@ class LifeStorageLayout:
         Path("life_engine_workspace/runtime/consciousness_presence.sqlite3"),
         Path("life_engine_workspace/runtime/world_projection.sqlite3"),
         Path("life_engine_workspace/.memory/archive_sync_state.sqlite3"),
+        Path("life_engine_workspace/runtime/proactive/proactive.sqlite3"),
     )
     exact_roots: tuple[Path, ...] = (
         Path("diaries"),

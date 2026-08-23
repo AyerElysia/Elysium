@@ -100,6 +100,17 @@ _SEND_VOICE = "action-life_send_voice"
 _SEND_FILE = "action-life_send_file"
 _SEND_EMOJI_MEME = "action-send_emoji_meme"
 _RETIRED_THINK_ACTION = "action-think"
+_RETIRED_PROACTIVE_ACTIONS = frozenset(
+    {
+        "nucleus_manage_attention_thread",
+        "nucleus_manage_initiative_seed",
+        "nucleus_reachability",
+        "nucleus_begin_outreach",
+        "nucleus_manage_thought_stream",
+        "nucleus_manage_autonomy_intent",
+        "nucleus_schedule_autonomy_intent",
+    }
+)
 _SUSPEND_TEXT = "__SUSPEND__"
 _GLOBAL_RUNTIME_BUSY_RETRY_SECONDS = 1.0
 _PLATFORM_ACTION_MAX_ATTEMPTS = 3
@@ -328,7 +339,7 @@ class LifeSendTextAction(BaseAction):
         "严禁把 reason/thought/expected_reaction 等元信息写进 content。"
         "私聊场景下 reply_to 默认不要使用，除非确实需要引用某条历史消息来避免歧义。"
         "本动作只在当前意识实例的物理表面发送；跨表面主动外联必须先由主体通过"
-        "nucleus_reachability 与 nucleus_begin_outreach 显式选择对象和表面。"
+        "nucleus_proactive_query 与 nucleus_proactive_command 显式选择对象和表面。"
     )
 
     chatter_allow: list[str] = ["life_chatter"]
@@ -556,6 +567,17 @@ class LifeSendTextAction(BaseAction):
             sender = get_message_sender()
             success = await sender.send_message(message)
             self._last_delivery_status = str(message.extra.get("delivery_status") or "")
+            self._last_delivery_receipt_sha256 = str(
+                message.extra.get("delivery_receipt_sha256") or ""
+            )
+            self._last_delivery_message_id = str(
+                message.extra.get("delivery_message_id")
+                or message.message_id
+                or ""
+            )
+            self._last_delivery_proof_status = str(
+                message.extra.get("delivery_proof_status") or ""
+            )
             return success
 
         if self._action_origin_extra():
@@ -605,6 +627,9 @@ class LifeSendTextAction(BaseAction):
         ] = "",
     ) -> tuple[bool, str]:
         self._last_delivery_status = ""
+        self._last_delivery_receipt_sha256 = ""
+        self._last_delivery_message_id = ""
+        self._last_delivery_proof_status = ""
         if not isinstance(thought, str) or not thought.strip():
             return (
                 False,
@@ -626,13 +651,23 @@ class LifeSendTextAction(BaseAction):
         if not cleaned_segments:
             return False, "发送内容不能只是省略号或占位符"
 
+        # A durable outreach claim fences exactly one platform side effect.
+        # Historical JSON-array/plain-text splitting remains available for
+        # ordinary chat, but proactive expression is one Message so a partial
+        # multi-segment send can never be mislabeled as wholly failed/spoken.
+        proactive_outreach = bool(
+            self._action_origin_extra().get("initiative_outreach_occurrences")
+        )
+        if proactive_outreach and len(cleaned_segments) > 1:
+            cleaned_segments = ["\n".join(cleaned_segments)]
+
         # 发送动作不能同时承担对象/表面选择。旧参数保留只为让历史
         # Python 调用明确失败，而不是静默回退到当前或近期聊天。
         normalized_target_key = str(target_key or "").strip()
         if normalized_target_key:
             return False, (
-                "target_key 已退役；请由主体先调用 nucleus_reachability，"
-                "再用 nucleus_begin_outreach 明确选择对象与可达表面"
+                "target_key 已退役；请由主体先调用 nucleus_proactive_query，"
+                "再用 nucleus_proactive_command(action=outreach.begin) 明确选择对象与可达表面"
             )
 
         structured_context = {
@@ -670,17 +705,44 @@ class LifeSendTextAction(BaseAction):
                 segment_reply_to,
                 segment_index=index,
             )
+            delivery_status = str(self._last_delivery_status or "").strip().lower()
             if not success:
-                if self._last_delivery_status == "unknown":
+                if delivery_status == "unknown":
                     return False, ActionResultDetail(
                         f"第{index + 1}条消息投递状态未知；为避免重复，系统不会自动重发",
                         technical_outcome="delivery_unknown",
                     )
+                if delivery_status == "suppressed":
+                    return False, ActionResultDetail(
+                        f"第{index + 1}条消息在平台调用前被拦截，未对外发送",
+                        technical_outcome="suppressed",
+                    )
                 return False, f"第{index + 1}条消息发送失败"
+            if delivery_status == "suppressed":
+                return False, ActionResultDetail(
+                    f"第{index + 1}条消息在平台调用前被拦截，未对外发送",
+                    technical_outcome="suppressed",
+                )
+            if proactive_outreach and (
+                delivery_status != "delivered"
+                or len(self._last_delivery_receipt_sha256) != 64
+                or self._last_delivery_proof_status != "durable"
+            ):
+                return False, ActionResultDetail(
+                    "平台调用没有返回可持久验证的交付凭据；按投递状态未知结算",
+                    technical_outcome="delivery_unknown",
+                    delivery_message_id=self._last_delivery_message_id,
+                )
             sent_count += 1
 
         preview = cleaned_segments[0][:80] if cleaned_segments else ""
-        return True, f"已发送{sent_count}条消息: {preview}"
+        return True, ActionResultDetail(
+            f"已发送{sent_count}条消息: {preview}",
+            technical_outcome=("delivered" if proactive_outreach else ""),
+            delivery_receipt_sha256=self._last_delivery_receipt_sha256,
+            delivery_message_id=self._last_delivery_message_id,
+            delivery_proof_status=self._last_delivery_proof_status,
+        )
 
 
 class _LifeSendMediaAction(BaseAction):
@@ -2143,38 +2205,66 @@ class LifeChatter(BaseChatter):
         split one expression into two generations.
         """
 
+        return cls._without_retired_tool_history(
+            payloads,
+            retired_names=frozenset({_RETIRED_THINK_ACTION}),
+        )
+
+    @classmethod
+    def _without_retired_proactive_history(
+        cls,
+        payloads: list[LLMPayload],
+    ) -> list[LLMPayload]:
+        """Remove obsolete proactive tool rituals from derived model context.
+
+        The immutable trajectory continues to preserve every historical call.
+        Only the rolling projection is normalized so an old failed call cannot
+        teach a later model turn that a second proactive interface still exists.
+        """
+
+        return cls._without_retired_tool_history(
+            payloads,
+            retired_names=_RETIRED_PROACTIVE_ACTIONS,
+        )
+
+    @staticmethod
+    def _without_retired_tool_history(
+        payloads: list[LLMPayload],
+        *,
+        retired_names: frozenset[str],
+    ) -> list[LLMPayload]:
         retired_call_ids = {
             str(part.id)
             for payload in payloads
             for part in (getattr(payload, "content", None) or [])
             if isinstance(part, ToolCall)
-            and part.name == _RETIRED_THINK_ACTION
+            and part.name in retired_names
             and part.id
         }
         cleaned_payloads: list[LLMPayload] = []
         for payload in payloads:
             original_content = list(getattr(payload, "content", None) or [])
-            contains_retired_think_call = any(
-                isinstance(part, ToolCall) and part.name == _RETIRED_THINK_ACTION
+            contains_retired_call = any(
+                isinstance(part, ToolCall) and part.name in retired_names
                 for part in original_content
             )
             content = [
                 part
                 for part in original_content
                 if not (
-                    isinstance(part, ToolCall) and part.name == _RETIRED_THINK_ACTION
+                    isinstance(part, ToolCall) and part.name in retired_names
                 )
                 and not (
                     isinstance(part, ToolResult)
                     and (
-                        part.name == _RETIRED_THINK_ACTION
+                        part.name in retired_names
                         or bool(part.call_id and part.call_id in retired_call_ids)
                     )
                 )
             ]
             if (
                 payload.role == ROLE.ASSISTANT
-                and contains_retired_think_call
+                and contains_retired_call
                 and not any(isinstance(part, ToolCall) for part in content)
             ):
                 # A retired think response can also contain incidental text,
@@ -2465,6 +2555,7 @@ class LifeChatter(BaseChatter):
     @classmethod
     def _snapshot_data_for_payloads(cls, payloads: list[LLMPayload]) -> dict[str, Any]:
         payloads = cls._without_retired_think_history(payloads)
+        payloads = cls._without_retired_proactive_history(payloads)
         payloads = cls._without_retired_reaction_guidance(payloads)
         serialized_payloads = [
             item
@@ -2765,6 +2856,7 @@ class LifeChatter(BaseChatter):
             if payload is not None
         ]
         payloads = self._without_retired_think_history(payloads)
+        payloads = self._without_retired_proactive_history(payloads)
         payloads = self._without_retired_reaction_guidance(payloads)
         # Legacy snapshots migrate to v3 canonical digests on the next
         # successful save. Do not rewrite storage from a read path.
@@ -3503,9 +3595,8 @@ class LifeChatter(BaseChatter):
             "- 只有后一个动作必须依赖前一个工具的未知结果时才分轮；例如先 `nucleus_view_screen`，看到结果后再 `life_send_text`。\n"
             "### 核心工具\n"
             "- `life_send_text`：**在当前意识实例表面发送文字**。`content` 只写纯文本正文，长内容用 `\\n` 分段；它不负责选择其他聊天。\n"
-            "- `nucleus_manage_initiative_seed`：显式保存、改写、再次遇见或释放主体主动线索。\n"
-            "- `nucleus_reachability`：只读查看已登记对象和物理表面；不按最近活跃替你排序。\n"
-            "- `nucleus_begin_outreach`：明确选择对象与表面，启动一次新的表达判断。\n"
+            "- `nucleus_proactive_query`：只读查看持续关注、未来意向或可达对象/表面；读取不改变状态。\n"
+            "- `nucleus_proactive_command`：统一主动写入口；显式管理关注/意向，或选择对象与表面发起一次表达判断。\n"
             "- `life_send_file`：发送本地文件给用户。\n"
             "- `action-life_pass_and_wait`：结束本轮，等待用户新消息。\n"
             "- `nucleus_bash`：查看或操作电脑终端。\n"
@@ -3691,6 +3782,18 @@ class LifeChatter(BaseChatter):
 
         # 外部机会或主体显式外联决定 → 交给主模型重新判断。
         # 这不是强制回复，只是让表达层看到新的真实上下文。
+        if unread_msgs and any(
+            self._message_flag(msg, "is_initiative_outreach_trigger")
+            for msg in unread_msgs
+        ):
+            return {
+                "reason": "主体显式外联已进入持久表达收件箱，交给当前表面重新判断",
+                "should_respond": True,
+                "force_reply": self._should_force_reply_for_unread_batch(
+                    unread_msgs
+                ),
+            }
+
         if unread_msgs and all(
             self._is_proactive_trigger_message(msg) for msg in unread_msgs
         ):
@@ -4845,6 +4948,27 @@ class LifeChatter(BaseChatter):
         )
 
     @classmethod
+    def _initiative_outreach_occurrence_scope(
+        cls,
+        unread_msgs: list[Message],
+    ) -> list[str]:
+        """Return stable outreach decisions carried by this expression turn."""
+
+        occurrences: list[str] = []
+        for message in unread_msgs:
+            if not cls._message_flag(message, "is_initiative_outreach_trigger"):
+                continue
+            raw = getattr(message, "initiative_outreach_occurrence_id", "")
+            if not raw:
+                extra = getattr(message, "extra", None)
+                if isinstance(extra, dict):
+                    raw = extra.get("initiative_outreach_occurrence_id", "")
+            occurrence_id = str(raw or "").strip()
+            if occurrence_id and occurrence_id not in occurrences:
+                occurrences.append(occurrence_id)
+        return occurrences
+
+    @classmethod
     def _autonomy_occurrence_scope(
         cls,
         unread_msgs: list[Message],
@@ -5444,6 +5568,22 @@ class LifeChatter(BaseChatter):
                 detail=detail,
             )
 
+        async def complete_active_initiative_outreach(
+            outcome: str,
+            *,
+            action_id: str = "",
+        ) -> None:
+            if service is None:
+                return
+            occurrences = self._initiative_outreach_occurrence_scope(rt.unreads)
+            if not occurrences:
+                return
+            await service.resolve_initiative_outreach_expressions(
+                occurrences,
+                outcome=outcome,
+                action_id=action_id,
+            )
+
         while True:
             # 每次循环都刷新当前来源流，避免等待全局锁期间新增/flush 状态变化。
             _, unread_msgs = await self.fetch_unreads()
@@ -5761,6 +5901,7 @@ class LifeChatter(BaseChatter):
                                 await complete_active_autonomy_as_failed(
                                     f"follow-up model failure: {fallback_error}"
                                 )
+                                await complete_active_initiative_outreach("failed")
                             return Failure("LLM 请求失败", fallback_error)
                     else:
                         self._discard_pending_memory_recall_deliveries(
@@ -5799,6 +5940,7 @@ class LifeChatter(BaseChatter):
                             await complete_active_autonomy_as_failed(
                                 f"follow-up model failure: {error}"
                             )
+                            await complete_active_initiative_outreach("failed")
                         return Failure(failure_message, error)
 
                 perception_delivery_receipt: Any | None = None
@@ -5898,6 +6040,7 @@ class LifeChatter(BaseChatter):
                         await complete_active_autonomy_as_failed(
                             "life_chatter reached max rounds without a terminal choice"
                         )
+                        await complete_active_initiative_outreach("failed")
                         if rt.must_reply:
                             await self._send_must_reply_fallback(
                                 chat_stream, rt.unreads
@@ -5953,15 +6096,24 @@ class LifeChatter(BaseChatter):
                     rt.unreads,
                     stream_id,
                 )
+                initiative_outreach_occurrences = (
+                    self._initiative_outreach_occurrence_scope(rt.unreads)
+                )
                 claimed_autonomy_actions: set[str] = set()
+                claimed_initiative_actions: set[str] = set()
                 delivery_unknown_action = False
+                delivery_unknown_action_id = ""
                 terminal_tool_failure = ""
                 terminal_tool_failure_action_id = ""
+                terminal_initiative_outcome = "failed"
                 if trigger_msg is not None:
                     trigger_msg.extra["life_turn_scope"] = {
                         "stream_id": stream_id,
                         "turn_key": rt.active_unread_turn_key,
                         "autonomy_occurrences": autonomy_occurrences,
+                        "initiative_outreach_occurrences": (
+                            initiative_outreach_occurrences
+                        ),
                     }
 
                 async def handle_tool_execution_result(
@@ -5969,10 +6121,28 @@ class LifeChatter(BaseChatter):
                     execution_result: tuple[bool, bool],
                 ) -> None:
                     nonlocal delivery_unknown_action
+                    nonlocal delivery_unknown_action_id
                     nonlocal terminal_tool_failure, terminal_tool_failure_action_id
+                    nonlocal terminal_initiative_outcome
                     _, success = execution_result
                     technical_outcome = str(
                         getattr(execution_result, "technical_outcome", "") or ""
+                    )
+                    delivery_receipt_sha256 = str(
+                        getattr(
+                            execution_result,
+                            "delivery_receipt_sha256",
+                            "",
+                        )
+                        or ""
+                    )
+                    delivery_message_id = str(
+                        getattr(execution_result, "delivery_message_id", "")
+                        or ""
+                    )
+                    delivery_proof_status = str(
+                        getattr(execution_result, "delivery_proof_status", "")
+                        or ""
                     )
                     executed_name = str(getattr(executed_call, "name", "") or "")
                     action_id = str(getattr(executed_call, "id", "") or "")
@@ -6028,10 +6198,68 @@ class LifeChatter(BaseChatter):
                             ),
                         )
                     if (
-                        technical_outcome == "delivery_unknown"
+                        service is not None
+                        and initiative_outreach_occurrences
+                        and action_id in claimed_initiative_actions
+                        and self._is_visible_reply_action(executed_name)
+                    ):
+                        exact_delivery = bool(
+                            success
+                            and technical_outcome == "delivered"
+                            and len(delivery_receipt_sha256) == 64
+                            and delivery_message_id
+                            and delivery_proof_status == "durable"
+                        )
+                        if exact_delivery:
+                            outreach_outcome = "spoke"
+                        elif technical_outcome == "suppressed":
+                            outreach_outcome = "suppressed"
+                        elif technical_outcome == "delivery_unknown" or success:
+                            outreach_outcome = "delivery_unknown"
+                        else:
+                            outreach_outcome = "failed"
+                        await service.resolve_initiative_outreach_expressions(
+                            initiative_outreach_occurrences,
+                            outcome=outreach_outcome,
+                            action_id=action_id,
+                            delivery_receipt_sha256=(
+                                delivery_receipt_sha256
+                                if outreach_outcome == "spoke"
+                                else ""
+                            ),
+                            delivery_message_id=(
+                                delivery_message_id
+                                if outreach_outcome == "spoke"
+                                else ""
+                            ),
+                        )
+                        if outreach_outcome in {"failed", "suppressed"}:
+                            terminal_tool_failure = (
+                                terminal_tool_failure
+                                or "initiative_outreach_action_failed"
+                            )
+                            terminal_tool_failure_action_id = action_id
+                            terminal_initiative_outcome = outreach_outcome
+                    if (
+                        (
+                            technical_outcome == "delivery_unknown"
+                            or (
+                                service is not None
+                                and initiative_outreach_occurrences
+                                and action_id in claimed_initiative_actions
+                                and success
+                                and not (
+                                    technical_outcome == "delivered"
+                                    and len(delivery_receipt_sha256) == 64
+                                    and delivery_message_id
+                                    and delivery_proof_status == "durable"
+                                )
+                            )
+                        )
                         and self._is_visible_reply_action(executed_name)
                     ):
                         delivery_unknown_action = True
+                        delivery_unknown_action_id = action_id
                         rt.must_reply = False
                     if success and self._is_visible_reply_action(executed_name):
                         reply_entry = self._visible_text_reply_cache_entry(
@@ -6088,6 +6316,25 @@ class LifeChatter(BaseChatter):
                     logger.debug(
                         f"LLM 调用 {call_name}，原因: {reason}，参数: {log_args}"
                     )
+
+                    if should_wait and self._is_visible_reply_action(
+                        str(call_name or "")
+                    ):
+                        await flush_parallel_calls()
+                        llm_response.add_payload(
+                            LLMPayload(
+                                ROLE.TOOL_RESULT,
+                                ToolResult(
+                                    value=(
+                                        "本轮已经显式选择 pass；后续可见动作已阻止，"
+                                        "避免同时表达和沉默"
+                                    ),
+                                    call_id=call.id,
+                                    name=call_name,
+                                ),
+                            )
+                        )
+                        continue
 
                     if delivery_unknown_action and self._is_visible_reply_action(
                         str(call_name or "")
@@ -6183,6 +6430,17 @@ class LifeChatter(BaseChatter):
                                 outcome="passed",
                                 action_id=str(getattr(call, "id", "") or ""),
                             )
+                        if (
+                            service is not None
+                            and initiative_outreach_occurrences
+                            and not rt.sent_visible_reply
+                            and not delivery_unknown_action
+                        ):
+                            await service.resolve_initiative_outreach_expressions(
+                                initiative_outreach_occurrences,
+                                outcome="passed",
+                                action_id=str(getattr(call, "id", "") or ""),
+                            )
                         llm_response.add_payload(
                             LLMPayload(
                                 ROLE.TOOL_RESULT,
@@ -6247,18 +6505,101 @@ class LifeChatter(BaseChatter):
                             continue
                         claimed_autonomy_actions.add(str(getattr(call, "id", "") or ""))
 
+                    if (
+                        service is not None
+                        and initiative_outreach_occurrences
+                        and self._is_visible_reply_action(str(call_name or ""))
+                    ):
+                        await flush_parallel_calls()
+                        action_id = str(getattr(call, "id", "") or "")
+                        try:
+                            claim = (
+                                await service.claim_initiative_outreach_expressions(
+                                    initiative_outreach_occurrences,
+                                    action_id=action_id,
+                                )
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:  # noqa: BLE001 - fail closed
+                            llm_response.add_payload(
+                                LLMPayload(
+                                    ROLE.TOOL_RESULT,
+                                    ToolResult(
+                                        value=(
+                                            "主体主动外联的发送前持久 claim 失败；"
+                                            "已阻止平台动作，不能假定消息已发送"
+                                        ),
+                                        call_id=call.id,
+                                        name=call_name,
+                                    ),
+                                )
+                            )
+                            terminal_tool_failure = (
+                                "initiative_outreach_claim_failed"
+                            )
+                            terminal_tool_failure_action_id = action_id
+                            logger.warning(
+                                "主体主动外联发送前 claim 失败，已 fail closed: "
+                                f"error_type={type(exc).__name__}"
+                            )
+                            continue
+                        if not bool(claim.get("execute_allowed", False)):
+                            llm_response.add_payload(
+                                LLMPayload(
+                                    ROLE.TOOL_RESULT,
+                                    ToolResult(
+                                        value=(
+                                            "该主动外联动作已存在持久 claim；"
+                                            "其平台投递状态按未知结算，禁止重复发送"
+                                        ),
+                                        call_id=call.id,
+                                        name=call_name,
+                                    ),
+                                )
+                            )
+                            delivery_unknown_action = True
+                            delivery_unknown_action_id = action_id
+                            continue
+                        claimed_initiative_actions.add(action_id)
+
                     # 执行工具（action / tool 统一处理）
                     if is_life_tool_call_parallel_safe(call):
                         pending_parallel_calls.append(call)
                         continue
 
                     await flush_parallel_calls()
-                    raw_results = await self.run_tool_call(
-                        call,
-                        llm_response,
-                        usable_map,
-                        trigger_msg,
-                    )
+                    try:
+                        raw_results = await self.run_tool_call(
+                            call,
+                            llm_response,
+                            usable_map,
+                            trigger_msg,
+                        )
+                    except asyncio.CancelledError:
+                        action_id = str(getattr(call, "id", "") or "")
+                        if (
+                            service is not None
+                            and action_id in claimed_initiative_actions
+                        ):
+                            await service.resolve_initiative_outreach_expressions(
+                                initiative_outreach_occurrences,
+                                outcome="delivery_unknown",
+                                action_id=action_id,
+                            )
+                        raise
+                    except Exception:
+                        action_id = str(getattr(call, "id", "") or "")
+                        if (
+                            service is not None
+                            and action_id in claimed_initiative_actions
+                        ):
+                            await service.resolve_initiative_outreach_expressions(
+                                initiative_outreach_occurrences,
+                                outcome="failed",
+                                action_id=action_id,
+                            )
+                        raise
                     result_list = self._normalize_tool_execution_results(raw_results, 1)
                     execution_result = result_list[0] if result_list else (False, False)
                     await handle_tool_execution_result(call, execution_result)
@@ -6273,6 +6614,10 @@ class LifeChatter(BaseChatter):
                             action_id=terminal_tool_failure_action_id,
                             detail=f"platform action stopped: {terminal_tool_failure}",
                         )
+                    await complete_active_initiative_outreach(
+                        terminal_initiative_outcome,
+                        action_id=terminal_tool_failure_action_id,
+                    )
                     if self._has_tool_result_tail(llm_response):
                         llm_response.add_payload(
                             LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT))
@@ -6303,6 +6648,10 @@ class LifeChatter(BaseChatter):
                     return Wait()
 
                 if delivery_unknown_action:
+                    await complete_active_initiative_outreach(
+                        "delivery_unknown",
+                        action_id=delivery_unknown_action_id,
+                    )
                     if self._has_tool_result_tail(llm_response):
                         llm_response.add_payload(
                             LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT))
@@ -6319,6 +6668,10 @@ class LifeChatter(BaseChatter):
                 # 用户已经看到回复或本轮命中了最近回复锚点后，对外表达已经闭合。
                 # 继续 follow-up 会再次询问模型，容易对同一事件生成二次回复。
                 if rt.sent_visible_reply or suppressed_recent_reply:
+                    if suppressed_recent_reply and not rt.sent_visible_reply:
+                        await complete_active_initiative_outreach(
+                            "suppressed_duplicate",
+                        )
                     if self._has_tool_result_tail(llm_response):
                         llm_response.add_payload(
                             LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT))
@@ -6340,6 +6693,7 @@ class LifeChatter(BaseChatter):
                     await complete_active_autonomy_as_failed(
                         "life_chatter reached max rounds without a terminal choice"
                     )
+                    await complete_active_initiative_outreach("failed")
                     if rt.must_reply and not rt.sent_visible_reply:
                         await self._send_must_reply_fallback(chat_stream, rt.unreads)
                         rt.must_reply = False

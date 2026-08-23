@@ -1,26 +1,22 @@
-"""Autonomy intent primitives for life_engine.
+"""Read-only decoder and scheduler cleanup for retired AutonomyIntent data.
 
-An autonomy intent is not a command. It is a delayed inner intention that may
-surface later and be re-evaluated by the expression layer.
+The canonical writable authority is ``plugins.life_engine.proactive``.
+AutonomyIntent remains solely so old snapshots can be inspected byte-for-byte
+and obsolete scheduler entries can be removed; no class in this module may
+create, update, or append live proactive state.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
 
-from src.app.plugin_system.api import log_api
 from src.kernel.scheduler import get_unified_scheduler
-
-from .storage_utils import atomic_write_text
-
-logger = log_api.get_logger("life_engine.autonomy", display="Autonomy")
 
 AutonomyIntentKind = Literal["speak", "reflect", "silence"]
 AutonomyIntentStatus = Literal[
@@ -34,20 +30,33 @@ AutonomyIntentStatus = Literal[
     "rejected",
     "failed",
 ]
+_VALID_INTENT_KINDS = {"speak", "reflect", "silence"}
+_VALID_INTENT_STATUSES = {
+    "scheduled",
+    "in_flight",
+    "triggered",
+    "renewal_required",
+    "paused",
+    "expired",
+    "cancelled",
+    "rejected",
+    "failed",
+}
 
 _STORE_FILE = "autonomy_intents.json"
 _STORE_VERSION = 3
-_EVENT_LOG_FILE = "autonomy_intent_events.jsonl"
 _MAX_OCCURRENCES_LIMIT = 10_000
 _MAX_LEASE_MINUTES = 7 * 24 * 60
-_LOCK: asyncio.Lock | None = None
 
 
-def _get_lock() -> asyncio.Lock:
-    global _LOCK
-    if _LOCK is None:
-        _LOCK = asyncio.Lock()
-    return _LOCK
+class LegacyAutonomyReadOnly(RuntimeError):
+    """Raised whenever retired code attempts to mutate legacy evidence."""
+
+
+def _reject_legacy_mutation() -> None:
+    raise LegacyAutonomyReadOnly(
+        "LegacyAutonomyReadOnly: use the unified ProactiveAuthority"
+    )
 
 
 def now_local() -> datetime:
@@ -86,7 +95,7 @@ def _shorten(value: Any, *, max_length: int) -> str:
 
 @dataclass(slots=True)
 class AutonomyIntent:
-    """A delayed intention created by life_engine itself."""
+    """Decoded historical record from the retired autonomy archive."""
 
     intent_id: str
     kind: AutonomyIntentKind
@@ -124,7 +133,16 @@ class AutonomyIntent:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "AutonomyIntent":
-        intent_id = str(data.get("intent_id") or uuid4().hex)
+        intent_id = str(data.get("intent_id") or "").strip()
+        kind = str(data.get("kind") or "").strip()
+        status = str(data.get("status") or "").strip()
+        scheduled_at = str(data.get("scheduled_at") or "").strip()
+        if not intent_id or not scheduled_at or "delay_minutes" not in data:
+            raise ValueError("legacy autonomy identity/time fields are incomplete")
+        if kind not in _VALID_INTENT_KINDS:
+            raise ValueError("legacy autonomy kind is invalid")
+        if status not in _VALID_INTENT_STATUSES:
+            raise ValueError("legacy autonomy status is invalid")
         task_name = str(data.get("task_name") or normalize_intent_task_name(intent_id))
         delay_minutes = int(data.get("delay_minutes") or 1)
         repeat = bool(data.get("repeat") or data.get("recurring"))
@@ -132,24 +150,26 @@ class AutonomyIntent:
         if repeat and interval_minutes <= 0:
             interval_minutes = delay_minutes
         constraints_raw = data.get("constraints") or []
+        if not isinstance(constraints_raw, list):
+            raise ValueError("legacy autonomy constraints must be a list")
         constraints = [
             _shorten(item, max_length=120)
             for item in constraints_raw
             if str(item or "").strip()
-        ] if isinstance(constraints_raw, list) else []
+        ]
         return cls(
             intent_id=intent_id,
-            kind=str(data.get("kind") or "reflect"),  # type: ignore[arg-type]
+            kind=kind,  # type: ignore[arg-type]
             motivation=_shorten(data.get("motivation"), max_length=600),
             delay_minutes=delay_minutes,
-            scheduled_at=str(data.get("scheduled_at") or iso_now()),
-            status=str(data.get("status") or "scheduled"),  # type: ignore[arg-type]
+            scheduled_at=scheduled_at,
+            status=status,  # type: ignore[arg-type]
             target_hint=_shorten(data.get("target_hint"), max_length=160),
             target_key=_shorten(data.get("target_key"), max_length=80),
             target_stream_id=_shorten(data.get("target_stream_id"), max_length=128),
             constraints=constraints[:8],
-            created_at=str(data.get("created_at") or iso_now()),
-            updated_at=str(data.get("updated_at") or iso_now()),
+            created_at=str(data.get("created_at") or scheduled_at),
+            updated_at=str(data.get("updated_at") or scheduled_at),
             triggered_at=str(data.get("triggered_at") or ""),
             rejected_reason=_shorten(data.get("rejected_reason"), max_length=240),
             schedule_id=str(data.get("schedule_id") or ""),
@@ -172,7 +192,7 @@ class AutonomyIntent:
 
 
 class SelectedAutonomyIntentStore:
-    """Async autonomy state/event adapter over the selected runtime store."""
+    """Read-only selected-backend view of the retired autonomy snapshot."""
 
     def __init__(self, runtime_store: Any) -> None:
         if runtime_store is None:
@@ -184,14 +204,15 @@ class SelectedAutonomyIntentStore:
     def _decode(payload: dict[str, Any]) -> list[AutonomyIntent]:
         if not isinstance(payload, dict):
             raise RuntimeError("AutonomyRemoteStateNotObject")
+        version = int(payload.get("version") or 0)
+        if version <= 0 or version > _STORE_VERSION:
+            raise RuntimeError("AutonomyRemoteSchemaUnsupported")
         items = payload.get("intents")
         if not isinstance(items, list):
             raise RuntimeError("AutonomyRemoteIntentsNotList")
-        return [
-            AutonomyIntent.from_dict(item)
-            for item in items
-            if isinstance(item, dict)
-        ]
+        if any(not isinstance(item, dict) for item in items):
+            raise RuntimeError("AutonomyRemoteIntentNotObject")
+        return [AutonomyIntent.from_dict(item) for item in items]
 
     async def load(self) -> list[AutonomyIntent]:
         record = await self.runtime_store.get_state(
@@ -205,28 +226,12 @@ class SelectedAutonomyIntentStore:
         return self._decode(record.payload)
 
     async def save(self, intents: list[AutonomyIntent]) -> None:
-        record = await self.runtime_store.put_state(
-            namespace="life_autonomy.intents",
-            state_key="current",
-            expected_revision=self._revision,
-            schema_version=_STORE_VERSION,
-            payload={
-                "version": _STORE_VERSION,
-                "updated_at": iso_now(),
-                "intents": [intent.to_dict() for intent in intents],
-            },
-        )
-        self._revision = int(record.revision)
+        del intents
+        _reject_legacy_mutation()
 
     async def upsert(self, intent: AutonomyIntent) -> None:
-        intents = await self.load()
-        for index, item in enumerate(intents):
-            if item.intent_id == intent.intent_id:
-                intents[index] = intent
-                break
-        else:
-            intents.append(intent)
-        await self.save(intents)
+        del intent
+        _reject_legacy_mutation()
 
     async def get(self, intent_id: str) -> AutonomyIntent | None:
         target = str(intent_id or "").strip()
@@ -252,39 +257,12 @@ class SelectedAutonomyIntentStore:
         action_id: str = "",
         detail: str = "",
     ) -> None:
-        payload = {
-            "event_type": str(event_type or "unknown"),
-            "intent_id": intent.intent_id,
-            "occurrence_id": str(occurrence_id or intent.active_occurrence_id),
-            "occurrence_count": int(intent.occurrence_count or 0),
-            "action_id": str(action_id or ""),
-            "status": intent.status,
-            "target_stream_id": intent.target_stream_id,
-            "detail": _shorten(detail, max_length=500),
-            "created_at": iso_now(),
-        }
-        identity_material = json.dumps(
-            payload,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        import hashlib
-
-        event_id = "autonomy:" + hashlib.sha256(
-            identity_material.encode("utf-8")
-        ).hexdigest()
-        await self.runtime_store.append_event(
-            namespace="life_autonomy.lifecycle",
-            occurrence_id=event_id,
-            event_kind=str(event_type or "unknown"),
-            payload=payload,
-            occurred_at=payload["created_at"],
-        )
+        del event_type, intent, occurrence_id, action_id, detail
+        _reject_legacy_mutation()
 
 
 class AutonomyIntentStore:
-    """JSON store for autonomy intents in explicit local mode."""
+    """Strict read-only JSON archive for old autonomy intents."""
 
     def __init__(self, workspace_path: str | Path) -> None:
         self.path = Path(workspace_path) / _STORE_FILE
@@ -295,46 +273,32 @@ class AutonomyIntentStore:
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"读取自主意向存储失败: {exc}")
-            return []
+            raise RuntimeError("LegacyAutonomyArchiveUnreadable") from exc
         if not isinstance(raw, dict):
-            return []
+            raise RuntimeError("LegacyAutonomyArchiveNotObject")
+        version = int(raw.get("version") or 0)
+        if version <= 0 or version > _STORE_VERSION:
+            raise RuntimeError("LegacyAutonomyArchiveSchemaUnsupported")
         items = raw.get("intents")
         if not isinstance(items, list):
-            return []
+            raise RuntimeError("LegacyAutonomyArchiveIntentsNotList")
         intents: list[AutonomyIntent] = []
         for item in items:
             if not isinstance(item, dict):
-                continue
+                raise RuntimeError("LegacyAutonomyArchiveIntentNotObject")
             try:
                 intents.append(AutonomyIntent.from_dict(item))
             except Exception as exc:  # noqa: BLE001
-                logger.warning(f"解析自主意向失败: {exc}")
+                raise RuntimeError("LegacyAutonomyArchiveIntentInvalid") from exc
         return intents
 
     def save(self, intents: list[AutonomyIntent]) -> None:
-        payload = {
-            "version": _STORE_VERSION,
-            "updated_at": iso_now(),
-            "intents": [intent.to_dict() for intent in intents],
-        }
-        atomic_write_text(
-            self.path,
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        del intents
+        _reject_legacy_mutation()
 
     def upsert(self, intent: AutonomyIntent) -> None:
-        intents = self.load()
-        replaced = False
-        for index, item in enumerate(intents):
-            if item.intent_id == intent.intent_id:
-                intents[index] = intent
-                replaced = True
-                break
-        if not replaced:
-            intents.append(intent)
-        self.save(intents)
+        del intent
+        _reject_legacy_mutation()
 
     def get(self, intent_id: str) -> AutonomyIntent | None:
         target = str(intent_id or "").strip()
@@ -357,26 +321,8 @@ class AutonomyIntentStore:
         action_id: str = "",
         detail: str = "",
     ) -> None:
-        """Append a technical lifecycle event without rewriting intent meaning."""
-
-        payload = {
-            "event_id": uuid4().hex,
-            "event_type": str(event_type or "unknown"),
-            "intent_id": intent.intent_id,
-            "occurrence_id": str(occurrence_id or intent.active_occurrence_id),
-            "occurrence_count": int(intent.occurrence_count or 0),
-            "action_id": str(action_id or ""),
-            "status": intent.status,
-            "target_stream_id": intent.target_stream_id,
-            "detail": _shorten(detail, max_length=500),
-            "created_at": iso_now(),
-        }
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        event_path = self.path.parent / _EVENT_LOG_FILE
-        with event_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+        del event_type, intent, occurrence_id, action_id, detail
+        _reject_legacy_mutation()
 
 
 class AsyncLocalAutonomyIntentStore:
@@ -464,6 +410,8 @@ def build_intent(
     max_occurrences: int | None = None,
     lease_minutes: int | None = None,
 ) -> AutonomyIntent:
+    """Build an in-memory legacy record for decoding/tests; never persist it."""
+
     kind_value = str(kind or "").strip().lower()
     if kind_value not in {"speak", "reflect", "silence"}:
         raise ValueError("kind 只能是 speak / reflect / silence")
@@ -565,7 +513,7 @@ async def schedule_autonomy_intent(plugin: Any, intent: AutonomyIntent) -> str:
     """Reject the retired executor; callers may only read legacy snapshots."""
 
     del plugin, intent
-    raise RuntimeError(
+    raise LegacyAutonomyReadOnly(
         "LegacyAutonomyReadOnly: stream-bound scheduling is retired"
     )
 
@@ -614,6 +562,9 @@ __all__ = [
     "AutonomyIntentKind",
     "AutonomyIntentStatus",
     "AutonomyIntentStore",
+    "AsyncLocalAutonomyIntentStore",
+    "LegacyAutonomyReadOnly",
+    "SelectedAutonomyIntentStore",
     "build_intent",
     "cleanup_autonomy_schedules",
     "format_due_message",

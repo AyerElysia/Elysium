@@ -18,10 +18,21 @@ from typing import Any
 import pytest
 
 from plugins.life_engine.storage.authority import FileAuthorityRegistry
-from plugins.life_engine.storage.factory import LocalBackendSettings, StorageFactorySettings, open_storage_backend
-from plugins.life_engine.storage.hot_path_bridge import MultiWriterHotPathBridge, _short_digest
+from plugins.life_engine.storage.factory import (
+    LocalBackendSettings,
+    StorageFactorySettings,
+    open_storage_backend,
+)
+from plugins.life_engine.storage.hot_path_bridge import (
+    MultiWriterHotPathBridge,
+    _short_digest,
+)
 from plugins.life_engine.storage.instance_identity import InstanceIdentity
-from plugins.life_engine.storage.models import BackendGeneration, BackendKind, GenerationStatus
+from plugins.life_engine.storage.models import (
+    BackendGeneration,
+    BackendKind,
+    GenerationStatus,
+)
 from plugins.life_engine.storage.outbox_adapters import SQLOutboxStore
 from plugins.life_engine.storage.outbox_contracts import OutboxStatus
 from plugins.life_engine.storage.projection_progress import SQLProjectionProgressStore
@@ -401,7 +412,9 @@ def test_message_reader_normalizes_mysql_datetime_round_trip() -> None:
     """
     from datetime import datetime, timezone
 
-    from plugins.life_engine.storage.message_stream_adapters import SQLMessageStreamStore
+    from plugins.life_engine.storage.message_stream_adapters import (
+        SQLMessageStreamStore,
+    )
 
     row = {
         "message_id": "m1",
@@ -439,7 +452,9 @@ async def test_record_message_equality_survives_datetime_reader(tmp_path: Path) 
     """
     from sqlalchemy import text
 
-    from plugins.life_engine.storage.message_stream_adapters import SQLMessageStreamStore
+    from plugins.life_engine.storage.message_stream_adapters import (
+        SQLMessageStreamStore,
+    )
     from plugins.life_engine.storage.message_stream_contracts import InboundMessage
 
     runtime = await _runtime(tmp_path)
@@ -493,9 +508,11 @@ async def test_outbox_settle_hook_registration_and_invoke(tmp_path: Path) -> Non
     saved_inbound = hooks._inbound_fact_hook
     saved_intent = hooks._outbox_intent_hook
     saved_settle = hooks._outbox_settle_hook
+    saved_delivery_proof = hooks._outbound_delivery_proof_hook
     hooks._inbound_fact_hook = None
     hooks._outbox_intent_hook = None
     hooks._outbox_settle_hook = None
+    hooks._outbound_delivery_proof_hook = None
     try:
         bridge = MultiWriterHotPathBridge(runtime, _identity("node-a"))
         settle_hook = bridge.settle_outbox_action
@@ -519,4 +536,38 @@ async def test_outbox_settle_hook_registration_and_invoke(tmp_path: Path) -> Non
         hooks._inbound_fact_hook = saved_inbound
         hooks._outbox_intent_hook = saved_intent
         hooks._outbox_settle_hook = saved_settle
+        hooks._outbound_delivery_proof_hook = saved_delivery_proof
         await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_delivery_proof_hook_has_one_exact_owner() -> None:
+    saved = hooks._outbound_delivery_proof_hook
+    hooks._outbound_delivery_proof_hook = None
+
+    async def first(_message: Any, receipt: dict[str, Any]) -> bool:
+        return receipt == {"message_id": "m1"}
+
+    async def second(_message: Any, _receipt: dict[str, Any]) -> bool:
+        return True
+
+    try:
+        assert await hooks.invoke_outbound_delivery_proof_hook(
+            object(), {"message_id": "m1"}
+        ) is None
+        hooks.register_outbound_delivery_proof_hook(first)
+        assert await hooks.invoke_outbound_delivery_proof_hook(
+            object(), {"message_id": "m1"}
+        ) is True
+        with pytest.raises(RuntimeError, match="AlreadyRegistered"):
+            hooks.register_outbound_delivery_proof_hook(second)
+        hooks.unregister_outbound_delivery_proof_hook(second)
+        assert await hooks.invoke_outbound_delivery_proof_hook(
+            object(), {"message_id": "m1"}
+        ) is True
+        hooks.unregister_outbound_delivery_proof_hook(first)
+        assert await hooks.invoke_outbound_delivery_proof_hook(
+            object(), {"message_id": "m1"}
+        ) is None
+    finally:
+        hooks._outbound_delivery_proof_hook = saved

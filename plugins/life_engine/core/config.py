@@ -73,6 +73,13 @@ class LifeEngineConfig(BaseConfig):
             "authority_state_path",
             "busy_timeout_seconds",
         },
+        "proactive": {
+            "local_database_path",
+            "local_authority_state_path",
+            "backend_binding_path",
+            "authority_lease_seconds",
+            "authority_renew_interval_seconds",
+        },
         "shared_sync": {
             "enabled",
             "remote_host",
@@ -1506,96 +1513,139 @@ class LifeEngineConfig(BaseConfig):
 
     @config_section("drives")
     class DrivesSection(SectionBase):
-        """冲动引擎配置。"""
+        """退役 Impulse/Leisure 驱动器的 TOML 兼容面。"""
 
         enabled: bool = Field(
-            default=True,
-            description="是否启用冲动引擎。冲动引擎将神经调质状态转化为具体行为建议。",
+            default=False,
+            description="兼容旧 TOML；运行时不会构造第二套冲动引擎。",
         )
 
         inject_to_heartbeat: bool = Field(
-            default=True,
-            description="是否将冲动建议注入心跳 prompt。",
+            default=False,
+            description="兼容旧 TOML；心跳只消费统一注意机会投影。",
         )
 
         curiosity_threshold: float = Field(
             default=0.65,
             ge=0.3,
             le=0.9,
-            description="好奇心冲动触发阈值。",
+            description="兼容旧 TOML；不再参与任何运行时判断。",
         )
 
         sociability_threshold: float = Field(
             default=0.6,
             ge=0.3,
             le=0.9,
-            description="社交欲冲动触发阈值。",
+            description="兼容旧 TOML；不再参与任何运行时判断。",
         )
 
         silence_trigger_minutes: int = Field(
             default=30,
             ge=5,
             le=120,
-            description="沉默多久后触发社交冲动（分钟）。",
+            description="兼容旧 TOML；不再触发主动表达。",
         )
 
     @config_section("streams")
     class StreamsSection(SectionBase):
-        """思考流系统配置。"""
+        """退役 ThoughtStream 的只读配置兼容面。"""
 
         enabled: bool = Field(
-            default=True,
-            description="是否启用思考流系统。思考流给爱莉持久在意的兴趣线索，让她在心跳间有事可想。",
+            default=False,
+            description="兼容旧 TOML；不再启动或注册 ThoughtStream 运行时。",
         )
 
         max_active_streams: int = Field(
             default=5,
             ge=1,
             le=10,
-            description="同时活跃的思考流上限。超过后自动将好奇心最低的转入休眠。",
+            description="兼容旧 TOML；退役归档不会再按容量改变任何状态。",
         )
 
         dormancy_threshold_hours: int = Field(
             default=24,
             ge=1,
             le=72,
-            description="多久不推进后自动进入休眠（小时）。",
+            description="兼容旧 TOML；退役归档不会再按时间改变任何状态。",
         )
 
         inject_to_heartbeat: bool = Field(
             default=True,
-            description="是否将思考流状态注入心跳 prompt。",
+            description="兼容旧 TOML；退役归档不会注入心跳 prompt。",
         )
 
         sync_to_chatter: bool = Field(
             default=True,
-            description="是否将思考流作为注意力脑区同步给 life_chatter。关闭后 chatter transient 中不再注入思考流块。",
+            description="兼容旧 TOML；chatter 只读取 canonical AttentionThread 投影。",
         )
 
         focus_window_minutes: int = Field(
             default=30,
             ge=1,
             le=720,
-            description="思考流焦点窗口（分钟）。last_focused_at 在此窗口内的活跃思考流被视为'当前焦点'，否则归入'背景在意'。",
+            description="兼容旧 TOML；退役归档不再计算焦点窗口。",
         )
 
         curiosity_decay_half_life_hours: float = Field(
             default=12.0,
             ge=0.5,
             le=240.0,
-            description="思考流 curiosity_score 的指数衰减半衰期（小时）。lazy 衰减：每次访问时按距 last_decay_at 的小时数衰减。",
+            description="兼容旧 TOML；退役归档的旧分数不会再被衰减。",
         )
 
         curiosity_floor: float = Field(
             default=0.15,
             ge=0.0,
             le=0.9,
-            description="思考流 curiosity_score 衰减下限。低于此值不再继续衰减。",
+            description="兼容旧 TOML；退役归档不再消费该阈值。",
         )
 
         delta_marking: bool = Field(
             default=True,
-            description="是否在 chatter 同步中给自上次以来 revision 增长的思考流加 🔄(刚推进) 标记。",
+            description="兼容旧 TOML；canonical AttentionThread 不消费该字段。",
+        )
+
+    @config_section("proactive")
+    class ProactiveSection(SectionBase):
+        """统一主动权威及本地 fenced runtime 配置。"""
+
+        local_database_path: str = Field(
+            default="runtime/proactive/proactive.sqlite3",
+            description=(
+                "全局 selectable storage 关闭时，统一主动权威使用的 workspace 内 SQLite 路径。"
+            ),
+        )
+        local_authority_state_path: str = Field(
+            default="runtime/proactive/authority.json",
+            description="本地主动权威的哈希链 authority registry；必须位于 workspace 内。",
+        )
+        backend_binding_path: str = Field(
+            default="runtime/proactive/backend-binding.json",
+            description=(
+                "统一主动历史绑定到唯一 backend generation 的 content-free 标记；"
+                "后端切换必须先完成显式复制、校验和冻结，运行时绝不自动改绑。"
+            ),
+        )
+        authority_lease_seconds: int = Field(
+            default=60,
+            ge=15,
+            le=600,
+            description="本地主动写权威租约秒数；进程锁和 fencing token 共同防止双写。",
+        )
+        authority_renew_interval_seconds: int = Field(
+            default=20,
+            ge=1,
+            le=240,
+            description="本地主动写权威续租间隔；运行时要求严格小于租约的一半。",
+        )
+        expression_claim_lease_seconds: int = Field(
+            default=300,
+            ge=15,
+            le=900,
+            description=(
+                "主动外联可见动作的 DB 时钟租约。崩溃恢复只会在租约过期后"
+                "结算 delivery_unknown，避免扫描器抢占当前进程正在发送的动作。"
+            ),
         )
 
     @config_section("runtime_sync")
@@ -2065,6 +2115,7 @@ class LifeEngineConfig(BaseConfig):
     media_observer: MediaObserverSection = Field(default_factory=MediaObserverSection)
     screen: ScreenSection = Field(default_factory=ScreenSection)
     streams: StreamsSection = Field(default_factory=StreamsSection)
+    proactive: ProactiveSection = Field(default_factory=ProactiveSection)
     runtime_sync: RuntimeSyncSection = Field(default_factory=RuntimeSyncSection)
     drives: DrivesSection = Field(default_factory=DrivesSection)
     minecraft: MinecraftSection = Field(default_factory=MinecraftSection)

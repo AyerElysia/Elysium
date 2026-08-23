@@ -269,6 +269,35 @@ export ELYSIUM_MYSQL_PASSWORD='<MYSQL_PASSWORD>'
 
 详细命令、目标库空库要求、幂等重放、备份与隔离恢复见 [MySQL 迁移、备份与恢复手册](./mysql_migration_and_backup.md)。如果部署本来就使用已经迁移并验证的 MySQL，则不应重复把旧 SQLite 强行导入。
 
+#### 6.1.1 统一主动权威不能拆域迁移
+
+AttentionThread 与 InitiativeSeed 必须和它们的 decision guard、重遇状态、outreach、inbox/turn/claim/platform delivery proof/resolution 一起迁移，不能只复制 Attention 表，也不能丢失已经证明 `spoke` 的 transport proof。维护窗口内由用户手工确认 Elysium 已停写后，先建立包含 proactive SQLite 的冻结快照：
+
+```powershell
+uv run --frozen --no-sync python .\scripts\backup_life_data.py `
+  --data-root .\data `
+  --output <IMMUTABLE_SNAPSHOT_DIR> `
+  --writer-frozen
+```
+
+默认源为 `life_engine_workspace/runtime/proactive/proactive.sqlite3`；若本机配置了其他安全相对路径，必须同时传 `--proactive-sqlite-relative`，不能让备份脚本猜测。`--writer-frozen` 只是对已完成停写窗口的声明，脚本不会也不得替用户停止进程。
+
+随后把这一份快照复制到 fenced MySQL candidate：
+
+```powershell
+uv run --frozen --no-sync python .\scripts\migrate_life_proactive.py `
+  --snapshot <IMMUTABLE_SNAPSHOT_DIR> `
+  --run-id <UNIQUE_PROACTIVE_COPY_RUN>
+```
+
+迁移器逐表复制并校验 canonical root；目标已有完全相同行可幂等续跑，多行、少行或任一值不同都会失败。只有源/目标 aggregate root 完全相等时才追加 content-free 迁移证书，不会修改配置或激活 generation。
+
+全生命域切换审计必须把该 run 作为 `--proactive-run` 传给 `scripts/audit_life_storage_cutover.py`，并同时提供 Life Event、Memory、Subject、Presence/World 与 Learning 的 copy run。报告中的 generation root 使用 `mysql:proactive_authority`；旧 `attention_thread` 单域 run 和旧 ThoughtStream snapshot 均不能满足激活门。
+
+workspace 的 `runtime/proactive/backend-binding.json` 绑定精确 backend identity、generation manifest、authority registry/provider identity 与 scope。运行时只在看到上述已验证迁移证书，且证书同时匹配当前 workspace 源 marker、源 binding identity、源历史 root 与目标证据时，才允许显式切到目标 binding；另一工作区的证书、没有证书、老 marker 已有历史或任一 identity 不一致都会拒绝启动。marker 已指向新后端后，旧后端中残留的历史 binding chain 也不能覆盖当前 marker；反向切换必须重新冻结、复制、验证并形成新的迁移证书与 binding epoch。禁止删除 marker、改空数据库或复制一个 marker/证书文件来绕过。
+
+回退同样不能只改 `[storage].backend`：目标尚未产生任何新写入时，可保留冻结源和全部 manifest 作为回退证据；一旦目标开始写入，旧源已经落后，必须先重新停写、完成全生命域反向导出/快照、逐项校验并登记新的 verified generation。项目不提供“自动回退并自动合并分叉”的捷径。
+
 现役 MySQL generation 合并新版本后，如果启动报某个新增生命域表不存在，不得让业务启动自动建表，也不要重新执行旧 SQLite 全量迁移。先停止 Elysium，在维护窗口使用同一份 `config/core.toml` 执行对应的幂等增量升级：
 
 ```powershell
@@ -294,7 +323,9 @@ uv run --frozen --no-sync python .\scripts\adopt_life_mysql_baseline.py upgrade-
 
 Life Engine 插件配置不再包含 `[storage]` 或 `[storage_mysql]`；MySQL 的连接、generation、registry 和 owner 登记只在 `config/core.toml` 配置，后端选择只看 `[storage].backend`。`backend="local"` 时系统自动使用 file authority、忽略保留的 MySQL generation；`backend="mysql"` 时系统自动使用 MySQL authority并严格校验该 generation。旧 `[storage].authority_provider` 会被配置迁移移除，切换时不要清空/恢复 generation，也不要修改第二个开关。插件仅保留 local 模式所需的 `[storage_local]` 路径。任何插件级 `enabled`、`authoritative_backend`、generation 或 MySQL 连接字段都是旧配置，严格校验会拒绝加载。
 
-MySQL 模式并不意味着把 Chroma 或媒体字节强行塞入关系表：Life Event、Life Memory、Presence、World、Learning、Attention 和主体文档版本由 MySQL 作为权威；Chroma、全文索引和工作区 Markdown 是可重建投影；图片、语音、视频和附件字节仍按受管媒体合同保存在文件或对象存储中，MySQL 保存其身份、哈希、权限和位置元数据。旧 `life_engine_workspace/thoughts/streams.json` 仅属于 local 模式和迁移证据；MySQL selected runtime 不得实例化文件型 `ThoughtStreamManager`，也不得继续修改该文件。
+MySQL 模式并不意味着把 Chroma 或媒体字节强行塞入关系表：Life Event、Life Memory、Presence、World、Learning、统一主动权威和主体文档版本由 MySQL 作为权威；Chroma、全文索引和工作区 Markdown 是可重建投影；图片、语音、视频和附件字节仍按受管媒体合同保存在文件或对象存储中，MySQL 保存其身份、哈希、权限和位置元数据。旧 `life_engine_workspace/thoughts/streams.json` 仅是迁移证据；可写 `ThoughtStreamManager` 已删除，任何模式都不得继续修改该文件。
+
+统一主动历史另有 `runtime/proactive/backend-binding.json`（可配置）记录 content-free backend identity 与 generation。它不含主体正文，也不是迁移工具。当前 binding 与拟启用 backend/generation 不一致时，启动必须失败；先在用户维护窗口完成复制、冻结、逐项校验与显式改绑，禁止删除 marker、改成空库或让运行时自动迁移来绕过。
 
 `action-report_state` 的提交目标是不可变 Life Event 与 World assertion，用于记录有来源的场景、关系或状态观察；它不是 `MEMORY.md` 主体文档写入。要修改 MySQL 中的 `MEMORY.md` current head，聊天意识必须走下述主体候选复盘与明确接受流程，不能把 World assertion 回执表述为主体文档已更新。
 

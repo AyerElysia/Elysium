@@ -9,7 +9,7 @@ import json
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from datetime import UTC, datetime
-from typing import Any, TypeVar
+from typing import Any, AsyncContextManager, TypeVar
 
 from sqlalchemy import bindparam, text
 from sqlalchemy.exc import DBAPIError
@@ -39,6 +39,10 @@ from ..attention_threads.projection import (
 )
 from .contracts import StorageBackendRuntime
 from .models import BackendKind
+from .proactive_decision_guard import (
+    ProactiveDecisionGuardConflict,
+    claim_proactive_decision,
+)
 
 _T = TypeVar("_T")
 _MAX_WRITE_ATTEMPTS = 3
@@ -80,11 +84,29 @@ def _json_string_tuple(value: Any) -> tuple[str, ...]:
 class SQLAttentionThreadStore:
     """Authority and ephemeral focus store bound to one coherent runtime."""
 
-    def __init__(self, runtime: StorageBackendRuntime) -> None:
+    def __init__(
+        self,
+        runtime: StorageBackendRuntime,
+        *,
+        validate_active_actor: Callable[[str], Awaitable[bool]] | None = None,
+        actor_decision_guard: (
+            Callable[[str], AsyncContextManager[None]] | None
+        ) = None,
+    ) -> None:
         if not runtime.enabled or runtime.engine is None:
             raise RuntimeError("attention adapter requires an enabled storage runtime")
+        if (
+            runtime.backend == BackendKind.LOCAL
+            and validate_active_actor is not None
+            and actor_decision_guard is None
+        ):
+            raise ValueError(
+                "local attention actor validation requires a commit gate"
+            )
         self.runtime = runtime
         self.backend = runtime.backend
+        self._validate_active_actor = validate_active_actor
+        self._actor_decision_guard = actor_decision_guard
 
     @property
     def _for_update(self) -> str:
@@ -124,6 +146,17 @@ class SQLAttentionThreadStore:
     async def _write(
         self,
         operation: Callable[[AsyncSession], Awaitable[_T]],
+        *,
+        actor_id: str = "",
+    ) -> _T:
+        if actor_id and self._actor_decision_guard is not None:
+            async with self._actor_decision_guard(actor_id):
+                return await self._write_attempts(operation)
+        return await self._write_attempts(operation)
+
+    async def _write_attempts(
+        self,
+        operation: Callable[[AsyncSession], Awaitable[_T]],
     ) -> _T:
         for attempt in range(_MAX_WRITE_ATTEMPTS):
             try:
@@ -142,6 +175,10 @@ class SQLAttentionThreadStore:
         *,
         database_now: datetime,
     ) -> None:
+        if self._validate_active_actor is not None:
+            if not await self._validate_active_actor(actor_id):
+                raise AttentionThreadActorInactive(actor_id)
+            return
         row = (
             (
                 await session.execute(
@@ -410,6 +447,22 @@ class SQLAttentionThreadStore:
         """Atomically gate the actor, append the event, and CAS the view."""
 
         async def operation(session: AsyncSession) -> AttentionThreadCommit:
+            database_now = await self._database_now(session)
+            try:
+                await claim_proactive_decision(
+                    session,
+                    backend=self.backend,
+                    occurrence_id=command.occurrence_id,
+                    record_family="attention",
+                    command_sha256=command.canonical_sha256(),
+                    occurred_at=command.occurred_at,
+                    recorded_at=database_now,
+                )
+            except ProactiveDecisionGuardConflict as exc:
+                raise AttentionThreadConflict(
+                    command.occurrence_id,
+                    thread_id=command.thread_id,
+                ) from exc
             replay = await self._event_by_occurrence_in_session(
                 session,
                 command.occurrence_id,
@@ -431,7 +484,6 @@ class SQLAttentionThreadStore:
                     idempotent_replay=True,
                 )
 
-            database_now = await self._database_now(session)
             await self._assert_active_actor(
                 session,
                 command.actor_consciousness_instance_id,
@@ -475,7 +527,10 @@ class SQLAttentionThreadStore:
                 idempotent_replay=False,
             )
 
-        return await self._write(operation)
+        return await self._write(
+            operation,
+            actor_id=command.actor_consciousness_instance_id,
+        )
 
     async def get(self, thread_id: str) -> AttentionThreadView | None:
         identity = str(thread_id or "").strip()
@@ -860,7 +915,10 @@ class SQLAttentionThreadStore:
                     raise AttentionThreadConflict(focus.instance_id)
             return focus
 
-        return await self._write(operation)
+        return await self._write(
+            operation,
+            actor_id=focus.instance_id,
+        )
 
     async def get_focus(self, instance_id: str) -> InstanceFocus | None:
         identity = str(instance_id or "").strip()
@@ -919,9 +977,10 @@ class SQLAttentionThreadStore:
         """Return content-free authority, projection, and focus diagnostics."""
 
         async with self.runtime.unit_of_work() as uow:
+            session = uow.session
             row = (
                 (
-                    await uow.session.execute(
+                    await session.execute(
                         text(
                             """SELECT
                                 (SELECT COUNT(*) FROM attention_thread_events)
@@ -942,8 +1001,89 @@ class SQLAttentionThreadStore:
                 .mappings()
                 .one()
             )
+            event_rows = (
+                (
+                    await session.execute(
+                        text(
+                            f"""SELECT {self._event_columns()}
+                            FROM attention_thread_events
+                            ORDER BY position"""
+                        )
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            head_rows = (
+                (
+                    await session.execute(
+                        text(
+                            f"""SELECT {self._view_columns()}
+                            FROM attention_thread_heads"""
+                        )
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            focus_thread_ids = tuple(
+                str(value or "")
+                for value in (
+                    await session.scalars(
+                        text(
+                            """SELECT thread_id
+                            FROM attention_instance_focus"""
+                        )
+                    )
+                ).all()
+            )
+
+        consistency_errors: set[str] = set()
+        replayed: dict[str, AttentionThreadView] = {}
+        try:
+            seen_occurrences: set[str] = set()
+            for raw in event_rows:
+                event = self._decode_event(raw)
+                if event.occurrence_id in seen_occurrences:
+                    raise AttentionThreadConflict(event.occurrence_id)
+                seen_occurrences.add(event.occurrence_id)
+                replayed[event.thread_id] = apply_attention_thread_event(
+                    replayed.get(event.thread_id),
+                    event,
+                )
+        except Exception:  # noqa: BLE001 - health stays content-free
+            consistency_errors.add("attention_event_replay_failed")
+
+        persisted: dict[str, AttentionThreadView] = {}
+        try:
+            for raw in head_rows:
+                view = self._decode_view(raw)
+                if view.thread_id in persisted:
+                    raise AttentionThreadConflict(view.thread_id)
+                persisted[view.thread_id] = view
+        except Exception:  # noqa: BLE001 - health stays content-free
+            consistency_errors.add("attention_head_decode_failed")
+
+        if not consistency_errors & {
+            "attention_event_replay_failed",
+            "attention_head_decode_failed",
+        }:
+            if replayed.keys() - persisted.keys():
+                consistency_errors.add("attention_head_missing")
+            if persisted.keys() - replayed.keys():
+                consistency_errors.add("attention_head_orphan")
+            if any(
+                replayed[thread_id] != persisted[thread_id]
+                for thread_id in replayed.keys() & persisted.keys()
+            ):
+                consistency_errors.add("attention_head_mismatch")
+        if any(
+            thread_id and thread_id not in replayed
+            for thread_id in focus_thread_ids
+        ):
+            consistency_errors.add("attention_focus_orphan")
         return {
-            "status": "healthy",
+            "status": "failed" if consistency_errors else "healthy",
             "event_count": int(row["event_count"]),
             "source_frontier": int(row["frontier"]),
             "threads": {
@@ -952,7 +1092,9 @@ class SQLAttentionThreadStore:
                 "closed": int(row["closed_count"]),
             },
             "instance_focus_count": int(row["focus_count"]),
-            "schema_version": 1,
+            "replayed_thread_count": len(replayed),
+            "consistency_error_types": tuple(sorted(consistency_errors)),
+            "schema_version": 2,
         }
 
 

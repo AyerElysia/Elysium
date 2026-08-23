@@ -48,6 +48,45 @@ class TestBaseAction:
         assert action.action_description == "A test action"
         assert action.primary_action is False
 
+    def test_proactive_outreach_action_message_id_is_stable_and_scoped(
+        self,
+        mock_chat_stream,
+        mock_plugin,
+    ):
+        trigger = MagicMock()
+        trigger.extra = {
+            "life_turn_scope": {
+                "stream_id": "qq-stream",
+                "turn_key": "turn-one",
+                "initiative_outreach_occurrences": ["outreach:one"],
+            }
+        }
+        first = ConcreteAction(mock_chat_stream, mock_plugin)
+        first._trigger_message = trigger
+        first._tool_call_id = "tool-call-one"
+        second = ConcreteAction(mock_chat_stream, mock_plugin)
+        second._trigger_message = trigger
+        second._tool_call_id = "tool-call-one"
+
+        first_id = first._action_message_id("qq-stream", 0)
+        assert first_id == second._action_message_id("qq-stream", 0)
+        assert first_id.startswith("action_test_action_")
+        assert first._action_origin_extra()[
+            "initiative_outreach_occurrences"
+        ] == ["outreach:one"]
+        assert first._action_message_id("qq-stream", 1) != first_id
+
+        changed_trigger = MagicMock()
+        changed_trigger.extra = {
+            "life_turn_scope": {
+                "stream_id": "qq-stream",
+                "turn_key": "turn-two",
+                "initiative_outreach_occurrences": ["outreach:two"],
+            }
+        }
+        second._trigger_message = changed_trigger
+        assert second._action_message_id("qq-stream", 0) != first_id
+
     def test_get_signature(self, mock_chat_stream, mock_plugin):
         """测试获取签名。"""
         # 默认情况下 plugin_name 是 unknown_plugin
@@ -261,7 +300,15 @@ class TestBaseAction:
 
         # Mock MessageSender
         mock_sender = MagicMock()
-        mock_sender.send_message = AsyncMock(return_value=True)
+
+        async def send_with_receipt(message):
+            message.extra["delivery_status"] = "delivered"
+            message.extra["delivery_receipt_sha256"] = "e" * 64
+            message.extra["delivery_message_id"] = "message:base-action"
+            message.extra["delivery_proof_status"] = "durable"
+            return True
+
+        mock_sender.send_message = AsyncMock(side_effect=send_with_receipt)
         mock_get_sender.return_value = mock_sender
 
         action = ConcreteAction(mock_chat_stream, mock_plugin)
@@ -269,11 +316,16 @@ class TestBaseAction:
 
         assert result is True
         mock_sender.send_message.assert_called_once()
+        assert action._last_delivery_status == "delivered"
+        assert action._last_delivery_receipt_sha256 == "e" * 64
+        assert action._last_delivery_message_id == "message:base-action"
+        assert action._last_delivery_proof_status == "durable"
 
     @patch("src.core.transport.message_send.get_message_sender")
     def test_send_to_stream_with_message(self, mock_get_sender, mock_chat_stream, mock_plugin):
         """测试 _send_to_stream 发送 Message 对象。"""
         import asyncio
+
         from src.core.models.message import Message, MessageType
 
         # Mock MessageSender

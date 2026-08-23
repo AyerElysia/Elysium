@@ -48,6 +48,12 @@ logger = log_api.get_logger("life_engine.tools")
 
 _MEMORY_READ_MAX_BYTES = DEFAULT_MAX_DOCUMENT_BYTES
 _SUBJECT_AUTHORITY_PATHS = frozenset({"SOUL.md", "USER.md", "MEMORY.md"})
+_PROACTIVE_PATH_DEFAULTS = {
+    "local_database_path": "runtime/proactive/proactive.sqlite3",
+    "local_authority_state_path": "runtime/proactive/authority.json",
+    "backend_binding_path": "runtime/proactive/backend-binding.json",
+}
+_RETIRED_IMMUTABLE_PATHS = frozenset({"thoughts/streams.json"})
 
 
 def _get_workspace_read_only(plugin: Any) -> Path:
@@ -369,6 +375,106 @@ def _subject_direct_mutation_error(path: str) -> str:
     )
 
 
+def _workspace_relative(workspace: Path, target: Path) -> str | None:
+    try:
+        return target.resolve().relative_to(workspace).as_posix()
+    except ValueError:
+        return None
+
+
+def _configured_proactive_paths(plugin: Any) -> dict[str, Path]:
+    """Resolve configured authority files without creating any target."""
+
+    workspace = _get_workspace(plugin)
+    config = getattr(plugin, "config", None)
+    proactive = (
+        config.proactive
+        if isinstance(config, LifeEngineConfig)
+        else None
+    )
+    resolved: dict[str, Path] = {}
+    for field_name, default in _PROACTIVE_PATH_DEFAULTS.items():
+        value = str(getattr(proactive, field_name, default) or default).strip()
+        candidate = Path(value)
+        candidate = (
+            candidate.resolve()
+            if candidate.is_absolute()
+            else (workspace / candidate).resolve()
+        )
+        try:
+            candidate.relative_to(workspace)
+        except ValueError:
+            # Runtime startup rejects this invalid configuration.  It cannot
+            # authorize a generic tool to touch outside-workspace state.
+            continue
+        resolved[field_name] = candidate
+    return resolved
+
+
+def _workspace_authority_mutation_path(
+    plugin: Any,
+    target: Path,
+) -> tuple[str, str] | None:
+    """Recognize runtime-owned files after symlink/path resolution."""
+
+    workspace = _get_workspace(plugin)
+    exact_target = target.resolve()
+    relative = _workspace_relative(workspace, exact_target)
+    if relative is None:
+        return None
+    if relative in _RETIRED_IMMUTABLE_PATHS:
+        return relative, "retired_thought_stream_archive"
+
+    paths = _configured_proactive_paths(plugin)
+    database = paths.get("local_database_path")
+    if database is not None:
+        database_family = {
+            database,
+            database.with_name(database.name + "-wal"),
+            database.with_name(database.name + "-shm"),
+            database.with_name(database.name + "-journal"),
+        }
+        if exact_target in database_family:
+            return relative, "proactive_database"
+
+    authority = paths.get("local_authority_state_path")
+    if authority is not None:
+        authority_family = {
+            authority,
+            authority.with_suffix(".writer.lock"),
+            authority.with_suffix(authority.suffix + ".lock"),
+        }
+        if exact_target in authority_family:
+            return relative, "proactive_authority_registry"
+
+    binding = paths.get("backend_binding_path")
+    if binding is not None:
+        binding_family = {
+            binding,
+            binding.with_suffix(binding.suffix + ".lock"),
+        }
+        if exact_target in binding_family:
+            return relative, "proactive_backend_binding"
+
+    for owner in paths.values():
+        if (
+            exact_target.parent == owner.parent
+            and exact_target.name.startswith(f".{owner.name}.")
+            and exact_target.name.endswith(".tmp")
+        ):
+            return relative, "proactive_atomic_state"
+    return None
+
+
+def _workspace_authority_mutation_error(path: str, owner: str) -> str:
+    return (
+        f"WorkspaceAuthorityMutationBlocked: `{path}` 由 {owner} 独占管理。"
+        "通用 file 工具和内部子代理不得创建、覆盖或编辑该路径；"
+        "请使用 nucleus_proactive_query / nucleus_proactive_command，"
+        "旧 ThoughtStream 归档则只能只读。"
+    )
+
+
 class LifeEngineWakeDFCTool(BaseTool):
     """Fail-closed shell for historical direct calls of the retired wake tool."""
 
@@ -597,6 +703,9 @@ class LifeEngineWriteFileTool(BaseTool):
         subject_path = _subject_authority_path(self.plugin, target)
         if subject_path is not None:
             return False, _subject_direct_mutation_error(subject_path)
+        reserved = _workspace_authority_mutation_path(self.plugin, target)
+        if reserved is not None:
+            return False, _workspace_authority_mutation_error(*reserved)
         existed = target.exists()
         before_content = _read_trace_before_content(target, encoding)
 
@@ -697,6 +806,9 @@ class LifeEngineEditFileTool(BaseTool):
         subject_path = _subject_authority_path(self.plugin, target)
         if subject_path is not None:
             return False, _subject_direct_mutation_error(subject_path)
+        reserved = _workspace_authority_mutation_path(self.plugin, target)
+        if reserved is not None:
+            return False, _workspace_authority_mutation_error(*reserved)
         if not target.exists():
             return False, f"文件不存在: {path}"
         if not target.is_file():
@@ -773,8 +885,8 @@ class LifeEngineEditFileTool(BaseTool):
             return False, f"编辑文件失败: {e}"
 
 
-# LifeEngineMoveFileTool 和 LifeEngineDeleteFileTool 已移除。
-# 移动/删除文件可通过 nucleus_bash 执行 mv/rm 命令实现。
+# LifeEngineMoveFileTool 和 LifeEngineDeleteFileTool 已移除；只读 sandbox
+# 中的 nucleus_bash 也不能移动或删除 workspace 文件。
 
 
 class LifeEngineListFilesTool(BaseTool):
@@ -974,6 +1086,9 @@ class LifeEngineMakeDirectoryTool(BaseTool):
             return False, str(result)
 
         target = result
+        reserved = _workspace_authority_mutation_path(self.plugin, target)
+        if reserved is not None:
+            return False, _workspace_authority_mutation_error(*reserved)
         if target.exists():
             if target.is_dir():
                 return True, {
@@ -1009,7 +1124,8 @@ class LifeEngineRunAgentTool(BaseTool):
         "\n\n"
         "**心跳态边界（重要）：**\n"
         "- life_engine 是潜意识 / 内在状态层，不是后台项目助手。\n"
-        "- 只用于整理 life_engine 私有记忆、笔记、思考流，或诊断中枢自身问题。\n"
+        "- 只用于整理 life_engine 私有记忆、普通笔记，或诊断中枢自身问题。\n"
+        "- 主动状态只能通过统一 proactive 工具读写；旧 ThoughtStream 归档只能只读。\n"
         "- 不要让子代理承接用户任务、查项目配置、跑命令、改代码、画图或生成对外交付物。\n"
         "- 如果任务来自用户当前请求，交给 life_chatter / 表达层判断和执行。\n"
         "\n"

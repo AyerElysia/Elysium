@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -129,11 +130,31 @@ class _FakeLifeEventStore:
         return await self.health_snapshot()
 
 
+class _EmptyMappingResult:
+    """SQLAlchemy-shaped empty result for contract-only runtime scans."""
+
+    def mappings(self) -> _EmptyMappingResult:
+        return self
+
+    def all(self) -> list[dict[str, Any]]:
+        return []
+
+
+class _FakeSession:
+    async def execute(self, _statement: Any, _parameters: Any = None) -> Any:
+        return _EmptyMappingResult()
+
+
 class _FakeRuntime:
     def __init__(self, backend: BackendKind) -> None:
         self.enabled = True
         self.backend = backend
         self.backend_identity = f"{backend.value}://service-contract"
+        self.generation = SimpleNamespace(
+            generation_id="fake-generation",
+            schema_version=3,
+            source_snapshot_sha256="f" * 64,
+        )
         self.close_calls = 0
         self.renew_calls: list[int] = []
         self.revoke_calls = 0
@@ -142,6 +163,17 @@ class _FakeRuntime:
         self.claim_calls: list[dict[str, Any]] = []
         self.learning_open_writer_claims: list[Any | None] = []
         self.invalidated_claims: list[Any] = []
+
+    @asynccontextmanager
+    async def unit_of_work(self, **_kwargs: Any) -> Any:
+        """Expose the same transactional boundary as StorageBackendRuntime.
+
+        These service tests start with no historical proactive decisions, so
+        the startup reconciliation legitimately observes two empty ledgers.
+        Dedicated proactive-runtime tests cover populated rows and conflicts.
+        """
+
+        yield SimpleNamespace(session=_FakeSession())
 
     async def acquire_singleton_writer(self, **kwargs: Any) -> Any:
         self.claim_calls.append(dict(kwargs))
@@ -212,6 +244,32 @@ class _FakeLearningStore:
             "latest_position": 0,
             "projection_states": {},
         }
+
+
+class _FakeInitiativeRecordStore:
+    async def health_snapshot(self) -> dict[str, Any]:
+        return {
+            "component": "proactive_initiative",
+            "status": "healthy",
+            "open_count": 0,
+            "released_count": 0,
+            "namespaces": {},
+        }
+
+    async def list_seeds(self, *, include_released: bool = False) -> tuple:
+        del include_released
+        return ()
+
+    async def get_seed(self, _seed_id: str) -> None:
+        return None
+
+    async def due_reencounters(self, *, now: str) -> tuple:
+        del now
+        return ()
+
+    async def pending_outreach(self, *, limit: int = 32) -> tuple:
+        del limit
+        return ()
 
 
 class _FakeAttentionStore:
@@ -414,6 +472,26 @@ def _install_selected_factories(
         factory_calls.append(("attention", initialize_schema))
         return SimpleNamespace(authority=attention_store, focus=attention_store)
 
+    async def _open_initiative(runtime: _FakeRuntime) -> _FakeInitiativeRecordStore:
+        assert runtime.backend == backend
+        factory_calls.append(("initiative", False))
+        return _FakeInitiativeRecordStore()
+
+    async def _ensure_proactive_binding(**_kwargs: Any) -> dict[str, Any]:
+        return {
+            "schema_version": 2,
+            "binding_epoch": 1,
+            "binding_sha256": "b" * 64,
+        }
+
+    async def _verify_proactive_binding(**_kwargs: Any) -> dict[str, Any]:
+        return {
+            "component": "proactive_backend_binding",
+            "status": "healthy",
+            "binding_epoch": 1,
+            "binding_sha256": "b" * 64,
+        }
+
     monkeypatch.setattr(
         "plugins.life_engine.storage.factory.open_storage_backend",
         _open_runtime,
@@ -441,6 +519,18 @@ def _install_selected_factories(
     monkeypatch.setattr(
         "plugins.life_engine.storage.attention_factory.open_attention_thread_stores",
         _open_attention,
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.storage.initiative_factory.open_initiative_record_store",
+        _open_initiative,
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.proactive.backend_binding.ensure_proactive_backend_binding",
+        _ensure_proactive_binding,
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.proactive.backend_binding.verify_proactive_backend_binding",
+        _verify_proactive_binding,
     )
     return runtimes, factory_calls
 
@@ -493,6 +583,7 @@ async def test_selected_service_uses_one_backend_for_presence_world_and_events(
         ("attention", False),
         ("learning", False),
         ("learning", False),
+        ("initiative", False),
     ]
     assert first.storage_runtime is runtimes[0]
     assert [
@@ -1056,9 +1147,9 @@ async def test_selected_service_injects_attention_and_clears_only_instance_focus
         thread_id=command.thread_id,
     )
     await service.set_instance_attention_focus(focus)
-    assert await service.attention_thread_service.get_focus(actor.instance_id) == focus
+    assert await service.proactive_authority.get_attention_focus(actor.instance_id) == focus
     assert await service.suspend_consciousness_instance(actor.instance_id)
-    assert await service.attention_thread_service.get_focus(actor.instance_id) is None
+    assert await service.proactive_authority.get_attention_focus(actor.instance_id) is None
     # Suspending an instance clears only its ephemeral focus; the subject event
     # and resulting thread remain untouched.
     assert page.source_frontier == 1
@@ -1067,8 +1158,8 @@ async def test_selected_service_injects_attention_and_clears_only_instance_focus
 
     await service._close_selected_storage()
     assert runtimes[0].close_calls == 1
-    with pytest.raises(RuntimeError, match="AttentionThreadAuthorityNotStarted"):
-        _ = service.attention_thread_service
+    with pytest.raises(RuntimeError, match="ProactiveAuthorityNotStarted"):
+        _ = service.proactive_authority
 
 
 async def test_service_stop_aggregates_consumer_failures_and_closes_runtime_last(
@@ -1689,7 +1780,7 @@ async def test_multi_writer_gate_fails_closed_on_unretired_singleton(
 
     stores = build_fake_stores()
     ledger = _FakeLifeEventStore()
-    runtimes, factory_calls = _install_selected_factories(
+    _runtimes, factory_calls = _install_selected_factories(
         monkeypatch,
         BackendKind.MYSQL,
         stores,
@@ -1714,6 +1805,7 @@ async def test_multi_writer_gate_fails_closed_on_unretired_singleton(
     runtime.generation = SimpleNamespace(
         generation_id="contract-g",
         schema_version=3,
+        source_snapshot_sha256="c" * 64,
     )
     service._storage_runtime = runtime
     service._storage_factory_settings = replace(
@@ -1772,6 +1864,7 @@ async def test_multi_writer_gate_keeps_learning_projector_singleton(
     runtime.generation = SimpleNamespace(
         generation_id="contract-g",
         schema_version=3,
+        source_snapshot_sha256="c" * 64,
     )
     service._storage_runtime = runtime
     service._storage_factory_settings = replace(

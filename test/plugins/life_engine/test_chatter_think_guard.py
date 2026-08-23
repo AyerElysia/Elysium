@@ -713,10 +713,13 @@ def test_life_tool_parallel_policy_only_allows_safe_reads() -> None:
     assert is_life_tool_call_parallel_safe(
         SimpleNamespace(name="nucleus_read_file", args={})
     )
-    assert is_life_tool_call_parallel_safe(
+    assert not is_life_tool_call_parallel_safe(
         SimpleNamespace(name="nucleus_manage_thought_stream", args={"action": "list"})
     )
     assert is_life_tool_call_parallel_safe(
+        SimpleNamespace(name="nucleus_proactive_query", args={"resource": "attention"})
+    )
+    assert not is_life_tool_call_parallel_safe(
         SimpleNamespace(name="nucleus_manage_attention_thread", args={"action": "list"})
     )
     assert not is_life_tool_call_parallel_safe(

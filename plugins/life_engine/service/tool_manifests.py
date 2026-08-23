@@ -46,9 +46,8 @@ CONSCIOUSNESS_TOOL_MANIFESTS: dict[str, list[str]] = {
         "action-send_emoji_meme",
         "tool-platform_action",
         "tool-nucleus_minecraft",
-        "tool-nucleus_manage_initiative_seed",
-        "tool-nucleus_reachability",
-        "tool-nucleus_begin_outreach",
+        "tool-nucleus_proactive_query",
+        "tool-nucleus_proactive_command",
         # 基础能力（文件/终端/屏幕/任务/日程/联网/子代理/媒体）：
         # 与 chatter._build_primary_tool_guide 静态文案对齐——文案列出的工具必须
         # 在 chat manifest 里，否则模型照文案调用会被过滤成"未知的工具"
@@ -73,17 +72,15 @@ CONSCIOUSNESS_TOOL_MANIFESTS: dict[str, list[str]] = {
     # 我的世界意识：具身交互，纯视觉→键鼠
     "minecraft": [
         "tool-nucleus_minecraft",
-        "tool-nucleus_manage_initiative_seed",
-        "tool-nucleus_reachability",
-        "tool-nucleus_begin_outreach",
+        "tool-nucleus_proactive_query",
+        "tool-nucleus_proactive_command",
         "action-life_send_text",
         "action-report_state",
     ],
     # 直播意识：弹幕互动，跨场景感知
     "livestream": [
-        "tool-nucleus_manage_initiative_seed",
-        "tool-nucleus_reachability",
-        "tool-nucleus_begin_outreach",
+        "tool-nucleus_proactive_query",
+        "tool-nucleus_proactive_command",
         "action-life_send_text",
         "action-report_state",
         "tool-inner_query",
@@ -91,9 +88,8 @@ CONSCIOUSNESS_TOOL_MANIFESTS: dict[str, list[str]] = {
     ],
     # 语音通话意识：实时语音交互，跨场景感知
     "voice_live": [
-        "tool-nucleus_manage_initiative_seed",
-        "tool-nucleus_reachability",
-        "tool-nucleus_begin_outreach",
+        "tool-nucleus_proactive_query",
+        "tool-nucleus_proactive_command",
         "action-report_state",  # 报告通话状态到 WorldState
         "tool-inner_query",  # 向潜意识查询
         "tool-conversation_evidence",  # 有界查阅对话证据

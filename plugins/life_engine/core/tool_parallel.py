@@ -17,6 +17,7 @@ _PARALLEL_SAFE_TOOL_NAMES: frozenset[str] = frozenset(
         "nucleus_list_schedules",
         "nucleus_list_todos",
         "nucleus_memory_stats",
+        "nucleus_proactive_query",
         "nucleus_read_file",
         "nucleus_web_search",
     }
@@ -27,22 +28,11 @@ def _tool_call_name(call: Any) -> str:
     return str(getattr(call, "name", "") or "").strip().lower()
 
 
-def _tool_call_args(call: Any) -> dict[str, Any]:
-    raw_args = getattr(call, "args", {}) or {}
-    return dict(raw_args) if isinstance(raw_args, dict) else {}
-
-
 def is_life_tool_call_parallel_safe(call: Any) -> bool:
     """Return whether a life_engine tool call can be grouped for parallel execution."""
     name = _tool_call_name(call)
     if not name or name.startswith("action-"):
         return False
-
-    if name in {
-        "nucleus_manage_attention_thread",
-        "nucleus_manage_thought_stream",
-    }:
-        return str(_tool_call_args(call).get("action", "") or "").strip().lower() == "list"
 
     return name in _PARALLEL_SAFE_TOOL_NAMES
 

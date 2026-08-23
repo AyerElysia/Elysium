@@ -2838,6 +2838,11 @@ class MemoryWitnessCoordinator:
         records: Sequence[ExperienceOccurrenceRef],
     ) -> _AuthoringResult:
         cfg = self.config
+        # Resolve the unified subject projection before allocating a model
+        # request or preparing transient World delivery.  A projection
+        # manifest conflict is a recoverable authority precondition failure;
+        # model configuration must not mask it or advance any cursor.
+        system_prompt = await self._build_system_prompt(instance)
         task_name = str(getattr(cfg, "model_task_name", "witness") or "witness")
         model_set = get_model_set_by_task(task_name)
         if not model_set:
@@ -2845,7 +2850,7 @@ class MemoryWitnessCoordinator:
         perception = await self._service.prepare_perception(instance.instance_id)
         request = LLMRequest(model_set, "life_memory_witness")
         request.add_payload(
-            LLMPayload(ROLE.SYSTEM, Text(await self._build_system_prompt(instance)))
+            LLMPayload(ROLE.SYSTEM, Text(system_prompt))
         )
         recent_subconscious = await self._build_recent_subconscious_background()
         if recent_subconscious:

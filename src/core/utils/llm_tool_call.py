@@ -33,6 +33,9 @@ class _PreparedCall:
     exec_success: bool = False
     result_value: Any = ""
     technical_outcome: str = ""
+    delivery_receipt_sha256: str = ""
+    delivery_message_id: str = ""
+    delivery_proof_status: str = ""
 
 
 class ToolCallExecutionResult(tuple[bool, bool]):
@@ -44,9 +47,17 @@ class ToolCallExecutionResult(tuple[bool, bool]):
         success: bool,
         *,
         technical_outcome: str = "",
+        delivery_receipt_sha256: str = "",
+        delivery_message_id: str = "",
+        delivery_proof_status: str = "",
     ) -> "ToolCallExecutionResult":
         instance = super().__new__(cls, (bool(appended), bool(success)))
         instance.technical_outcome = str(technical_outcome or "")
+        instance.delivery_receipt_sha256 = str(
+            delivery_receipt_sha256 or ""
+        )
+        instance.delivery_message_id = str(delivery_message_id or "")
+        instance.delivery_proof_status = str(delivery_proof_status or "")
         return instance
 
     @property
@@ -385,6 +396,15 @@ async def run_tool_call(
                 item.technical_outcome = str(
                     getattr(result, "technical_outcome", "") or ""
                 )
+                item.delivery_receipt_sha256 = str(
+                    getattr(result, "delivery_receipt_sha256", "") or ""
+                )
+                item.delivery_message_id = str(
+                    getattr(result, "delivery_message_id", "") or ""
+                )
+                item.delivery_proof_status = str(
+                    getattr(result, "delivery_proof_status", "") or ""
+                )
                 # Preserve structured tool results.  ToolResult owns the
                 # canonical JSON rendering; converting a dict with ``str``
                 # produces a Python repr and destroys its transport contract.
@@ -409,6 +429,9 @@ async def run_tool_call(
             True,
             item.exec_success,
             technical_outcome=item.technical_outcome,
+            delivery_receipt_sha256=item.delivery_receipt_sha256,
+            delivery_message_id=item.delivery_message_id,
+            delivery_proof_status=item.delivery_proof_status,
         )
         for item in prepared
     ]

@@ -32,6 +32,9 @@ def create_life_backup(
     *,
     writer_frozen: bool = False,
     core_sqlite_relative: Path = Path("Elysium.db"),
+    proactive_sqlite_relative: Path = Path(
+        "life_engine_workspace/runtime/proactive/proactive.sqlite3"
+    ),
     precreated_output: bool = False,
 ) -> dict[str, Any]:
     """Compatibility wrapper around the versioned snapshot implementation."""
@@ -46,11 +49,24 @@ def create_life_backup(
         or any(part in {"", ".", ".."} for part in core_sqlite_relative.parts)
     ):
         raise LifeBackupError("Core SQLite 路径必须是 data 下的安全相对路径")
+    if (
+        proactive_sqlite_relative.is_absolute()
+        or not proactive_sqlite_relative.parts
+        or any(part in {"", ".", ".."} for part in proactive_sqlite_relative.parts)
+    ):
+        raise LifeBackupError("主动系统 SQLite 路径必须是 data 下的安全相对路径")
+    default_proactive = Path(
+        "life_engine_workspace/runtime/proactive/proactive.sqlite3"
+    )
     layout = replace(
         default_layout,
-        sqlite_sources=(
-            core_sqlite_relative,
-            *default_layout.sqlite_sources[1:],
+        sqlite_sources=tuple(
+            core_sqlite_relative
+            if relative == default_layout.sqlite_sources[0]
+            else proactive_sqlite_relative
+            if relative == default_proactive
+            else relative
+            for relative in default_layout.sqlite_sources
         ),
     )
 
@@ -105,6 +121,15 @@ def main() -> int:
         help="Core SQLite path relative to --data-root (default: Elysium.db)",
     )
     parser.add_argument(
+        "--proactive-sqlite-relative",
+        type=Path,
+        default=Path("life_engine_workspace/runtime/proactive/proactive.sqlite3"),
+        help=(
+            "Proactive SQLite path relative to --data-root "
+            "(default: life_engine_workspace/runtime/proactive/proactive.sqlite3)"
+        ),
+    )
+    parser.add_argument(
         "--precreated-output",
         action="store_true",
         help=argparse.SUPPRESS,
@@ -124,6 +149,7 @@ def main() -> int:
             args.output,
             writer_frozen=args.writer_frozen,
             core_sqlite_relative=args.core_sqlite_relative,
+            proactive_sqlite_relative=args.proactive_sqlite_relative,
             precreated_output=args.precreated_output,
         )
     except (LifeBackupError, OSError, sqlite3.Error) as error:

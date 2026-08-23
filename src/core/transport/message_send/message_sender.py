@@ -67,6 +67,55 @@ class MessageSender:
         self._adapter_manager = adapter_manager
         logger.debug("MessageSender 设置适配器管理器")
 
+    @staticmethod
+    def _mark_delivery_status(
+        message: "Message",
+        *,
+        status: str,
+        adapter_signature: str = "",
+        provider_receipt: dict[str, Any] | None = None,
+    ) -> None:
+        """Attach a content-free, deterministic transport outcome.
+
+        The public ``send_message`` API remains a boolean for compatibility,
+        while callers that must persist the truth of a visible side effect can
+        distinguish delivered, suppressed, failed, and unknown.  Only an
+        adapter/virtual acknowledgement creates a delivery receipt hash.
+        """
+
+        normalized = str(status or "failed").strip().lower()
+        message.extra["delivery_status"] = normalized
+        message.extra.pop("delivery_receipt_sha256", None)
+        message.extra.pop("delivery_receipt_kind", None)
+        message.extra.pop("delivery_message_id", None)
+        message.extra.pop("delivery_receipt_payload", None)
+        if normalized != "delivered":
+            return
+        receipt = {
+            "schema_version": 1,
+            "receipt_kind": (
+                "virtual_history_commit"
+                if adapter_signature == "core:adapter:virtual_send"
+                else "adapter_ack"
+            ),
+            "message_id": str(getattr(message, "message_id", "") or ""),
+            "platform": str(getattr(message, "platform", "") or ""),
+            "adapter_signature": str(adapter_signature or ""),
+            "provider_receipt": dict(provider_receipt or {}),
+        }
+        encoded = json.dumps(
+            receipt,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        message.extra["delivery_receipt_sha256"] = hashlib.sha256(
+            encoded.encode("utf-8")
+        ).hexdigest()
+        message.extra["delivery_receipt_kind"] = str(receipt["receipt_kind"])
+        message.extra["delivery_message_id"] = str(receipt["message_id"])
+        message.extra["delivery_receipt_payload"] = dict(receipt)
+
     async def send_message(
         self,
         message: "Message",
@@ -91,6 +140,8 @@ class MessageSender:
         adapter_send_started = False
         adapter_send_completed = False
         timeout_fingerprint = ""
+        provider_receipt: dict[str, Any] = {}
+        message.extra.pop("delivery_proof_status", None)
         try:
             # 1. 确定目标 Adapter
             if not adapter_signature:
@@ -104,6 +155,7 @@ class MessageSender:
                     f"无法确定目标 Adapter: platform={message.platform}, "
                     f"message_id={message.message_id}"
                 )
+                self._mark_delivery_status(message, status="failed")
                 return False
 
             # 2. 获取 Adapter 实例
@@ -118,6 +170,11 @@ class MessageSender:
                 logger.error(
                     f"Adapter 未找到: {adapter_signature}, "
                     f"message_id={message.message_id}"
+                )
+                self._mark_delivery_status(
+                    message,
+                    status="failed",
+                    adapter_signature=adapter_signature,
                 )
                 return False
 
@@ -135,7 +192,12 @@ class MessageSender:
             )
             if not should_send:
                 logger.info(f"消息被事件处理器拦截，取消发送: {message.message_id}")
-                return True
+                self._mark_delivery_status(
+                    message,
+                    status="suppressed",
+                    adapter_signature=adapter_signature,
+                )
+                return False
 
             # 5.1 多写者 outbox：平台调用前先持久化发送意图（默认无钩子时放行）。
             # 意图落库失败必须 fail closed——没有审计记录的发送在崩溃后无法恢复。
@@ -144,6 +206,11 @@ class MessageSender:
                 logger.error(
                     "多写者 outbox 意图落库失败，已阻止平台发送: "
                     f"message_id={message.message_id}, platform={message.platform}"
+                )
+                self._mark_delivery_status(
+                    message,
+                    status="failed",
+                    adapter_signature=adapter_signature,
                 )
                 return False
 
@@ -175,6 +242,13 @@ class MessageSender:
             )
             if provider_receipt:
                 message.extra["provider_receipt"] = provider_receipt
+            self._mark_delivery_status(
+                message,
+                status="delivered",
+                adapter_signature=adapter_signature,
+                provider_receipt=provider_receipt,
+            )
+            await self._record_outbound_delivery_proof(message)
 
             # 7.1 多写者 outbox：平台调用完成后以回执收尾发送意图。
             # 收尾失败只影响审计状态，不改变"平台已发送"这一事实。
@@ -208,16 +282,42 @@ class MessageSender:
             return True
 
         except ValueError as e:
+            self._mark_delivery_status(
+                message,
+                status="failed",
+                adapter_signature=adapter_signature or "",
+            )
             logger.error(f"消息格式错误: {e}")
             return False
         except Exception as e:
+            if adapter_send_completed:
+                # The platform side effect has already returned successfully.
+                # A later history/projection failure must never turn that fact
+                # into "failed", because callers could then duplicate-send.
+                self._mark_delivery_status(
+                    message,
+                    status="delivered",
+                    adapter_signature=adapter_signature or "",
+                    provider_receipt=provider_receipt,
+                )
+                logger.warning(
+                    "平台消息已送达，但后置历史/事件处理未完成；"
+                    "保留送达事实并禁止按失败重发: "
+                    f"message_id={message.message_id}, "
+                    f"error_type={type(e).__name__}"
+                )
+                return True
             delivery_unknown = (
                 adapter_send_started
                 and not adapter_send_completed
                 and self._is_timeout_exception(e)
             )
             if delivery_unknown:
-                message.extra["delivery_status"] = "unknown"
+                self._mark_delivery_status(
+                    message,
+                    status="unknown",
+                    adapter_signature=adapter_signature or "",
+                )
                 if timeout_fingerprint:
                     self._remember_unknown_delivery_fingerprint(timeout_fingerprint)
                 logger.warning(
@@ -241,7 +341,11 @@ class MessageSender:
                     error_type=type(e).__name__,
                 )
                 return False
-            message.extra["delivery_status"] = "failed"
+            self._mark_delivery_status(
+                message,
+                status="failed",
+                adapter_signature=adapter_signature or "",
+            )
             await self._emit_delivery_status_event(
                 message,
                 adapter_signature or "",
@@ -272,11 +376,12 @@ class MessageSender:
             )
 
             return await invoke_outbox_intent_hook(message)
-        except Exception as exc:  # noqa: BLE001 - never break the send path
+        except Exception as exc:  # noqa: BLE001 - active hook must fail closed
             logger.warning(
-                f"多写者 outbox 意图检查异常，按未启用处理: message_id={message.message_id}, error={exc}"
+                "多写者 outbox 意图检查异常，已阻止平台发送: "
+                f"message_id={message.message_id}, error_type={type(exc).__name__}"
             )
-            return None
+            return False
 
     async def _settle_outbox_intent(
         self,
@@ -307,6 +412,49 @@ class MessageSender:
                 "多写者 outbox 收尾异常（不影响发送结果）: "
                 f"message_id={message.message_id}, error={exc}"
             )
+
+    async def _record_outbound_delivery_proof(self, message: "Message") -> bool:
+        """Persist proactive delivery truth before returning to the action."""
+
+        extra = getattr(message, "extra", None)
+        if not isinstance(extra, dict):
+            return True
+        occurrences = extra.get("initiative_outreach_occurrences")
+        if not isinstance(occurrences, list) or not any(
+            str(item or "").strip() for item in occurrences
+        ):
+            return True
+        receipt = extra.get("delivery_receipt_payload")
+        action_id = str(extra.get("tool_call_id") or "").strip()
+        if not isinstance(receipt, dict) or not action_id:
+            extra["delivery_proof_status"] = "unverified"
+            return False
+        try:
+            from src.core.transport.multi_writer_hooks import (
+                invoke_outbound_delivery_proof_hook,
+            )
+
+            recorded = await invoke_outbound_delivery_proof_hook(
+                message,
+                receipt,
+            )
+        except Exception as exc:  # noqa: BLE001 - side effect already happened
+            extra["delivery_proof_status"] = "unverified"
+            logger.warning(
+                "平台消息已确认，但主动外联送达证明未落账: "
+                f"message_id={message.message_id}, "
+                f"error_type={type(exc).__name__}"
+            )
+            return False
+        if recorded is not True:
+            extra["delivery_proof_status"] = "unverified"
+            logger.warning(
+                "平台消息已确认，但主动外联送达证明 owner 不可用: "
+                f"message_id={message.message_id}"
+            )
+            return False
+        extra["delivery_proof_status"] = "durable"
+        return True
 
     @staticmethod
     def _extract_provider_receipt(response: Any, *, platform: str) -> dict[str, Any]:
@@ -511,11 +659,29 @@ class MessageSender:
             )
             if not should_send:
                 logger.info(f"虚拟消息被事件处理器拦截: {message.message_id}")
-                return True
+                self._mark_delivery_status(
+                    message,
+                    status="suppressed",
+                    adapter_signature=adapter_signature,
+                )
+                return False
 
             history_persisted = await self._persist_sent_message_to_history(message)
             if history_persisted:
+                self._mark_delivery_status(
+                    message,
+                    status="delivered",
+                    adapter_signature=adapter_signature,
+                )
+                await self._record_outbound_delivery_proof(message)
                 await self._emit_delivery_event(message, envelope, adapter_signature)
+            else:
+                self._mark_delivery_status(
+                    message,
+                    status="failed",
+                    adapter_signature=adapter_signature,
+                )
+                return False
 
             msg_text = (
                 message.processed_plain_text
@@ -530,6 +696,11 @@ class MessageSender:
             return True
 
         except Exception as e:
+            self._mark_delivery_status(
+                message,
+                status="failed",
+                adapter_signature=adapter_signature,
+            )
             logger.error(
                 f"虚拟消息发送失败: message_id={message.message_id}, error={e}",
                 exc_info=True,

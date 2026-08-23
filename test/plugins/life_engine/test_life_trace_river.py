@@ -22,7 +22,6 @@ import pytest
 
 from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.service import LifeEngineService
-from plugins.life_engine.streams.manager import ThoughtStreamManager
 from plugins.life_engine.streams.tools import LifeEngineManageThoughtStreamTool
 from plugins.life_engine.trace.store import AsyncLocalLifeTraceStore, LifeTraceStore
 from src.core.config.core_config import CoreConfig
@@ -217,10 +216,36 @@ def _make_tool_env(
             CuriositySignal(active=True, anchor="反复出现的旋律", why="", unknown="", approach="")
         )
     )
+    snapshot_path = tmp_path / "thoughts" / "streams.json"
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "global_revision": 1,
+                "streams": [
+                    {
+                        "id": "ts_legacy_melody",
+                        "title": "那段旋律",
+                        "status": "active",
+                        "created_at": "2026-08-01T00:00:00+00:00",
+                        "last_advanced_at": "2026-08-01T00:00:00+00:00",
+                        "revision": 1,
+                    }
+                ],
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
     fake_service = SimpleNamespace(
-        _thought_manager=ThoughtStreamManager(workspace_path=str(tmp_path)),
+        _cfg=lambda: SimpleNamespace(
+            settings=SimpleNamespace(workspace_path=str(tmp_path))
+        ),
         _get_curiosity_engine=lambda: curiosity_engine,
         _record_life_moment=lambda **kwargs: captured.append(kwargs),
+        _legacy_snapshot_path=snapshot_path,
     )
     monkeypatch.setattr(
         "plugins.life_engine.streams.tools._get_service",
@@ -234,20 +259,25 @@ def test_legacy_retire_fails_closed_without_attention_authority(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     tool, captured, service = _make_tool_env(tmp_path, monkeypatch)
-    ts = service._thought_manager.create(title="那段旋律")
+    before = service._legacy_snapshot_path.read_bytes()
 
     ok, message = asyncio.run(
         tool.execute(
             action="retire",
-            stream_id=ts.id,
+            stream_id="ts_legacy_melody",
             new_status="completed",
             conclusion="原来是她小时候的童谣",
         )
     )
 
     assert ok is False
-    assert "canonical AttentionThread" in message
-    assert service._thought_manager.get(ts.id).status == "active"
+    assert message == {
+        "action": "retire",
+        "authority_committed": False,
+        "error": "ThoughtStreamArchiveReadOnly",
+        "replacement": "nucleus_proactive_command",
+    }
+    assert service._legacy_snapshot_path.read_bytes() == before
     assert captured == []
 
 
@@ -255,6 +285,7 @@ def test_legacy_create_does_not_absorb_curiosity_without_attention_authority(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     tool, captured, service = _make_tool_env(tmp_path, monkeypatch)
+    before = service._legacy_snapshot_path.read_bytes()
 
     ok, message = asyncio.run(
         tool.execute(action="create", title="旋律之谜", absorb_curiosity=True)
@@ -262,9 +293,14 @@ def test_legacy_create_does_not_absorb_curiosity_without_attention_authority(
 
     signal = asyncio.run(service._get_curiosity_engine().load_signal())
     assert ok is False
-    assert "canonical AttentionThread" in message
+    assert message == {
+        "action": "create",
+        "authority_committed": False,
+        "error": "ThoughtStreamArchiveReadOnly",
+        "replacement": "nucleus_proactive_command",
+    }
     assert signal.active is True
-    assert service._thought_manager.list_all() == []
+    assert service._legacy_snapshot_path.read_bytes() == before
     assert captured == []
 
 

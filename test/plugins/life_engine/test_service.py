@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import logging
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -84,6 +83,61 @@ def _workspace_file_hashes(workspace: Path) -> dict[str, str]:
         for path in sorted(workspace.rglob("*"))
         if path.is_file()
     }
+
+
+@pytest.mark.asyncio
+async def test_proactive_delivery_proof_hook_binds_transport_to_authority(
+    tmp_path: Path,
+) -> None:
+    from src.core.transport import multi_writer_hooks as hooks
+
+    service = _make_service(tmp_path)
+    authority = SimpleNamespace(
+        record_outreach_delivery_proof=AsyncMock(return_value=object())
+    )
+    service._proactive_authority = authority
+    message = SimpleNamespace(
+        extra={
+            "initiative_outreach_occurrences": [
+                "outreach:one",
+                "outreach:one",
+                "outreach:two",
+            ],
+            "tool_call_id": "action:one",
+        }
+    )
+    receipt = {
+        "schema_version": 1,
+        "receipt_kind": "adapter_ack",
+        "message_id": "message:one",
+        "platform": "qq",
+        "adapter_signature": "mock:adapter:qq",
+        "provider_receipt": {"status": "ok"},
+    }
+    saved = hooks._outbound_delivery_proof_hook
+    hooks._outbound_delivery_proof_hook = None
+    try:
+        service._attach_proactive_delivery_proof_hook()
+        assert await hooks.invoke_outbound_delivery_proof_hook(
+            message,
+            receipt,
+        ) is True
+        assert authority.record_outreach_delivery_proof.await_count == 2
+        first = authority.record_outreach_delivery_proof.await_args_list[0].kwargs
+        second = authority.record_outreach_delivery_proof.await_args_list[1].kwargs
+        assert first["outreach_occurrence_id"] == "outreach:one"
+        assert second["outreach_occurrence_id"] == "outreach:two"
+        assert first["action_id"] == second["action_id"] == "action:one"
+        assert first["delivery_receipt"] == receipt
+        assert first["occurred_at"] == second["occurred_at"]
+        service._detach_proactive_delivery_proof_hook()
+        assert await hooks.invoke_outbound_delivery_proof_hook(
+            message,
+            receipt,
+        ) is None
+    finally:
+        service._detach_proactive_delivery_proof_hook()
+        hooks._outbound_delivery_proof_hook = saved
 
 
 def _heartbeat_result(text: str, world_perception: Any) -> HeartbeatModelResult:
@@ -565,7 +619,7 @@ def test_retired_thought_manager_is_not_a_runtime_authority(
         _DummyPlugin(config=config, global_storage_config=global_config)
     )
 
-    assert service._thought_manager is None
+    assert not hasattr(service, "_thought_manager")
     assert not hasattr(service, "_initialize_legacy_thought_manager")
     assert not (tmp_path / "thoughts").exists()
 

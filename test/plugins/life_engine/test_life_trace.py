@@ -8,6 +8,7 @@ import pytest
 from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.tools.file_tools import (
     LifeEngineEditFileTool,
+    LifeEngineMakeDirectoryTool,
     LifeEngineWriteFileTool,
 )
 from plugins.life_engine.trace.store import AsyncLocalLifeTraceStore, LifeTraceStore
@@ -108,6 +109,94 @@ async def test_generic_file_tool_blocks_symlink_to_subject_authority(
     assert ok is False
     assert "SubjectAuthorityDirectMutationBlocked" in str(error)
     assert target.read_text(encoding="utf-8") == "original\n"
+
+
+@pytest.mark.parametrize(
+    "path",
+    (
+        "runtime/proactive/proactive.sqlite3",
+        "runtime/proactive/proactive.sqlite3-wal",
+        "runtime/proactive/authority.json",
+        "runtime/proactive/authority.writer.lock",
+        "runtime/proactive/backend-binding.json",
+        "runtime/proactive/backend-binding.json.lock",
+        "runtime/proactive/.authority.json.test.tmp",
+        "thoughts/streams.json",
+    ),
+)
+async def test_generic_file_tools_cannot_mutate_proactive_authority_or_archive(
+    tmp_path: Path,
+    path: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = _plugin(tmp_path)
+    target = tmp_path / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"original-authority-bytes\n")
+    index_calls: list[str] = []
+
+    async def record_index_call(*_args: object, **_kwargs: object) -> None:
+        index_calls.append(path)
+
+    monkeypatch.setattr(
+        "plugins.life_engine.tools.file_tools._sync_memory_embedding_for_file",
+        record_index_call,
+    )
+
+    write_ok, write_error = await LifeEngineWriteFileTool(plugin=plugin).execute(
+        path,
+        "replacement\n",
+        reason="must not bypass proactive authority",
+    )
+    edit_ok, edit_error = await LifeEngineEditFileTool(plugin=plugin).execute(
+        path,
+        "original",
+        "replacement",
+        reason="must not bypass proactive authority",
+    )
+
+    assert write_ok is False and edit_ok is False
+    assert "WorkspaceAuthorityMutationBlocked" in str(write_error)
+    assert "WorkspaceAuthorityMutationBlocked" in str(edit_error)
+    assert target.read_bytes() == b"original-authority-bytes\n"
+    assert LifeTraceStore(tmp_path).history(path) == []
+    assert index_calls == []
+
+
+async def test_proactive_mutation_guard_uses_custom_config_and_resolves_symlinks(
+    tmp_path: Path,
+) -> None:
+    plugin = _plugin(tmp_path)
+    plugin.config.proactive.local_database_path = "state/custom.db"
+    database = tmp_path / "state" / "custom.db"
+    database.parent.mkdir(parents=True)
+    database.write_bytes(b"database-authority")
+    (tmp_path / "notes").mkdir()
+    alias = tmp_path / "notes" / "alias.db"
+    alias.symlink_to(database)
+
+    ok, error = await LifeEngineWriteFileTool(plugin=plugin).execute(
+        "notes/alias.db",
+        "replacement",
+    )
+
+    assert ok is False
+    assert "WorkspaceAuthorityMutationBlocked" in str(error)
+    assert database.read_bytes() == b"database-authority"
+
+
+async def test_mkdir_cannot_preempt_a_configured_authority_file(
+    tmp_path: Path,
+) -> None:
+    plugin = _plugin(tmp_path)
+
+    ok, error = await LifeEngineMakeDirectoryTool(plugin=plugin).execute(
+        "runtime/proactive/proactive.sqlite3"
+    )
+
+    assert ok is False
+    assert "WorkspaceAuthorityMutationBlocked" in str(error)
+    assert not (tmp_path / "runtime" / "proactive" / "proactive.sqlite3").exists()
 
 
 async def test_trace_query_tools(tmp_path: Path) -> None:

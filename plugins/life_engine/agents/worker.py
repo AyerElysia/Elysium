@@ -18,10 +18,10 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from src.app.plugin_system.api.llm_api import create_llm_request, get_model_set_by_task
 from src.core.utils.llm_tool_call import exec_llm_usable
-from src.kernel.llm import LLMPayload, ROLE, Text, ToolRegistry, ToolResult
+from src.kernel.llm import ROLE, LLMPayload, Text, ToolRegistry, ToolResult
 from src.kernel.logger import get_logger
 
-from .contracts import TaskBudget, TaskContract, TaskKind, TaskResult, TaskStatus
+from .contracts import TaskContract, TaskKind, TaskResult, TaskStatus
 
 if TYPE_CHECKING:
     from src.app.plugin_system.base import BasePlugin
@@ -48,7 +48,7 @@ _READ_ONLY_TOOL_NAMES: frozenset[str] = frozenset({
     "nucleus_browser_fetch",
     "nucleus_view_screen",
     "nucleus_minecraft",
-    "nucleus_manage_thought_stream",
+    "nucleus_proactive_query",
     "nucleus_todo",
     "nucleus_schedule",
     "nucleus_list_todos",
@@ -188,10 +188,10 @@ class Worker:
     async def _run_loop(self) -> tuple[dict[str, Any] | str, int, int]:
         """多轮工具调用循环。返回 (output, rounds, tokens)。"""
         from ..core.config import LifeEngineConfig
-        from ..tools import ALL_TOOLS
-        from ..tools.todo_tools import TODO_TOOLS
         from ..memory.tools import MEMORY_TOOLS
+        from ..tools import ALL_TOOLS
         from ..tools.grep_tools import GREP_TOOLS
+        from ..tools.todo_tools import TODO_TOOLS
         from ..tools.web_tools import WEB_TOOLS
 
         config = getattr(self.plugin, "config", None)

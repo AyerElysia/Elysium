@@ -5,11 +5,6 @@ from __future__ import annotations
 from ..narrative.tools import NARRATIVE_TOOLS, LifeEngineWriteNarrativeTool
 from ..streams.tools import STREAM_TOOLS
 from ..trace.tools import LIFE_TRACE_TOOLS
-from .autonomy_tools import (
-    AUTONOMY_TOOLS,
-    LifeEngineManageAutonomyIntentTool,
-    LifeEngineScheduleAutonomyIntentTool,
-)
 from .chat_history_tools import (
     CHAT_HISTORY_TOOLS,
     LifeEngineFetchChatHistoryTool,
@@ -64,7 +59,6 @@ __all__ = [
     "STREAM_TOOLS",
     "REST_TOOLS",
     "SCREEN_TOOLS",
-    "AUTONOMY_TOOLS",
     "SKILL_TOOLS",
     "LIFE_TRACE_TOOLS",
     "NARRATIVE_TOOLS",
@@ -74,8 +68,6 @@ __all__ = [
     "LifeEngineSyncPlatformHistoryTool",
     "LifeEngineRestHeartbeatTool",
     "LifeEngineViewScreenTool",
-    "LifeEngineScheduleAutonomyIntentTool",
-    "LifeEngineManageAutonomyIntentTool",
     "LifeEngineSkillTool",
     "LifeEngineReadFileTool",
     "LifeEngineWriteFileTool",

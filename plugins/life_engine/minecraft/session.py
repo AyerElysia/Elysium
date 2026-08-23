@@ -129,6 +129,10 @@ class MinecraftSession:
         llm_helper: Any | None = None,
         consciousness_registry: Any | None = None,
         save_consciousness_registry: Any | None = None,
+        register_consciousness_instance: Any | None = None,
+        touch_consciousness_instance: Any | None = None,
+        resume_consciousness_instance: Any | None = None,
+        terminate_consciousness_instance: Any | None = None,
         get_recent_subconscious_context: Any | None = None,
         report_world_observation: Any | None = None,
     ) -> None:
@@ -141,6 +145,10 @@ class MinecraftSession:
         self._capture = WindowCapture()
         self._registry = consciousness_registry
         self._save_registry = save_consciousness_registry
+        self._register_presence = register_consciousness_instance
+        self._touch_presence = touch_consciousness_instance
+        self._resume_presence = resume_consciousness_instance
+        self._terminate_presence = terminate_consciousness_instance
         self._get_recent_subconscious_context = get_recent_subconscious_context
         self._report_world_observation = report_world_observation
         self._state = SessionState()
@@ -1207,7 +1215,7 @@ class MinecraftSession:
         timestamp = datetime.now(UTC).isoformat()
         resumed = False
         if bool(getattr(instance, "is_suspended", False)):
-            resume = getattr(self._registry, "resume", None)
+            resume = self._resume_presence or getattr(self._registry, "resume", None)
             if resume is None:
                 raise RuntimeError(
                     "Minecraft Presence registry cannot resume an expired lease"
@@ -1221,13 +1229,16 @@ class MinecraftSession:
                 )
             )
         if not resumed:
+            touch = self._touch_presence or getattr(self._registry, "touch", None)
+            if touch is None:
+                raise RuntimeError("Minecraft Presence lifecycle cannot touch")
             await _invoke_callback(
-                self._registry.touch,
+                touch,
                 instance_id,
                 timestamp=timestamp,
                 reason=reason,
             )
-        if self._save_registry is not None:
+        if self._touch_presence is None and self._save_registry is not None:
             await _invoke_callback(self._save_registry)
 
     async def _register_consciousness(self) -> None:
@@ -1254,9 +1265,16 @@ class MinecraftSession:
             session_id=self._state.session_id,
             lease_duration_seconds=300,
         )
-        await _invoke_callback(self._registry.register, instance)
+        register = self._register_presence or getattr(
+            self._registry,
+            "register",
+            None,
+        )
+        if register is None:
+            raise RuntimeError("Minecraft Presence lifecycle cannot register")
+        await _invoke_callback(register, instance)
         self._presence_registered = True
-        if self._save_registry is not None:
+        if self._register_presence is None and self._save_registry is not None:
             await _invoke_callback(self._save_registry)
 
     async def _terminate_consciousness(self) -> None:
@@ -1265,12 +1283,19 @@ class MinecraftSession:
         if self._registry is None or not self._state.consciousness_instance_id:
             self._presence_registered = False
             return
+        terminate = self._terminate_presence or getattr(
+            self._registry,
+            "terminate",
+            None,
+        )
+        if terminate is None:
+            raise RuntimeError("Minecraft Presence lifecycle cannot terminate")
         await _invoke_callback(
-            self._registry.terminate,
+            terminate,
             self._state.consciousness_instance_id,
             reason="minecraft_session_ended",
         )
-        if self._save_registry is not None:
+        if self._terminate_presence is None and self._save_registry is not None:
             await _invoke_callback(self._save_registry)
         self._presence_registered = False
 

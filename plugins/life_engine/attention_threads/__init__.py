@@ -24,14 +24,9 @@ from .projection import (
     build_attention_thread_projection,
 )
 from .service import AttentionThreadService
-from .tools import (
-    ATTENTION_THREAD_TOOLS,
-    LifeEngineManageAttentionThreadTool,
-)
 
 __all__ = [
     "ATTENTION_THREAD_PROJECTION_ALGORITHM",
-    "ATTENTION_THREAD_TOOLS",
     "AttentionThreadActorInactive",
     "AttentionThreadAuthorityPort",
     "AttentionThreadCommand",
@@ -49,7 +44,6 @@ __all__ = [
     "AttentionThreadView",
     "InstanceFocus",
     "InstanceFocusPort",
-    "LifeEngineManageAttentionThreadTool",
     "apply_attention_thread_event",
     "build_attention_thread_projection",
 ]

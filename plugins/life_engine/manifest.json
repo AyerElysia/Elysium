@@ -124,31 +124,19 @@
     },
     {
       "component_type": "tool",
-      "component_name": "nucleus_manage_initiative_seed",
+      "component_name": "nucleus_proactive_query",
       "dependencies": [],
       "enabled": true
     },
     {
       "component_type": "tool",
-      "component_name": "nucleus_reachability",
-      "dependencies": [],
-      "enabled": true
-    },
-    {
-      "component_type": "tool",
-      "component_name": "nucleus_begin_outreach",
+      "component_name": "nucleus_proactive_command",
       "dependencies": [],
       "enabled": true
     },
     {
       "component_type": "tool",
       "component_name": "nucleus_skill",
-      "dependencies": [],
-      "enabled": true
-    },
-    {
-      "component_type": "tool",
-      "component_name": "nucleus_manage_attention_thread",
       "dependencies": [],
       "enabled": true
     },

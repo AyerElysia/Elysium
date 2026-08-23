@@ -9,7 +9,7 @@ ThoughtStream→AttentionThread 的领域生产者、兼容 facade 与平台迁�
 ## 已实现
 
 - canonical Port、local/MySQL adapter、Presence DB-time actor gate、append-only event、head CAS、稳定分页与 UTF-8 chunk；
-- 旧 ThoughtStream 写入口退役为 canonical facade；没有 canonical authority 时 mutation fail closed，查询优先 canonical、仅保留有界旧快照 fallback；
+- 该阶段曾保留 canonical facade；截至 2026-08-23 已进一步收口：旧可写 manager/model 删除，旧工具不在生产注册且 mutation 无条件 fail closed，只保留严格有界的旧快照读取；当前写入只走统一 `ProactiveAuthority`；
 - `attention_legacy_snapshots` 与 `attention_legacy_candidates` 两张 snapshot-only 迁移表；
 - SQLite/MySQL 数据库级 UPDATE/DELETE 拒绝，MySQL schema migration v1/v2 与 trigger contract 校验；
 - 新目录原字节 archive、incomplete marker、manifest SHA-256、row root 和防篡改加载；

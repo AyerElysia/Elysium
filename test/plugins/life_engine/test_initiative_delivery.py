@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from plugins.life_engine.core.chatter import LifeChatter
 from plugins.life_engine.initiative.contracts import (
     InitiativeOutreachCommand,
+    InitiativeOutreachDeliveryReceipt,
+    InitiativeOutreachReceipt,
+    InitiativePendingExpression,
     InitiativeSeedView,
 )
 from plugins.life_engine.initiative.projection import (
@@ -55,14 +60,20 @@ def _view() -> InitiativeSeedView:
     )
 
 
-def test_heartbeat_nucleus_pool_exposes_subject_initiative_tools() -> None:
+def test_heartbeat_nucleus_pool_exposes_only_unified_proactive_tools() -> None:
     service = LifeEngineService.__new__(LifeEngineService)
     names = {tool.tool_name for tool in service._get_nucleus_tools()}
     assert {
+        "nucleus_proactive_query",
+        "nucleus_proactive_command",
+    } <= names
+    assert {
+        "nucleus_manage_thought_stream",
+        "nucleus_manage_attention_thread",
         "nucleus_manage_initiative_seed",
         "nucleus_reachability",
         "nucleus_begin_outreach",
-    } <= names
+    }.isdisjoint(names)
     assert "nucleus_schedule_autonomy_intent" not in names
 
 
@@ -223,11 +234,13 @@ async def test_outreach_wake_uses_stable_message_identity_and_dedupes(
         stream_id="qq-stream",
         platform="qq",
         command=command,
+        turn_id="initiative-turn-stable",
     )
     await service._wake_stream_for_initiative(
         stream_id="qq-stream",
         platform="qq",
         command=command,
+        turn_id="initiative-turn-stable",
     )
 
     assert len(context.unread_messages) == 1
@@ -236,12 +249,307 @@ async def test_outreach_wake_uses_stable_message_identity_and_dedupes(
     assert message.extra["initiative_outreach_occurrence_id"] == (
         command.occurrence_id
     )
+    assert message.extra["initiative_outreach_turn_id"] == "initiative-turn-stable"
     assert message.sender_id == "life_engine_initiative"
     assert not getattr(message, "target_user_id", "")
     assert not getattr(message, "target_user_name", "")
     assert "重新判断" in message.processed_plain_text
     assert "必须发送" not in message.processed_plain_text
     assert loop_manager._wait_states == {}
+
+
+def test_outreach_occurrence_scope_reads_only_exact_trigger_metadata() -> None:
+    valid = SimpleNamespace(
+        is_initiative_outreach_trigger=True,
+        initiative_outreach_occurrence_id="outreach:one",
+        extra={},
+    )
+    fallback = SimpleNamespace(
+        is_initiative_outreach_trigger=False,
+        extra={
+            "is_initiative_outreach_trigger": True,
+            "initiative_outreach_occurrence_id": "outreach:two",
+        },
+    )
+    ordinary = SimpleNamespace(
+        is_initiative_outreach_trigger=False,
+        initiative_outreach_occurrence_id="outreach:forged",
+        extra={},
+    )
+
+    assert LifeChatter._initiative_outreach_occurrence_scope(  # type: ignore[arg-type]
+        [valid, fallback, valid, ordinary]
+    ) == ["outreach:one", "outreach:two"]
+
+
+@pytest.mark.asyncio
+async def test_service_claim_replay_preserves_live_lease_without_reexecuting() -> None:
+    resolutions: list[dict[str, object]] = []
+
+    class _Authority:
+        async def claim_outreach_expression(self, **_kwargs: object) -> object:
+            return SimpleNamespace(
+                claim_epoch=4,
+                execute_allowed=False,
+            )
+
+        async def resolve_outreach_expression(self, **kwargs: object) -> object:
+            resolutions.append(kwargs)
+            return SimpleNamespace()
+
+    service = LifeEngineService.__new__(LifeEngineService)
+    service._proactive_authority = _Authority()
+    service._active_initiative_expression_claims = set()
+    service._pending_initiative_expression_resolutions = {}
+    service._proactive_claim_owner = "boot:test:claim-replay"
+    service._cfg = lambda: SimpleNamespace(  # type: ignore[method-assign]
+        proactive=SimpleNamespace(expression_claim_lease_seconds=300)
+    )
+
+    result = await service.claim_initiative_outreach_expressions(
+        ["outreach:one"],
+        action_id="action:one",
+    )
+
+    assert result["execute_allowed"] is False
+    assert result["reason"] == "claim_replayed"
+    assert resolutions == []
+    assert service._active_initiative_expression_claims == set()
+
+
+@pytest.mark.asyncio
+async def test_recovery_scanner_never_settles_a_live_expression_claim() -> None:
+    command = InitiativeOutreachCommand(
+        occurrence_id="initiative:outreach:live-claim",
+        actor_consciousness_instance_id="chat:active",
+        source_instance_id="chat:active",
+        source_occurrence_ids=("life:event:live-claim",),
+        causation_occurrence_id="life:event:live-claim",
+        audience_ref="person:xiaoxi",
+        surface_ref="surface:qq",
+        public_intention="我选择表达。",
+        occurred_at="2026-08-23T12:00:00+00:00",
+    )
+    pending = InitiativePendingExpression(
+        authority_event_id="initiative:outreach:event:1",
+        event_position=1,
+        command=command,
+        delivery_event_id="initiative:outreach:inbox:2",
+        delivery_position=2,
+        stream_id="qq-stream",
+        platform="qq",
+        trigger_message_id="initiative_outreach_live_claim",
+        turn_id="initiative-turn-live-claim",
+        delivered_at="2026-08-23T12:00:01+00:00",
+        status="processing",
+        claimed_action_id="action:live",
+        claim_epoch=1,
+        claim_owner="boot:other-process",
+        claim_lease_until="2099-01-01T00:00:00+00:00",
+        claim_expired=False,
+    )
+    service = LifeEngineService.__new__(LifeEngineService)
+    service._stop_event = asyncio.Event()
+
+    class _Authority:
+        async def pending_outreach(self, **_kwargs: object) -> tuple[()]:
+            return ()
+
+        async def pending_expression_outreach(
+            self, **_kwargs: object
+        ) -> tuple[InitiativePendingExpression, ...]:
+            service._stop_event.set()
+            return (pending,)
+
+        async def due_reencounters(self, **_kwargs: object) -> tuple[()]:
+            return ()
+
+    service._proactive_authority = _Authority()
+    service._active_initiative_expression_claims = set()
+    service._pending_initiative_expression_resolutions = {}
+    service.resolve_initiative_outreach_expressions = AsyncMock()  # type: ignore[method-assign]
+    service._wake_stream_for_initiative = AsyncMock()  # type: ignore[method-assign]
+
+    await service._initiative_reencounter_loop()
+
+    service.resolve_initiative_outreach_expressions.assert_not_awaited()
+    service._wake_stream_for_initiative.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recovery_scanner_marks_only_expired_claim_delivery_unknown() -> None:
+    command = InitiativeOutreachCommand(
+        occurrence_id="initiative:outreach:expired-claim",
+        actor_consciousness_instance_id="chat:active",
+        source_instance_id="chat:active",
+        source_occurrence_ids=("life:event:expired-claim",),
+        causation_occurrence_id="life:event:expired-claim",
+        audience_ref="person:xiaoxi",
+        surface_ref="surface:qq",
+        public_intention="我选择表达。",
+        occurred_at="2026-08-23T12:00:00+00:00",
+    )
+    pending = InitiativePendingExpression(
+        authority_event_id="initiative:outreach:event:1",
+        event_position=1,
+        command=command,
+        delivery_event_id="initiative:outreach:inbox:2",
+        delivery_position=2,
+        stream_id="qq-stream",
+        platform="qq",
+        trigger_message_id="initiative_outreach_expired_claim",
+        turn_id="initiative-turn-expired-claim",
+        delivered_at="2026-08-23T12:00:01+00:00",
+        status="processing",
+        claimed_action_id="action:expired",
+        claim_epoch=1,
+        claim_owner="boot:stopped-process",
+        claim_lease_until="2020-01-01T00:00:00+00:00",
+        claim_expired=True,
+    )
+    service = LifeEngineService.__new__(LifeEngineService)
+    service._stop_event = asyncio.Event()
+
+    class _Authority:
+        async def pending_outreach(self, **_kwargs: object) -> tuple[()]:
+            return ()
+
+        async def pending_expression_outreach(
+            self, **_kwargs: object
+        ) -> tuple[InitiativePendingExpression, ...]:
+            service._stop_event.set()
+            return (pending,)
+
+        async def due_reencounters(self, **_kwargs: object) -> tuple[()]:
+            return ()
+
+    service._proactive_authority = _Authority()
+    service._active_initiative_expression_claims = set()
+    service._pending_initiative_expression_resolutions = {}
+    service.resolve_initiative_outreach_expressions = AsyncMock()  # type: ignore[method-assign]
+    service._wake_stream_for_initiative = AsyncMock()  # type: ignore[method-assign]
+
+    await service._initiative_reencounter_loop()
+
+    service.resolve_initiative_outreach_expressions.assert_awaited_once_with(
+        [command.occurrence_id],
+        outcome="delivery_unknown",
+        action_id="action:expired",
+    )
+    service._wake_stream_for_initiative.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_service_retries_terminal_outreach_receipt_without_rewake() -> None:
+    attempts = 0
+
+    class _Authority:
+        async def resolve_outreach_expression(self, **_kwargs: object) -> object:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("temporary database outage")
+            return SimpleNamespace()
+
+    service = LifeEngineService.__new__(LifeEngineService)
+    service._proactive_authority = _Authority()
+    service._active_initiative_expression_claims = {"outreach:one"}
+    service._pending_initiative_expression_resolutions = {}
+
+    first = await service.resolve_initiative_outreach_expressions(
+        ["outreach:one"],
+        outcome="spoke",
+        action_id="action:one",
+        delivery_receipt_sha256="d" * 64,
+        delivery_message_id="message:one",
+    )
+    assert first["resolved_count"] == 0
+    assert first["pending_count"] == 1
+    assert "outreach:one" in service._pending_initiative_expression_resolutions
+    assert service._active_initiative_expression_claims == set()
+
+    await service._flush_pending_initiative_expression_resolutions()
+
+    assert attempts == 2
+    assert service._pending_initiative_expression_resolutions == {}
+
+
+@pytest.mark.asyncio
+async def test_outreach_wake_failure_preserves_durable_inbox_before_volatile_wake(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order: list[str] = []
+    command = InitiativeOutreachCommand(
+        occurrence_id="initiative:outreach:durable-before-wake",
+        actor_consciousness_instance_id="chat:active",
+        source_instance_id="chat:active",
+        source_occurrence_ids=("life:event:outreach",),
+        causation_occurrence_id="life:event:outreach",
+        audience_ref="person:xiaoxi",
+        surface_ref="surface:qq",
+        public_intention="我明确选择去问候她。",
+        occurred_at="2026-08-17T08:00:00+00:00",
+    )
+
+    class _Authority:
+        async def begin_outreach(self, _command: object) -> InitiativeOutreachReceipt:
+            order.append("authority")
+            return InitiativeOutreachReceipt(
+                event_id="initiative:outreach:event:9",
+                occurrence_id=command.occurrence_id,
+                audience_ref=command.audience_ref,
+                surface_ref=command.surface_ref,
+                idempotent_replay=False,
+            )
+
+        async def record_outreach_delivery(
+            self,
+            **kwargs: object,
+        ) -> InitiativeOutreachDeliveryReceipt:
+            order.append("inbox")
+            assert kwargs["platform"] == "qq"
+            return InitiativeOutreachDeliveryReceipt(
+                event_id="initiative:outreach:inbox:10",
+                occurrence_id="initiative:outreach:inbox:stable",
+                outreach_occurrence_id=command.occurrence_id,
+                stream_id="qq-stream",
+                trigger_message_id=(
+                    service._initiative_outreach_trigger_message_id(
+                        command.occurrence_id
+                    )
+                ),
+                turn_id="initiative-outreach-turn-10",
+                inbox_payload_sha256="a" * 64,
+                idempotent_replay=False,
+            )
+
+    async def resolve(**_kwargs: object) -> object:
+        return SimpleNamespace(stream_id="qq-stream", platform="qq")
+
+    async def fail_wake(**_kwargs: object) -> str:
+        order.append("wake")
+        raise RuntimeError("expression inbox unavailable")
+
+    monkeypatch.setattr(
+        "plugins.life_engine.initiative.reachability.resolve_reachable_surface",
+        resolve,
+    )
+    service = LifeEngineService.__new__(LifeEngineService)
+    service._proactive_authority = _Authority()
+    service._wake_stream_for_initiative = fail_wake  # type: ignore[method-assign]
+
+    result = await service.begin_initiative_outreach(command)
+
+    assert result["authority_committed"] is True
+    assert result["inbox_committed"] is True
+    assert result["expression_wake_enqueued"] is False
+    assert result["delivery_pending"] is True
+    assert result["message_sent"] is False
+    assert result["event_id"] == "initiative:outreach:event:9"
+    assert result["occurrence_id"] == command.occurrence_id
+    assert result["delivery_event_id"] == "initiative:outreach:inbox:10"
+    assert result["delivery_error_type"] == "RuntimeError"
+    assert order == ["authority", "inbox", "wake"]
 
 
 @pytest.mark.asyncio
@@ -262,7 +570,7 @@ async def test_surface_reencounter_queues_bounded_subject_projection_without_act
 
     service._initiative_life_event_exists = _missing  # type: ignore[method-assign]
     service._queue_pending_event = _queue  # type: ignore[method-assign]
-    service._initiative_authority = SimpleNamespace(
+    service._proactive_authority = SimpleNamespace(
         record_reencounter_delivery=_record
     )
 
@@ -338,7 +646,7 @@ async def test_existing_durable_reencounter_repairs_receipt_without_requeue() ->
 
     service._initiative_life_event_exists = _exists  # type: ignore[method-assign]
     service._queue_pending_event = _forbidden_queue  # type: ignore[method-assign]
-    service._initiative_authority = SimpleNamespace(
+    service._proactive_authority = SimpleNamespace(
         record_reencounter_delivery=_record
     )
 

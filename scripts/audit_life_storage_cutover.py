@@ -39,7 +39,7 @@ _REQUIRED_DOMAINS = (
     "subject_document",
     "presence_world",
     "life_learning",
-    "attention_thread",
+    "proactive_authority",
 )
 _IMMUTABLE_DOMAINS = frozenset(
     {
@@ -47,7 +47,7 @@ _IMMUTABLE_DOMAINS = frozenset(
         "life_memory",
         "subject_document",
         "life_learning",
-        "attention_thread",
+        "proactive_authority",
     }
 )
 
@@ -67,14 +67,14 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--subject-run", required=True)
     parser.add_argument("--presence-world-run", required=True)
     parser.add_argument("--learning-run", required=True)
-    parser.add_argument("--attention-run", required=True)
+    parser.add_argument("--proactive-run", required=True)
     parser.add_argument("--generation-id")
     parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
 
 def _domain_root(domain: str, verification: dict[str, Any]) -> str:
-    if domain == "attention_thread":
+    if domain == "proactive_authority":
         authority = dict(verification.get("canonical_authority") or {})
         value = str(authority.get("root_sha256") or "")
         if len(value) == 64:
@@ -137,23 +137,30 @@ def evaluate_cutover_runs(
         immutability = str(verification.get("database_immutability") or "")
         if domain in _IMMUTABLE_DOMAINS and immutability != "trigger-enforced":
             reasons.append("database immutability is not trigger-enforced")
-        if domain == "attention_thread":
-            legacy = dict(verification.get("legacy_snapshot") or {})
+        if domain == "proactive_authority":
             authority = dict(verification.get("canonical_authority") or {})
-            if legacy.get("import_mode") != "snapshot_only":
-                reasons.append("legacy Attention evidence is not snapshot-only")
-            if legacy.get("history_claim") != "no_fabricated_events":
-                reasons.append("legacy Attention history claim is unsafe")
-            if legacy.get("generation_eligible") is not False:
-                reasons.append("legacy Attention snapshot is incorrectly activatable")
+            copied = dict(verification.get("copy") or {})
+            independent = dict(
+                verification.get("independent_verification") or {}
+            )
+            legacy = dict(verification.get("legacy_thought_stream") or {})
             if not bool(authority.get("generation_eligible")):
-                reasons.append("canonical Attention authority is not generation-ready")
-            if int(authority.get("event_frontier", -1)) != 0:
-                reasons.append("canonical Attention authority did not start empty")
-            if int(authority.get("head_count", -1)) != 0:
-                reasons.append("canonical Attention heads did not start empty")
-            if int(authority.get("focus_count", -1)) != 0:
-                reasons.append("canonical Attention focus did not start empty")
+                reasons.append("canonical proactive authority is not generation-ready")
+            root = str(authority.get("root_sha256") or "")
+            if len(root) != 64:
+                reasons.append("canonical proactive root is missing")
+            if str(copied.get("source_root_sha256") or "") != root:
+                reasons.append("proactive source root differs")
+            if str(copied.get("target_root_sha256") or "") != root:
+                reasons.append("proactive target root differs")
+            if not bool(independent.get("verified")):
+                reasons.append("proactive independent verification failed")
+            if len(str(copied.get("migration_certificate_sha256") or "")) != 64:
+                reasons.append("proactive migration certificate is missing")
+            if legacy.get("mode") != "archive_only":
+                reasons.append("legacy ThoughtStream is not archive-only")
+            if legacy.get("migrated_as_live_authority") is not False:
+                reasons.append("legacy ThoughtStream was promoted into live authority")
         domain_results[domain] = {
             "run_id": str(run.get("run_id") or ""),
             "state": str(run.get("state") or ""),
@@ -262,7 +269,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         "subject_document": args.subject_run,
         "presence_world": args.presence_world_run,
         "life_learning": args.learning_run,
-        "attention_thread": args.attention_run,
+        "proactive_authority": args.proactive_run,
     }
     try:
         runs: dict[str, dict[str, Any]] = {}

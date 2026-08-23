@@ -32,9 +32,17 @@ OutboxSettleHook = Callable[[Any, dict[str, Any]], Awaitable[bool]]
 ``provider_receipt`` (content-free receipt fields), ``error_type`` and
 ``delivery_unknown``; a missing hook means the outbox is not active."""
 
+OutboundDeliveryProofHook = Callable[[Any, dict[str, Any]], Awaitable[bool]]
+"""Persists an exact transport acknowledgement for its domain owner.
+
+This hook is independent of multi-writer mode.  A missing hook means no
+delivery-proof owner is active.
+"""
+
 _inbound_fact_hook: InboundFactHook | None = None
 _outbox_intent_hook: OutboxIntentHook | None = None
 _outbox_settle_hook: OutboxSettleHook | None = None
+_outbound_delivery_proof_hook: OutboundDeliveryProofHook | None = None
 _hooks_lock = threading.Lock()
 
 
@@ -81,6 +89,32 @@ def unregister_outbox_settle_hook(hook: OutboxSettleHook) -> None:
     with _hooks_lock:
         if _outbox_settle_hook is hook:
             _outbox_settle_hook = None
+
+
+def register_outbound_delivery_proof_hook(
+    hook: OutboundDeliveryProofHook,
+) -> None:
+    """Register the single active durable delivery-proof owner."""
+
+    global _outbound_delivery_proof_hook
+    with _hooks_lock:
+        if (
+            _outbound_delivery_proof_hook is not None
+            and _outbound_delivery_proof_hook is not hook
+        ):
+            raise RuntimeError("OutboundDeliveryProofHookAlreadyRegistered")
+        _outbound_delivery_proof_hook = hook
+
+
+def unregister_outbound_delivery_proof_hook(
+    hook: OutboundDeliveryProofHook,
+) -> None:
+    """Unregister only the exact delivery-proof owner."""
+
+    global _outbound_delivery_proof_hook
+    with _hooks_lock:
+        if _outbound_delivery_proof_hook is hook:
+            _outbound_delivery_proof_hook = None
 
 
 async def invoke_inbound_fact_hook(message: Any) -> bool | None:
@@ -138,6 +172,19 @@ async def invoke_outbox_settle_hook(
     return await hook(message, outcome)
 
 
+async def invoke_outbound_delivery_proof_hook(
+    message: Any,
+    receipt: dict[str, Any],
+) -> bool | None:
+    """Persist one exact receipt when a domain proof owner is active."""
+
+    with _hooks_lock:
+        hook = _outbound_delivery_proof_hook
+    if hook is None:
+        return None
+    return await hook(message, dict(receipt))
+
+
 def multi_writer_hooks_active() -> bool:
     """Report whether any core hot-path hook is currently registered."""
     with _hooks_lock:
@@ -145,6 +192,7 @@ def multi_writer_hooks_active() -> bool:
             _inbound_fact_hook is not None
             or _outbox_intent_hook is not None
             or _outbox_settle_hook is not None
+            or _outbound_delivery_proof_hook is not None
         )
 
 
@@ -152,14 +200,18 @@ __all__ = [
     "InboundFactHook",
     "OutboxIntentHook",
     "OutboxSettleHook",
+    "OutboundDeliveryProofHook",
     "invoke_inbound_fact_hook",
+    "invoke_outbound_delivery_proof_hook",
     "invoke_outbox_intent_hook",
     "invoke_outbox_settle_hook",
     "multi_writer_hooks_active",
     "register_inbound_fact_hook",
+    "register_outbound_delivery_proof_hook",
     "register_outbox_intent_hook",
     "register_outbox_settle_hook",
     "unregister_inbound_fact_hook",
+    "unregister_outbound_delivery_proof_hook",
     "unregister_outbox_intent_hook",
     "unregister_outbox_settle_hook",
 ]

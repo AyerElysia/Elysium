@@ -372,23 +372,24 @@ async def test_build_chatter_runtime_filters_tool_call_noise() -> None:
     assert hw == 3
 
 
-async def test_build_chatter_runtime_thought_delta_waits_for_exact_receipt() -> None:
-    """未确认送达应重投 thought delta，精确确认后才去重。"""
+async def test_build_chatter_runtime_attention_frontier_waits_for_exact_receipt() -> None:
+    """未确认送达不得推进 canonical Attention 投影 frontier。"""
     service = LifeEngineService(SimpleNamespace(config=None))
     chat = SimpleNamespace(stream_id="stream-d")
-    service._thought_manager = SimpleNamespace(
-        format_for_prompt=lambda **kw: (
-            "🔄 (刚推进) idea-1" if kw.get("revision_cursor", 0) < 5 else "idea-1"
-        ),
-        current_revision=5,
-    )
+    service._proactive_authority = object()
+
+    async def _attention_projection(**_kwargs: object) -> tuple[str, int]:
+        return "attention:thread:idea-1", 5
+
+    service._format_chatter_attention_threads = _attention_projection  # type: ignore[method-assign]
     service._event_history = []
 
     first, high_water = await service.build_chatter_runtime_context(chat)
     unconfirmed_retry, _ = await service.build_chatter_runtime_context(chat)
 
-    assert "🔄" in first
-    assert "🔄" in unconfirmed_retry
+    assert "attention:thread:idea-1" in first
+    assert "attention:thread:idea-1" in unconfirmed_retry
+    assert service._chatter_thought_cursor("stream-d") == 0
 
     delivery = service.get_pending_chatter_runtime_delivery("stream-d")
     assert delivery is not None
@@ -404,8 +405,7 @@ async def test_build_chatter_runtime_thought_delta_waits_for_exact_receipt() -> 
         ),
     )
 
-    confirmed_next, _ = await service.build_chatter_runtime_context(chat)
-    assert "🔄" not in confirmed_next
+    assert service._chatter_thought_cursor("stream-d") == 5
 
 
 async def test_build_chatter_runtime_includes_latest_think_and_recent_chat() -> None:

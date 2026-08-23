@@ -151,10 +151,155 @@ async def test_send_message_overrides_sender_with_bot_info(
         "retcode": 0,
         "message_id": "provider-m1",
     }
+    assert message.extra["delivery_status"] == "delivered"
+    assert len(message.extra["delivery_receipt_sha256"]) == 64
+    assert message.extra["delivery_receipt_kind"] == "adapter_ack"
+    assert message.extra["delivery_message_id"] == "m1"
     assert [args.args[0] for args in event_manager.publish_event.await_args_list] == [
         EventType.ON_MESSAGE_SENT,
         EventType.ON_MESSAGE_DELIVERED,
     ]
+
+
+async def test_history_failure_after_adapter_ack_preserves_delivery_truth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sender = MessageSender()
+    adapter = SimpleNamespace(
+        get_bot_info=AsyncMock(return_value={}),
+        _send_platform_message=AsyncMock(
+            return_value={"status": "ok", "data": {"message_id": "provider-ack"}}
+        ),
+    )
+    sender.set_adapter_manager(SimpleNamespace(get_adapter=lambda _sig: adapter))
+    sender._converter = SimpleNamespace(  # type: ignore[assignment]
+        message_to_envelope=AsyncMock(
+            return_value=_envelope(
+                platform="qq",
+                target_user_id="user-123",
+                segments=[{"type": "text", "data": "already sent"}],
+            )
+        )
+    )
+    stream_manager = _make_stream_manager()
+    stream_manager.add_sent_message_to_history = AsyncMock(
+        side_effect=RuntimeError("history unavailable")
+    )
+    event_manager = SimpleNamespace(publish_event=AsyncMock(return_value={"params": {}}))
+    _patch_stream_manager(monkeypatch, stream_manager)
+    _patch_event_manager(monkeypatch, event_manager)
+
+    message = _message("adapter-acked", content="already sent")
+
+    assert await sender.send_message(message, adapter_signature="mock:adapter:qq") is True
+    assert message.extra["delivery_status"] == "delivered"
+    assert len(message.extra["delivery_receipt_sha256"]) == 64
+    assert message.extra["delivery_message_id"] == "adapter-acked"
+    adapter._send_platform_message.assert_awaited_once()
+    stream_manager.add_sent_message_to_history.assert_awaited_once_with(message)
+    assert [args.args[0] for args in event_manager.publish_event.await_args_list] == [
+        EventType.ON_MESSAGE_SENT
+    ]
+
+
+@pytest.mark.parametrize(
+    ("proof_result", "proof_side_effect", "expected_status"),
+    [
+        (True, None, "durable"),
+        (False, None, "unverified"),
+        (None, RuntimeError("proof store unavailable"), "unverified"),
+    ],
+)
+async def test_proactive_send_requires_durable_delivery_proof(
+    monkeypatch: pytest.MonkeyPatch,
+    proof_result: bool | None,
+    proof_side_effect: Exception | None,
+    expected_status: str,
+) -> None:
+    sender = MessageSender()
+    adapter = SimpleNamespace(
+        get_bot_info=AsyncMock(return_value={}),
+        _send_platform_message=AsyncMock(
+            return_value={"status": "ok", "retcode": 0}
+        ),
+    )
+    sender.set_adapter_manager(SimpleNamespace(get_adapter=lambda _sig: adapter))
+    sender._converter = SimpleNamespace(  # type: ignore[assignment]
+        message_to_envelope=AsyncMock(
+            return_value=_envelope(
+                platform="qq",
+                target_user_id="user-123",
+                segments=[{"type": "text", "data": "proactive"}],
+            )
+        )
+    )
+    stream_manager = _make_stream_manager()
+    event_manager = SimpleNamespace(
+        publish_event=AsyncMock(return_value={"params": {}})
+    )
+    _patch_stream_manager(monkeypatch, stream_manager)
+    _patch_event_manager(monkeypatch, event_manager)
+    proof_hook = AsyncMock(
+        return_value=proof_result,
+        side_effect=proof_side_effect,
+    )
+    monkeypatch.setattr(
+        "src.core.transport.multi_writer_hooks.invoke_outbound_delivery_proof_hook",
+        proof_hook,
+    )
+
+    message = _message("proactive-1", content="proactive")
+    message.extra.update(
+        {
+            "initiative_outreach_occurrences": ["outreach:one"],
+            "tool_call_id": "action:one",
+        }
+    )
+
+    assert await sender.send_message(
+        message,
+        adapter_signature="mock:adapter:qq",
+    ) is True
+    assert message.extra["delivery_status"] == "delivered"
+    assert message.extra["delivery_proof_status"] == expected_status
+    receipt = message.extra["delivery_receipt_payload"]
+    proof_hook.assert_awaited_once_with(message, receipt)
+
+
+async def test_outbox_hook_exception_fails_closed_before_platform(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sender = MessageSender()
+    adapter = SimpleNamespace(
+        get_bot_info=AsyncMock(return_value={}),
+        _send_platform_message=AsyncMock(return_value=None),
+    )
+    sender.set_adapter_manager(SimpleNamespace(get_adapter=lambda _sig: adapter))
+    sender._converter = SimpleNamespace(  # type: ignore[assignment]
+        message_to_envelope=AsyncMock(
+            return_value=_envelope(
+                platform="qq",
+                target_user_id="user-123",
+                segments=[{"type": "text", "data": "must not send"}],
+            )
+        )
+    )
+    stream_manager = _make_stream_manager()
+    event_manager = SimpleNamespace(publish_event=AsyncMock(return_value={"params": {}}))
+    _patch_stream_manager(monkeypatch, stream_manager)
+    _patch_event_manager(monkeypatch, event_manager)
+    monkeypatch.setattr(
+        "src.core.transport.multi_writer_hooks.invoke_outbox_intent_hook",
+        AsyncMock(side_effect=RuntimeError("outbox unavailable")),
+    )
+
+    message = _message("outbox-failed", content="must not send")
+
+    assert await sender.send_message(message, adapter_signature="mock:adapter:qq") is False
+    assert message.extra["delivery_status"] == "failed"
+    assert "delivery_receipt_sha256" not in message.extra
+    adapter._send_platform_message.assert_not_awaited()
+    stream_manager.add_sent_message_to_history.assert_not_awaited()
 
 
 async def test_normal_duplicate_messages_are_both_sent(
@@ -449,6 +594,8 @@ async def test_send_and_delivery_events_wrap_adapter_and_history_persistence(
     message = _message("ordered-1", content="ordered")
 
     assert await sender.send_message(message, adapter_signature="mock:adapter:qq") is True
+    assert message.extra["delivery_status"] == "delivered"
+    assert len(message.extra["delivery_receipt_sha256"]) == 64
 
     assert order == ["sent", "adapter", "stream", "history", "delivered"]
     assert [args.args[0] for args in event_manager.publish_event.await_args_list] == [
@@ -536,7 +683,9 @@ async def test_continue_send_false_intercepts_before_adapter_and_history(
 
     message = _message("blocked-1", content="blocked")
 
-    assert await sender.send_message(message, adapter_signature="mock:adapter:qq") is True
+    assert await sender.send_message(message, adapter_signature="mock:adapter:qq") is False
+    assert message.extra["delivery_status"] == "suppressed"
+    assert "delivery_receipt_sha256" not in message.extra
     adapter._send_platform_message.assert_not_awaited()
     stream_manager.get_or_create_stream.assert_not_awaited()
     stream_manager.add_sent_message_to_history.assert_not_awaited()
@@ -583,6 +732,10 @@ async def test_virtual_send_events_wrap_history_persistence(
     ]
     _, params = event_manager.publish_event.await_args_list[1].args
     assert params["adapter_signature"] == "core:adapter:virtual_send"
+    assert message.extra["delivery_status"] == "delivered"
+    assert len(message.extra["delivery_receipt_sha256"]) == 64
+    assert message.extra["delivery_receipt_kind"] == "virtual_history_commit"
+    assert message.extra["delivery_message_id"] == "virtual-1"
 
 
 async def test_virtual_send_can_be_intercepted_before_history(
@@ -612,7 +765,9 @@ async def test_virtual_send_can_be_intercepted_before_history(
 
     message = _message("virtual-blocked", content="blocked virtual", platform="live")
 
-    assert await sender.send_message(message) is True
+    assert await sender.send_message(message) is False
+    assert message.extra["delivery_status"] == "suppressed"
+    assert "delivery_receipt_sha256" not in message.extra
     stream_manager.get_or_create_stream.assert_not_awaited()
     stream_manager.add_sent_message_to_history.assert_not_awaited()
     event_manager.publish_event.assert_awaited_once()

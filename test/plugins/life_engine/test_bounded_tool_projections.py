@@ -10,9 +10,6 @@ from typing import Any
 import pytest
 
 from plugins.life_engine.core.config import LifeEngineConfig
-from plugins.life_engine.tools.autonomy_tools import (
-    LifeEngineManageAutonomyIntentTool,
-)
 from plugins.life_engine.tools.bounded_projection import (
     BOUNDED_TOOL_CURSOR_VERSION,
     BOUNDED_TOOL_PROJECTION_VERSION,
@@ -201,63 +198,6 @@ def test_bounded_text_cursor_is_short_copyable_and_source_bound() -> None:
             **{**kwargs, "frontier": {"content_sha256": "source-v2"}},
             continuation=cursor,
         )
-
-
-@pytest.mark.asyncio
-async def test_autonomy_archive_list_is_bounded_and_mutations_fail_closed() -> None:
-    intents = [
-        {
-            "intent_id": f"intent-{index}",
-            "motivation": "继续看看这件事" * 1000,
-            "status": "scheduled",
-        }
-        for index in range(12)
-    ]
-    calls: list[dict[str, Any]] = []
-
-    class FakeService:
-        async def manage_autonomy_intent(self, **kwargs: Any) -> dict[str, Any]:
-            calls.append(dict(kwargs))
-            if kwargs["action"] == "list":
-                return {"action": "list", "intents": intents}
-            return {"action": kwargs["action"], "mutated": True}
-
-    tool = LifeEngineManageAutonomyIntentTool(
-        plugin=SimpleNamespace(service=FakeService())
-    )
-    tool._runtime_task_name = "core"
-
-    ok, first = await tool.execute(action="list")
-    assert ok is True
-    assert isinstance(first, dict)
-    _assert_exact_budget(first, CORE_TOOL_RESULT_MAX_BYTES)
-    assert first["continuation"]
-
-    ok, second = await tool.execute(
-        action="list",
-        continuation=first["continuation"],
-    )
-    assert ok is True
-    assert isinstance(second, dict)
-    _assert_exact_budget(second, CORE_TOOL_RESULT_MAX_BYTES)
-    assert (
-        first["intents"][0]["_projection"]["ref"]
-        != second["intents"][0]["_projection"]["ref"]
-    )
-
-    ok, mutation = await tool.execute(
-        action="pause",
-        intent_id="intent-1",
-        continuation="not-a-list-cursor",
-        max_bytes=1024,
-    )
-    assert ok is False
-    assert mutation == {
-        "error": "LegacyAutonomyReadOnly",
-        "mutated": False,
-        "replacement": "nucleus_manage_initiative_seed",
-    }
-    assert [call["action"] for call in calls] == ["list", "list"]
 
 
 def test_bounded_items_compact_mode_delivers_full_listing() -> None:

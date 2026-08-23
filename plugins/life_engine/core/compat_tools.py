@@ -157,8 +157,11 @@ class LifeScheduleFollowupMessageAction(BaseAction):
         del delay_seconds, thought, topic, followup_type
         return (
             False,
-            "LegacyFollowupReadOnly: 使用 InitiativeSeed 保留未来连续性；"
-            "行动时通过 nucleus_reachability 与 nucleus_begin_outreach 明确选择对象和表面。",
+            (
+                "LegacyFollowupReadOnly: 使用统一主动系统保留未来连续性；"
+                "行动时通过 nucleus_proactive_query 与 nucleus_proactive_command "
+                "明确选择对象和表面。"
+            ),
         )
 
 

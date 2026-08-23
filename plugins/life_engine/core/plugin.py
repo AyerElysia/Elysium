@@ -7,12 +7,11 @@ from src.kernel.logger import get_logger
 
 from ..agents import register_builtin_agents
 from ..agents.mission_tool import MISSION_TOOLS
-from ..attention_threads.tools import ATTENTION_THREAD_TOOLS
-from ..initiative.tools import INITIATIVE_TOOLS
 from ..learning.tools import LEARNING_TOOLS
 from ..memory.boundary_tools import MEMORY_BOUNDARY_TOOLS
 from ..memory.continuity_tools import CONTINUITY_REVIEW_TOOLS
 from ..memory.tools import MEMORY_TOOLS
+from ..proactive.tools import PROACTIVE_TOOLS
 from ..service import LifeEngineService
 from ..service.audit import (
     get_life_log_file,
@@ -108,8 +107,7 @@ class LifeEnginePlugin(BasePlugin):
             *SKILL_TOOLS,
             *EVENT_GREP_TOOLS,
             *LEARNING_TOOLS,
-            *ATTENTION_THREAD_TOOLS,
-            *INITIATIVE_TOOLS,
+            *PROACTIVE_TOOLS,
             *MISSION_TOOLS,
         ]
 

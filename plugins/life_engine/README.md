@@ -64,10 +64,12 @@ plugins/life_engine/
 ├── memory/           记忆服务、经历账本、认识论、检索、索引与修复
 ├── learning/         反思、审计、压缩、指标、技能蒸馏
 ├── agents/           Mission 编排、规划、DAG 调度、worker 与 trace
-├── tools/            文件、平台、网络、记忆、思考流等主体可用工具
+├── tools/            文件、平台、网络、记忆等主体可用工具
 ├── narrative/        追加式叙事记录与自传投影
 ├── minecraft/        视觉—键鼠具身闭环
 ├── initiative/       主体线索、对象/表面解析与显式外联权威
+├── proactive/        唯一主动权威、统一 query/command 与 local fenced runtime
+├── streams/          旧 ThoughtStream 严格只读快照/迁移审计（无可写 manager）
 ├── autonomy.py       已退役 AutonomyIntent 的只读证据兼容
 ├── curiosity/        有来源认知机会候选、不可变账本与旧接口适配
 └── manifest.json     插件清单与依赖
@@ -172,9 +174,11 @@ Life Event
 
 ### 主体主动性
 
-生产链已经从 `AutonomyIntent + target_stream_id + 周期调度` 迁移到 `initiative/`：活跃意识实例可以把自己明确愿意让未来继续看到的第一人称表述保存为 `InitiativeSeed`，也可以只安排一次重新相遇。重新相遇只进入 Life Event，不等于必须行动。旧延迟续话和 `nucleus_tell_dfc` 最近流唤醒也已退出生产注册，不能绕过显式对象/表面决定。
+生产只有一个 `ProactiveAuthority` 和两个模型入口：`nucleus_proactive_query` / `nucleus_proactive_command`。`AttentionThread` 与 `InitiativeSeed` 是同一权威内的两种记录，不是两套主动系统。前者保存主体明确选择的持续关注，后者保存未来行动可能性；两者共享 actor gate、occurrence 防重、backend generation、健康和关闭链。
 
-真正外联时，当前意识分别选择 `audience_ref` 与 `surface_ref`。来源实例不绑定未来平台；跨平台同一人只接受显式 `canonical_person_key`，不使用昵称、内容或最近聊天推断。目标表达实例在真实上下文中重新决定表达或沉默，`life_send_text` 只发送到当前表面。完整契约见 [`docs/architecture/主体主动性与外联.md`](../../docs/architecture/主体主动性与外联.md)。
+旧 `ThoughtStreamManager` 已删除，`streams.json` 只保留逐字节只读审计；旧 Attention/Initiative/Reachability/Outreach 与 Autonomy 模型工具实现也已删除。派生 rolling context 会净化历史旧调用，但不可变 trajectory 保持原样可追溯。生产链已从 `AutonomyIntent + target_stream_id + 周期调度` 迁移：活跃意识实例可以保存第一人称 InitiativeSeed，或只安排一次重新相遇。重新相遇只进入 Life Event，不等于必须行动。旧延迟续话和 `nucleus_tell_dfc` 最近流唤醒也已退出生产注册。
+
+真正外联时，当前意识分别选择 `audience_ref` 与 `surface_ref`。来源实例不绑定未来平台；跨平台同一人只接受显式 `canonical_person_key`，不使用昵称、内容或最近聊天推断。目标表达实例在真实上下文中重新决定表达或沉默，`life_send_text` 只发送到当前表面。`spoke` 不是由布尔成功或任意 64 位字符串推断：传输层必须先把规范化平台回执写入统一主动权威的不可变 delivery-proof 账本，再由同一 action/claim/message 的精确证明结算。主动 health 会从 Attention/Initiative 不可变事件重放 head，并检出缺失、孤立或篡改的投影。完整契约见 [`docs/architecture/主体主动性与外联.md`](../../docs/architecture/主体主动性与外联.md)。
 
 旧 `autonomy.py` 和旧快照只保留历史证据读取；启动不恢复调度，旧 mutation 不再写入，也不会自动迁移成主体决定。
 
@@ -220,7 +224,7 @@ Life Engine 不把所有能力一次塞进每个意识上下文。能力通过�
 - 对话与表达；
 - 有界对话证据：`conversation_evidence` 按意识实例与任务字节预算分页、检索和分块读取；平台历史同步与读取分离；
 - 记忆检索与关系观察；
-- 思考流和内在对话；
+- 统一主动查询/决定与内在对话；
 - 文件与私人工作空间；
 - 网络搜索与正文获取；
 - Mission 编排；

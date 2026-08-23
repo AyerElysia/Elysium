@@ -12,10 +12,28 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Literal, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 
 InitiativeSeedAction = Literal["hold", "rewrite", "reencounter", "release"]
 InitiativeSeedStatus = Literal["open", "released"]
+InitiativeOutreachOutcome = Literal[
+    "spoke",
+    "passed",
+    "failed",
+    "delivery_unknown",
+    "suppressed",
+    "suppressed_duplicate",
+]
+INITIATIVE_OUTREACH_OUTCOMES = frozenset(
+    {
+        "spoke",
+        "passed",
+        "failed",
+        "delivery_unknown",
+        "suppressed",
+        "suppressed_duplicate",
+    }
+)
 INITIATIVE_SEED_ACTIONS = frozenset(
     {"hold", "rewrite", "reencounter", "release"}
 )
@@ -317,6 +335,106 @@ class InitiativeOutreachReceipt:
 
 
 @dataclass(frozen=True, slots=True)
+class InitiativePendingOutreach:
+    """One committed outreach decision awaiting expression-layer intake."""
+
+    authority_event_id: str
+    event_position: int
+    command: InitiativeOutreachCommand
+
+
+@dataclass(frozen=True, slots=True)
+class InitiativeOutreachDeliveryReceipt:
+    """Durable evidence that one outreach trigger entered a stream inbox."""
+
+    event_id: str
+    occurrence_id: str
+    outreach_occurrence_id: str
+    stream_id: str
+    trigger_message_id: str
+    idempotent_replay: bool
+    turn_id: str = ""
+    inbox_payload_sha256: str = ""
+    expression_resolved: bool = False
+    expression_outcome: InitiativeOutreachOutcome | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class InitiativeOutreachClaimReceipt:
+    """Fenced technical claim for one visible expression action.
+
+    ``execute_allowed`` is true only for the transaction that first moved the
+    durable turn into ``processing``.  A caller that lost the return value must
+    not repeat the platform action; replay is deliberately at-most-once and is
+    recovered as ``delivery_unknown``.
+    """
+
+    event_id: str
+    occurrence_id: str
+    outreach_occurrence_id: str
+    turn_id: str
+    action_id: str
+    claim_epoch: int
+    claim_owner: str
+    lease_until: str
+    execute_allowed: bool
+    idempotent_replay: bool
+
+
+@dataclass(frozen=True, slots=True)
+class InitiativePlatformDeliveryProofReceipt:
+    """Immutable proof recorded only after a transport acknowledgement."""
+
+    event_id: str
+    occurrence_id: str
+    outreach_occurrence_id: str
+    turn_id: str
+    action_id: str
+    claim_epoch: int
+    delivery_receipt_sha256: str
+    delivery_message_id: str
+    idempotent_replay: bool
+
+
+@dataclass(frozen=True, slots=True)
+class InitiativePendingExpression:
+    """One durable inbox turn awaiting the subject's expression outcome."""
+
+    authority_event_id: str
+    event_position: int
+    command: InitiativeOutreachCommand
+    delivery_event_id: str
+    delivery_position: int
+    stream_id: str
+    platform: str
+    trigger_message_id: str
+    turn_id: str
+    delivered_at: str
+    status: Literal["pending", "retryable", "processing"] = "pending"
+    claimed_action_id: str = ""
+    claim_epoch: int = 0
+    claim_owner: str = ""
+    claim_lease_until: str = ""
+    claim_expired: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class InitiativeOutreachResolutionReceipt:
+    """Content-free terminal outcome of one durable expression turn."""
+
+    event_id: str
+    occurrence_id: str
+    outreach_occurrence_id: str
+    turn_id: str
+    outcome: InitiativeOutreachOutcome
+    idempotent_replay: bool
+    action_id: str = ""
+    claim_epoch: int = 0
+    delivery_receipt_sha256: str = ""
+    delivery_message_id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class ReachableSurface:
     """Verified physical route kept internal to the embodiment boundary."""
 
@@ -338,7 +456,8 @@ class ReachableSurface:
 
 
 @runtime_checkable
-class InitiativeAuthorityPort(Protocol):
+class InitiativeRecordStorePort(Protocol):
+    async def health_snapshot(self) -> dict[str, Any]: ...
     async def decide_seed(
         self, command: InitiativeSeedCommand
     ) -> InitiativeSeedCommit: ...
@@ -360,3 +479,45 @@ class InitiativeAuthorityPort(Protocol):
     async def begin_outreach(
         self, command: InitiativeOutreachCommand
     ) -> InitiativeOutreachReceipt: ...
+    async def pending_outreach(
+        self, *, limit: int = 32
+    ) -> tuple[InitiativePendingOutreach, ...]: ...
+    async def record_outreach_delivery(
+        self,
+        *,
+        outreach_occurrence_id: str,
+        stream_id: str,
+        trigger_message_id: str,
+        occurred_at: str,
+        platform: str = "unknown",
+    ) -> InitiativeOutreachDeliveryReceipt: ...
+    async def pending_expression_outreach(
+        self, *, limit: int = 32
+    ) -> tuple[InitiativePendingExpression, ...]: ...
+    async def claim_outreach_expression(
+        self,
+        *,
+        outreach_occurrence_id: str,
+        action_id: str,
+        claim_owner: str,
+        lease_seconds: int,
+        occurred_at: str,
+    ) -> InitiativeOutreachClaimReceipt: ...
+    async def record_outreach_delivery_proof(
+        self,
+        *,
+        outreach_occurrence_id: str,
+        action_id: str,
+        delivery_receipt: dict[str, Any],
+        occurred_at: str,
+    ) -> InitiativePlatformDeliveryProofReceipt: ...
+    async def resolve_outreach_expression(
+        self,
+        *,
+        outreach_occurrence_id: str,
+        outcome: InitiativeOutreachOutcome,
+        action_id: str = "",
+        delivery_receipt_sha256: str = "",
+        delivery_message_id: str = "",
+        occurred_at: str,
+    ) -> InitiativeOutreachResolutionReceipt: ...

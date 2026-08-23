@@ -28,20 +28,23 @@ def _run(domain: str, *, writer_frozen: bool = True) -> dict[str, object]:
         "database_immutability": immutability,
         "copy": {"target_root_sha256": "c" * 64},
     }
-    if domain == "attention_thread":
+    if domain == "proactive_authority":
         verification.update(
             {
-                "legacy_snapshot": {
-                    "import_mode": "snapshot_only",
-                    "history_claim": "no_fabricated_events",
-                    "generation_eligible": False,
+                "copy": {
+                    "source_root_sha256": "f" * 64,
+                    "target_root_sha256": "f" * 64,
+                    "migration_certificate_sha256": "e" * 64,
                 },
+                "independent_verification": {"verified": True},
                 "canonical_authority": {
                     "generation_eligible": True,
-                    "event_frontier": 0,
-                    "head_count": 0,
-                    "focus_count": 0,
                     "root_sha256": "f" * 64,
+                    "row_count": 12,
+                },
+                "legacy_thought_stream": {
+                    "mode": "archive_only",
+                    "migrated_as_live_authority": False,
                 },
             }
         )
@@ -67,7 +70,7 @@ def _runs() -> dict[str, dict[str, object]]:
             "subject_document",
             "presence_world",
             "life_learning",
-            "attention_thread",
+            "proactive_authority",
         )
     }
 
@@ -91,17 +94,17 @@ def test_cutover_audit_accepts_only_complete_frozen_trigger_evidence() -> None:
         "mysql:subject_document",
         "mysql:presence_world",
         "mysql:life_learning",
-        "mysql:attention_thread",
+        "mysql:proactive_authority",
     }
 
 
-def test_cutover_rejects_fabricated_or_activatable_legacy_attention() -> None:
+def test_cutover_rejects_legacy_thought_stream_promoted_to_live_authority() -> None:
     runs = _runs()
-    attention = runs["attention_thread"]["verification"]
-    assert isinstance(attention, dict)
-    legacy = attention["legacy_snapshot"]
+    proactive = runs["proactive_authority"]["verification"]
+    assert isinstance(proactive, dict)
+    legacy = proactive["legacy_thought_stream"]
     assert isinstance(legacy, dict)
-    legacy["generation_eligible"] = True
+    legacy["migrated_as_live_authority"] = True
 
     result = evaluate_cutover_runs(
         _manifest(writer_frozen=True),
@@ -114,7 +117,7 @@ def test_cutover_rejects_fabricated_or_activatable_legacy_attention() -> None:
     )
 
     assert result["eligible"] is False
-    assert any("legacy Attention snapshot" in reason for reason in result["failures"])
+    assert any("legacy ThoughtStream" in reason for reason in result["failures"])
 
 
 def test_cutover_audit_rejects_online_shadow_and_application_immutability() -> None:

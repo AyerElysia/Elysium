@@ -1092,6 +1092,69 @@ def test_rolling_context_projection_drops_whole_retired_think_assistant() -> Non
     )
 
 
+def test_rolling_context_projection_drops_retired_proactive_tool_chain() -> None:
+    payloads = [
+        LLMPayload(ROLE.USER, Text("请继续")),
+        LLMPayload(
+            ROLE.ASSISTANT,
+            [
+                Text("__SUSPEND__"),
+                ToolCall(
+                    id="legacy-proactive",
+                    name="nucleus_manage_thought_stream",
+                    args={"action": "advance"},
+                ),
+            ],
+        ),
+        LLMPayload(
+            ROLE.TOOL_RESULT,
+            ToolResult(
+                value="retired",
+                call_id="legacy-proactive",
+                name="nucleus_manage_thought_stream",
+            ),
+        ),
+        LLMPayload(
+            ROLE.ASSISTANT,
+            ToolCall(
+                id="canonical-proactive",
+                name="nucleus_proactive_query",
+                args={"resource": "attention"},
+            ),
+        ),
+        LLMPayload(
+            ROLE.TOOL_RESULT,
+            ToolResult(
+                value="bounded projection",
+                call_id="canonical-proactive",
+                name="nucleus_proactive_query",
+            ),
+        ),
+        LLMPayload(ROLE.ASSISTANT, Text("__SUSPEND__")),
+    ]
+
+    cleaned = LifeChatter._without_retired_proactive_history(payloads)
+
+    assert [payload.role for payload in cleaned] == [
+        ROLE.USER,
+        ROLE.ASSISTANT,
+        ROLE.TOOL_RESULT,
+        ROLE.ASSISTANT,
+    ]
+    assert LifeChatter._without_retired_proactive_history(cleaned) == cleaned
+    names = [
+        getattr(part, "name", "")
+        for payload in cleaned
+        for part in payload.content
+        if isinstance(part, (ToolCall, ToolResult))
+    ]
+    assert names == ["nucleus_proactive_query", "nucleus_proactive_query"]
+    LLMContextManager()._validate_payloads(
+        cleaned,
+        allow_incomplete_tail=False,
+    )
+
+
 def test_rolling_context_projection_drops_retired_reaction_guidance() -> None:
     legacy_hint = (
         "incoming emoji remains visible"
@@ -1865,6 +1928,153 @@ async def test_life_chatter_visible_reply_ends_turn(monkeypatch) -> None:
     assert rt.must_reply is False
     assert rt.follow_up_rounds == 0
 
+    LifeChatter.reset_global_runtime()
+
+
+@pytest.mark.parametrize(
+    ("call_name", "tool_success", "technical_outcome", "expected_outcome"),
+    [
+        ("action-life_send_text", True, "delivered", "spoke"),
+        (
+            "action-life_send_text",
+            False,
+            "delivery_unknown",
+            "delivery_unknown",
+        ),
+        ("action-life_pass_and_wait", True, "", "passed"),
+    ],
+)
+async def test_initiative_outreach_claims_before_send_and_commits_exact_terminal(
+    monkeypatch,
+    call_name: str,
+    tool_success: bool,
+    technical_outcome: str,
+    expected_outcome: str,
+) -> None:
+    LifeChatter.reset_global_runtime()
+    call = SimpleNamespace(
+        id="outreach-action-1",
+        name=call_name,
+        args={"content": "我来找你啦"} if "send_text" in call_name else {},
+    )
+
+    class FakeResponse:
+        def __init__(self) -> None:
+            self.payloads = []
+            self.call_list = [call]
+            self.message = ""
+
+        def add_payload(self, payload) -> None:
+            self.payloads.append(payload)
+
+    outreach = Message(
+        message_id="initiative_outreach_stable",
+        content="主体主动外联",
+        processed_plain_text="主体主动外联",
+        sender_role="other",
+        platform="qq",
+        stream_id="stream-a",
+        is_initiative_outreach_trigger=True,
+        initiative_outreach_occurrence_id="outreach:one",
+    )
+    rt = _WorkflowRuntime(
+        response=FakeResponse(),
+        phase=_Phase.TOOL_EXEC,
+        history_merged=True,
+        unreads=[outreach],
+        cross_round_seen_signatures=set(),
+        unread_msgs_to_flush=[],
+        active_stream_id="stream-a",
+    )
+    LifeChatter._GLOBAL_RUNTIME = rt
+    LifeChatter._GLOBAL_USABLE_MAP = {}
+    order: list[str] = []
+
+    class FakeService:
+        async def claim_initiative_outreach_expressions(
+            self,
+            occurrences,
+            *,
+            action_id: str,
+        ):
+            order.append("claim")
+            assert occurrences == ["outreach:one"]
+            assert action_id == call.id
+            return {"claimed": True, "execute_allowed": True}
+
+        async def resolve_initiative_outreach_expressions(
+            self,
+            occurrences,
+            *,
+            outcome: str,
+            action_id: str = "",
+            delivery_receipt_sha256: str = "",
+            delivery_message_id: str = "",
+        ):
+            order.append(f"resolve:{outcome}")
+            assert occurrences == ["outreach:one"]
+            if outcome != "passed":
+                assert action_id == call.id
+            if outcome == "spoke":
+                assert delivery_receipt_sha256 == "a" * 64
+                assert delivery_message_id == "platform-message:1"
+            else:
+                assert delivery_receipt_sha256 == ""
+                assert delivery_message_id == ""
+            return {"resolved_count": 1, "pending_count": 0}
+
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.plugin = SimpleNamespace(config=None)
+    chatter.stream_id = "stream-a"
+
+    async def fake_fetch_unreads():
+        return [], []
+
+    async def fake_run_tool_call(*_args, **_kwargs):
+        order.append("platform")
+        return [
+            ToolCallExecutionResult(
+                True,
+                tool_success,
+                technical_outcome=technical_outcome,
+                delivery_receipt_sha256=(
+                    "a" * 64 if technical_outcome == "delivered" else ""
+                ),
+                delivery_message_id=(
+                    "platform-message:1"
+                    if technical_outcome == "delivered"
+                    else ""
+                ),
+                delivery_proof_status=(
+                    "durable" if technical_outcome == "delivered" else ""
+                ),
+            )
+        ]
+
+    monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
+    monkeypatch.setattr(chatter, "run_tool_call", fake_run_tool_call)
+    monkeypatch.setattr(chatter, "_maybe_compact_runtime_context", lambda _response: None)
+    monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", _skip_snapshot_save)
+    monkeypatch.setattr(
+        "src.kernel.concurrency.get_watchdog",
+        lambda: SimpleNamespace(feed_dog=lambda _stream_id: None),
+    )
+
+    result = await chatter._drive_global_runtime_until_yield(
+        SimpleNamespace(stream_id="stream-a"),
+        service=FakeService(),  # type: ignore[arg-type]
+    )
+
+    assert isinstance(result, Wait)
+    if call_name == "action-life_pass_and_wait":
+        assert order == ["resolve:passed"]
+    else:
+        assert order[:2] == ["claim", "platform"]
+        assert f"resolve:{expected_outcome}" in order
+        assert outreach.extra["life_turn_scope"][
+            "initiative_outreach_occurrences"
+        ] == ["outreach:one"]
+    assert rt.phase == _Phase.WAIT_USER
     LifeChatter.reset_global_runtime()
 
 
@@ -2737,10 +2947,6 @@ async def test_life_chatter_dynamic_context_is_separate_snapshot() -> None:
     chatter = LifeChatter.__new__(LifeChatter)
     chat_stream = SimpleNamespace(stream_id="stream-1")
     service = LifeEngineService(_service_plugin())
-    service._thought_manager = SimpleNamespace(
-        format_for_prompt=lambda **kwargs: "THOUGHT_STREAM_NOW",
-        current_revision=1,
-    )
     service._event_history = [
         LifeEngineEvent(
             event_id="evt-1",
@@ -2763,7 +2969,7 @@ async def test_life_chatter_dynamic_context_is_separate_snapshot() -> None:
     )
 
     assert "<life_runtime_context>" in dynamic
-    assert "THOUGHT_STREAM_NOW" in dynamic
+    assert "THOUGHT_STREAM_NOW" not in dynamic
     assert "RECENT_EVENT" in dynamic
     assert "RUNTIME_NOW" in dynamic
     assert high_water == 1
@@ -3494,7 +3700,8 @@ def test_execution_tool_descriptions_respect_heartbeat_boundary() -> None:
     assert "交给 life_chatter / 表达层" in bash_description
 
     assert "不是把用户请求转交后台执行的入口" in agent_description
-    assert "只用于整理 life_engine 私有记忆、笔记、思考流" in agent_description
+    assert "只用于整理 life_engine 私有记忆、普通笔记" in agent_description
+    assert "主动状态只能通过统一 proactive 工具读写" in agent_description
     assert "不要让子代理承接用户任务、查项目配置、跑命令、改代码、画图" in agent_description
     assert "交给 life_chatter / 表达层判断和执行" in agent_description
 
@@ -3533,32 +3740,22 @@ def test_heartbeat_prompt_uses_explicit_subject_initiative_contract(
     prompt = "\n".join(service._build_prompt_header())
 
     assert "nucleus_tell_dfc" not in prompt
-    assert "InitiativeSeed" in prompt
-    assert "nucleus_reachability" in prompt
-    assert "nucleus_begin_outreach" in prompt
+    assert "nucleus_proactive_command" in prompt
+    assert "nucleus_proactive_query" in prompt
+    assert "持续关注" in prompt
+    assert "nucleus_reachability" not in prompt
+    assert "nucleus_begin_outreach" not in prompt
     assert "audience_ref" in prompt
     assert "surface_ref" in prompt
 
 
-def test_impulse_rules_based_on_auditable_state() -> None:
-    """冲动规则应基于现存可审计状态，不依赖已删除的 neuromod。"""
-    from plugins.life_engine.drives.rules import DEFAULT_RULES
+def test_legacy_impulse_engine_is_not_constructed(tmp_path) -> None:
+    config = LifeEngineConfig()
+    config.settings.workspace_path = str(tmp_path)
+    service = LifeEngineService(_service_plugin(config))
 
-    # 确认所有规则都不依赖 neuromod（规则 condition 函数只接受 context 参数）
-    for rule in DEFAULT_RULES:
-        assert rule.name in {
-            "learning_reflect",
-            "river_consolidate",
-            "intent_review",
-            "todo_attend",
-        }, f"发现未预期的规则: {rule.name}"
-    
-    # 确认社交类规则已被移除（它们依赖已删除的 sociability 调质）
-    rule_names = {rule.name for rule in DEFAULT_RULES}
-    assert "thought_deepen" not in rule_names
-    assert "curiosity_engage" not in rule_names
-    assert "social_reach_out" not in rule_names
-    assert "break_silence" not in rule_names
+    assert config.drives.enabled is False
+    assert not hasattr(service, "_impulse_engine")
 # ── loop 中收到新消息的并发回归测试 ────────────────────────────────────
 
 async def test_inject_delta_unreads_appends_new_messages_to_payload(monkeypatch) -> None:

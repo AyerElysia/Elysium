@@ -24,9 +24,8 @@ _CHAT_GUIDE_TOOLS = {
     "tool-inspect_media",  # 把图片/视频/语音提升为原生多模态输入
     "action-life_send_text",  # 发送文字给用户
     "action-life_pass_and_wait",  # 结束本轮
-    "tool-nucleus_manage_initiative_seed",
-    "tool-nucleus_reachability",
-    "tool-nucleus_begin_outreach",
+    "tool-nucleus_proactive_query",
+    "tool-nucleus_proactive_command",
 }
 
 
@@ -61,13 +60,19 @@ def test_manifest_kind_declared(kind: str) -> None:
 
 
 @pytest.mark.parametrize("kind", ["chat", "minecraft", "livestream", "voice_live"])
-def test_consciousness_instances_share_subject_initiative_tools(kind: str) -> None:
+def test_consciousness_instances_share_one_proactive_surface(kind: str) -> None:
     manifest = set(get_tool_manifest(kind))
     assert {
+        "tool-nucleus_proactive_query",
+        "tool-nucleus_proactive_command",
+    } <= manifest
+    assert {
+        "tool-nucleus_manage_thought_stream",
+        "tool-nucleus_manage_attention_thread",
         "tool-nucleus_manage_initiative_seed",
         "tool-nucleus_reachability",
         "tool-nucleus_begin_outreach",
-    } <= manifest
+    }.isdisjoint(manifest)
     assert "tool-nucleus_schedule_autonomy_intent" not in manifest
 
 
