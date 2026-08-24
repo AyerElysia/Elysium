@@ -112,3 +112,58 @@ async def test_challenge_records_evidence_without_code_side_confidence_rule(
     reloaded = InsightStore(tmp_path).get_insight(insight.insight_id)
     assert reloaded.confidence == 0.8
     assert [evidence.weight for evidence in reloaded.evidence] == [1.0, 1.0]
+
+
+def test_should_compress_enforces_interval_floor_above_trigger_count(
+    tmp_path,
+) -> None:
+    """触发数不能绕过压缩最小间隔。
+
+    validated 洞察数持续高于触发数时，间隔门禁仍然必须生效；否则慢环
+    会每个维护周期都重写同一份 base，间隔配置变成死代码。
+    """
+    from datetime import UTC, datetime, timedelta
+
+    store = InsightStore(tmp_path)
+    for index in range(5):
+        _insight(store, claim=f"Validated claim {index}.", status=InsightStatus.VALIDATED)
+
+    compressor = SelfKnowledgeCompressor(
+        store=store,
+        workspace_path=tmp_path,
+        trigger_count=5,
+        interval_hours=48.0,
+    )
+
+    # 无可用材料时永远不压缩。
+    empty_store = InsightStore(tmp_path / "empty")
+    empty_compressor = SelfKnowledgeCompressor(
+        store=empty_store,
+        workspace_path=tmp_path / "empty",
+        trigger_count=5,
+        interval_hours=48.0,
+    )
+    assert empty_compressor.should_compress() is False
+
+    # 从未压缩过且存在可用材料：允许引导性的第一次压缩（不限触发数）。
+    assert compressor.should_compress() is True
+
+    # 刚压缩完成：即使 validated 洞察数仍高于触发数，间隔未到也不压缩。
+    state = store.load_state()
+    state["last_compress_at"] = datetime.now(UTC).isoformat()
+    store.save_state(state)
+    assert compressor.should_compress() is False
+
+    # 间隔已过且材料足够：允许再次压缩。
+    state = store.load_state()
+    state["last_compress_at"] = (
+        datetime.now(UTC) - timedelta(hours=49)
+    ).isoformat()
+    store.save_state(state)
+    assert compressor.should_compress() is True
+
+    # last_compress 损坏（无法解析）：显式允许压缩，而不是静默锁死。
+    state = store.load_state()
+    state["last_compress_at"] = "not-a-timestamp"
+    store.save_state(state)
+    assert compressor.should_compress() is True

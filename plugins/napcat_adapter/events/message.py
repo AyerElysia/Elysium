@@ -266,7 +266,7 @@ class MessageEventHandler:
             return {"type": "text", "data": "[无法解析的图片]"}
 
         try:
-            async with asyncio.timeout(10):
+            async with asyncio.timeout(25):
                 image_base64 = await download_image_base64(image_url)
         except TimeoutError:
             logger.error(f"图片下载超时: {image_url}")

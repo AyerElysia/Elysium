@@ -172,3 +172,4 @@ skill/*
 # 视觉嵌入服务的独立 venv 与运行日志（模型在 /root/models，不在仓库内）
 services/visual_embedding/.venv/
 services/visual_embedding/*.log
+elysia_credential.json

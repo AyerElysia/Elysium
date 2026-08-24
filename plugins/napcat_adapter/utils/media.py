@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 from typing import TYPE_CHECKING
 
@@ -18,27 +19,48 @@ if TYPE_CHECKING:
 logger = get_logger("napcat_adapter")
 
 
-async def download_image_base64(url: str) -> str:
-    """下载图片并返回 Base64 编码。"""
+async def download_image_base64(url: str, max_attempts: int = 3) -> str:
+    """下载图片并返回 Base64 编码。
+
+    WSL 出站网络存在间歇性丢包（TCP 握手偶发十余秒），单次下载容易踩中，
+    这里做多次尝试 + 递增退避；单次内部仍保留代理失败降级直连的逻辑。
+    """
     if not url:
         raise ValueError("图片URL为空")
 
-    timeout = httpx.Timeout(timeout=10.0, connect=5.0)
+    timeout = httpx.Timeout(timeout=6.0, connect=3.0)
+    last_error: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            image_bytes = await _download_image_once(url, timeout)
+            if not image_bytes:
+                raise ValueError("图片内容为空")
+            return await get_task_manager().to_thread(base64_encode_bytes, image_bytes)
+        except Exception as e:  # noqa: BLE001 - 穷尽尝试后再抛出
+            last_error = e
+            if attempt < max_attempts:
+                logger.warning(
+                    f"图片下载第 {attempt} 次尝试失败: {e!s}，稍后重试"
+                )
+                await asyncio.sleep(0.5 * attempt)
+    raise RuntimeError(
+        f"图片下载失败（已尝试 {max_attempts} 次）: {last_error!s}"
+    ) from last_error
+
+
+async def _download_image_once(url: str, timeout: httpx.Timeout) -> bytes:
+    """单次下载：代理/连接类错误自动降级直连再试一次。"""
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.get(url)
             response.raise_for_status()
-            image_bytes = response.content
+            return response.content
     except (httpx.ProxyError, httpx.ConnectError, httpx.ConnectTimeout) as e:
         logger.warning(f"图片下载代理/连接失败，重试直连: {e!s}")
         async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
             response = await client.get(url)
             response.raise_for_status()
-            image_bytes = response.content
-
-    if not image_bytes:
-        raise ValueError("图片内容为空")
-    return await get_task_manager().to_thread(base64_encode_bytes, image_bytes)
+            return response.content
 
 
 async def convert_image_to_gif(image_base64: str) -> str:

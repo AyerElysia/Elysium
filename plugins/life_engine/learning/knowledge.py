@@ -105,24 +105,26 @@ class SelfKnowledgeCompressor:
     def should_compress(self) -> bool:
         """判断是否应该触发压缩。"""
         promotable = self._store.list_for_compression()
-        if len(promotable) >= self._trigger_count:
-            return True
+        if not promotable:
+            return False
 
-        # 检查时间间隔
+        # 首次压缩允许用任意可用材料引导（契约：无 last_compress 即允许）。
         state = self._store.load_state()
         last_compress = state.get("last_compress_at", "")
-        if not last_compress and promotable:
+        if not last_compress:
             return True
-        if last_compress:
-            try:
-                last_dt = datetime.fromisoformat(last_compress)
-                now = datetime.now(UTC).astimezone()
-                hours_elapsed = (now - last_dt).total_seconds() / 3600.0
-                if hours_elapsed >= self._interval_hours and promotable:
-                    return True
-            except (ValueError, TypeError):
-                pass
-        return False
+
+        # 之后间隔是配置文档定义的"两次压缩的最小间隔"，是硬下限；触发数
+        # 不能绕过它。validated 洞察只在主体接受后才离开可压缩列表，接受
+        # 链未打通时它们会长期高于触发数——一旦触发数可以绕过间隔，慢环
+        # 就会每个维护周期都从同一份 base 重写一遍，间隔门禁成为死代码。
+        try:
+            last_dt = datetime.fromisoformat(last_compress)
+            now = datetime.now(UTC).astimezone()
+            hours_elapsed = (now - last_dt).total_seconds() / 3600.0
+            return hours_elapsed >= self._interval_hours
+        except (ValueError, TypeError):
+            return True
 
     async def run_compression(self) -> bool:
         """Create one immutable proposal; never accept it on the subject's behalf."""
