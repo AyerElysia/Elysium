@@ -3,7 +3,12 @@ from __future__ import annotations
 
 from typing import ClassVar
 
-from src.core.components.base.config import BaseConfig, Field, SectionBase, config_section
+from src.core.components.base.config import (
+    BaseConfig,
+    Field,
+    SectionBase,
+    config_section,
+)
 
 
 class NapcatAdapterConfig(BaseConfig):
@@ -244,6 +249,16 @@ class NapcatAdapterConfig(BaseConfig):
             input_type="slider",
             tag="network",
             order=14,
+        )
+        qq_voice_projection_enabled: bool = Field(
+            default=True,
+            description=(
+                "发送内联 WAV 语音到 QQ 前应用平台专用清晰度补偿；"
+                "不修改 TTS 原始音频、URL 或已有 Silk"
+            ),
+            label="QQ 语音清晰度补偿",
+            tag="performance",
+            order=15,
         )
 
     @config_section("events", title="事件感知", tag="general", order=40)

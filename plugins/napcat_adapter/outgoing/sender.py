@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import random
 from typing import TYPE_CHECKING, Any
 
@@ -21,6 +22,10 @@ from src.core.transport.wire import (
 )
 
 from ..utils.media import convert_image_to_gif, get_image_format
+from .voice_projection import (
+    QQ_VOICE_PROJECTION_ALGORITHM_VERSION,
+    project_inline_qq_voice,
+)
 
 if TYPE_CHECKING:
     from ..client import NapCatClient
@@ -67,6 +72,44 @@ class OutgoingSender:
             _DEFAULT_SEND_CONFIRM_TIMEOUT_SECONDS,
         )
         return max(5.0, min(60.0, float(configured or 0.0)))
+
+    def _qq_voice_projection_enabled(self) -> bool:
+        config = self._config()
+        features = getattr(config, "features", None)
+        return bool(getattr(features, "qq_voice_projection_enabled", True))
+
+    async def _prepare_qq_voice_file(self, voice_data: str) -> str:
+        """Project inline WAV for QQ while preserving every unsupported input."""
+
+        if voice_data.startswith(("http://", "https://")):
+            return voice_data
+        file_value = (
+            voice_data
+            if voice_data.startswith("base64://")
+            else f"base64://{voice_data}"
+        )
+        if not self._qq_voice_projection_enabled():
+            return file_value
+
+        try:
+            projection = await asyncio.to_thread(
+                project_inline_qq_voice,
+                file_value,
+            )
+        except Exception as exc:  # noqa: BLE001 - platform projection must fail open
+            logger.warning(
+                f"QQ 语音清晰度补偿失败，保留原始音频: error_type={type(exc).__name__}"
+            )
+            return file_value
+
+        if projection.applied:
+            logger.info(
+                "QQ 语音清晰度补偿完成: "
+                f"algorithm={QQ_VOICE_PROJECTION_ALGORITHM_VERSION}, "
+                f"input_bytes={projection.input_bytes}, "
+                f"output_bytes={projection.output_bytes}"
+            )
+        return projection.file_value
 
     @staticmethod
     def _is_send_receipt_timeout_response(response: dict[str, Any]) -> bool:
@@ -233,7 +276,7 @@ class OutgoingSender:
             case "voice":
                 voice_data = str(seg.get("data", ""))
                 if voice_data:
-                    file_val = voice_data if voice_data.startswith(("base64://", "http://", "https://")) else f"base64://{voice_data}"
+                    file_val = await self._prepare_qq_voice_file(voice_data)
                     payload.append({"type": "record", "data": {"file": file_val}})
                 return payload
 

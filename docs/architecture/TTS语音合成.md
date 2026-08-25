@@ -84,7 +84,14 @@ TTS 后端只在真正请求语音且端口未就绪时按配置启动。插件�
 
 ### 4.1 QQ 与飞书
 
-本地合成成功后，平台适配器再完成各自协议转换与发送。QQ/NapCat 使用 OneBot 语音记录；飞书需要可播放音频上传。只有平台返回真实成功，才算“已经说出口”。
+本地合成成功后，平台适配器再完成各自协议转换与发送。QQ/NapCat 使用 OneBot
+语音记录；飞书需要可播放音频上传。只有平台返回真实成功，才算“已经说出口”。
+
+QQ 的最终 NT-Silk 编码会显著削弱辅音所在的中高频。NapCat 出站适配器因此可为内联
+WAV 派生 `qq_voice_presence_v1`：24 kHz SOXR 单声道、2.8 kHz presence 与
+4.5 kHz high-shelf 补偿、2 dB headroom 和限幅，然后仍由 NapCat 执行最终
+Silk 编码。它是可关闭、可复现的平台运输投影，不是新的 TTS 音色，也不修改 TTS
+原件或其他平台音频。URL、已有 Silk、非 WAV 与投影失败均保持原输入。
 
 ### 4.2 N.E.K.O Surface
 
