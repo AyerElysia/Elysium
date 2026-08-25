@@ -657,7 +657,7 @@ class BaseAction(ABC, LLMUsable):
                     processed_plain_text=content_str,
                     message_type=MessageType.TEXT,
                     sender_id=bot_info.get("bot_id", "") if bot_info else "",
-                    sender_name=bot_info.get("bot_name", "Bot") if bot_info else "Bot",
+                    sender_name=(bot_info.get("bot_name") or "爱莉") if bot_info else "爱莉",
                     platform=platform,
                     chat_type=chat_type,
                     stream_id=target_stream_id,

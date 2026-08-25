@@ -112,7 +112,7 @@ class LifeEngineCommandHandler(BaseEventHandler):
             chat_type=trigger_message.chat_type,
             stream_id=trigger_message.stream_id,
             sender_id="",
-            sender_name="Bot",
+            sender_name="爱莉",
             sender_role="assistant",
             message_type=MessageType.TEXT,
             content=content,

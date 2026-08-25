@@ -253,6 +253,9 @@ async def collect_global_chat_history_entries_from_db(
         return []
 
     del stream_manager
+    bot_display_name = str(
+        getattr(current_stream, "bot_nickname", "") or ""
+    ).strip() or "爱莉"
 
     try:
         from src.core.models.message import MessageType
@@ -316,7 +319,7 @@ async def collect_global_chat_history_entries_from_db(
         person = person_meta.get(person_id)
         if person_id == "bot":
             sender_id = "bot"
-            sender_name = "Bot"
+            sender_name = bot_display_name
             sender_cardname = ""
         elif person is not None:
             sender_id = str(

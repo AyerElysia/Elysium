@@ -1001,14 +1001,14 @@ class StreamManager:
                     bot_id = str(bot_info.get("bot_id", "") or "")
                     bot_nickname = str(bot_info.get("bot_name", "") or "")
                     sender_id = bot_id or "bot"
-                    sender_name = bot_nickname or "Bot"
+                    sender_name = bot_nickname or "爱莉"
                     sender_cardname = bot_nickname or ""
             except Exception as e:
                 logger.warning(
                     f"恢复 Bot 发送者信息失败: platform={db_message.platform}, error={e}"
                 )
                 sender_id = "bot"
-                sender_name = "Bot"
+                sender_name = "爱莉"
 
         normalized_plain_text = db_message.processed_plain_text
         if defer_content and normalized_plain_text is not None:
