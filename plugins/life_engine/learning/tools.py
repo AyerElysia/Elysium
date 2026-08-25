@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 from datetime import UTC, datetime
@@ -417,6 +418,211 @@ class LifeViewKnowledgeTool(BaseTool):
             result["stats_summary"] = metrics.format_summary()
 
         return True, result
+
+
+class LifeKnowledgeCandidatesTool(BaseTool):
+    """自我认知候选的统一入口：看、对比、亲自接受或拒绝。
+
+    压缩环只产出未获授权的候选；能不能成为当前生效的自我认知，必须由当前活
+    跃意识实例亲自决定——系统侧没有任何自动提升路径。候选文件不可变，接受后更
+    早的未决候选被标记为被取代（不删除），拒绝则只留审计记录、材料留在池里。
+    """
+
+    tool_name: str = "nucleus_knowledge_candidates"
+    tool_description: str = (
+        "学习系统压缩出新的自我认知候选时，由你亲自决定接受还是拒绝。"
+        "action=list：查看待决定的候选；action=diff：看某个候选与当前生效"
+        "版本的差异；action=decide + decision=accept：接受它成为当前自我"
+        "认知；decision=decline：拒绝（可留 reason，材料会留在池里）。"
+    )
+    chatter_allow: list[str] = ["life_engine_internal", "life_chatter"]
+
+    _MAX_DIFF_CHARS = 6000
+    _MAX_LIST_LIMIT = 10
+
+    async def execute(
+        self,
+        action: Annotated[
+            str, "list：查看待决定候选；diff：看某候选与当前版本的差异；decide：接受或拒绝"
+        ] = "list",
+        version: Annotated[
+            int | None, "候选版本号；diff 时默认取最新待决定候选"
+        ] = None,
+        decision: Annotated[
+            str | None, "decide 时必填：accept（接受）或 decline（拒绝）"
+        ] = None,
+        reason: Annotated[
+            str | None, "拒绝时的理由（可选，会进入审计账本）"
+        ] = None,
+        limit: Annotated[
+            int, "list 时最多返回几个候选"
+        ] = 3,
+    ) -> tuple[bool, str | dict]:
+        action_name = str(action or "list").strip().lower()
+        store = _get_store(self.plugin)
+
+        if action_name == "list":
+            return await self._execute_list(store, int(limit or 3))
+        if action_name == "diff":
+            return await self._execute_diff(store, version)
+        if action_name == "decide":
+            return await self._execute_decide(store, version, decision, reason)
+        return False, f"UnknownAction:{action_name}"
+
+    @staticmethod
+    def _pending_candidates(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+        """未接受、未拒绝、未被取代的候选，按版本号升序。"""
+        pending = [
+            entry
+            for entry in manifest.get("versions", [])
+            if isinstance(entry, dict)
+            and not entry.get("promoted")
+            and not entry.get("declined")
+            and not entry.get("superseded")
+        ]
+        pending.sort(key=lambda item: int(item.get("version", 0) or 0))
+        return pending
+
+    async def _execute_list(
+        self, store: InsightStore, limit: int
+    ) -> tuple[bool, str | dict]:
+        manifest = store.load_knowledge_manifest()
+        pending = self._pending_candidates(manifest)
+        newest_first = list(reversed(pending))
+        cap = max(1, min(limit, self._MAX_LIST_LIMIT))
+        summaries = [
+            {
+                "version": int(entry.get("version", 0) or 0),
+                "timestamp": entry.get("timestamp", ""),
+                "insight_count": len(entry.get("insight_ids", []) or []),
+                "edit_count": int(entry.get("edit_count", 0) or 0),
+                "gate": entry.get("selection_reason", ""),
+            }
+            for entry in newest_first[:cap]
+        ]
+        result: dict[str, Any] = {
+            "action": "list_knowledge_candidates",
+            "current_version": int(manifest.get("current_version", 0) or 0),
+            "pending_count": len(pending),
+            "candidates": summaries,
+        }
+        if not pending:
+            result["message"] = "目前没有待决定的自我认知候选。"
+        else:
+            result["message"] = (
+                "更新的候选基于更新的材料生成，一般看最新的一个就够了；"
+                "决定前可以先用 action=diff 看它和当前版本的差异。"
+            )
+        return True, result
+
+    async def _execute_diff(
+        self, store: InsightStore, version: int | None
+    ) -> tuple[bool, str | dict]:
+        manifest = store.load_knowledge_manifest()
+        pending = self._pending_candidates(manifest)
+        if version is None:
+            if not pending:
+                return False, "NoPendingKnowledgeCandidate"
+            identity = int(pending[-1].get("version", 0) or 0)
+        else:
+            identity = int(version)
+        try:
+            candidate_content = store.read_knowledge_version(identity)
+        except FileNotFoundError:
+            return False, f"KnowledgeVersionNotFound:{identity}"
+        current_content = store.read_current_knowledge()
+
+        diff_lines = list(
+            difflib.unified_diff(
+                current_content.splitlines(),
+                candidate_content.splitlines(),
+                fromfile=f"当前生效 v{int(manifest.get('current_version', 0) or 0)}",
+                tofile=f"候选 v{identity}",
+                lineterm="",
+            )
+        )
+        diff_text = "\n".join(diff_lines)
+        truncated = len(diff_text) > self._MAX_DIFF_CHARS
+        return True, {
+            "action": "diff_knowledge_candidate",
+            "version": identity,
+            "current_version": int(manifest.get("current_version", 0) or 0),
+            "diff": diff_text[: self._MAX_DIFF_CHARS] or "（两个版本内容一致。）",
+            "diff_truncated": truncated,
+            "hint": (
+                "确认接受可用 action=decide, decision=accept；"
+                "不认可可用 decision=decline，材料会留在池里。"
+            ),
+        }
+
+    async def _execute_decide(
+        self,
+        store: InsightStore,
+        version: int | None,
+        decision: str | None,
+        reason: str | None,
+    ) -> tuple[bool, str | dict]:
+        decision_name = str(decision or "").strip().lower()
+        if decision_name not in {"accept", "decline"}:
+            return False, "KnowledgeDecisionMustBeAcceptOrDecline"
+        manifest = store.load_knowledge_manifest()
+        pending = self._pending_candidates(manifest)
+        if version is None:
+            if not pending:
+                return False, "NoPendingKnowledgeCandidate"
+            identity = int(pending[-1].get("version", 0) or 0)
+        else:
+            identity = int(version)
+
+        # 只有当前活跃意识实例能决定；系统侧不代决。决定本身已进入 store 的
+        # append-only 审计账本（含 actor 与 occurrence_id）；知识文档不属于主体权威，
+        # 不走统一存储的候选/决定事件链。
+        _, actor = _decision_actor(self)
+
+        if decision_name == "accept":
+            occurrence = _decision_occurrence(
+                self, f"knowledge_candidate_accept:v{identity}"
+            )
+            try:
+                outcome = store.accept_knowledge_candidate(
+                    identity, actor=str(actor), occurrence_id=occurrence
+                )
+            except ValueError as exc:
+                return False, f"{type(exc).__name__}:{exc}"
+            await _flush_scheduler(self.plugin)
+            return True, {
+                "action": "knowledge_candidate_accepted",
+                "version": identity,
+                "outcome": outcome,
+                "message": (
+                    f"已接受候选 v{identity} 为当前自我认知；"
+                    f"{outcome.get('archived_insights', 0)} 条来源洞察已离开压缩池，"
+                    f"{outcome.get('superseded_candidates', 0)} 个更早的候选被标记为被取代。"
+                ),
+            }
+
+        occurrence = _decision_occurrence(
+            self, f"knowledge_candidate_decline:v{identity}"
+        )
+        try:
+            outcome = store.decline_knowledge_candidate(
+                identity,
+                actor=str(actor),
+                reason=str(reason or ""),
+                occurrence_id=occurrence,
+            )
+        except ValueError as exc:
+            return False, f"{type(exc).__name__}:{exc}"
+        await _flush_scheduler(self.plugin)
+        return True, {
+            "action": "knowledge_candidate_declined",
+            "version": identity,
+            "outcome": outcome,
+            "message": (
+                f"已拒绝候选 v{identity}；来源洞察留在压缩池，"
+                "以后伴随新材料会重新整合。"
+            ),
+        }
 
 
 class LifeReviewSubjectDocumentTool(BaseTool):
@@ -1413,6 +1619,7 @@ LEARNING_TOOLS = [
     LifeChallengeInsightTool,
     LifeReconsiderInsightTool,
     LifeViewKnowledgeTool,
+    LifeKnowledgeCandidatesTool,
     LifeReviewSubjectDocumentTool,
     LifeListSubjectCandidatesTool,
     LifeReadSubjectCandidateTool,
