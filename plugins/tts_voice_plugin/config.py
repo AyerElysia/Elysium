@@ -93,12 +93,13 @@ class TTSSection(SectionBase):
         description="长文本是否在 TTS 内部按自然句与有界片段顺序合成，再拼成一条音频",
     )
     segment_max_units: int = Field(
-        default=48,
+        default=24,
         ge=16,
         le=200,
         description=(
-            "单个 TTS 片段的近似语音单位硬上限；中日韩字符按一单位、"
-            "连续拉丁数字按约四字符一单位估算"
+            "不具备原生切分合同的 TTS transport 单片段近似语音单位硬上限；"
+            "中日韩字符按一单位、连续拉丁数字按约四字符一单位估算。"
+            "legacy_compat 把完整表达交给后端原生 text_split_method"
         ),
     )
     segment_min_units: int = Field(
@@ -209,7 +210,7 @@ class TTSStyle(SectionBase):
     gpt_weights: str = Field(default="C:/path/to/your/gpt_weights.ckpt", description="GPT 模型路径")
     sovits_weights: str = Field(default="C:/path/to/your/sovits_weights.pth", description="SoVITS 模型路径")
     speed_factor: float = Field(
-        default=1.0,
+        default=0.9,
         ge=0.5,
         le=2.0,
         description=(

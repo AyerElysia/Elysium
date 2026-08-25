@@ -609,8 +609,8 @@ retry_failed = true
 语音链路的通用实现和协议要求为：
 
 - `tasks.voice` 必须指向兼容当前音频输入合同的音频理解或 ASR 模型。飞书入站 Opus 会先转为 16 kHz 单声道 WAV；`MediaManager` 可先尝试原生音频理解，失败后回退 ASR。
-- 当前消息 TTS 使用本地微调 **IndexTTS2.5**，由 `tts_voice_plugin:service:tts` 通过本机 `config/plugins/tts_voice_plugin/config.toml` 接入 vLLM-Omni 的 `/v1/audio/speech`。`models.toml` 没有也不需要 `tasks.tts`；Life Chatter 的 `life_send_voice(text=...)` 直接消费 Service，绝不回退旧 `model.toml`、MiMo speech client 或其他模型任务。
-- Service 的生产协议是 OpenAI-compatible speech API；历史 GPT-SoVITS `api_v2` 兼容 `/tts` 仅保留为显式回退。长表达会在同一表达内按自然边界分段，vLLM-Omni 默认最多并发 2 段、硬上限 4，随后按原序拼成一条语音；内部片段不形成多次表达，也不分段外发。启用插件时必须安装锁定的 `aiohttp`、`soundfile`、`pedalboard` 依赖，并单独验证本机地址、完整模型 bundle、参考音色和 IndexTTS2.5 revision。
+- 当前消息 TTS 由 `tts_voice_plugin:service:tts` 通过本机 `config/plugins/tts_voice_plugin/config.toml` 显式选择 IndexTTS2.5/vLLM-Omni `/v1/audio/speech` 或 GPT-SoVITS `api_v2` `/tts`。`models.toml` 没有也不需要 `tasks.tts`；Life Chatter 的 `life_send_voice(text=...)` 直接消费 Service，绝不回退旧 `model.toml`、MiMo speech client 或其他模型任务。
+- 两个后端只有一个稳定 Service 接口，但切分 owner 不同：vLLM-Omni 的长表达由 Service 以默认 24 单位上限做有界运输切分，最多并发 2 段、硬上限 4，再按原序拼成一条语音；GPT-SoVITS 的完整表达只发出一次 `/tts`，由配置的原生 `text_split_method`（默认 `cut5`）切分，禁止 Elysium 二次拆句。默认风格 `speed_factor=0.90`，日志只记录完整表达的时长与无正文语速指标。内部片段不形成多次表达，也不分段外发。
 - `[tts].idle_shutdown_seconds` 默认 1800 秒：只对插件通过 `start_command` 创建的后端进程组生效。最后一条完整表达结束并持续闲置到期后释放模型；下一次语音自动按需启动。设为 0 可保持常驻。外部手工服务、正在执行的长表达和 replacement process 不受旧计时影响；不要用定时 kill、端口猜测或 vLLM sleep endpoint 代替 owner 校验。
 - N.E.K.O Surface 自动调用同一消息 TTS Service 并按回复顺序播放，显式 TTS 动作在该场景必须抑制。直播使用自己的有界 HTTP TTS 客户端；Voice Live 使用 Realtime Provider，二者都不能冒充消息 TTS 的平台发送回执。
 - QQ/NapCat 与飞书共用核心 `voice` 消息段，但出站协议不同：NapCat 映射为 OneBot `record`，并默认对内联 WAV 应用可关闭的 `qq_voice_presence_v1` 平台投影，再由 QQ 编码为 NT-Silk；飞书转为 Opus 并发送 `audio`。该投影不修改 TTS 原件，失败时原样发送。QQ/NapCat 语音收发仍须在用户手动重启后完成真实端到端验收。

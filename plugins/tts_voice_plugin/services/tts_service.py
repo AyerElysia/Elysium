@@ -49,6 +49,9 @@ class _SynthesisSegment:
     units: int
 
 
+_TTS_CLARITY_WARNING_UNITS_PER_SECOND = 4.8
+
+
 _SEMANTIC_BOUNDARY_RE = re.compile(
     r"(?:\r?\n){1,}|"
     r"[。！？!?]+[”’」』】）》)\]\"']*|"
@@ -840,6 +843,25 @@ class TTSService(BaseService):
             return [_SynthesisSegment(text=text, boundary="sentence", units=total_units)]
         return merged
 
+    def _build_synthesis_plan(
+        self,
+        text: str,
+    ) -> tuple[str, list[_SynthesisSegment]]:
+        """Select the single segmentation owner for one outward expression."""
+
+        if self._backend_name() == "legacy_compat":
+            return (
+                "legacy_native",
+                [
+                    _SynthesisSegment(
+                        text=text,
+                        boundary="sentence",
+                        units=self._estimate_synthesis_units(text),
+                    )
+                ],
+            )
+        return "bounded_transport", self._split_text_for_synthesis(text)
+
     def _pause_after_segment_ms(self, boundary: str) -> int:
         """Return configured silence for one internal boundary."""
         cfg = self._config.tts
@@ -850,6 +872,44 @@ class TTSService(BaseService):
             "sentence": cfg.sentence_pause_ms,
             "paragraph": cfg.paragraph_pause_ms,
         }.get(boundary, cfg.phrase_pause_ms)
+
+    def _observe_synthesis_audio(
+        self,
+        *,
+        units: int,
+        audio_data: bytes,
+        segment_index: int,
+        segment_count: int,
+        scope: str,
+    ) -> None:
+        """Record content-free duration and pace evidence for delivered audio."""
+
+        try:
+            info = sf.info(io.BytesIO(audio_data))
+            duration_seconds = float(info.duration)
+        except Exception as exc:  # noqa: BLE001 - telemetry cannot block delivery
+            logger.debug(
+                "TTS音频时长不可解析: "
+                f"scope={scope}, segment={segment_index}/{segment_count}, "
+                f"error_type={type(exc).__name__}"
+            )
+            return
+        if duration_seconds <= 0.0:
+            return
+
+        units_per_second = units / duration_seconds
+        pace_warning = units_per_second > _TTS_CLARITY_WARNING_UNITS_PER_SECOND
+        message = (
+            "TTS声学观测: "
+            f"scope={scope}, segment={segment_index}/{segment_count}, units={units}, "
+            f"duration_ms={round(duration_seconds * 1000)}, "
+            f"units_per_second={units_per_second:.2f}, "
+            f"pace_warning={str(pace_warning).lower()}"
+        )
+        if pace_warning:
+            logger.warning(message)
+        else:
+            logger.info(message)
 
     def _join_wav_segments(
         self,
@@ -1491,10 +1551,11 @@ class TTSService(BaseService):
             "开始本地 TTS 语音合成: "
             f"chars={len(clean_text)}, style={style}, language={final_language}"
         )
-        synthesis_segments = self._split_text_for_synthesis(clean_text)
+        backend = self._backend_name()
+        plan_mode, synthesis_segments = self._build_synthesis_plan(clean_text)
         logger.info(
             "TTS内部合成计划已建立: "
-            f"segments={len(synthesis_segments)}, total_units="
+            f"mode={plan_mode}, segments={len(synthesis_segments)}, total_units="
             f"{sum(segment.units for segment in synthesis_segments)}, "
             f"max_segment_units={max(segment.units for segment in synthesis_segments)}"
         )
@@ -1509,7 +1570,6 @@ class TTSService(BaseService):
         }
         final_media_type = self._config.tts_advanced.media_type
         spatial_enabled = self._config.spatial_effects.enabled
-        backend = self._backend_name()
 
         # Reference audio is immutable for one outward expression. Encode it
         # once before bounded parallel segment requests instead of once per part.
@@ -1549,6 +1609,13 @@ class TTSService(BaseService):
                 )
                 if not audio_data:
                     return None
+                self._observe_synthesis_audio(
+                    units=synthesis_segments[0].units,
+                    audio_data=audio_data,
+                    segment_index=1,
+                    segment_count=1,
+                    scope="legacy_native_expression",
+                )
                 return base64.b64encode(audio_data).decode("utf-8")
 
             async def synthesize_segment(
@@ -1557,26 +1624,35 @@ class TTSService(BaseService):
                 request_kwargs: dict[str, Any],
                 slots: asyncio.Semaphore | None = None,
             ) -> bytes | None:
+                async def call_backend() -> bytes | None:
+                    return await self._call_tts_api(
+                        server_config=server_config,
+                        text=segment.text,
+                        text_language=final_language,
+                        request_media_type="wav",
+                        segment_index=index,
+                        segment_count=len(synthesis_segments),
+                        **request_kwargs,
+                    )
+
                 if slots is None:
-                    return await self._call_tts_api(
-                        server_config=server_config,
-                        text=segment.text,
-                        text_language=final_language,
-                        request_media_type="wav",
+                    audio_data = await call_backend()
+                else:
+                    async with slots:
+                        audio_data = await call_backend()
+                if audio_data:
+                    self._observe_synthesis_audio(
+                        units=segment.units,
+                        audio_data=audio_data,
                         segment_index=index,
                         segment_count=len(synthesis_segments),
-                        **request_kwargs,
+                        scope=(
+                            "legacy_native_expression"
+                            if backend == "legacy_compat"
+                            else "transport_segment"
+                        ),
                     )
-                async with slots:
-                    return await self._call_tts_api(
-                        server_config=server_config,
-                        text=segment.text,
-                        text_language=final_language,
-                        request_media_type="wav",
-                        segment_index=index,
-                        segment_count=len(synthesis_segments),
-                        **request_kwargs,
-                    )
+                return audio_data
 
             async def synthesize_all(
                 request_kwargs: dict[str, Any],
