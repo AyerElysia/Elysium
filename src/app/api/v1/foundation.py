@@ -337,7 +337,14 @@ def snapshot_from_bot(bot: Any) -> FoundationSnapshot:
     sync_error = str(getattr(life_service, "_shared_sync_error", "") or "")
     config = getattr(life_plugin, "config", None) if life_plugin is not None else None
     shared_sync_config = getattr(config, "shared_sync", None)
-    sync_enabled = bool(getattr(shared_sync_config, "enabled", False))
+    configured_sync_enabled = bool(getattr(shared_sync_config, "enabled", False))
+    sync_enabled = bool(
+        getattr(
+            life_service,
+            "_shared_sync_effective_enabled",
+            configured_sync_enabled,
+        )
+    )
     if not sync_enabled:
         sync_state = "disabled"
         sync_reason = None

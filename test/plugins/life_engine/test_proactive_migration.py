@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import shutil
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,8 +16,13 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from plugins.life_engine.attention_threads import AttentionThreadCommand
 from plugins.life_engine.initiative import InitiativeSeedCommand
+from plugins.life_engine.proactive import backend_binding
 from plugins.life_engine.proactive.backend_binding import (
+    ProactiveBackendBindingConflict,
+    complete_proactive_initial_binding,
     ensure_proactive_backend_binding,
+    read_sqlite_proactive_backend_binding,
+    repair_proactive_generation_binding,
     verify_proactive_backend_binding,
 )
 from plugins.life_engine.proactive.runtime import open_local_proactive_runtime
@@ -207,6 +216,101 @@ async def _activate_migrated_runtime(
     )
 
 
+async def _activate_repaired_generation(
+    active: StorageBackendRuntime,
+    target_workspace: Path,
+    *,
+    proactive_root_sha256: str | None = None,
+    source_snapshot_sha256: str | None = None,
+) -> StorageBackendRuntime:
+    """Activate a new immutable generation over unchanged copied authority."""
+
+    previous = active.generation
+    registry = active.authority_registry
+    assert previous is not None
+    assert isinstance(registry, FileAuthorityRegistry)
+    backend_identity = active.backend_identity
+    await active.revoke_authority()
+    await active.close()
+
+    generation = BackendGeneration(
+        generation_id=f"{previous.generation_id}-v3",
+        backend=previous.backend,
+        schema_version=previous.schema_version,
+        source_snapshot_sha256=(
+            source_snapshot_sha256 or previous.source_snapshot_sha256
+        ),
+        root_hashes={
+            **previous.root_hashes,
+            "local:proactive_authority": (
+                proactive_root_sha256
+                or previous.root_hashes["local:proactive_authority"]
+            ),
+        },
+        frontiers=dict(previous.frontiers),
+        created_at=previous.created_at,
+        verified_at=datetime.now(UTC).isoformat(),
+        status=GenerationStatus.VERIFIED,
+        metadata={**previous.metadata, "generation_repair_test": "v3"},
+    )
+    await registry.register_generation(generation)
+    health = await registry.health()
+    token = await registry.activate_generation(
+        generation.generation_id,
+        expected_epoch=int(health["authority_epoch"]),
+        owner_id="generation-repair-test",
+        lease_seconds=60,
+        confirm_previous_writers_stopped=False,
+    )
+    database_path = target_workspace / "runtime/proactive/proactive.sqlite3"
+    engine = create_sqlite_storage_engine(
+        SQLiteStorageConfig(database_path=database_path, busy_timeout_seconds=10)
+    )
+    return StorageBackendRuntime(
+        enabled=True,
+        backend=BackendKind.LOCAL,
+        backend_identity=backend_identity,
+        generation=generation,
+        authority_registry=registry,
+        authority_token=token,
+        engine=engine,
+        session_factory=async_sessionmaker(engine, expire_on_commit=False),
+    )
+
+
+async def _prepare_generation_repair(
+    tmp_path: Path,
+    *,
+    proactive_root_sha256: str | None = None,
+    source_snapshot_sha256: str | None = None,
+) -> tuple[StorageBackendRuntime, BackendGeneration, Path, str]:
+    snapshot, source_workspace = await _frozen_source(tmp_path)
+    target_workspace = tmp_path / "target-workspace"
+    active, _copied = await _activate_migrated_runtime(
+        snapshot,
+        target_workspace,
+        migration_id="copy-proactive-generation-repair",
+    )
+    binding_path = "runtime/proactive/backend-binding.json"
+    target_binding = target_workspace / binding_path
+    target_binding.parent.mkdir(parents=True, exist_ok=True)
+    target_binding.write_bytes((source_workspace / binding_path).read_bytes())
+    await ensure_proactive_backend_binding(
+        workspace_path=target_workspace,
+        binding_path=binding_path,
+        runtime=active,
+    )
+    previous = active.generation
+    assert previous is not None
+    repaired = await _activate_repaired_generation(
+        active,
+        target_workspace,
+        proactive_root_sha256=proactive_root_sha256,
+        source_snapshot_sha256=source_snapshot_sha256,
+    )
+    return repaired, previous, target_workspace, binding_path
+
+
 @pytest.mark.asyncio
 async def test_frozen_proactive_copy_is_exact_resumable_and_certified(
     tmp_path: Path,
@@ -320,6 +424,184 @@ async def test_verified_certificate_allows_explicit_backend_rebinding(
 
 
 @pytest.mark.asyncio
+async def test_generation_repair_is_audited_idempotent_and_recovers_cache_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    active, previous, workspace, binding_path = await _prepare_generation_repair(
+        tmp_path
+    )
+    try:
+        with pytest.raises(
+            ProactiveBackendBindingConflict,
+            match="ProactiveGenerationRepairRequired",
+        ):
+            await ensure_proactive_backend_binding(
+                workspace_path=workspace,
+                binding_path=binding_path,
+                runtime=active,
+            )
+
+        original_write = backend_binding._write_atomic
+        calls = 0
+
+        def fail_once(path: Path, payload: dict[str, object]) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError("simulated cache interruption")
+            original_write(path, payload)
+
+        monkeypatch.setattr(backend_binding, "_write_atomic", fail_once)
+        with pytest.raises(OSError, match="simulated cache interruption"):
+            await repair_proactive_generation_binding(
+                workspace_path=workspace,
+                binding_path=binding_path,
+                runtime=active,
+                previous_generation_id=previous.generation_id,
+                previous_generation_manifest_sha256=previous.manifest_sha256,
+                repair_id="repair-v2-to-v3",
+            )
+
+        repaired = await repair_proactive_generation_binding(
+            workspace_path=workspace,
+            binding_path=binding_path,
+            runtime=active,
+            previous_generation_id=previous.generation_id,
+            previous_generation_manifest_sha256=previous.manifest_sha256,
+            repair_id="repair-v2-to-v3",
+        )
+        replay = await repair_proactive_generation_binding(
+            workspace_path=workspace,
+            binding_path=binding_path,
+            runtime=active,
+            previous_generation_id=previous.generation_id,
+            previous_generation_manifest_sha256=previous.manifest_sha256,
+            repair_id="repair-v2-to-v3",
+        )
+        health = await verify_proactive_backend_binding(
+            workspace_path=workspace,
+            binding_path=binding_path,
+            runtime=active,
+        )
+        async with active.unit_of_work() as uow:
+            repair_rows = (
+                await uow.session.execute(
+                    text(
+                        "SELECT occurrence_id FROM runtime_events "
+                        "WHERE namespace = 'life_proactive.generation_repairs'"
+                    )
+                )
+            ).all()
+    finally:
+        await active.revoke_authority()
+        await active.close()
+
+    assert repaired["binding_epoch"] == 2
+    assert repaired["migration"]["repair_id"] == "repair-v2-to-v3"
+    assert replay == repaired
+    assert health["status"] == "healthy"
+    assert health["binding_epoch"] == 2
+    assert len(repair_rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_generation_repair_rejects_old_manifest_root_and_snapshot_mismatch(
+    tmp_path: Path,
+) -> None:
+    active, previous, workspace, binding_path = await _prepare_generation_repair(
+        tmp_path / "old-manifest"
+    )
+    try:
+        with pytest.raises(
+            ProactiveBackendBindingConflict,
+            match="PreviousIdentityMismatch",
+        ):
+            await repair_proactive_generation_binding(
+                workspace_path=workspace,
+                binding_path=binding_path,
+                runtime=active,
+                previous_generation_id=previous.generation_id,
+                previous_generation_manifest_sha256="0" * 64,
+                repair_id="repair-old-manifest",
+            )
+    finally:
+        await active.revoke_authority()
+        await active.close()
+
+    active, previous, workspace, binding_path = await _prepare_generation_repair(
+        tmp_path / "root-mismatch",
+        proactive_root_sha256="a" * 64,
+    )
+    try:
+        with pytest.raises(
+            ProactiveBackendBindingConflict,
+            match="RootMismatch",
+        ):
+            await repair_proactive_generation_binding(
+                workspace_path=workspace,
+                binding_path=binding_path,
+                runtime=active,
+                previous_generation_id=previous.generation_id,
+                previous_generation_manifest_sha256=previous.manifest_sha256,
+                repair_id="repair-root-mismatch",
+            )
+    finally:
+        await active.revoke_authority()
+        await active.close()
+
+    active, previous, workspace, binding_path = await _prepare_generation_repair(
+        tmp_path / "snapshot-mismatch",
+        source_snapshot_sha256="b" * 64,
+    )
+    try:
+        with pytest.raises(
+            ProactiveBackendBindingConflict,
+            match="SnapshotMismatch",
+        ):
+            await repair_proactive_generation_binding(
+                workspace_path=workspace,
+                binding_path=binding_path,
+                runtime=active,
+                previous_generation_id=previous.generation_id,
+                previous_generation_manifest_sha256=previous.manifest_sha256,
+                repair_id="repair-snapshot-mismatch",
+            )
+    finally:
+        await active.revoke_authority()
+        await active.close()
+
+
+@pytest.mark.asyncio
+async def test_generation_repair_rejects_changed_backend_endpoint(
+    tmp_path: Path,
+) -> None:
+    active, previous, workspace, binding_path = await _prepare_generation_repair(
+        tmp_path / "backend-endpoint"
+    )
+    moved = replace(
+        active,
+        backend_identity=f"{active.backend_identity}#relocated-endpoint",
+    )
+    try:
+        with pytest.raises(
+            ProactiveBackendBindingConflict,
+            match="ProactiveGenerationRepairBackendIdentityMismatch",
+        ):
+            await repair_proactive_generation_binding(
+                workspace_path=workspace,
+                binding_path=binding_path,
+                runtime=moved,
+                previous_generation_id=previous.generation_id,
+                previous_generation_manifest_sha256=previous.manifest_sha256,
+                repair_id="repair-backend-endpoint",
+            )
+    finally:
+        await active.revoke_authority()
+        await active.close()
+
+
+@pytest.mark.asyncio
 async def test_migration_certificate_cannot_rebind_another_workspace(
     tmp_path: Path,
 ) -> None:
@@ -372,3 +654,224 @@ async def test_live_snapshot_is_never_proactive_migration_source(
             )
     finally:
         await target.close()
+
+
+@pytest.mark.asyncio
+async def test_generation_repair_restores_missing_head(tmp_path: Path) -> None:
+    active, previous, workspace, binding_path = await _prepare_generation_repair(
+        tmp_path / "missing-head"
+    )
+    try:
+        async with active.unit_of_work() as uow:
+            await uow.session.execute(
+                text(
+                    """DELETE FROM runtime_states
+                    WHERE namespace = 'life_proactive.backend_binding'
+                      AND state_key = 'active'"""
+                )
+            )
+        repaired = await repair_proactive_generation_binding(
+            workspace_path=workspace,
+            binding_path=binding_path,
+            runtime=active,
+            previous_generation_id=previous.generation_id,
+            previous_generation_manifest_sha256=previous.manifest_sha256,
+            repair_id="repair-missing-head",
+        )
+        health = await verify_proactive_backend_binding(
+            workspace_path=workspace,
+            binding_path=binding_path,
+            runtime=active,
+        )
+    finally:
+        await active.revoke_authority()
+        await active.close()
+
+    assert repaired["identity"]["generation_id"] == (
+        f"{previous.generation_id}-v3"
+    )
+    assert health["status"] == "healthy"
+
+
+@pytest.mark.asyncio
+async def test_generation_repair_rejects_empty_chain(tmp_path: Path) -> None:
+    snapshot, source_workspace = await _frozen_source(tmp_path / "empty-chain")
+    target_workspace = tmp_path / "target-workspace"
+    active, _copied = await _activate_migrated_runtime(
+        snapshot,
+        target_workspace,
+        migration_id="copy-proactive-empty-chain",
+    )
+    binding_path = "runtime/proactive/backend-binding.json"
+    target_binding = target_workspace / binding_path
+    target_binding.parent.mkdir(parents=True, exist_ok=True)
+    target_binding.write_bytes((source_workspace / binding_path).read_bytes())
+    source_binding = json.loads(
+        (source_workspace / binding_path).read_text(encoding="utf-8")
+    )
+    try:
+        with pytest.raises(
+            ProactiveBackendBindingConflict,
+            match="ProactiveBackendBindingChainMissing",
+        ):
+            await repair_proactive_generation_binding(
+                workspace_path=target_workspace,
+                binding_path=binding_path,
+                runtime=active,
+                previous_generation_id=str(
+                    source_binding["identity"]["generation_id"]
+                ),
+                previous_generation_manifest_sha256=str(
+                    source_binding["identity"]["generation_manifest_sha256"]
+                ),
+                repair_id="repair-empty-chain",
+            )
+    finally:
+        await active.revoke_authority()
+        await active.close()
+
+
+@pytest.mark.asyncio
+async def test_complete_initial_binding_after_relocated_verified_copy(
+    tmp_path: Path,
+) -> None:
+    snapshot, source_workspace = await _frozen_source(tmp_path / "source")
+    candidate_workspace = tmp_path / "candidate-workspace"
+    active, _copied = await _activate_migrated_runtime(
+        snapshot,
+        candidate_workspace,
+        migration_id="copy-proactive-relocate",
+    )
+    candidate_identity_sha256 = hashlib.sha256(
+        active.backend_identity.encode("utf-8")
+    ).hexdigest()
+    generation = active.generation
+    assert generation is not None
+    await active.revoke_authority()
+    await active.close()
+
+    source_db = source_workspace / "runtime/proactive/proactive.sqlite3"
+    source_binding = read_sqlite_proactive_backend_binding(source_db)
+    candidate_db = candidate_workspace / "runtime/proactive/proactive.sqlite3"
+    relocated_workspace = tmp_path / "relocated-workspace"
+    binding_path = "runtime/proactive/backend-binding.json"
+    relocated_db = relocated_workspace / "runtime/proactive/proactive.sqlite3"
+    relocated_db.parent.mkdir(parents=True)
+    shutil.copy2(candidate_db, relocated_db)
+    for suffix in ("-wal", "-shm"):
+        extra = Path(str(candidate_db) + suffix)
+        if extra.exists():
+            shutil.copy2(extra, Path(str(relocated_db) + suffix))
+    stale_cache = relocated_workspace / binding_path
+    stale_cache.write_bytes((source_workspace / binding_path).read_bytes())
+
+    registry = FileAuthorityRegistry(
+        relocated_workspace / "runtime/proactive/authority.json",
+        registry_id="life-proactive-relocated",
+    )
+    await registry.register_generation(generation)
+    token = await registry.activate_generation(
+        generation.generation_id,
+        expected_epoch=0,
+        owner_id="relocated-test",
+        lease_seconds=60,
+        confirm_previous_writers_stopped=False,
+    )
+    sqlite_config = SQLiteStorageConfig(
+        database_path=relocated_db,
+        busy_timeout_seconds=10,
+    )
+    engine = create_sqlite_storage_engine(sqlite_config)
+    relocated = StorageBackendRuntime(
+        enabled=True,
+        backend=BackendKind.LOCAL,
+        backend_identity=sqlite_config.safe_identity,
+        generation=generation,
+        authority_registry=registry,
+        authority_token=token,
+        engine=engine,
+        session_factory=async_sessionmaker(engine, expire_on_commit=False),
+    )
+    try:
+        with pytest.raises(
+            ProactiveBackendBindingConflict,
+            match="ProactiveMigrationCertificateBackendIdentityMismatch",
+        ):
+            await ensure_proactive_backend_binding(
+                workspace_path=relocated_workspace,
+                binding_path=binding_path,
+                runtime=relocated,
+            )
+        with pytest.raises(
+            ProactiveBackendBindingConflict,
+            match="ProactiveMigrationCertificateBackendIdentityMismatch",
+        ):
+            await complete_proactive_initial_binding(
+                workspace_path=relocated_workspace,
+                binding_path=binding_path,
+                runtime=relocated,
+                source_binding=source_binding,
+                repair_id="initial-bind-relocated",
+            )
+        stale_identity = dict(source_binding["identity"])
+        stale_identity["generation_id"] = "local-selectable-20260823-v2"
+        stale_source = backend_binding._binding_payload(
+            stale_identity,
+            binding_epoch=1,
+            previous_binding_sha256="",
+            migration=(
+                source_binding.get("migration")
+                if isinstance(source_binding.get("migration"), dict)
+                else None
+            ),
+        )
+        with pytest.raises(
+            ProactiveBackendBindingConflict,
+            match="ProactiveMigrationSourceBindingMismatch",
+        ):
+            await complete_proactive_initial_binding(
+                workspace_path=relocated_workspace,
+                binding_path=binding_path,
+                runtime=relocated,
+                source_binding=stale_source,
+                repair_id="initial-bind-stale-source",
+                certificate_backend_identity_sha256=candidate_identity_sha256,
+            )
+        completed = await complete_proactive_initial_binding(
+            workspace_path=relocated_workspace,
+            binding_path=binding_path,
+            runtime=relocated,
+            source_binding=source_binding,
+            repair_id="initial-bind-relocated",
+            certificate_backend_identity_sha256=candidate_identity_sha256,
+        )
+        replayed = await complete_proactive_initial_binding(
+            workspace_path=relocated_workspace,
+            binding_path=binding_path,
+            runtime=relocated,
+            source_binding=source_binding,
+            repair_id="initial-bind-relocated",
+            certificate_backend_identity_sha256=candidate_identity_sha256,
+        )
+        health = await verify_proactive_backend_binding(
+            workspace_path=relocated_workspace,
+            binding_path=binding_path,
+            runtime=relocated,
+        )
+        ensured = await ensure_proactive_backend_binding(
+            workspace_path=relocated_workspace,
+            binding_path=binding_path,
+            runtime=relocated,
+        )
+    finally:
+        await relocated.revoke_authority()
+        await relocated.close()
+
+    assert completed["binding_epoch"] == 1
+    assert completed["identity"]["generation_id"] == generation.generation_id
+    assert completed["identity"]["backend_identity_sha256"] == hashlib.sha256(
+        sqlite_config.safe_identity.encode("utf-8")
+    ).hexdigest()
+    assert replayed == completed
+    assert health["status"] == "healthy"
+    assert ensured["identity"]["generation_id"] == generation.generation_id

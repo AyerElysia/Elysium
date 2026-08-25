@@ -469,15 +469,6 @@ class LifeMemoryService:
 
     def _get_db_path(self) -> Path:
         """获取数据库路径。"""
-        runtime = self._storage_runtime
-        if (
-            runtime is not None
-            and runtime.enabled
-            and runtime.backend == BackendKind.LOCAL
-            and runtime.engine is not None
-            and runtime.engine.url.database
-        ):
-            return Path(str(runtime.engine.url.database)).resolve()
         if self._workspace_override is not None:
             workspace = self._workspace_override
         else:

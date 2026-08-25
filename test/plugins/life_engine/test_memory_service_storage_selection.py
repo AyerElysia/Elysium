@@ -298,6 +298,30 @@ def _healthy_mysql_readiness(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_selected_local_memory_keeps_private_sqlite_database(
+    tmp_path: Path,
+) -> None:
+    runtime = SimpleNamespace(
+        enabled=True,
+        backend=BackendKind.LOCAL,
+        engine=SimpleNamespace(
+            url=SimpleNamespace(
+                database=str(tmp_path / "life_storage" / "local.sqlite3")
+            )
+        ),
+    )
+    service = LifeMemoryService(
+        tmp_path,
+        vector_backend_enabled=False,
+        storage_runtime=runtime,  # type: ignore[arg-type]
+        selectable_storage_enabled=True,
+    )
+
+    assert service._get_db_path() == tmp_path / ".memory" / "memory.db"
+    assert service._get_db_path() != Path(runtime.engine.url.database)
+
+
+@pytest.mark.asyncio
 async def test_selected_storage_requires_injected_coherent_runtime(
     tmp_path: Path,
 ) -> None:

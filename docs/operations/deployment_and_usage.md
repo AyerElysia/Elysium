@@ -327,6 +327,10 @@ MySQL 模式并不意味着把 Chroma 或媒体字节强行塞入关系表：Lif
 
 统一主动历史另有 `runtime/proactive/backend-binding.json`（可配置）记录 content-free backend identity 与 generation。它不含主体正文，也不是迁移工具。当前 binding 与拟启用 backend/generation 不一致时，启动必须失败；先在用户维护窗口完成复制、冻结、逐项校验与显式改绑，禁止删除 marker、改成空库或让运行时自动迁移来绕过。
 
+同一本地后端、同一 SQLite 端点、同一 authority registry 上只更换 verified generation identity（例如 `local-selectable-20260823-v2` → `local-selectable-20260824-v3`）时，这不是后端迁移。启动路径必须失败关闭并报告 `ProactiveGenerationRepairRequired`，不得把残留的后端迁移证书解读成新 generation 的证明。运维窗口使用 `scripts/repair_proactive_generation_binding.py --apply` 追加无内容 repair 证书并改绑 cache；该命令不改写主体文件或主动历史行。根哈希或后端端点不一致时必须拒绝，改走完整冻结复制。
+
+引导 copy 只写入历史和 copy 证书，不写入 binding 链。若生产 sqlite 是从候选文件搬过来的，证书仍记录候选路径 identity，JSON cache 也不是权威。此时启动必须失败关闭；运维使用 `scripts/repair_proactive_generation_binding.py --complete-initial-binding --apply --certificate-backend-identity-sha256 <证书中的旧路径哈希>`，以 leftover 源 sqlite 的 certified binding 完成首次生产绑定。禁止把 workspace JSON cache 提升成 chain。
+
 `action-report_state` 的提交目标是不可变 Life Event 与 World assertion，用于记录有来源的场景、关系或状态观察；它不是 `MEMORY.md` 主体文档写入。要修改 MySQL 中的 `MEMORY.md` current head，聊天意识必须走下述主体候选复盘与明确接受流程，不能把 World assertion 回执表述为主体文档已更新。
 
 用户昵称、平台账号归属和跨平台人物键也属于运行数据，不应硬编码为 `config.toml` 中的个人记录。适配器配置只保留通用解析能力、权限策略和空的兼容 alias 列表；入站平台 ID、昵称、群名片及已确认的人物归属由 Core 的 `PersonInfo` 数据库记录承载。MySQL 模式下不得把插件配置 alias 当成用户数据权威；若旧部署曾填写具体 alias，应在确认相应数据库记录已存在后清空，并保留迁移/审计证据。

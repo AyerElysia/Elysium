@@ -1702,6 +1702,58 @@ class SQLSubjectDocumentStore:
 
         await self._write(operation)
 
+    async def retry_projection(
+        self,
+        task: SubjectProjectionTask,
+        *,
+        worker_id: str,
+    ) -> SubjectProjectionTask:
+        """Requeue an exact failed task after the caller resolves file conflict."""
+
+        worker = str(worker_id).strip()
+        if not worker or len(worker) > 255:
+            raise ValueError("projection worker_id must be 1..255 characters")
+
+        async def operation(session: AsyncSession) -> SubjectProjectionTask:
+            updated = await session.execute(
+                text(
+                    """UPDATE subject_projection_outbox SET
+                    state = 'pending', lease_owner = :empty_owner,
+                    lease_until = :empty_lease, last_error = '',
+                    revision = revision + 1
+                    WHERE outbox_id = :outbox_id AND state = 'failed'
+                      AND revision = :revision AND version_id = :version_id
+                      AND content_hash = :content_hash"""
+                ),
+                {
+                    "empty_owner": "",
+                    "empty_lease": (None if self.backend == BackendKind.MYSQL else ""),
+                    "outbox_id": task.outbox_id,
+                    "revision": task.revision,
+                    "version_id": task.version_id,
+                    "content_hash": task.content_hash,
+                },
+            )
+            if updated.rowcount != 1:
+                raise SubjectDocumentConflict("projection retry CAS failed")
+            row = (
+                (
+                    await session.execute(
+                        text(
+                            f"SELECT {self._projection_columns()} "
+                            "FROM subject_projection_outbox "
+                            "WHERE outbox_id = :outbox_id"
+                        ),
+                        {"outbox_id": task.outbox_id},
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            return self._decode_projection(row)
+
+        return await self._write(operation)
+
     async def heal_projection(
         self,
         task: SubjectProjectionTask,
@@ -1774,15 +1826,25 @@ class SQLSubjectDocumentStore:
                 .mappings()
                 .all()
             )
+        outbox = {str(row["state"]): int(row["total"]) for row in outbox_rows}
+        failed = int(outbox.get("failed", 0))
+        pending = int(outbox.get("pending", 0))
         return {
-            "status": "healthy",
+            "status": "failed" if failed else ("degraded" if pending else "healthy"),
             "backend": self.backend.value,
             "backend_identity": self.runtime.backend_identity,
             "documents": documents,
             "versions": versions,
-            "projection_outbox": {
-                str(row["state"]): int(row["total"]) for row in outbox_rows
-            },
+            "projection_outbox": outbox,
+            "reason": (
+                "subject workspace projection failures require operator review"
+                if failed
+                else (
+                    "subject workspace projection backlog is pending"
+                    if pending
+                    else "subject workspace projection is current"
+                )
+            ),
         }
 
 

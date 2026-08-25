@@ -221,12 +221,13 @@ async def test_subject_document_preserves_bytes_provenance_and_head_cas(
         assert await store.list_heads(after_logical_path="SOUL.md") == []
         assert await store.list_current_versions() == [second]
         assert await store.health_snapshot() == {
-            "status": "healthy",
+            "status": "degraded",
             "backend": "local",
             "backend_identity": runtime.backend_identity,
             "documents": 1,
             "versions": 2,
             "projection_outbox": {"pending": 2},
+            "reason": "subject workspace projection backlog is pending",
         }
 
 
@@ -332,6 +333,88 @@ async def test_subject_projection_claim_confirmation_and_failure_are_cas(
         assert (await store.health_snapshot())["projection_outbox"] == {
             "confirmed": 2,
         }
+
+
+async def test_subject_projection_skips_superseded_history_and_confirms_current_head(
+    tmp_path: Path,
+) -> None:
+    async with _local_store(tmp_path) as (_, store, _):
+        data_root = tmp_path / "data"
+        logical_path = "life_engine_workspace/MEMORY.md"
+        first = await store.append_version(
+            _command(path=logical_path, content=b"historical\n")
+        )
+        second = await store.append_version(
+            _command(
+                path=logical_path,
+                revision=1,
+                head=first.version.version_id,
+                occurrence="subject:current",
+                content=b"current\n",
+            )
+        )
+        workspace_file = data_root / logical_path
+        workspace_file.parent.mkdir(parents=True)
+        workspace_file.write_bytes(second.version.content_bytes)
+        projector = SubjectWorkspaceProjector(
+            store,
+            data_root=data_root,
+            worker_id="workspace-projector",
+        )
+
+        superseded = await projector.project_one()
+        current = await projector.project_one()
+
+        assert superseded.status == "superseded"
+        assert superseded.version_id == first.version.version_id
+        assert current.status == "confirmed_existing"
+        assert current.version_id == second.version.version_id
+        assert workspace_file.read_bytes() == second.version.content_bytes
+        health = await store.health_snapshot()
+        assert health["status"] == "healthy"
+        assert health["projection_outbox"] == {"confirmed": 2}
+
+
+async def test_failed_subject_projection_can_requeue_exact_task_after_resolution(
+    tmp_path: Path,
+) -> None:
+    async with _local_store(tmp_path) as (_, store, _):
+        data_root = tmp_path / "data"
+        logical_path = "life_engine_workspace/SOUL.md"
+        committed = await store.append_version(
+            _command(path=logical_path, content=b"authority\n")
+        )
+        workspace_file = data_root / logical_path
+        workspace_file.parent.mkdir(parents=True)
+        workspace_file.write_bytes(b"untracked external bytes\n")
+        projector = SubjectWorkspaceProjector(
+            store,
+            data_root=data_root,
+            worker_id="workspace-projector",
+        )
+
+        failed = await projector.project_one()
+        assert failed.status == "failed"
+        failed_task = await store.get_projection_task(
+            logical_path,
+            committed.version.version_id,
+        )
+        assert failed_task is not None and failed_task.state == "failed"
+        assert (await store.health_snapshot())["status"] == "failed"
+
+        workspace_file.unlink()
+        retried = await store.retry_projection(
+            failed_task,
+            worker_id=projector.worker_id,
+        )
+        assert retried.state == "pending"
+        projected = await projector.project_one(logical_path=logical_path)
+
+        assert projected.status == "projected"
+        assert workspace_file.read_bytes() == committed.version.content_bytes
+        history = await store.list_history(logical_path)
+        assert [item.version_id for item in history] == [committed.version.version_id]
+        assert (await store.health_snapshot())["status"] == "healthy"
 
 
 async def test_subject_workspace_projection_and_observation_never_overwrite_divergence(

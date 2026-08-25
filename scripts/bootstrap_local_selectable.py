@@ -66,10 +66,13 @@ from plugins.life_engine.storage.migration.manifest import (
     build_backend_generation,
     load_snapshot_manifest,
 )
+from plugins.life_engine.storage.migration.runtime_context_copy import (
+    copy_runtime_context_from_snapshot,
+)
 from plugins.life_engine.storage.migration.subject_copy import (
     copy_subject_documents_from_snapshot,
 )
-from plugins.life_engine.storage.models import BackendKind
+from plugins.life_engine.storage.models import AuthorityToken, BackendKind
 from plugins.life_engine.storage.proactive_migration import (
     copy_proactive_authority_from_snapshot,
     verify_proactive_authority_copy,
@@ -226,14 +229,63 @@ def _snapshot_event_source(snapshot: Path, manifest: dict[str, Any]) -> Path:
     return source
 
 
-def _open_local_copy_runtime(database_path: Path) -> StorageBackendRuntime:
+async def _open_local_copy_runtime(
+    database_path: Path,
+    bootstrap_authority_path: Path,
+) -> tuple[StorageBackendRuntime, FileAuthorityRegistry, AuthorityToken]:
+    """Open the candidate-copy runtime fenced by an isolated bootstrap authority.
+
+    生产权威（data/life_storage/authority.json）在最后一步才注册目标
+    generation；引导写入自身使用证据目录里的隔离文件权威，每笔事务都经
+    registry.fenced(token) 校验，与 open_mysql_copy_runtime 的语义一致。
+    """
+
+    from plugins.life_engine.storage.authority import FileAuthorityRegistry
+    from plugins.life_engine.storage.models import (
+        BackendGeneration,
+        GenerationStatus,
+    )
+
     config = SQLiteStorageConfig(
         database_path=database_path,
         busy_timeout_seconds=10,
     )
     engine = create_sqlite_storage_engine(config)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
-    return StorageBackendRuntime(
+    registry = FileAuthorityRegistry(
+        bootstrap_authority_path,
+        registry_id="local-selectable-bootstrap",
+    )
+    bootstrap_generation = BackendGeneration(
+        generation_id="bootstrap-copy-v1",
+        backend=BackendKind.LOCAL,
+        schema_version=_SCHEMA_VERSION,
+        source_snapshot_sha256="0" * 64,
+        root_hashes={},
+        frontiers={},
+        created_at=datetime.now(UTC).isoformat(),
+        verified_at=datetime.now(UTC).isoformat(),
+        status=GenerationStatus.VERIFIED,
+    )
+    await registry.register_generation(bootstrap_generation)
+    health = await registry.health()
+    token = await registry.activate_generation(
+        "bootstrap-copy-v1",
+        expected_epoch=int(health.get("authority_epoch") or 0),
+        owner_id="bootstrap-local-selectable",
+        lease_seconds=86400,
+        confirm_previous_writers_stopped=bool(
+            health.get("active_generation")
+        ),
+    )
+
+    # 与 open_mysql_copy_runtime 的 runtime 形态完全一致：fence 走
+    # _write_fence 每笔事务校验引导权威，registry/token 字段保持 None
+    # （domain adapter 的 _require_candidate_copy 逐字段检查该形态）。
+    async def write_fence(session: Any) -> None:
+        await registry.validate(token)
+
+    runtime = StorageBackendRuntime(
         enabled=True,
         backend=BackendKind.LOCAL,
         backend_identity=config.safe_identity,
@@ -242,9 +294,12 @@ def _open_local_copy_runtime(database_path: Path) -> StorageBackendRuntime:
         authority_token=None,
         engine=engine,
         session_factory=session_factory,
+        _write_fence=write_fence,
+        _writer_validator=lambda: registry.validate(token),
         writer_role=StorageWriterRole.CANDIDATE_COPY,
-        writer_epoch=1,
+        writer_epoch=int(token.authority_epoch),
     )
+    return runtime, registry, token
 
 
 def _verification_root(reports: dict[str, Any]) -> str:
@@ -280,7 +335,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         run_id=f"local-selectable-{manifest.get('manifest_sha256', '')[:16]}",
         writer_frozen=True,
     )
-    token = CopyAuthorityToken(
+    copy_token = CopyAuthorityToken(
         run_id=recorder.run_id,
         authority_epoch=1,
         owner_id="bootstrap-local-selectable",
@@ -288,7 +343,12 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         fencing_token=os.urandom(32).hex(),
     )
 
-    runtime = _open_local_copy_runtime(database_path)
+    runtime, bootstrap_registry, bootstrap_authority_token = (
+        await _open_local_copy_runtime(
+            database_path,
+            output_root / "bootstrap-authority.json",
+        )
+    )
     report: dict[str, Any] = {
         "started_at": datetime.now(UTC).isoformat(),
         "generation_id": args.generation_id,
@@ -304,8 +364,11 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         subject_store = await open_subject_document_store(
             runtime, initialize_schema=True, require_database_immutability=False
         )
+        # initialize_schema=True 同时执行 initialize_contract（写入 as_of=0
+        # 等 virgin 合同 meta）。copy 前置校验要求目标已有合法 frontier；
+        # 合同行与源的时间戳漂移由 domain_copy 的 virgin 修复合同处理。
         await open_presence_world_stores(
-            runtime, initialize_schema=True, require_database_immutability=False
+            runtime, initialize_schema=True
         )
         await open_learning_stores(
             runtime, initialize_schema=True, require_database_immutability=False
@@ -314,13 +377,22 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         await ensure_attention_thread_schema(runtime)
         report["schema_initialized"] = True
 
+        # ── Technical runtime checkpoint ──
+        runtime_context_report = await copy_runtime_context_from_snapshot(
+            snapshot_dir,
+            runtime,
+        )
+        if not bool(runtime_context_report.get("verified")):
+            raise BootstrapError("runtime context import verification failed")
+        report["domains"]["runtime_context"] = runtime_context_report
+
         # ── Life Event ──
         event_source = _snapshot_event_source(snapshot_dir, manifest)
         event_report = await copy_life_events_from_sqlite(
             event_source,
             event_store,
             copy_registry=recorder,  # type: ignore[arg-type]
-            token=token,
+            token=copy_token,
         )
         report["domains"]["life_event"] = event_report.to_dict()
 
@@ -329,7 +401,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             snapshot_dir,
             subject_store,
             copy_registry=recorder,  # type: ignore[arg-type]
-            token=token,
+            token=copy_token,
         )
         report["domains"]["subject_document"] = subject_report.to_dict()
 
@@ -338,7 +410,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             snapshot_dir,
             runtime,
             copy_registry=recorder,  # type: ignore[arg-type]
-            token=token,
+            token=copy_token,
         )
         report["domains"]["presence_world"] = presence_world_report.to_dict()
 
@@ -348,7 +420,14 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             verify_legacy_learning_import,
         )
 
-        snapshot_workspace = snapshot_dir / "life_engine_workspace"
+        # 快照布局：工作区文件在 workspace/ 下，sqlite 文件在 sqlite/ 下。
+        snapshot_workspace = (
+            snapshot_dir / "workspace" / "life_engine_workspace"
+        )
+        if not (snapshot_workspace / ".life_learning").exists():
+            raise BootstrapError(
+                "snapshot does not contain a legacy .life_learning workspace"
+            )
         learning_report = await import_legacy_learning_snapshot(
             snapshot_workspace,
             (await open_learning_stores(runtime, initialize_schema=False)).store,
@@ -382,18 +461,39 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             "verified": True,
         }
 
-        # ── 注册 VERIFIED 本地 generation ──
-        verification = {
-            "verified": True,
-            "verified_at": datetime.now(UTC).isoformat(),
-            "verification_root_sha256": _verification_root(report["domains"]),
+        # ── 收集动态根并注册 VERIFIED 本地 generation ──
+        # 启动期 _verified_migration_certificate 要求
+        # generation.root_hashes["<backend>:proactive_authority"] 等于复制后
+        # 的 proactive 历史根；缺失会直接抛
+        # ProactiveMigrationGenerationRootMismatch。绑定锚点行使用
+        # life_proactive.backend_binding 命名空间，不在历史快照范围内，
+        # 因此启动期追加锚点不会使该根失效。
+        from plugins.life_engine.proactive.history import (
+            read_runtime_proactive_history,
+        )
+
+        proactive_history = await read_runtime_proactive_history(runtime)
+        proactive_root = str(proactive_history.root_sha256)
+        report["proactive_authority_root"] = proactive_root
+        runtime_context_root = str(
+            report["domains"]["runtime_context"]["initial_root_sha256"]
+        )
+        report["runtime_context_initial_root"] = runtime_context_root
+        generation_roots = {
+            f"{BackendKind.LOCAL.value}:proactive_authority": proactive_root,
+            f"{BackendKind.LOCAL.value}:runtime_context_initial": runtime_context_root,
         }
         generation = build_backend_generation(
             manifest,
             generation_id=args.generation_id,
             backend=BackendKind.LOCAL,
             backend_schema_version=_SCHEMA_VERSION,
-            verification=verification,
+            verification={
+                "verified": True,
+                "verified_at": datetime.now(UTC).isoformat(),
+                "verification_root_sha256": _verification_root(report["domains"]),
+            },
+            additional_root_hashes=generation_roots,
         )
         registry = FileAuthorityRegistry(authority_path, registry_id="life-domain")
         await registry.register_generation(generation)
@@ -410,6 +510,13 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         return report
     finally:
         await runtime.close()
+        try:
+            await bootstrap_registry.revoke(bootstrap_authority_token)
+        except Exception as exc:  # noqa: BLE001 - 隔离引导权威,释放失败不阻断
+            print(
+                f"note: bootstrap authority revoke skipped: {type(exc).__name__}",
+                file=sys.stderr,
+            )
 
 
 def _arguments() -> argparse.Namespace:

@@ -269,6 +269,51 @@ class FileAuthorityRegistry:
             raise AuthorityError("authority audit head does not match registry state")
         return event_count
 
+    def _registered_manifest_sha256_unlocked(self, generation_id: str) -> str:
+        """Return the target generation's unique immutable registration hash."""
+
+        registered: list[str] = []
+        if self.audit_path.exists():
+            try:
+                with self.audit_path.open(encoding="utf-8") as handle:
+                    for raw_line in handle:
+                        event = json.loads(raw_line)
+                        if event.get("event_type") != "generation_registered":
+                            continue
+                        payload = event.get("payload")
+                        if not isinstance(payload, dict):
+                            raise AuthorityError(
+                                "generation registration payload is invalid"
+                            )
+                        if str(payload.get("generation_id") or "") == generation_id:
+                            registered.append(str(payload.get("manifest_sha256") or ""))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise AuthorityError("authority audit is unreadable") from exc
+        if len(registered) != 1 or len(registered[0]) != 64:
+            raise AuthorityError(
+                "generation must have exactly one valid registration audit event"
+            )
+        return registered[0]
+
+    def _assert_generation_immutable_unlocked(
+        self,
+        state: dict[str, Any],
+        generation_id: str,
+    ) -> BackendGeneration:
+        raw = dict(state["generations"]).get(generation_id)
+        if raw is None:
+            raise GenerationNotVerified(f"generation is not registered: {generation_id}")
+        generation = BackendGeneration.from_dict(dict(raw))
+        registered_sha256 = self._registered_manifest_sha256_unlocked(generation_id)
+        if not secrets.compare_digest(
+            generation.manifest_sha256,
+            registered_sha256,
+        ):
+            raise AuthorityError(
+                f"generation manifest differs from immutable registration: {generation_id}"
+            )
+        return generation
+
     def _assert_token_unlocked(
         self,
         state: dict[str, Any],
@@ -276,6 +321,12 @@ class FileAuthorityRegistry:
     ) -> None:
         if token.registry_id != self.registry_id:
             raise StaleAuthorityToken("authority registry identity mismatch")
+        generation = self._assert_generation_immutable_unlocked(
+            state,
+            token.generation_id,
+        )
+        if generation.backend != token.backend:
+            raise StaleAuthorityToken("authority token backend differs from generation")
         expected = {
             "active_backend": token.backend.value,
             "active_generation": token.generation_id,
@@ -303,7 +354,10 @@ class FileAuthorityRegistry:
             existing = generations.get(generation.generation_id)
             body = generation.to_dict()
             if existing is not None:
-                restored = BackendGeneration.from_dict(dict(existing))
+                restored = self._assert_generation_immutable_unlocked(
+                    state,
+                    generation.generation_id,
+                )
                 if restored.manifest_sha256 != generation.manifest_sha256:
                     raise GenerationConflict(
                         f"generation identity reused with different manifest: {generation.generation_id}"
@@ -332,7 +386,9 @@ class FileAuthorityRegistry:
             state = self._read_state_unlocked(allow_missing=False)
             self._verify_audit_unlocked(state)
             raw = dict(state["generations"]).get(generation_id)
-            return BackendGeneration.from_dict(dict(raw)) if raw is not None else None
+            if raw is None:
+                return None
+            return self._assert_generation_immutable_unlocked(state, generation_id)
 
     async def get_generation(
         self,
@@ -365,7 +421,10 @@ class FileAuthorityRegistry:
             raw = dict(state["generations"]).get(generation_id)
             if raw is None:
                 raise GenerationNotVerified(f"generation is not registered: {generation_id}")
-            generation = BackendGeneration.from_dict(dict(raw))
+            generation = self._assert_generation_immutable_unlocked(
+                state,
+                generation_id,
+            )
             if generation.status != GenerationStatus.VERIFIED:
                 raise GenerationNotVerified(
                     f"generation is not verified: {generation_id} ({generation.status.value})"
@@ -561,7 +620,13 @@ class FileAuthorityRegistry:
                 if value.tzinfo is None:
                     value = value.replace(tzinfo=UTC)
                 expired = value <= _utc_now()
-            active = bool(str(state.get("active_generation") or ""))
+            active_generation = str(state.get("active_generation") or "")
+            active = bool(active_generation)
+            if active:
+                self._assert_generation_immutable_unlocked(
+                    state,
+                    active_generation,
+                )
             return {
                 "status": "disabled" if not active else ("degraded" if expired else "healthy"),
                 "registry_id": self.registry_id,
@@ -651,8 +716,9 @@ class MySQLAuthorityRegistry:
             raise ValueError("authority registry_id must not be empty")
         self._schema_ready = False
         self._schema_lock = asyncio.Lock()
-        self._verified_audit_head = ""
+        self._verified_audit_head: str | None = None
         self._verified_audit_count = 0
+        self._verified_generation_registrations: dict[str, str] = {}
         self._audit_lock = asyncio.Lock()
         lock_suffix = hashlib.sha256(self.registry_id.encode("utf-8")).hexdigest()[:16]
         self._activation_lock_name = f"elysium:authority:{lock_suffix}"
@@ -674,14 +740,36 @@ class MySQLAuthorityRegistry:
             existing = (
                 await connection.execute(
                     text(
-                        "SELECT manifest_sha256 FROM storage_backend_generations "
+                        "SELECT generation_id, manifest_json, manifest_sha256 "
+                        "FROM storage_backend_generations "
                         "WHERE generation_id = :generation_id FOR UPDATE"
                     ),
                     {"generation_id": generation.generation_id},
                 )
             ).mappings().one_or_none()
             if existing is not None:
-                if str(existing["manifest_sha256"]) != generation.manifest_sha256:
+                current = (
+                    await connection.execute(
+                        text(
+                            "SELECT last_event_hash FROM storage_authority_registry "
+                            "WHERE registry_id = :registry_id FOR UPDATE"
+                        ),
+                        {"registry_id": self.registry_id},
+                    )
+                ).mappings().one_or_none()
+                if current is None:
+                    raise AuthorityError(
+                        "registered generation has no authority registry"
+                    )
+                await self._verify_audit(
+                    connection,
+                    expected_head=str(current["last_event_hash"] or ""),
+                )
+                restored = await self._decode_verified_generation_row(
+                    connection,
+                    existing,
+                )
+                if restored.manifest_sha256 != generation.manifest_sha256:
                     raise GenerationConflict(
                         f"generation identity reused with different manifest: {generation.generation_id}"
                     )
@@ -762,15 +850,81 @@ class MySQLAuthorityRegistry:
             row = (
                 await connection.execute(
                     text(
-                        "SELECT manifest_json, manifest_sha256 "
+                        "SELECT generation_id, manifest_json, manifest_sha256 "
                         "FROM storage_backend_generations "
                         "WHERE generation_id = :generation_id"
                     ),
                     {"generation_id": generation_id},
                 )
             ).mappings().one_or_none()
-        if row is None:
-            return None
+            if row is None:
+                return None
+            current = (
+                await connection.execute(
+                    text(
+                        "SELECT last_event_hash FROM storage_authority_registry "
+                        "WHERE registry_id = :registry_id"
+                    ),
+                    {"registry_id": self.registry_id},
+                )
+            ).mappings().one_or_none()
+            if current is None:
+                raise AuthorityError("registered generation has no authority registry")
+            await self._verify_audit(
+                connection,
+                expected_head=str(current["last_event_hash"] or ""),
+            )
+            return await self._decode_verified_generation_row(connection, row)
+
+    async def _verify_generation_registration(
+        self,
+        connection: AsyncConnection,
+        *,
+        generation_id: str,
+        manifest_sha256: str,
+    ) -> None:
+        """Verify one generation row against its immutable registration event."""
+
+        generation_key = str(generation_id)
+        manifest_hash = str(manifest_sha256)
+        registered = self._verified_generation_registrations.get(generation_key)
+        if registered is not None:
+            if not secrets.compare_digest(manifest_hash, registered):
+                raise AuthorityError(
+                    f"generation manifest differs from immutable registration: {generation_key}"
+                )
+            return
+        rows = (
+            await connection.execute(
+                text(
+                    "SELECT payload_json FROM storage_authority_events "
+                    "WHERE registry_id = :registry_id "
+                    "AND event_type = 'generation_registered' "
+                    "AND generation_id = :generation_id ORDER BY event_position"
+                ),
+                {
+                    "registry_id": self.registry_id,
+                    "generation_id": generation_id,
+                },
+            )
+        ).mappings().all()
+        if len(rows) != 1:
+            raise AuthorityError(
+                "generation must have exactly one registration audit event"
+            )
+        payload = self._json_object(rows[0]["payload_json"])
+        registered_sha256 = str(payload.get("manifest_sha256") or "")
+        if not secrets.compare_digest(manifest_hash, registered_sha256):
+            raise AuthorityError(
+                f"generation manifest differs from immutable registration: {generation_key}"
+            )
+        self._verified_generation_registrations[generation_key] = registered_sha256
+
+    async def _decode_verified_generation_row(
+        self,
+        connection: AsyncConnection,
+        row: Any,
+    ) -> BackendGeneration:
         raw = row["manifest_json"]
         if isinstance(raw, (bytes, bytearray)):
             raw = raw.decode("utf-8")
@@ -778,8 +932,17 @@ class MySQLAuthorityRegistry:
         if not isinstance(value, dict):
             raise AuthorityError("generation manifest is not a JSON object")
         generation = BackendGeneration.from_dict(value)
-        if generation.manifest_sha256 != str(row["manifest_sha256"]):
+        row_generation_id = str(row["generation_id"])
+        if generation.generation_id != row_generation_id:
+            raise AuthorityError("generation manifest identity mismatch")
+        stored_sha256 = str(row["manifest_sha256"])
+        if not secrets.compare_digest(generation.manifest_sha256, stored_sha256):
             raise AuthorityError("generation manifest checksum mismatch")
+        await self._verify_generation_registration(
+            connection,
+            generation_id=generation.generation_id,
+            manifest_sha256=stored_sha256,
+        )
         return generation
 
     @staticmethod
@@ -958,7 +1121,8 @@ class MySQLAuthorityRegistry:
                     generation = (
                         await connection.execute(
                             text(
-                                "SELECT backend, status FROM storage_backend_generations "
+                                "SELECT generation_id, backend, status, manifest_json, "
+                                "manifest_sha256 FROM storage_backend_generations "
                                 "WHERE generation_id = :generation_id FOR UPDATE"
                             ),
                             {"generation_id": generation_id},
@@ -989,6 +1153,10 @@ class MySQLAuthorityRegistry:
                         connection,
                         expected_head=str(current["last_event_hash"] or ""),
                     )
+                    verified_generation = await self._decode_verified_generation_row(
+                        connection,
+                        generation,
+                    )
                     if actual_epoch != int(expected_epoch):
                         raise AuthorityConflict(
                             f"authority epoch conflict: expected {expected_epoch}, actual {actual_epoch}"
@@ -1008,7 +1176,7 @@ class MySQLAuthorityRegistry:
                             "live authority exists; writer isolation is not proven"
                         )
                     next_epoch = actual_epoch + 1
-                    backend = str(generation["backend"])
+                    backend = verified_generation.backend.value
                     await connection.execute(
                         text(
                             "UPDATE storage_authority_registry SET "
@@ -1107,7 +1275,8 @@ class MySQLAuthorityRegistry:
             row = (
                 await connection.execute(
                     text(
-                        "SELECT g.backend, g.status, r.active_backend, "
+                        "SELECT g.generation_id, g.backend, g.status, "
+                        "g.manifest_json, g.manifest_sha256, r.active_backend, "
                         "r.active_generation, r.authority_epoch, r.last_event_hash "
                         "FROM storage_backend_generations AS g "
                         "JOIN storage_authority_registry AS r "
@@ -1130,14 +1299,18 @@ class MySQLAuthorityRegistry:
                 connection,
                 expected_head=str(row["last_event_hash"] or ""),
             )
+            generation = await self._decode_verified_generation_row(
+                connection,
+                row,
+            )
             if str(row["active_generation"]) != generation_id:
                 raise AuthorityConflict(
                     "configured generation is not the active shared generation"
                 )
-            if str(row["active_backend"]) != str(row["backend"]):
+            if str(row["active_backend"]) != generation.backend.value:
                 raise AuthorityConflict("active backend does not match generation")
             epoch = int(row["authority_epoch"])
-            backend = str(row["backend"])
+            backend = generation.backend.value
         return AuthorityToken(
             registry_id=self.registry_id,
             backend=BackendKind(backend),
@@ -1158,18 +1331,28 @@ class MySQLAuthorityRegistry:
         row = (
             await connection.execute(
                 text(
-                    "SELECT active_backend, active_generation, authority_epoch "
-                    "FROM storage_authority_registry "
-                    "WHERE registry_id = :registry_id FOR SHARE"
+                    "SELECT r.active_backend, r.active_generation, "
+                    "r.authority_epoch, r.last_event_hash, "
+                    "g.generation_id, g.manifest_json, g.manifest_sha256 "
+                    "FROM storage_authority_registry AS r "
+                    "JOIN storage_backend_generations AS g "
+                    "ON g.generation_id = r.active_generation "
+                    "WHERE r.registry_id = :registry_id FOR SHARE"
                 ),
                 {"registry_id": self.registry_id},
             )
         ).mappings().one_or_none()
         if row is None:
             raise StaleAuthorityToken("authority registry is not initialized")
+        await self._verify_audit(
+            connection,
+            expected_head=str(row["last_event_hash"] or ""),
+        )
+        generation = await self._decode_verified_generation_row(connection, row)
         checks = {
             "registry_id": token.registry_id == self.registry_id,
-            "backend": str(row["active_backend"]) == token.backend.value,
+            "backend": str(row["active_backend"]) == generation.backend.value
+            == token.backend.value,
             "generation": str(row["active_generation"]) == token.generation_id,
             "epoch": int(row["authority_epoch"]) == token.authority_epoch,
         }
@@ -1197,20 +1380,30 @@ class MySQLAuthorityRegistry:
         row = (
             await connection.execute(
                 text(
-                    "SELECT active_backend, active_generation, authority_epoch, "
-                    "fencing_token_hash, owner_id, lease_until, "
-                    "CURRENT_TIMESTAMP(6) AS database_now "
-                    "FROM storage_authority_registry WHERE registry_id = :registry_id"
-                    + suffix
+                    "SELECT r.active_backend, r.active_generation, "
+                    "r.authority_epoch, r.fencing_token_hash, r.owner_id, "
+                    "r.lease_until, r.last_event_hash, "
+                    "CURRENT_TIMESTAMP(6) AS database_now, "
+                    "g.generation_id, g.manifest_json, g.manifest_sha256 "
+                    "FROM storage_authority_registry AS r "
+                    "JOIN storage_backend_generations AS g "
+                    "ON g.generation_id = r.active_generation "
+                    "WHERE r.registry_id = :registry_id" + suffix
                 ),
                 {"registry_id": self.registry_id},
             )
         ).mappings().one_or_none()
         if row is None:
             raise StaleAuthorityToken("authority registry is not initialized")
+        await self._verify_audit(
+            connection,
+            expected_head=str(row["last_event_hash"] or ""),
+        )
+        generation = await self._decode_verified_generation_row(connection, row)
         checks = {
             "registry_id": token.registry_id == self.registry_id,
-            "backend": str(row["active_backend"]) == token.backend.value,
+            "backend": str(row["active_backend"]) == generation.backend.value
+            == token.backend.value,
             "generation": str(row["active_generation"]) == token.generation_id,
             "epoch": int(row["authority_epoch"]) == token.authority_epoch,
             "token": secrets.compare_digest(
@@ -1352,10 +1545,15 @@ class MySQLAuthorityRegistry:
                 row = (
                     await connection.execute(
                         text(
-                            "SELECT active_backend, active_generation, authority_epoch, "
-                            "owner_id, lease_until, last_event_hash, updated_at, "
-                            "CURRENT_TIMESTAMP(6) AS database_now "
-                            "FROM storage_authority_registry WHERE registry_id = :registry_id"
+                            "SELECT r.active_backend, r.active_generation, "
+                            "r.authority_epoch, r.owner_id, r.lease_until, "
+                            "r.last_event_hash, r.updated_at, "
+                            "CURRENT_TIMESTAMP(6) AS database_now, "
+                            "g.generation_id, g.manifest_json, g.manifest_sha256 "
+                            "FROM storage_authority_registry AS r "
+                            "LEFT JOIN storage_backend_generations AS g "
+                            "ON g.generation_id = r.active_generation "
+                            "WHERE r.registry_id = :registry_id"
                         ),
                         {"registry_id": self.registry_id},
                     )
@@ -1370,11 +1568,13 @@ class MySQLAuthorityRegistry:
                     connection,
                     expected_head=str(row["last_event_hash"] or ""),
                 )
+                active = bool(str(row["active_generation"] or ""))
+                if active:
+                    await self._decode_verified_generation_row(connection, row)
             expired = (
                 row["lease_until"] is not None
                 and row["lease_until"] <= row["database_now"]
             )
-            active = bool(str(row["active_generation"] or ""))
             return {
                 "status": "healthy" if active else "disabled",
                 "registry_id": self.registry_id,

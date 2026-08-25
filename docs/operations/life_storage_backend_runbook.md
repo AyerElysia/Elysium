@@ -14,13 +14,14 @@
 
 ## 1. 当前安全状态
 
-- `config/core.toml [storage].backend` 是 Core 与 Life Engine 的唯一后端选择，只接受 `local` 或 `mysql`；
+- `config/core.toml [storage].backend` 是 Core 与 Life Engine 的唯一物理后端选择，只接受 `local` 或 `mysql`；
+- `backend=local` 默认是 legacy-local 兼容模式；只有显式设置 `local_selectable_enabled=true` 才打开 SQLite selectable runtime、要求 verified local generation 并取得文件权威；
 - Life Engine 插件配置不再拥有 `enabled` 或 `authoritative_backend` 开关；
 - 本机配置虽可选择 `mysql`，但正式 generation、authority 与 fencing 未通过时必须失败关闭，不得退回混合的 Core=MySQL、Life=local；
 - 新的存储 runtime 不会自动创建、注册或切换 generation；MySQL registry 尚未激活时，首个业务进程可以激活已登记且 verified 的目标 generation，后续进程只能加入该 generation；
 - `LifeEngineService` 是唯一 runtime owner；各子域只消费注入对象，禁止自行再次打开或关闭 runtime；
 - 后端打开失败时 fail closed，不会从 MySQL 静默回退到 local，也不会反向回退；
-- 全局 MySQL 模式不打开或双写旧 Life Event、Presence、World SQLite，也不回写 `.life_learning`；全局 local 模式保持原本地行为；
+- 全局 MySQL 模式不打开或双写旧 Life Event、Presence、World SQLite，也不回写 `.life_learning`；local selectable 同样只写所选 `local.sqlite3` 与受控工作区投影，不回写旧 `.life_learning`；legacy-local 模式保持原本地行为；
 - 快照、迁移和校验器没有删除、移动、截断或覆盖源数据的权限；
 - Elysium 只能由用户手动启动。脚本不会停止或重启 Elysium。
 
@@ -94,33 +95,51 @@ MySQL 的后端选择、连接、generation 与 authority 只配置在 Core 全�
 ```toml
 # config/core.toml
 [storage]
-backend = "local"  # 日常切换只改这一项；另一个合法值是 "mysql"
-backend_generation = "<VERIFIED_MYSQL_GENERATION_ID>"  # local 自动忽略
-schema_version = 1
+backend = "local"  # 物理后端；另一个合法值是 "mysql"
+local_selectable_enabled = false  # false=legacy-local；true=selectable local
+backend_generation = "<VERIFIED_GENERATION_ID>"
+schema_version = 3
 registry_id = "life-domain"
 authority_owner_id = "<UNIQUE_WRITER_ID>"
 require_verified_generation = true
 authority_lease_seconds = 120
 authority_renew_interval_seconds = 40
-
-[database]
-mysql_host = "127.0.0.1"
-mysql_port = 3306
-mysql_database = "elysium"
-mysql_user = "elysium"
-mysql_password = "${ELYSIUM_MYSQL_PASSWORD}"
-mysql_ssl_mode = "disabled"
-connection_pool_size = 10
-connection_timeout = 10
 ```
 
-Life Engine 插件文件不再包含 `[storage]` 或 `[storage_mysql]`。它只保留 local 模式所需的 `[storage_local]` 路径；MySQL 模式会直接复用上述全局配置。
+- `local + local_selectable_enabled=false`：兼容旧本地路径，忽略 generation。
+- `local + local_selectable_enabled=true`：必须使用已登记的 verified local generation、`local.sqlite3` 和 file authority。
+- `mysql`：必须使用已登记的 verified MySQL generation；`local_selectable_enabled` 不参与 MySQL 选择。
 
-只有 MySQL generation、连接和 authority 控制面验收完成后，才允许把全局 `backend` 改为 `mysql`。日常 local/MySQL 切换只改这一字段：`local` 自动使用 file authority 并忽略保留在配置中的 MySQL generation，`mysql` 自动使用 MySQL authority 并严格校验该 generation。旧 `authority_provider` 字段由配置迁移自动移除，不再允许人工联动。每个 worktree/部署实例仍须提供稳定且唯一的 `authority_owner_id`；不要把真实用户名、机器绝对路径或密钥放进公共配置示例。连接密码仍只能通过配置中的环境变量提供。首个进程负责在尚未激活时创建 generation epoch；后续进程只加入同一 epoch。shared writer 不需要把 epoch、lease 或 fencing token 写入配置或环境变量，也不会通过周期维护夺取其他进程资格。异常和健康输出使用不含密码的 backend identity。
+Life Engine 插件文件只保留本地路径参数；MySQL 连接仍来自全局 `[database]` 配置和环境变量。任一 selectable 模式的 generation、schema、authority 或 fencing 不满足时必须失败关闭，不能静默回退。
 
 MySQL 模式不使用入口级 `data/runtime/elysium.lock`；不同 worktree 可以同时打开同一 generation，并并发处理互不冲突的领域数据。每个完整 Elysium 进程仍需拥有不冲突的 HTTP 端口、临时目录和不可共享外部适配器会话；若它们都要拥有同一个 `runtime_context/global`，只有取得 writer claim 的进程能启动到可写状态，其他进程必须显示 owner/epoch 诊断并失败关闭。认证失败、TLS/权限错误、schema 漂移、generation 不匹配、单例 claim 冲突、端口冲突和外部会话争用都不能用静默 local 回退或空实现伪装成功。
 
 正常关闭和插件启动回滚都必须在 `finally` 路径释放当前进程已经取得的 singleton writer claims；运行上下文保存冲突、消费者关闭失败或领域 store 尚未完成挂载，均不得跳过 claim 撤销与 runtime 关闭。`LifeEngineService` 启动时，`runtime_context` 与 `learning` 两个 claim 共用一个最长为一个 lease 周期加单次短轮询余量的 monotonic deadline：上一实例异常退出但 lease 尚未自然到期时，新实例只轮询调用原子 acquire，由数据库时间判定到期并 takeover；若真实 owner 持续 renew，则到期保留 owner/epoch 诊断并 fail closed。两个 claim 不得各自重置 deadline；取消、非冲突错误和第二 claim 失败都必须立即传播并释放已取得的第一 claim。遇到 `SingletonWriterAlreadyClaimed` 时，不得删除 claim 行、强制改 epoch、解析 owner PID 后抢占或自动修改 token：可只读核对 owner、数据库时间的 `lease_until` 与只追加 claim events，但 lease 是否过期只由 acquire 事务内的数据库时间裁决。正常退出应产生 `released` 事件，异常退出则只能在租约自然过期后 takeover。
+
+### 6.0 本地 selectable 引导与激活
+
+仅在 Elysium 已停止、`data/runtime/elysium.lock` 已释放且目标 `local.sqlite3` 不存在时执行：
+
+```bash
+uv run python scripts/bootstrap_local_selectable.py \
+  --generation-id <NEW_VERIFIED_LOCAL_GENERATION_ID> \
+  --output /new/evidence/local-selectable-<UTC> \
+  --snapshot /absolute/writer-frozen-snapshot
+```
+
+省略 `--snapshot` 时脚本会在输出目录内调用 `backup_life_data.py --writer-frozen` 创建新快照。输出目录和目标库都必须是新的；失败现场不可复用。脚本使用证据目录中的隔离 file authority 和 `CANDIDATE_COPY` runtime 初始化 schema、复制并校验各域，成功后撤销隔离权威并把 generation 注册到生产 `authority.json`，但不激活它、不改配置、不启动进程。
+
+成功后人工设置：
+
+```toml
+[storage]
+backend = "local"
+local_selectable_enabled = true
+backend_generation = "<NEW_VERIFIED_LOCAL_GENERATION_ID>"
+schema_version = 3
+```
+
+用户手工启动后必须核验：active backend/generation、owner PID 与进程一致；同一 owner/epoch 上 lease 和 authority audit head 至少推进一次；Life Event、Learning event、Subject、Presence/World 与 Proactive 都绑定同一 runtime；主体文档 head 与工作区投影逐字节一致。任何一项失败都不得删除源、覆盖旧 generation 或接受主体候选来制造全绿。
 
 ### 6.1 Memory 隔离合同验证
 

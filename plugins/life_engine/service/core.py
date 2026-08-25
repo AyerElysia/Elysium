@@ -659,6 +659,9 @@ class LifeEngineService(BaseService):
         self._shared_sync_task_id: str | None = None
         self._shared_sync_bridge = None
         self._shared_sync_error: str = ""
+        self._shared_sync_configured_enabled: bool = False
+        self._shared_sync_effective_enabled: bool = False
+        self._shared_sync_disabled_reason: str = ""
         self._memory_archive_sync_task_id: str | None = None
         self._memory_archive_sync_bridge = None
         self._memory_archive_sync_error: str = ""
@@ -797,6 +800,12 @@ class LifeEngineService(BaseService):
         self._projection_frontier: int = 0
         self._subject_workspace_observer: Any | None = None
         self._subject_workspace_projector: Any | None = None
+        self._subject_projection_task_id: str | None = None
+        self._subject_projection_health: dict[str, Any] = {
+            "status": "disabled",
+            "last_success_at": "",
+            "last_error_type": "",
+        }
         self._storage_health_cache: dict[str, Any] = {
             "status": (
                 "initializing" if self._selectable_storage_enabled else "disabled"
@@ -2101,6 +2110,7 @@ class LifeEngineService(BaseService):
             settings,
             authority_epoch=int(token.authority_epoch),
             authority_owner_id=owner_id,
+            fencing_token_env=_LIFE_LOCAL_FENCING_ENV,
         )
         return activated, {
             _LIFE_LOCAL_FENCING_ENV: str(token.fencing_token)
@@ -2508,10 +2518,40 @@ class LifeEngineService(BaseService):
                 else "immutable events only; singleton projector is owned elsewhere"
             ),
         }
-        # MySQL is the only runtime data source: subject heads remain remote and
-        # no filesystem observer/projector is attached.
-        self._subject_workspace_observer = None
-        self._subject_workspace_projector = None
+        from ..storage.models import BackendKind
+        from ..storage.subject_workspace import (
+            SubjectWorkspaceObserver,
+            SubjectWorkspaceProjector,
+        )
+
+        if runtime.backend == BackendKind.LOCAL:
+            data_root = Path(self._cfg().settings.workspace_path).resolve().parent
+            self._subject_workspace_observer = SubjectWorkspaceObserver(
+                subject_store,
+                data_root=data_root,
+                recorded_source="workspace:selected-local",
+            )
+            self._subject_workspace_projector = SubjectWorkspaceProjector(
+                subject_store,
+                data_root=data_root,
+                worker_id=f"{self._storage_writer_instance_id}:subject-projector",
+            )
+            self._subject_projection_health = {
+                "status": "initializing",
+                "last_success_at": "",
+                "last_error_type": "",
+            }
+        else:
+            # MySQL keeps subject bytes in the selected store and does not attach
+            # a local workspace observer/projector.
+            self._subject_workspace_observer = None
+            self._subject_workspace_projector = None
+            self._subject_projection_health = {
+                "status": "disabled",
+                "last_success_at": "",
+                "last_error_type": "",
+                "reason": "mysql subject authority has no local workspace projector",
+            }
         self._consciousness_registry = registry
         self._event_bus = event_bus
         self._world_projection = stores.world
@@ -3033,6 +3073,65 @@ class LifeEngineService(BaseService):
                 errors,
             )
 
+    async def _subject_projection_loop(self) -> None:
+        """Drain local subject outbox without overwriting unknown workspace bytes."""
+
+        projector = self._subject_workspace_projector
+        if projector is None or self._stop_event is None:
+            return
+        retry_delay = 1.0
+        while not self._stop_event.is_set():
+            try:
+                result = await projector.project_one()
+                if result.status == "idle":
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=1.0)
+                    return
+                if result.status == "failed":
+                    self._subject_projection_health = {
+                        "status": "failed",
+                        "last_success_at": self._subject_projection_health.get(
+                            "last_success_at", ""
+                        ),
+                        "last_error_type": "SubjectProjectionFailed",
+                        "reason": result.detail,
+                    }
+                    logger.error(
+                        "subject workspace projection failed closed: "
+                        f"path={result.logical_path} version={result.version_id}"
+                    )
+                    return
+                retry_delay = 1.0
+                self._subject_projection_health = {
+                    "status": "healthy",
+                    "last_success_at": _now_iso(),
+                    "last_error_type": "",
+                }
+            except TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - retain retryable backlog
+                self._subject_projection_health = {
+                    "status": "degraded",
+                    "last_success_at": self._subject_projection_health.get(
+                        "last_success_at", ""
+                    ),
+                    "last_error_type": type(exc).__name__,
+                    "reason": "subject projection worker is retrying pending work",
+                }
+                logger.warning(
+                    f"subject workspace projection worker retrying after "
+                    f"{type(exc).__name__}"
+                )
+                try:
+                    await asyncio.wait_for(
+                        self._stop_event.wait(),
+                        timeout=retry_delay,
+                    )
+                    return
+                except TimeoutError:
+                    retry_delay = min(retry_delay * 2.0, 30.0)
+
     async def _project_subject_version(
         self,
         *,
@@ -3051,6 +3150,22 @@ class LifeEngineService(BaseService):
             projector = self._subject_workspace_projector
             if projector is None:
                 raise RuntimeError("SelectedSubjectProjectorNotStarted")
+            task = await store.get_projection_task(logical_path, version_id)
+            if task is None:
+                raise RuntimeError(
+                    f"SubjectProjectionMissing: {logical_path}:{version_id}"
+                )
+            if task.state == "confirmed":
+                return {
+                    "status": "confirmed_existing",
+                    "logical_path": logical_path,
+                    "version_id": version_id,
+                }
+            if task.state == "failed":
+                await store.retry_projection(
+                    task,
+                    worker_id=projector.worker_id,
+                )
             for _ in range(max(1, int(max_tasks))):
                 result = await projector.project_one(logical_path=logical_path)
                 if result.status == "idle":
@@ -3064,6 +3179,7 @@ class LifeEngineService(BaseService):
                 if result.version_id == version_id and result.status in {
                     "projected",
                     "confirmed_existing",
+                    "superseded",
                 }:
                     return {
                         "status": result.status,
@@ -4654,6 +4770,9 @@ class LifeEngineService(BaseService):
             learning_component.update(self._learning_storage_health)
             if store_status == "failed":
                 learning_component["status"] = "failed"
+        components["subject_projection_worker"] = dict(
+            self._subject_projection_health
+        )
         components["authority_renewal"] = dict(self._storage_renewal_health)
         for (namespace, state_key), item in sorted(
             self._lost_singleton_health.items()
@@ -4770,16 +4889,15 @@ class LifeEngineService(BaseService):
                     "degraded_reason": f"health unavailable: {type(exc).__name__}: {exc}",
                 }
         else:
-            sync_enabled = bool(
-                getattr(getattr(self._cfg(), "shared_sync", None), "enabled", False)
-            )
             snapshot["shared_sync"] = {
                 "component": "offline_sync",
                 "status": "degraded" if self._shared_sync_error else "disabled",
                 "running": False,
                 "outbox_backlog": 0,
                 "degraded_reason": self._shared_sync_error,
-                "enabled": sync_enabled,
+                "enabled": self._shared_sync_effective_enabled,
+                "configured_enabled": self._shared_sync_configured_enabled,
+                "disabled_reason": self._shared_sync_disabled_reason,
             }
         if self._memory_archive_sync_bridge is not None:
             try:
@@ -9239,6 +9357,55 @@ class LifeEngineService(BaseService):
         self._pending_events = pending
         self._event_history = history
 
+    async def _start_shared_sync(self, cfg: Any) -> None:
+        """Start the legacy-local sync bridge or report expected disablement."""
+
+        shared_sync_cfg = getattr(cfg, "shared_sync", None)
+        self._shared_sync_configured_enabled = bool(
+            getattr(shared_sync_cfg, "enabled", False)
+        )
+        self._shared_sync_effective_enabled = (
+            self._shared_sync_configured_enabled
+            and not self._selectable_storage_enabled
+        )
+        self._shared_sync_disabled_reason = ""
+        if (
+            self._shared_sync_configured_enabled
+            and not self._shared_sync_effective_enabled
+        ):
+            self._shared_sync_error = ""
+            self._shared_sync_disabled_reason = (
+                "selected_authoritative_backend_unsupported"
+            )
+            logger.warning(
+                "legacy shared_sync is disabled for selected authoritative "
+                "Life Event storage; selected export-outbox bridge is not implemented"
+            )
+            return
+        if not self._shared_sync_effective_enabled:
+            return
+        try:
+            from .shared_sync import SharedSyncBridge
+
+            self._shared_sync_bridge = SharedSyncBridge(
+                shared_sync_cfg,
+                self._get_event_bus().store,
+            )
+            shared_sync_task = get_task_manager().create_task(
+                self._shared_sync_bridge.run(self._stop_event),
+                name="life_engine_shared_sync",
+                daemon=True,
+            )
+            self._shared_sync_task_id = shared_sync_task.task_id
+            self._shared_sync_error = ""
+        except Exception as exc:  # noqa: BLE001
+            self._shared_sync_bridge = None
+            self._shared_sync_task_id = None
+            self._shared_sync_error = f"{type(exc).__name__}: {exc}"
+            logger.error(
+                f"life_engine 共享同步初始化失败: {self._shared_sync_error}"
+            )
+
     async def start(self) -> None:
         """Start all consumers, rolling back them before the owned runtime."""
 
@@ -9493,34 +9660,7 @@ class LifeEngineService(BaseService):
             f"technical_schedules_removed={removed_schedules}"
         )
 
-        shared_sync_cfg = getattr(cfg, "shared_sync", None)
-        if bool(getattr(shared_sync_cfg, "enabled", False)):
-            try:
-                from .shared_sync import SharedSyncBridge
-
-                if self._selectable_storage_enabled:
-                    raise RuntimeError(
-                        "legacy shared_sync cannot bind a selected authoritative "
-                        "Life Event backend"
-                    )
-                self._shared_sync_bridge = SharedSyncBridge(
-                    shared_sync_cfg,
-                    self._get_event_bus().store,
-                )
-                shared_sync_task = get_task_manager().create_task(
-                    self._shared_sync_bridge.run(self._stop_event),
-                    name="life_engine_shared_sync",
-                    daemon=True,
-                )
-                self._shared_sync_task_id = shared_sync_task.task_id
-                self._shared_sync_error = ""
-            except Exception as exc:  # noqa: BLE001
-                self._shared_sync_bridge = None
-                self._shared_sync_task_id = None
-                self._shared_sync_error = f"{type(exc).__name__}: {exc}"
-                logger.error(
-                    f"life_engine 共享同步初始化失败: {self._shared_sync_error}"
-                )
+        await self._start_shared_sync(cfg)
 
         memory_archive_cfg = getattr(cfg, "memory_archive_sync", None)
         if bool(getattr(memory_archive_cfg, "enabled", False)):
@@ -9589,6 +9729,14 @@ class LifeEngineService(BaseService):
                 daemon=True,
             )
             self._router_context_projection_task_id = projection_task.task_id
+
+        if self._subject_workspace_projector is not None:
+            subject_task = get_task_manager().create_task(
+                self._subject_projection_loop(),
+                name="life_engine_subject_workspace_projection",
+                daemon=True,
+            )
+            self._subject_projection_task_id = subject_task.task_id
 
         if self._learning_scheduler is not None and bool(
             getattr(self._learning_scheduler, "projector_owner", True)
@@ -9717,6 +9865,12 @@ class LifeEngineService(BaseService):
 
         if self._router_context_projection is not None:
             self._router_context_projection.request_stop()
+
+        await self._await_managed_task(
+            self._subject_projection_task_id,
+            timeout=10.0,
+        )
+        self._subject_projection_task_id = None
 
         await self._await_managed_task(
             self._router_context_projection_task_id,

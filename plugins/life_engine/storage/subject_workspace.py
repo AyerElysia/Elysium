@@ -206,6 +206,16 @@ class SubjectWorkspaceProjector:
                 != task.content_hash
             ):
                 raise RuntimeError("authoritative version bytes/hash mismatch")
+            head = await self.store.get_head(task.logical_path)
+            if head is None:
+                raise RuntimeError("authoritative document head is missing")
+            if head.current_version_id != task.version_id:
+                await self.store.confirm_projection(task, worker_id=self.worker_id)
+                return SubjectProjectionResult(
+                    status="superseded",
+                    logical_path=task.logical_path,
+                    version_id=task.version_id,
+                )
             path = _safe_workspace_path(self.data_root, task.logical_path)
             if path.exists() and self._hash(path) == task.content_hash:
                 await self.store.confirm_projection(task, worker_id=self.worker_id)

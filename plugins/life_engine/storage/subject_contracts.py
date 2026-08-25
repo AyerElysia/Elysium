@@ -279,6 +279,14 @@ class SubjectDocumentStorePort(SubjectAuthorityPort, Protocol):
     ) -> None:
         """Persist a bounded projection failure without changing history."""
 
+    async def retry_projection(
+        self,
+        task: SubjectProjectionTask,
+        *,
+        worker_id: str,
+    ) -> SubjectProjectionTask:
+        """Requeue one exact failed projection without changing subject history."""
+
     async def heal_projection(
         self,
         task: SubjectProjectionTask,

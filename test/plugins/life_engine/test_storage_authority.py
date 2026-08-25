@@ -13,6 +13,7 @@ from plugins.life_engine.storage.authority import (
     FileAuthorityRegistry,
     GenerationConflict,
     GenerationNotVerified,
+    MySQLAuthorityRegistry,
     StaleAuthorityToken,
 )
 from plugins.life_engine.storage.models import (
@@ -104,6 +105,109 @@ async def test_file_authority_rejects_unverified_conflicting_and_stale_state(
             lease_seconds=60,
             confirm_previous_writers_stopped=True,
         )
+
+
+async def test_file_authority_generation_drift_is_target_scoped_and_fenced(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "authority.json"
+    registry = FileAuthorityRegistry(state_path)
+    await registry.register_generation(generation("local-v2", marker="2"))
+    verified_v3 = generation("local-v3", marker="3")
+    await registry.register_generation(verified_v3)
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["generations"]["local-v2"]["root_hashes"]["life_events"] = "4" * 64
+    state_path.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    assert await registry.get_generation("local-v3") == verified_v3
+    with pytest.raises(AuthorityError, match="immutable registration"):
+        await registry.get_generation("local-v2")
+
+    token = await registry.activate_generation(
+        "local-v3",
+        expected_epoch=0,
+        owner_id="writer-v3",
+        lease_seconds=60,
+        confirm_previous_writers_stopped=True,
+    )
+    await registry.validate(token)
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["generations"]["local-v3"]["frontiers"]["life_events"] = 13
+    state_path.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AuthorityError, match="immutable registration"):
+        await registry.validate(token)
+    assert (await registry.health())["status"] == "failed"
+
+
+async def test_mysql_generation_registration_proof_rejects_two_column_drift() -> None:
+    verified = generation("mysql-v1", marker="5")
+    verified = BackendGeneration.from_dict(
+        {
+            **verified.to_dict(),
+            "backend": BackendKind.MYSQL.value,
+        }
+    )
+    registration_queries = 0
+
+    class Result:
+        def __init__(self, rows: list[dict[str, object]]) -> None:
+            self._rows = rows
+
+        def mappings(self) -> Result:
+            return self
+
+        def all(self) -> list[dict[str, object]]:
+            return self._rows
+
+    class Connection:
+        async def execute(self, _statement: object, _params: object) -> Result:
+            nonlocal registration_queries
+            registration_queries += 1
+            return Result(
+                [
+                    {
+                        "payload_json": json.dumps(
+                            {"manifest_sha256": verified.manifest_sha256}
+                        )
+                    }
+                ]
+            )
+
+    registry = MySQLAuthorityRegistry(object())  # type: ignore[arg-type]
+    connection = Connection()
+    row = {
+        "generation_id": verified.generation_id,
+        "manifest_json": json.dumps(verified.to_dict()),
+        "manifest_sha256": verified.manifest_sha256,
+    }
+
+    assert await registry._decode_verified_generation_row(connection, row) == verified  # type: ignore[arg-type]
+    assert registration_queries == 1
+
+    drifted = generation("mysql-v1", marker="6")
+    drifted = BackendGeneration.from_dict(
+        {
+            **drifted.to_dict(),
+            "backend": BackendKind.MYSQL.value,
+        }
+    )
+    drifted_row = {
+        "generation_id": drifted.generation_id,
+        "manifest_json": json.dumps(drifted.to_dict()),
+        "manifest_sha256": drifted.manifest_sha256,
+    }
+    with pytest.raises(AuthorityError, match="immutable registration"):
+        await registry._decode_verified_generation_row(connection, drifted_row)  # type: ignore[arg-type]
+    assert registration_queries == 1
 
 
 async def test_local_fence_blocks_cutover_until_transaction_scope_exits(

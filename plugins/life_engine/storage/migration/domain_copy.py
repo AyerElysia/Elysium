@@ -80,6 +80,10 @@ class PresenceWorldCopyReport:
         }
 
 
+_CONTRACT_GENERATED_META_KEYS = frozenset(
+    {"projector_policy", "projector_schema_version", "rebuild_state"}
+)
+
 _SPECS = (
     DomainTableSpec(
         "presence",
@@ -605,7 +609,19 @@ async def _insert_missing_rows(
                     # frontier before a first snapshot copy.  It is safe to
                     # replace only that virgin default; any materialized World
                     # row turns the same mismatch into a hard conflict.
-                    metadata_repairs.append(row)
+                    metadata_repairs.append((row, "0"))
+                    continue
+                if (
+                    spec.name == "world_projection_meta"
+                    and virgin_world_projection
+                    and str(identity[0]) in _CONTRACT_GENERATED_META_KEYS
+                    and str(target["meta_value"]) == str(row["meta_value"])
+                ):
+                    # projector_policy/schema_version/rebuild_state 由运行合
+                    # 同生成，不能冒充源记录（runbook）。目标为 virgin 且值
+                    # 一致时，仅 updated_at 漂移不构成证据冲突；按源行对齐
+                    # 时间戳使逐表根哈希可比。任何值差异仍是硬冲突。
+                    metadata_repairs.append((row, str(target["meta_value"])))
                     continue
                 raise PresenceWorldCopyError(
                     f"candidate identity has different evidence: {spec.name}:{identity}"
@@ -613,14 +629,19 @@ async def _insert_missing_rows(
 
     copied = 0
     async with runtime.unit_of_work() as uow:
-        for row in metadata_repairs:
+        for row, where_value in metadata_repairs:
             updated = await uow.session.execute(
                 text(
                     "UPDATE world_projection_meta SET meta_value = :meta_value, "
                     "updated_at = :updated_at WHERE meta_key = :meta_key "
-                    "AND meta_value = '0'"
+                    "AND meta_value = :where_value"
                 ),
-                _mysql_bindings(TABLE_SPECS["world_projection_meta"], row),
+                {
+                    **_mysql_bindings(
+                        TABLE_SPECS["world_projection_meta"], row
+                    ),
+                    "where_value": where_value,
+                },
             )
             if updated.rowcount != 1:
                 raise PresenceWorldCopyError(

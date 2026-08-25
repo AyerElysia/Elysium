@@ -1,6 +1,6 @@
 # Elysium 生命域可选 MySQL / 本地存储重构方案
 
-> 状态：阶段 0—8 的存储基座、各生命域 Port、local/MySQL 双适配、同一 service-owned runtime 现役接线、复制/校验/反向导出工具、汇总审计工具和数据库不可变门均已落地。全局后端由 `config/core.toml [storage].backend` 唯一选择；MySQL runtime 已支持同一 verified generation 内多个合法进程共享写入。对 `runtime_context/global` 这类不能由多个进程共同拥有的单例状态，现已增加 generation-scoped、数据库时间驱动的 writer claim；每次写事务同时复核 generation fencing 与 claim epoch/token，失租后失败关闭，不做自动 rebase 或最后写入覆盖。历史远程 shadow 来自 `writer_frozen=false` 在线快照，只证明无损复制/恢复，不能作为新的生产 generation 激活证据。任何新部署或重新切换仍需使用独立目标库、触发器创建能力、冻结快照、五域同源复制、verified generation 和用户手工启动后的全链路验收。
+> 状态：阶段 0—8 的存储基座、各生命域 Port、local/MySQL 双适配、同一 service-owned runtime 现役接线、复制/校验/反向导出工具、汇总审计工具和数据库不可变门均已落地。全局后端由 `config/core.toml [storage].backend` 唯一选择；`backend=local` 默认保留 legacy-local 兼容运行，显式设置 `local_selectable_enabled=true` 后则使用本地 SQLite selectable runtime、文件权威和预先注册的 verified local generation。MySQL runtime 已支持同一 verified generation 内多个合法进程共享写入，本地 selectable runtime 仍由进程锁限制为单 writer。对 `runtime_context/global` 这类不能由多个进程共同拥有的单例状态，现已增加 generation-scoped writer claim；每次写事务同时复核 generation fencing 与 claim epoch/token，失租后失败关闭，不做自动 rebase 或最后写入覆盖。历史远程 shadow 来自 `writer_frozen=false` 在线快照，只证明无损复制/恢复，不能作为新的生产 generation 激活证据。任何新部署或重新切换仍需使用独立目标库、冻结快照、领域同源复制、verified generation 和用户手工启动后的全链路验收。
 >
 > 目标：在不改变爱莉主体语义、不丢失不可变历史、不把 Chroma 误作权威存储的前提下，为 Elysium 建立行为等价的本地与 MySQL 两套耐久存储后端。迁移采用“复制、校验、可选切换”，绝不移动、删除或改写原 SQLite、Markdown、JSON、JSONL 与媒体数据文件。
 
@@ -491,38 +491,50 @@ MySQL 结构化过滤
 
 ```toml
 [storage]
-backend = "local"  # 日常切换只改这一项；另一个合法值是 "mysql"
-backend_generation = "<VERIFIED_MYSQL_GENERATION_ID>"  # local 自动忽略
-schema_version = 1
+backend = "local"  # 物理后端；另一个合法值是 "mysql"
+local_selectable_enabled = false  # false=legacy-local；true=selectable local
+backend_generation = "<VERIFIED_GENERATION_ID>"
+schema_version = 3
 registry_id = "life-domain"
 authority_owner_id = "<UNIQUE_WRITER_ID>"
 require_verified_generation = true
 authority_lease_seconds = 120
 authority_renew_interval_seconds = 40
-
-[database]
-mysql_host = "<MYSQL_HOST>"
-mysql_port = 3306
-mysql_database = "elysium"
-mysql_user = "<MYSQL_USER>"
-mysql_password = "${ELYSIUM_MYSQL_PASSWORD}"
-mysql_charset = "utf8mb4"
-mysql_ssl_mode = "required"
-mysql_ssl_ca = "<MYSQL_CA_PATH>"
-connection_pool_size = 10
-connection_timeout = 10
 ```
 
-`backend_generation`、连接、registry 与 owner 是 MySQL 部署初始化信息，长期保留；完成初始化后，local/MySQL 日常切换只改 `backend`。local 自动使用 file authority 并忽略 MySQL generation，mysql 自动使用 MySQL authority并校验 generation；`authority_provider` 不再是配置字段。`authority_owner_id` 必须在各 worktree/部署实例之间唯一且可审计，但它只是调用者身份，不代表独占 generation。shared writer 的写资格来自 active backend/generation/epoch 的事务校验。真实密码、主机、个人端口和绝对路径不得进入公共文档或 Git。
+配置有三种明确形态：
+
+- `backend="local"` 且 `local_selectable_enabled=false`：legacy-local 兼容模式；不打开 selectable runtime，`backend_generation` 自动忽略。
+- `backend="local"` 且 `local_selectable_enabled=true`：一等 local selectable 模式；`backend_generation` 必须指向 `authority.json` 中已登记且 verified 的 local generation，运行时使用 `local.sqlite3`、文件权威和主机进程锁。
+- `backend="mysql"`：一等 MySQL selectable 模式；开关值不参与判断，`backend_generation` 必须指向 MySQL registry 中对应 verified generation。
+
+任一 selectable 模式缺 generation、schema、权威或 fencing 时都失败关闭，不回退到 legacy-local 或另一物理后端。真实密码、主机、个人端口和绝对路径不得进入公共文档或 Git。
 
 ### 13.1 日常选择本地方案
+
+legacy-local 兼容模式：
 
 ```toml
 [storage]
 backend = "local"
+local_selectable_enabled = false
 ```
 
-启动时加载完整本地 adapter，继续使用原 SQLite、主体文件和 Chroma 投影。MySQL 可以不存在，也不会被后台隐式写入。本地模式保留进程级单实例保护，不允许多个 Elysium 进程并发写同一套 SQLite/文件。
+该模式继续使用原分散 SQLite、主体文件与 `.life_learning` 路径，不要求 generation，适合尚未 bootstrap 的部署。
+
+local selectable 模式：
+
+```toml
+[storage]
+backend = "local"
+local_selectable_enabled = true
+backend_generation = "<VERIFIED_LOCAL_GENERATION_ID>"
+schema_version = 3
+```
+
+启用前必须在 Elysium 已停止且实例锁释放的维护窗口运行 `scripts/bootstrap_local_selectable.py`。脚本从 writer-frozen 快照复制 Life Event、Subject、Presence/World、Learning、Proactive 等已登记领域到新的 `data/life_storage/local.sqlite3`，逐域校验后只注册 verified generation；它不修改配置，也不启动 Elysium。运行时取得 `data/life_storage/authority.json` 的文件权威并周期续租，每笔耐久写事务受 generation/epoch/token fence。原 SQLite、Markdown、JSON/JSONL 与快照保持不动。
+
+两种本地形态都保持进程级单实例保护，不允许多个 Elysium 进程并发写同一套 SQLite/文件。local selectable 已提供 Learning 与 Subject Authority 的完整 Port，因此主体接受链不依赖 MySQL；是否接受具体候选仍只能由爱莉自己的活动意识实例裁决。
 
 ### 13.2 复制并选择 MySQL 方案
 

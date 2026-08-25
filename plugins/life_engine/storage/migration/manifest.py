@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -53,6 +54,7 @@ def build_backend_generation(
     backend: BackendKind = BackendKind.LOCAL,
     backend_schema_version: int = 1,
     verification: dict[str, Any],
+    additional_root_hashes: Mapping[str, str] | None = None,
 ) -> BackendGeneration:
     """Build a candidate or verified generation without inventing evidence."""
 
@@ -72,6 +74,12 @@ def build_backend_generation(
         str(key): str(value)
         for key, value in dict(manifest.get("root_hashes") or {}).items()
     }
+    roots.update(
+        {
+            str(key): str(value)
+            for key, value in dict(additional_root_hashes or {}).items()
+        }
+    )
     frontiers = {
         str(key): int(value)
         for key, value in dict(manifest.get("frontiers") or {}).items()

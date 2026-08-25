@@ -333,6 +333,8 @@ def test_life_service_health_exposes_disabled_sync_without_connecting(tmp_path) 
         "outbox_backlog": 0,
         "degraded_reason": "",
         "enabled": False,
+        "configured_enabled": False,
+        "disabled_reason": "",
     }
 
 

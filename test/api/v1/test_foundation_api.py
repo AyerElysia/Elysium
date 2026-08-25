@@ -246,6 +246,43 @@ def test_snapshot_reports_mounted_command_store_as_ready(monkeypatch) -> None:
     assert commands.degraded_reason is None
 
 
+def test_snapshot_disables_legacy_sync_for_selected_storage(monkeypatch) -> None:
+    life_service = SimpleNamespace(
+        _event_bus=object(),
+        _shared_sync_bridge=None,
+        _shared_sync_error="",
+        _shared_sync_effective_enabled=False,
+        _shared_sync_disabled_reason="selected_authoritative_backend_unsupported",
+    )
+    loaded_plugins = {
+        "life_engine": SimpleNamespace(
+            _service=life_service,
+            config=SimpleNamespace(
+                shared_sync=SimpleNamespace(enabled=True),
+            ),
+        ),
+    }
+    bot = SimpleNamespace(
+        bot_name="Elysium",
+        manifests={"life_engine": SimpleNamespace(enabled=True)},
+        load_results={"life_engine": True},
+        plugin_manager=SimpleNamespace(get_all_plugins=lambda: loaded_plugins),
+    )
+    monkeypatch.setattr(
+        "src.core.managers.adapter_manager.get_adapter_manager",
+        lambda: SimpleNamespace(get_all_adapters=dict),
+    )
+
+    snapshot = snapshot_from_bot(bot)
+    remote_sync = next(
+        item for item in snapshot.modules if item.component == "remote_sync"
+    )
+
+    assert remote_sync.state == "disabled"
+    assert remote_sync.enabled is False
+    assert remote_sync.degraded_reason is None
+
+
 def test_snapshot_exposes_config_disabled_adapter_without_marking_failure(
     monkeypatch,
 ) -> None:

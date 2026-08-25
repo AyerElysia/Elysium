@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from typing import Self
 
 import pytest
@@ -103,6 +104,38 @@ def test_domain_root_is_independent_of_input_report_order() -> None:
     reports = domain_reports(rows)
 
     assert aggregate_domain_root(reports) == aggregate_domain_root(list(reversed(reports)))
+
+
+def test_local_schema_accepts_adapter_normalized_optional_timestamps() -> None:
+    connection = sqlite3.connect(":memory:")
+    try:
+        for statement in domain_schema_module._LOCAL_STATEMENTS:
+            connection.execute(statement)
+        optional_columns = {
+            "consciousness_presence": {
+                "created_at",
+                "last_active_at",
+                "suspended_at",
+                "lease_expires_at",
+            },
+            "world_assertions": {
+                "observed_at",
+                "valid_from",
+                "valid_to",
+                "recorded_at",
+                "retracted_at",
+            },
+            "world_projection_changes": {"occurred_at", "recorded_at"},
+        }
+        for table_name, column_names in optional_columns.items():
+            columns = {
+                str(row[1]): row
+                for row in connection.execute(f"PRAGMA table_info({table_name})")
+            }
+            assert column_names <= columns.keys()
+            assert all(int(columns[name][3]) == 0 for name in column_names)
+    finally:
+        connection.close()
 
 
 async def test_candidate_copy_can_create_schema_only_while_fenced(
@@ -211,6 +244,66 @@ async def test_only_virgin_initialized_world_frontier_is_repairable() -> None:
 
     assert await _insert_missing_rows(_Runtime(), source, target) == 0  # type: ignore[arg-type]
 
+    target["world_projection_changes"] = [{"ingest_position": 1}]
+    with pytest.raises(PresenceWorldCopyError, match="different evidence"):
+        await _insert_missing_rows(_Runtime(), source, target)  # type: ignore[arg-type]
+
+
+async def test_virgin_contract_meta_timestamp_drift_is_repairable() -> None:
+    """合同 meta（policy/version/rebuild_state）在 virgin 目标上只允许时间戳对齐。
+
+    runbook：这些键由运行合同生成、不能冒充源记录。目标为 virgin 且值一致
+    时，仅 updated_at 漂移不构成证据冲突，按源行对齐；值差异仍是硬冲突。
+    """
+
+    source = {name: [] for name in TABLE_SPECS}
+    target = {name: [] for name in TABLE_SPECS}
+    source["world_projection_meta"] = [
+        {
+            "meta_key": "projector_policy",
+            "meta_value": "source-preserving-v1",
+            "updated_at": "2026-08-04T10:27:07.735073+00:00",
+        }
+    ]
+    target["world_projection_meta"] = [
+        {
+            "meta_key": "projector_policy",
+            "meta_value": "source-preserving-v1",
+            "updated_at": "2026-08-23T08:00:00+00:00",
+        }
+    ]
+
+    class _Result:
+        rowcount = 1
+
+    class _Session:
+        async def execute(self, *_args: object, **_kwargs: object) -> _Result:
+            return _Result()
+
+    class _Uow:
+        session = _Session()
+
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    class _Runtime:
+        def unit_of_work(self) -> _Uow:
+            return _Uow()
+
+    assert (
+        await _insert_missing_rows(_Runtime(), source, target) == 0  # type: ignore[arg-type]
+    )
+
+    # 值不同：仍是硬冲突，不允许修复。
+    target["world_projection_meta"][0]["meta_value"] = "different-policy"
+    with pytest.raises(PresenceWorldCopyError, match="different evidence"):
+        await _insert_missing_rows(_Runtime(), source, target)  # type: ignore[arg-type]
+
+    # 非 virgin（已有物化行）：时间戳漂移也是硬冲突。
+    target["world_projection_meta"][0]["meta_value"] = "source-preserving-v1"
     target["world_projection_changes"] = [{"ingest_position": 1}]
     with pytest.raises(PresenceWorldCopyError, match="different evidence"):
         await _insert_missing_rows(_Runtime(), source, target)  # type: ignore[arg-type]

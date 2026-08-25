@@ -1578,6 +1578,73 @@ async def test_memory_index_lifecycle_start_toggle_and_stop_close(
     assert lifecycle_events.index("witness_wait") < lifecycle_events.index("memory_close")
 
 
+async def test_selected_storage_disables_legacy_shared_sync_without_bridge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _make_service(tmp_path)
+    service._selectable_storage_enabled = True
+    service.plugin.config.shared_sync.enabled = True
+    service._stop_event = asyncio.Event()
+
+    class ForbiddenBridge:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            raise AssertionError("selected storage constructed the legacy sync bridge")
+
+    monkeypatch.setattr(
+        "plugins.life_engine.service.shared_sync.SharedSyncBridge",
+        ForbiddenBridge,
+    )
+
+    await service._start_shared_sync(service.plugin.config)
+    health = service.health()["shared_sync"]
+
+    assert service._shared_sync_bridge is None
+    assert service._shared_sync_task_id is None
+    assert service._shared_sync_error == ""
+    assert health["status"] == "disabled"
+    assert health["enabled"] is False
+    assert health["configured_enabled"] is True
+    assert health["disabled_reason"] == (
+        "selected_authoritative_backend_unsupported"
+    )
+
+
+async def test_subject_projection_worker_retries_transient_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _make_service(tmp_path)
+    service._stop_event = asyncio.Event()
+    calls = 0
+
+    class FailingOnceProjector:
+        async def project_one(self) -> object:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("transient storage failure")
+            service._stop_event.set()
+            return SimpleNamespace(status="superseded")
+
+    async def immediate_timeout(awaitable: object, *, timeout: float) -> object:
+        assert timeout == 1.0
+        awaitable.close()  # type: ignore[attr-defined]
+        raise TimeoutError
+
+    service._subject_workspace_projector = FailingOnceProjector()
+    monkeypatch.setattr(
+        "plugins.life_engine.service.core.asyncio.wait_for",
+        immediate_timeout,
+    )
+
+    await service._subject_projection_loop()
+
+    assert calls == 2
+    assert service._subject_projection_health["status"] == "healthy"
+    assert service._subject_projection_health["last_error_type"] == ""
+
+
 async def test_shared_sync_uses_managed_lifecycle_and_closes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
