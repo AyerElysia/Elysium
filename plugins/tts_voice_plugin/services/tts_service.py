@@ -624,11 +624,10 @@ class TTSService(BaseService):
         #    避免贪婪匹配把标记后面的正文一起删掉。
         text = re.sub(r"<\s*\|[\w:\-.\s]*(?:\|\s*>|>|(?=\s)|$)", "", text)
 
-        # 1. 基本清理
+        # 1. 基本清理。展示文本中的装饰性停顿不能原样进入声学模型：
+        #    GPT-SoVITS 会把单个全角波浪号解释成省略停顿，导致拖音、弱化词尾和吞辅音。
         text = re.sub(r"[\(（\[【].*?[\)）\]】]", "", text)
-        text = re.sub(r"([，。！？、；：,.!?;:~\-`])\1+", r"\1", text)
-        text = re.sub(r"~{2,}|～{2,}", "，", text)
-        text = re.sub(r"\.{3,}|…{1,}", "。", text)
+        text = re.sub(r"\.{3,}|…+", "。", text)
 
         # 2. 词语替换
         replacements = {"www": "哈哈哈", "hhh": "哈哈", "233": "哈哈", "666": "厉害", "88": "拜拜"}
@@ -642,7 +641,19 @@ class TTSService(BaseService):
             text,
         )
 
-        # 4. 确保结尾有标点
+        # 4. 生成非权威的可发音投影。句尾波浪号表达语气，不应制造额外省略音；
+        #    句中波浪号使用普通短停顿。原始消息和训练轨迹始终保留展示文本。
+        text = re.sub(r"\s+", " ", text).strip()
+        text = re.sub(r"[~～]+(?=\s*$)", "。", text)
+        text = re.sub(r"[~～]+", "，", text)
+        text = re.sub(r"[，,]+\s*([。！？.!?])", r"\1", text)
+        text = re.sub(
+            r"([，。！？、；：,.!?;:\-`])\1+",
+            r"\1",
+            text,
+        )
+
+        # 5. 确保结尾有标点
         if text and not text.endswith(tuple("，。！？、；：,.!?;:")):
             text += "。"
 

@@ -12,6 +12,8 @@ Elysium 的本地消息 TTS Service。它用一个稳定接口支持 **IndexTTS2
 
 TTS 不决定正文、情绪或是否表达。Service 缺失、合成失败、返回空音频或平台发送失败时必须如实失败，禁止换成陌生默认音色。
 
+展示文本、trajectory 和记忆保留爱莉真正写出的正文。Service 只为声学模型派生一份非权威的可发音投影：移除不可发音符号，把装饰性波浪号与连续省略号收敛成稳定句界；投影绝不写回正文。
+
 ## 功能
 
 - vLLM-Omni `/v1/audio/speech` 合成、健康检查与按需启动；
@@ -39,13 +41,14 @@ TTS 不决定正文、情绪或是否表达。Service 缺失、合成失败、�
 - `[tts].segment_concurrency`：同一长表达在 vLLM-Omni 中的有界并发，默认 2、硬上限 4；GPT-SoVITS 不使用外层片段并发；
 - `[tts].phrase_pause_ms`、`clause_pause_ms`、`sentence_pause_ms`、`paragraph_pause_ms`：拼接时按原标点追加的停顿；
 - `[[tts_styles]]`：必须至少有 `default`，包含参考音频、提示文本、语言、速度与可选 GPT-SoVITS 权重字段；默认 `speed_factor=0.90`，部署值仍须试听验收；
+- `[tts_advanced].text_split_method`、`seed`：GPT-SoVITS 原生切分与语义采样合同；`seed=-1` 表示随机，生产固定值必须来自成对试听；
 - `[spatial_effects]`：可选混响与卷积。
 
 vLLM-Omni 模式发送官方字段 `model/input/response_format/speed/ref_audio/extra_params`，不会发送历史 `text_lang/ref_audio_path`。参考音频在一条表达开始时读取并编码一次，各并发片段共享同一不可变 data URL；也可配置预先上传的命名音色，避免每次传输参考音频。客户端不会把历史 GPT-SoVITS 的 3～10 秒限制强加给 IndexTTS2.5。
 
 长文本拆分只是合成运输细节。对上游意识实例、trajectory、平台与记忆而言，输入仍是一条完整表达，输出仍是一条语音消息；内部片段不形成多条人格样本，也不允许分段发送。vLLM-Omni 可对片段做有限并行批处理，但结果必须按原序号归位，随后统一拼接、施加一次空间效果并编码一次；任何一段失败都会使整条语音显式失败。
 
-`legacy_compat` 不得先由 Elysium 拆句、再由 GPT-SoVITS 的 `text_split_method` 二次切分。Service 将清洗后的完整表达一次性交给 `/tts`，每条表达最多切换一次 GPT/SoVITS 权重，由后端 `cut5` 等原生策略维护句内韵律。因为 legacy API 不返回内部切分回执，观测只记录整条表达的单位数、时长和语速告警，不伪造内部片段指标，也不记录正文。
+`legacy_compat` 不得先由 Elysium 拆句、再由 GPT-SoVITS 的 `text_split_method` 二次切分。Service 将可发音投影后的完整表达一次性交给 `/tts`，每条表达最多切换一次 GPT/SoVITS 权重，由配置的原生切分策略维护句内韵律。因为 legacy API 不返回内部切分回执，观测只记录整条表达的单位数、时长和语速告警，不伪造内部片段指标，也不记录正文。
 
 ## 依赖与部署
 
@@ -74,6 +77,7 @@ vLLM-Omni 模式发送官方字段 `model/input/response_format/speed/ref_audio/
 9. 任一内部片段失败时不返回半截音频，完整文本超限时不发生网络请求。
 10. vLLM-Omni 的片段并发不超过配置上限，完成顺序变化也不改变最终正文顺序。
 11. 闲置到期只关闭插件自有进程；新合成、长合成和替换后的进程不会被旧计时误杀，关闭后下一次请求可按需重启。
+12. 装饰符号只改变可发音投影，不修改原始表达；固定试听文本必须同时验证标准中文与真实聊天标点。
 
 完整架构见 [TTS 语音合成](../../docs/architecture/TTS语音合成.md)。
 

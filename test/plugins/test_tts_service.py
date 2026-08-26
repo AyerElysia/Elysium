@@ -89,6 +89,7 @@ def test_long_text_config_defaults_and_bounds() -> None:
     assert config.tts.long_text_split_enabled is True
     assert config.tts.segment_max_units == 24
     assert config.tts_advanced.text_split_method == "cut5"
+    assert config.tts_advanced.seed == -1
     assert config.tts_styles[0].speed_factor == 0.9
     assert config.tts.segment_min_units == 8
     assert config.tts.segment_concurrency == 2
@@ -108,6 +109,44 @@ def test_long_text_config_defaults_and_bounds() -> None:
         TTSVoiceConfig.model_validate({"tts": {"idle_shutdown_seconds": -0.1}})
     with pytest.raises(ValueError):
         TTSVoiceConfig.model_validate({"tts": {"idle_shutdown_seconds": 86_401}})
+    with pytest.raises(ValueError):
+        TTSVoiceConfig.model_validate({"tts_advanced": {"seed": -2}})
+
+
+def test_tts_spoken_projection_removes_decorative_pause_artifacts(
+    tmp_path: Path,
+) -> None:
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"RIFF")
+    service = _service_with_reference(reference)
+
+    original = "小希～头发好闻嘛？其实呀……我想悄悄告诉你一句话……我喜欢你哦～♪ 💖"
+
+    assert service._clean_text_for_tts(original) == (
+        "小希，头发好闻嘛？其实呀。我想悄悄告诉你一句话。我喜欢你哦。"
+    )
+    assert original.endswith("♪ 💖")
+
+
+@pytest.mark.parametrize(
+    ("original", "projected"),
+    [
+        ("你好～", "你好。"),
+        ("你好～～世界", "你好，世界。"),
+        ("等等……我会回来。", "等等。我会回来。"),
+        ("真的嘛～～？", "真的嘛？"),
+    ],
+)
+def test_tts_spoken_projection_has_stable_pause_boundaries(
+    tmp_path: Path,
+    original: str,
+    projected: str,
+) -> None:
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"RIFF")
+    service = _service_with_reference(reference)
+
+    assert service._clean_text_for_tts(original) == projected
 
 
 def test_vllm_omni_payload_uses_official_indextts25_contract(
@@ -304,6 +343,7 @@ async def test_legacy_expression_uses_native_cut_once(
     reference = tmp_path / "reference.wav"
     reference.write_bytes(b"RIFF")
     service = _service_with_reference(reference)
+    service._config.tts_advanced.seed = 20260826
     service._ensure_server_alive = AsyncMock(return_value=True)  # type: ignore[method-assign]
     monkeypatch.setattr(service, "_validate_main_ref_duration", lambda _path: True)
     monkeypatch.setattr(
@@ -346,6 +386,7 @@ async def test_legacy_expression_uses_native_cut_once(
     assert isinstance(payload, dict)
     assert payload["text"] == text
     assert payload["text_split_method"] == "cut5"
+    assert payload["seed"] == 20260826
     assert payload["speed_factor"] == 0.9
     assert payload["media_type"] == "wav"
     service._ensure_server_alive.assert_awaited_once()

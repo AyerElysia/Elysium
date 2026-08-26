@@ -234,6 +234,11 @@ class TTSAdvancedSection(SectionBase):
     repetition_penalty: float = Field(default=1.4, description="重复惩罚因子")
     sample_steps: int = Field(default=150, description="采样步数")
     super_sampling: bool = Field(default=True, description="是否启用超采样")
+    seed: int = Field(
+        default=-1,
+        ge=-1,
+        description="GPT-SoVITS 语义采样种子；-1 表示每次随机",
+    )
     text_normalization: bool = Field(
         default=True,
         description="是否启用 IndexTTS2.5 文本规范化；仅 vLLM-Omni 消费",
