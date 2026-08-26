@@ -646,6 +646,156 @@ class InsightStore:
         })
         return kv
 
+    def _knowledge_manifest_entry(
+        self, manifest: dict[str, Any], version: int
+    ) -> dict[str, Any]:
+        """Locate one manifest entry by version; raise on missing or malformed."""
+        for entry in manifest.get("versions", []):
+            if isinstance(entry, dict) and int(entry.get("version", 0) or 0) == int(
+                version
+            ):
+                return entry
+        raise ValueError(f"KnowledgeVersionNotFound:{version}")
+
+    def accept_knowledge_candidate(
+        self,
+        version: int,
+        *,
+        actor: str,
+        occurrence_id: str = "",
+    ) -> dict[str, Any]:
+        """由当前活跃意识接受一个知识候选。
+
+        接受是唯一能把候选提升为当前自我认知的路径：更新 manifest、
+        回写 self_knowledge.md、把来源洞察移出可压缩池（next_action 转
+        ARCHIVE），并标记更早的未决候选为 superseded。幂等：重复接受同
+        一版本返回原证明。
+        """
+        version = int(version)
+        manifest = self.load_knowledge_manifest()
+        entry = self._knowledge_manifest_entry(manifest, version)
+        if entry.get("declined"):
+            raise ValueError("KnowledgeCandidateAlreadyDeclined")
+        if entry.get("superseded"):
+            raise ValueError("KnowledgeCandidateSuperseded")
+        if entry.get("promoted"):
+            return {
+                "version": version,
+                "accepted_at": str(entry.get("accepted_at", "") or ""),
+                "idempotent": True,
+            }
+
+        content = self.read_knowledge_version(version)
+        accepted_at = _now_iso()
+        entry["promoted"] = True
+        entry["accepted_at"] = accepted_at
+        entry["accepted_by"] = str(actor or "")
+        if occurrence_id:
+            entry["accept_occurrence_id"] = str(occurrence_id)
+
+        # 更新的候选基于更新的账本生成；接受最新一个时，更早的未决候选
+        # 不再单独呈现，只标记来源不删除文件。
+        superseded: list[int] = []
+        for other in manifest.get("versions", []):
+            if not isinstance(other, dict):
+                continue
+            other_version = int(other.get("version", 0) or 0)
+            if (
+                other_version < version
+                and not other.get("promoted")
+                and not other.get("declined")
+                and not other.get("superseded")
+            ):
+                other["superseded"] = True
+                other["superseded_at"] = accepted_at
+                other["superseded_by"] = version
+                superseded.append(other_version)
+
+        manifest["current_version"] = version
+        self.save_knowledge_manifest(manifest)
+
+        current_path = self.get_current_knowledge_path()
+        current_temporary = current_path.with_suffix(".md.tmp")
+        current_temporary.write_text(content, encoding="utf-8")
+        current_temporary.replace(current_path)
+
+        # 来源洞察离开可压缩池：接受链打通后，慢环不再重写同一份材料。
+        archived_insights: list[str] = []
+        for insight_id in list(entry.get("insight_ids", [])):
+            insight = self.get_insight(str(insight_id))
+            if insight is None:
+                continue
+            if version not in insight.knowledge_versions:
+                insight.knowledge_versions.append(version)
+            if insight.next_action != InsightNextAction.ARCHIVE.value:
+                insight.next_action = InsightNextAction.ARCHIVE.value
+                archived_insights.append(insight.insight_id)
+            self.update_insight(insight)
+
+        self._append_audit({
+            "action": "knowledge_version_accepted",
+            "version": version,
+            "actor": str(actor or ""),
+            "occurrence_id": str(occurrence_id or ""),
+            "insight_count": len(entry.get("insight_ids", [])),
+            "superseded_count": len(superseded),
+        })
+        for insight_id in archived_insights:
+            self._append_audit({
+                "action": "status_transition",
+                "insight_id": insight_id,
+                "to_next_action": InsightNextAction.ARCHIVE.value,
+                "reason": f"knowledge_candidate_accepted:v{version}",
+            })
+        return {
+            "version": version,
+            "accepted_at": accepted_at,
+            "archived_insights": len(archived_insights),
+            "superseded_candidates": len(superseded),
+            "idempotent": False,
+        }
+
+    def decline_knowledge_candidate(
+        self,
+        version: int,
+        *,
+        actor: str,
+        reason: str = "",
+        occurrence_id: str = "",
+    ) -> dict[str, Any]:
+        """由当前活跃意识拒绝一个知识候选。
+
+        拒绝只留审计证据：候选文件与 manifest 行不删除，来源洞察留在可压
+        缩池，以后伴随新材料重新压缩。幂等：重复拒绝返回原证明。
+        """
+        version = int(version)
+        manifest = self.load_knowledge_manifest()
+        entry = self._knowledge_manifest_entry(manifest, version)
+        if entry.get("promoted"):
+            raise ValueError("KnowledgeCandidateAlreadyAccepted")
+        if entry.get("declined"):
+            return {"version": version, "declined": True, "idempotent": True}
+        if entry.get("superseded"):
+            raise ValueError("KnowledgeCandidateSuperseded")
+
+        entry["declined"] = True
+        entry["declined_at"] = _now_iso()
+        entry["declined_by"] = str(actor or "")
+        if reason:
+            entry["declined_reason"] = str(reason)
+        if occurrence_id:
+            entry["decline_occurrence_id"] = str(occurrence_id)
+        self.save_knowledge_manifest(manifest)
+
+        self._append_audit({
+            "action": "knowledge_version_declined",
+            "version": version,
+            "actor": str(actor or ""),
+            "reason": str(reason or ""),
+            "occurrence_id": str(occurrence_id or ""),
+        })
+        return {"version": version, "declined": True, "idempotent": False}
+
     # ── 状态持久化 ───────────────────────────────────────────
 
     def load_state(self) -> dict[str, Any]:

@@ -40,6 +40,12 @@ logger = logging.getLogger("life_engine.learning.knowledge")
 # 默认参数
 _DEFAULT_TRIGGER_COUNT = 5  # 触发压缩的 validated 数量
 _DEFAULT_INTERVAL_HOURS = 48.0  # 压缩最小间隔
+# 候选与当前生效文档之间至少要有这么多处连续变更区域或这么多行变更，才值得产出新版本；
+# 否则压缩只是在反复重述近似内容（实测：接受链未打通时同一批洞察会被反复
+# 压缩出只差几行的候选），直接跳过，不写候选也不跑门禁评估。两个口径取其一：
+# 区域数抓"离散修改处"，行数抓"一次大段重写"。
+_DEFAULT_MIN_EDIT_REGIONS = 3
+_DEFAULT_MIN_CHANGED_LINES = 8
 
 # 后台知识整合 / 门禁的单次 LLM 往返总预算；质量优先且仍保持有界。
 # 两次独立模型往返各自领取一份预算，单次往返内部仍只有一个 monotonic deadline。
@@ -86,6 +92,8 @@ class SelfKnowledgeCompressor:
         trigger_count: int = _DEFAULT_TRIGGER_COUNT,
         interval_hours: float = _DEFAULT_INTERVAL_HOURS,
         max_edits: int | None = None,
+        min_edit_regions: int = _DEFAULT_MIN_EDIT_REGIONS,
+        min_changed_lines: int = _DEFAULT_MIN_CHANGED_LINES,
     ) -> None:
         self._store = store
         self._workspace = Path(workspace_path).resolve()
@@ -99,6 +107,8 @@ class SelfKnowledgeCompressor:
         )
         # 兼容旧配置入口；认知内容的修改范围由整合过程自行判断。
         del max_edits
+        self._min_edit_regions = max(1, int(min_edit_regions or _DEFAULT_MIN_EDIT_REGIONS))
+        self._min_changed_lines = max(1, int(min_changed_lines or _DEFAULT_MIN_CHANGED_LINES))
         self._lock = asyncio.Lock()
         self._last_projection_stats: dict[str, Any] = {}
 
@@ -122,9 +132,15 @@ class SelfKnowledgeCompressor:
             last_dt = datetime.fromisoformat(last_compress)
             now = datetime.now(UTC).astimezone()
             hours_elapsed = (now - last_dt).total_seconds() / 3600.0
-            return hours_elapsed >= self._interval_hours
+            if hours_elapsed < self._interval_hours:
+                return False
         except (ValueError, TypeError):
             return True
+
+        # 上一次压缩已经确认"同一批材料产不出有意义的候选"（变化过小或压缩
+        # 未变化），在新洞察进入可压缩池之前不再重复烧 LLM 调用。池子变化时由
+        # run_compression 里写入候选的路径清除该标记。
+        return not bool(state.get("last_compress_no_candidate", False))
 
     async def run_compression(self) -> bool:
         """Create one immutable proposal; never accept it on the subject's behalf."""
@@ -158,6 +174,29 @@ class SelfKnowledgeCompressor:
             )
             if not new_content or new_content.strip() == current_knowledge.strip():
                 logger.info("压缩未产生变化")
+                state = self._store.load_state()
+                state["last_compress_no_candidate"] = True
+                self._store.save_state(state)
+                return False
+
+            # 3.5 节流守卫：与当前生效文档差异过小（近似重述）就不产出候选。
+            # 先于门禁评估执行，避免为无实质变化的版本再烧一次 LLM 往返。
+            regions, changed_lines = self._diff_stats(current_knowledge, new_content)
+            if (
+                regions < self._min_edit_regions
+                and changed_lines < self._min_changed_lines
+            ):
+                logger.info(
+                    "压缩产生的变化过小（%d 区域/%d 行，阈值 %d/%d），跳过候选",
+                    regions,
+                    changed_lines,
+                    self._min_edit_regions,
+                    self._min_changed_lines,
+                )
+                state = self._store.load_state()
+                state["last_compress_at"] = _now_iso()
+                state["last_compress_no_candidate"] = True
+                self._store.save_state(state)
                 return False
 
             # 4. Independent assessment. This is a recommendation, not the
@@ -187,7 +226,7 @@ class SelfKnowledgeCompressor:
                 content=new_content,
                 version=next_version,
                 insight_ids=insight_ids,
-                edit_count=self._count_change_regions(current_knowledge, new_content),
+                edit_count=regions,
                 promoted=False,
                 reason=(
                     "independent_gate_recommended"
@@ -200,6 +239,9 @@ class SelfKnowledgeCompressor:
             state["last_compress_at"] = _now_iso()
             state["last_knowledge_candidate_version"] = next_version
             state["last_knowledge_candidate_recommended"] = recommended
+            # 池子里的材料已经产出候选，解除"无候选"节流标记；等她接受或拒
+            # 绝后（洞察离开池或留下新洞察），下一轮压缩才有意义。
+            state["last_compress_no_candidate"] = False
             self._store.save_state(state)
             logger.info(
                 "自我认知候选 v%s 已保存（独立评估=%s，尚未由主体接受）",
@@ -326,12 +368,24 @@ class SelfKnowledgeCompressor:
     @staticmethod
     def _count_change_regions(old_content: str, new_content: str) -> int:
         """Count actual contiguous diff regions for audit metadata only."""
+        return SelfKnowledgeCompressor._diff_stats(old_content, new_content)[0]
+
+    @staticmethod
+    def _diff_stats(old_content: str, new_content: str) -> tuple[int, int]:
+        """返回（连续变更区域数，变更行数）；仅供审计元数据与节流判断。"""
         matcher = difflib.SequenceMatcher(
             a=old_content.splitlines(),
             b=new_content.splitlines(),
             autojunk=False,
         )
-        return sum(1 for tag, *_ in matcher.get_opcodes() if tag != "equal")
+        regions = 0
+        changed_lines = 0
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag == "equal":
+                continue
+            regions += 1
+            changed_lines += max(i2 - i1, j2 - j1)
+        return regions, changed_lines
 
     def collect_reconsidered_memo(self, limit: int = 0) -> list[Insight]:
         """挑出"曾经写进认知文档、后来她自己不这么想了"的洞察。

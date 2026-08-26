@@ -133,6 +133,29 @@ ban_user_id = ["333333333", "444444444"]
 - **配置 schema**: `plugins/napcat_adapter/config.py`
 - **实际配置**: `config/plugins/napcat_adapter/config.toml`
 
+### QQ 语音清晰度投影
+
+核心 `voice` 消息段保存 TTS Service 生成的原始音频；NapCat 适配器只在发送到 QQ
+的最后一跳，为内联 WAV 派生一份平台专用投影。当前 `qq_voice_presence_v1`
+固定执行：
+
+- 以 SOXR 重采样为 QQ/NT-Silk 实际使用的 24 kHz 单声道 PCM；
+- 在 2.8 kHz 增益 2.5 dB，并从 4.5 kHz 起提升 3 dB，补偿实测 Silk
+  往返造成的辅音频段衰减；
+- 预留 2 dB 电平空间并限幅，避免补偿后削波；
+- 再交给 NapCat/QQ NT 内核完成最终 Silk 编码。
+
+这份投影不覆盖 TTS 原件，也不进入训练数据、飞书、Surface、直播或 Voice Live。
+URL、已有 Silk、非 WAV 与超过输入硬上限的内容保持原样。FFmpeg 或投影失败时同样
+保留原始语音继续发送，只记录不含正文和音频内容的错误类型。
+
+默认启用；需要对照排查时可在本机配置关闭：
+
+```toml
+[features]
+qq_voice_projection_enabled = false
+```
+
 #### 📊 日志信息
 
 被过滤的消息会在调试日志中记录：
