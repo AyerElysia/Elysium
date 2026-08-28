@@ -2827,7 +2827,47 @@ class LifeEngineService(BaseService):
             exc_info=True,
         )  # noqa: G201 - project Logger has no exception()
 
+    def _exit_for_lost_storage_authority(self, reason: str) -> None:
+        """权威丢失后退出进程，交给外层守护重拉并重新激活。
+
+        本地模式下入口级实例锁已排除同机第二个主写者，重启重新激活是安全
+        的恢复路径；带着过期租约继续运行只会让每条写入路径反复抛
+        StaleAuthorityToken（2026-08-26 事故形态）。
+        """
+
+        logger.error(
+            "life_engine storage authority was lost "
+            f"({reason}); exiting for supervised restart"
+        )
+        os._exit(30)
+
     async def _renew_storage_authority_loop(self) -> None:
+        """守护包装：续租循环任何非正常关闭的退出都视为权威丢失。
+
+        内层循环存在多条静默 return 路径（stop_event、runtime 置空、
+        fail-closed）；2026-08-26 事故中任务被取消后无日志、无自愈，
+        进程带着过期租约持续运行。这里确保只要服务仍在运行，就以受监管
+        重启收场，而不是静默变成僵尸写者。
+        """
+
+        try:
+            await self._run_storage_authority_renewal()
+        except asyncio.CancelledError:
+            stop_event = self._stop_event
+            if stop_event is not None and stop_event.is_set():
+                raise
+            logger.warning(
+                "life_engine storage authority renewal task was cancelled "
+                "outside shutdown"
+            )
+            self._exit_for_lost_storage_authority("renewal task cancelled")
+            raise
+        stop_event = self._stop_event
+        if stop_event is not None and stop_event.is_set():
+            return
+        self._exit_for_lost_storage_authority("renewal loop exited")
+
+    async def _run_storage_authority_renewal(self) -> None:
         """Renew authority without turning connectivity unknown into lease loss."""
 
         from ..storage.authority import (
@@ -2860,6 +2900,9 @@ class LifeEngineService(BaseService):
             try:
                 await runtime.renew_authority(lease_seconds=lease_seconds)
             except asyncio.CancelledError:
+                logger.warning(
+                    "life_engine storage authority renewal was cancelled",
+                )
                 raise
             except ManagedSingletonWriterClaimLost as exc:
                 if not await self._handle_managed_singleton_loss(exc):

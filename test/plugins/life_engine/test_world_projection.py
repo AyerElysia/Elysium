@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -214,6 +215,75 @@ def test_projection_rejects_same_position_with_different_evidence(
     )
     with pytest.raises(WorldProjectionConflict, match="ingest position"):
         projection.apply_events([conflicting])
+
+
+class _EmptyCursor:
+    def fetchone(self) -> None:
+        return None
+
+
+class _RacingDb:
+    """模拟竞争投影者：幂等检查看到空行，插入时却撞上对方刚提交的行。
+
+    这正是 2026-08-26 线上见证循环崩溃三天的竞争形态：SELECT-then-INSERT
+    之间的窗口被并发追赶者命中，原始 IntegrityError 漏捕后被当致命错误。
+    """
+
+    def __init__(self) -> None:
+        self.executed: list[str] = []
+
+    def execute(self, sql: str, params: Any = ()) -> Any:
+        self.executed.append(sql.strip())
+        if sql.lstrip().upper().startswith("SELECT"):
+            return _EmptyCursor()
+        raise sqlite3.IntegrityError(
+            "UNIQUE constraint failed: world_projection_changes.ingest_position"
+        )
+
+
+def _presence_event() -> LifeEvent:
+    return LifeEvent(
+        event_id="event-presence-race",
+        sequence=7,
+        timestamp="2026-08-26T12:00:00+08:00",
+        source="test.world",
+        channel=LifeEventChannel.LIFE.value,
+        event_type="consciousness.instance_seen",
+        content=json.dumps(
+            {"instance": {"instance_id": "memory_witness", "revision": 1}},
+            ensure_ascii=False,
+        ),
+        stream_id="stream-test",
+        occurrence_id="presence_race",
+        source_instance_id="memory_witness",
+    )
+
+
+def test_projection_change_insert_race_converts_to_recoverable_conflict(
+    tmp_path: Path,
+) -> None:
+    """插入撞行不再泄漏原始 IntegrityError，而是转为可重试的领域冲突。"""
+
+    projection = WorldProjectionStore(tmp_path / "projection.sqlite3")
+
+    with pytest.raises(WorldProjectionConflict, match="concurrent world projection"):
+        projection._insert_change(
+            _RacingDb(),
+            _presence_event(),
+            change_kind="consciousness_presence",
+            payload={"revision": 1},
+        )
+
+
+def test_projection_assertion_insert_race_converts_to_recoverable_conflict(
+    tmp_path: Path,
+) -> None:
+    projection = WorldProjectionStore(tmp_path / "projection.sqlite3")
+    event = _observation("race", source_instance_id="chat_global", value="seen")
+    assertion = json.loads(event.content)["assertion"]
+
+    with pytest.raises(WorldProjectionConflict, match="concurrent world assertion"):
+        projection._insert_assertion(_RacingDb(), event, assertion, 0)
 
 
 def test_perception_cursor_uses_position_revision_cas_and_stable_noop(

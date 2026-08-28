@@ -69,6 +69,7 @@ from .perception_gateway import (
     PerceptionDeliveryReceipt,
 )
 from .presence_store import PresenceRevisionConflict
+from .world_projection import WorldProjectionConflict
 from .world_state import PerceptionFilter
 
 # 双路径加载身份兼容。plugin_manager 以顶层包身份（life_engine.*）加载插件，
@@ -92,6 +93,12 @@ try:
 except ImportError:  # pragma: no cover
     _PluginsWriterClaimConflict = SingletonWriterClaimConflict
     _PluginsWriterClaimLost = SingletonWriterClaimLost
+try:
+    from plugins.life_engine.service.world_projection import (  # type: ignore[import-not-found]
+        WorldProjectionConflict as _PluginsWorldProjectionConflict,
+    )
+except ImportError:  # pragma: no cover
+    _PluginsWorldProjectionConflict = WorldProjectionConflict
 
 _PRESENCE_CONFLICT_TYPES = (
     PresenceRevisionConflict,
@@ -102,6 +109,13 @@ _WRITER_CLAIM_TYPES = (
     _PluginsWriterClaimConflict,
     SingletonWriterClaimLost,
     _PluginsWriterClaimLost,
+)
+# 世界投影追赶的并发碰撞（同一账本位置的重复插入被转为领域冲突）：
+# 整批回滚后重放即可收敛，不是致命错误。2026-08-23 迁移后因漏捕此异常，
+# 见证循环在同一位置持续崩溃三天、无新见证产出。
+_WORLD_PROJECTION_CONFLICT_TYPES = (
+    WorldProjectionConflict,
+    _PluginsWorldProjectionConflict,
 )
 
 if TYPE_CHECKING:
@@ -556,6 +570,7 @@ class MemoryWitnessCoordinator:
                         CursorConflict,
                         MemoryWitnessProjectionFilesystemChanged,
                         *_WRITER_CLAIM_TYPES,
+                        *_WORLD_PROJECTION_CONFLICT_TYPES,
                     ),
                 ):
                     transient_failures = 0

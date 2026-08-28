@@ -59,41 +59,45 @@ async def _verify(
     config = TTSVoiceConfig.load(config_path, auto_update=False)
     service = TTSService(SimpleNamespace(config=config))  # type: ignore[arg-type]
     cleaned_text = service._clean_text_for_tts(text)
-    segments = service._split_text_for_synthesis(cleaned_text)
-    encoded = await service.generate_voice(
-        text,
-        style_hint=style,
-        language_hint=language,
-    )
-    if not isinstance(encoded, str) or not encoded.strip():
-        raise RuntimeError("local TTS returned empty audio")
+    plan_mode, segments = service._build_synthesis_plan(cleaned_text)
     try:
-        audio = base64.b64decode(encoded, validate=True)
-    except ValueError as exc:
-        raise RuntimeError("local TTS returned invalid Base64 audio") from exc
-    if not audio:
-        raise RuntimeError("local TTS decoded to empty audio")
-    resolved_output: str | None = None
-    if output_path is not None:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_bytes(audio)
-        resolved_output = str(output_path.resolve())
-    return {
-        "status": "ok",
-        "server": config.tts.server,
-        "style": style,
-        "language": language or "auto",
-        "input_chars": len(text),
-        "audio_format": _audio_format(audio),
-        "audio_bytes": len(audio),
-        "audio_sha256": hashlib.sha256(audio).hexdigest(),
-        "synthesis_segments": len(segments),
-        "segment_chars": [len(segment.text) for segment in segments],
-        "segment_units": [segment.units for segment in segments],
-        "segment_boundaries": [segment.boundary for segment in segments],
-        "output_path": resolved_output,
-        **_audio_metadata(audio),
-    }
+        encoded = await service.generate_voice(
+            text,
+            style_hint=style,
+            language_hint=language,
+        )
+        if not isinstance(encoded, str) or not encoded.strip():
+            raise RuntimeError("local TTS returned empty audio")
+        try:
+            audio = base64.b64decode(encoded, validate=True)
+        except ValueError as exc:
+            raise RuntimeError("local TTS returned invalid Base64 audio") from exc
+        if not audio:
+            raise RuntimeError("local TTS decoded to empty audio")
+        resolved_output: str | None = None
+        if output_path is not None:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(audio)
+            resolved_output = str(output_path.resolve())
+        return {
+            "status": "ok",
+            "server": config.tts.server,
+            "style": style,
+            "language": language or "auto",
+            "input_chars": len(text),
+            "audio_format": _audio_format(audio),
+            "audio_bytes": len(audio),
+            "audio_sha256": hashlib.sha256(audio).hexdigest(),
+            "synthesis_plan_mode": plan_mode,
+            "synthesis_segments": len(segments),
+            "segment_chars": [len(segment.text) for segment in segments],
+            "segment_units": [segment.units for segment in segments],
+            "segment_boundaries": [segment.boundary for segment in segments],
+            "output_path": resolved_output,
+            **_audio_metadata(audio),
+        }
+    finally:
+        await service.stop()
 
 
 def main() -> int:

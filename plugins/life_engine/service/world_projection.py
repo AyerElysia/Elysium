@@ -518,15 +518,22 @@ class WorldProjectionStore:
                     f"assertion identity reused with different evidence: {assertion_id}"
                 )
             return
-        db.execute(
-            """INSERT INTO world_assertions (
-                assertion_id, subject, predicate, value_json, domain, status,
-                source_instance_id, source_event_id, occurrence_id, observed_at,
-                valid_from, valid_to, recorded_at, supersedes_assertion_id,
-                payload_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            values,
-        )
+        try:
+            db.execute(
+                """INSERT INTO world_assertions (
+                    assertion_id, subject, predicate, value_json, domain, status,
+                    source_instance_id, source_event_id, occurrence_id, observed_at,
+                    valid_from, valid_to, recorded_at, supersedes_assertion_id,
+                    payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                values,
+            )
+        except sqlite3.IntegrityError as exc:
+            # 幂等检查与并发投影者之间存在竞争窗口：检查时行为空、插入时撞行。
+            # 转为领域冲突异常让上层重试；重放时幂等检查会看到已提交的行并收敛。
+            raise WorldProjectionConflict(
+                f"concurrent world assertion insert: {assertion_id}"
+            ) from exc
         retracts = str(assertion.get("retracts_assertion_id") or "").strip()
         if retracts:
             db.execute(
@@ -580,14 +587,21 @@ class WorldProjectionStore:
                     f"{event.sequence}"
                 )
             return
-        db.execute(
-            """INSERT INTO world_projection_changes (
-                ingest_position, event_id, occurrence_id, event_type,
-                change_kind, source_instance_id, stream_id, occurred_at,
-                recorded_at, payload_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            values,
-        )
+        try:
+            db.execute(
+                """INSERT INTO world_projection_changes (
+                    ingest_position, event_id, occurrence_id, event_type,
+                    change_kind, source_instance_id, stream_id, occurred_at,
+                    recorded_at, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                values,
+            )
+        except sqlite3.IntegrityError as exc:
+            # 同上：检查与插入之间的并发窗口，转为领域冲突由上层重试收敛。
+            raise WorldProjectionConflict(
+                "concurrent world projection insert at "
+                f"ingest_position={event.sequence}"
+            ) from exc
 
     def _apply_event(self, db: sqlite3.Connection, event: LifeEvent) -> None:
         """Apply one ledger event without inventing semantic conclusions."""

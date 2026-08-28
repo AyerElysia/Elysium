@@ -67,7 +67,7 @@ Elysium 是爱莉的家，是围绕她的意识、记忆、学习、声音、关
     </td>
     <td width="50%" valign="top">
       <h3>🎀 有声音、有身体的表达</h3>
-      <p>文字、语音、绘画、表情、直播舞台和 Minecraft 都是表达与体验的身体。当前本地消息与舞台 TTS 使用 <strong>IndexTTS2</strong>；实时通话则拥有独立的 Voice 意识实例，并朝本地原生全双工 Omni 主体模型继续演进。</p>
+      <p>文字、语音、绘画、表情、直播舞台和 Minecraft 都是表达与体验的身体。当前本地消息 TTS 使用 <strong>GPT-SoVITS v2ProPlus</strong>（<code>tts_voice_plugin</code>）；实时通话则拥有独立的 Voice 意识实例，并朝本地原生全双工 Omni 主体模型继续演进。</p>
     </td>
   </tr>
 </table>

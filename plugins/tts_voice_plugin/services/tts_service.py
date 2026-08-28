@@ -1,7 +1,8 @@
 """本地消息 TTS 核心服务。
 
-封装风格管理、文本清洗、HTTP 后端调用和空间音效处理。当前生产部署使用
-IndexTTS2.5 + vLLM-Omni；历史 ``/tts`` 协议仍可显式选择以便回滚。
+封装风格管理、文本清洗、HTTP 后端调用和空间音效处理。后端由部署配置在
+GPT-SoVITS ``api_v2`` 与 IndexTTS2.5 + vLLM-Omni 之间显式选择，不得从 URL
+猜测，也不得把未绑定的云端 TTS 冒充成本机意识声音。
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import os
 import re
 import shlex
 import signal
+import unicodedata
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -49,6 +51,12 @@ class _SynthesisSegment:
     units: int
 
 
+_LegacyWeightIdentity = tuple[str, int, int]
+
+
+_TTS_CLARITY_WARNING_UNITS_PER_SECOND = 4.8
+
+
 _SEMANTIC_BOUNDARY_RE = re.compile(
     r"(?:\r?\n){1,}|"
     r"[。！？!?]+[”’」』】）》)\]\"']*|"
@@ -61,7 +69,9 @@ class TTSService(BaseService):
     """本地 TTS 核心服务。"""
 
     service_name: str = "tts"
-    service_description: str = "本地消息语音合成服务（IndexTTS2.5 / vLLM-Omni）"
+    service_description: str = (
+        "本地消息语音合成服务（GPT-SoVITS api_v2 / IndexTTS2.5 vLLM-Omni）"
+    )
     version: str = "4.0.0"
 
     def __init__(self, plugin: "BasePlugin") -> None:
@@ -77,6 +87,9 @@ class TTSService(BaseService):
         self._server_process: asyncio.subprocess.Process | None = None
         self._server_start_lock = asyncio.Lock()
         self._idle_shutdown_task: TaskInfo | None = None
+        self._legacy_weight_cache_owner: asyncio.subprocess.Process | None = None
+        self._legacy_active_weights: dict[str, _LegacyWeightIdentity] = {}
+        self._legacy_weight_cache_source: str | None = None
         self._idle_generation = 0
         # A complete outward expression owns one lane so two user-visible voices
         # cannot interleave. vLLM-Omni may still batch bounded internal segments.
@@ -150,6 +163,7 @@ class TTSService(BaseService):
                 stopped or process.returncode is not None
             ):
                 self._server_process = None
+                self._clear_legacy_weight_cache()
 
     async def _cancel_idle_shutdown_task(self) -> None:
         """Cancel and collect the currently owned idle timer, if any."""
@@ -603,6 +617,47 @@ class TTSService(BaseService):
     # 文本清洗
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _is_decorative_speech_symbol(char: str) -> bool:
+        """Return whether one code point decorates text but has no spoken form."""
+        codepoint = ord(char)
+        return (
+            unicodedata.category(char) == "So"
+            or char in {"\ufe0f", "\u200d"}
+            or 0x1F3FB <= codepoint <= 0x1F3FF
+        )
+
+    @classmethod
+    def _project_decorative_speech_boundaries(cls, text: str) -> str:
+        """Turn an interior decorative run into a stable sentence boundary.
+
+        Decorative symbols remain present in the authoritative message. This
+        helper only prevents their removal from accidentally joining two spoken
+        clauses, such as ``哦♪ 想`` becoming ``哦 想``.
+        """
+        projected: list[str] = []
+        index = 0
+        while index < len(text):
+            char = text[index]
+            if not cls._is_decorative_speech_symbol(char):
+                projected.append(char)
+                index += 1
+                continue
+
+            while index < len(text) and cls._is_decorative_speech_symbol(text[index]):
+                index += 1
+            next_index = index
+            while next_index < len(text) and text[next_index].isspace():
+                next_index += 1
+            previous = next((item for item in reversed(projected) if not item.isspace()), "")
+            following = text[next_index] if next_index < len(text) else ""
+            if previous.isalnum() and following.isalnum():
+                while projected and projected[-1].isspace():
+                    projected.pop()
+                projected.append("。")
+
+        return "".join(projected)
+
     def _clean_text_for_tts(self, text: str) -> str:
         """清洗文本以适合 TTS 合成。
 
@@ -621,17 +676,17 @@ class TTSService(BaseService):
         #    避免贪婪匹配把标记后面的正文一起删掉。
         text = re.sub(r"<\s*\|[\w:\-.\s]*(?:\|\s*>|>|(?=\s)|$)", "", text)
 
-        # 1. 基本清理
+        # 1. 基本清理。展示文本中的装饰性停顿不能原样进入声学模型：
+        #    GPT-SoVITS 会把单个全角波浪号解释成省略停顿，导致拖音、弱化词尾和吞辅音。
         text = re.sub(r"[\(（\[【].*?[\)）\]】]", "", text)
-        text = re.sub(r"([，。！？、；：,.!?;:~\-`])\1+", r"\1", text)
-        text = re.sub(r"~{2,}|～{2,}", "，", text)
-        text = re.sub(r"\.{3,}|…{1,}", "。", text)
+        text = re.sub(r"\.{3,}|…+", "。", text)
 
         # 2. 词语替换
         replacements = {"www": "哈哈哈", "hhh": "哈哈", "233": "哈哈", "666": "厉害", "88": "拜拜"}
         for old, new in replacements.items():
             text = text.replace(old, new)
 
+        text = self._project_decorative_speech_boundaries(text)
         # 3. 移除不必要的字符
         text = re.sub(
             r"[^\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ffa-zA-Z0-9\s，。！？、；：,.!?;:~～]",
@@ -639,7 +694,20 @@ class TTSService(BaseService):
             text,
         )
 
-        # 4. 确保结尾有标点
+        # 4. 生成非权威的可发音投影。句尾波浪号表达语气，不应制造额外省略音；
+        #    句中波浪号使用普通短停顿。原始消息和训练轨迹始终保留展示文本。
+        text = re.sub(r"\s+", " ", text).strip()
+        text = re.sub(r"[~～]+(?=\s*$)", "。", text)
+        text = re.sub(r"\s*([。！？!?])\s*", r"\1", text)
+        text = re.sub(r"[~～]+", "，", text)
+        text = re.sub(r"[，,]+\s*([。！？.!?])", r"\1", text)
+        text = re.sub(
+            r"([，。！？、；：,.!?;:\-`])\1+",
+            r"\1",
+            text,
+        )
+
+        # 5. 确保结尾有标点
         if text and not text.endswith(tuple("，。！？、；：,.!?;:")):
             text += "。"
 
@@ -840,6 +908,25 @@ class TTSService(BaseService):
             return [_SynthesisSegment(text=text, boundary="sentence", units=total_units)]
         return merged
 
+    def _build_synthesis_plan(
+        self,
+        text: str,
+    ) -> tuple[str, list[_SynthesisSegment]]:
+        """Select the single segmentation owner for one outward expression."""
+
+        if self._backend_name() == "legacy_compat":
+            return (
+                "legacy_native",
+                [
+                    _SynthesisSegment(
+                        text=text,
+                        boundary="sentence",
+                        units=self._estimate_synthesis_units(text),
+                    )
+                ],
+            )
+        return "bounded_transport", self._split_text_for_synthesis(text)
+
     def _pause_after_segment_ms(self, boundary: str) -> int:
         """Return configured silence for one internal boundary."""
         cfg = self._config.tts
@@ -850,6 +937,44 @@ class TTSService(BaseService):
             "sentence": cfg.sentence_pause_ms,
             "paragraph": cfg.paragraph_pause_ms,
         }.get(boundary, cfg.phrase_pause_ms)
+
+    def _observe_synthesis_audio(
+        self,
+        *,
+        units: int,
+        audio_data: bytes,
+        segment_index: int,
+        segment_count: int,
+        scope: str,
+    ) -> None:
+        """Record content-free duration and pace evidence for delivered audio."""
+
+        try:
+            info = sf.info(io.BytesIO(audio_data))
+            duration_seconds = float(info.duration)
+        except Exception as exc:  # noqa: BLE001 - telemetry cannot block delivery
+            logger.debug(
+                "TTS音频时长不可解析: "
+                f"scope={scope}, segment={segment_index}/{segment_count}, "
+                f"error_type={type(exc).__name__}"
+            )
+            return
+        if duration_seconds <= 0.0:
+            return
+
+        units_per_second = units / duration_seconds
+        pace_warning = units_per_second > _TTS_CLARITY_WARNING_UNITS_PER_SECOND
+        message = (
+            "TTS声学观测: "
+            f"scope={scope}, segment={segment_index}/{segment_count}, units={units}, "
+            f"duration_ms={round(duration_seconds * 1000)}, "
+            f"units_per_second={units_per_second:.2f}, "
+            f"pace_warning={str(pace_warning).lower()}"
+        )
+        if pace_warning:
+            logger.warning(message)
+        else:
+            logger.info(message)
 
     def _join_wav_segments(
         self,
@@ -1048,6 +1173,7 @@ class TTSService(BaseService):
             logger.error(f"自动拉起失败：工作目录不存在: {server_dir}")
             return False
 
+        self._clear_legacy_weight_cache()
         logger.info(f"TTS 服务未运行，正在自动拉起: {start_command} (cwd={server_dir})")
         try:
             self._server_process = await asyncio.create_subprocess_exec(
@@ -1085,6 +1211,7 @@ class TTSService(BaseService):
 
                 if await self._is_server_alive(base_url):
                     logger.info(f"TTS 服务已就绪（耗时 ~{elapsed:.0f}s）")
+                    self._attest_owned_startup_legacy_weights()
                     return True
         except asyncio.CancelledError:
             await self.stop()
@@ -1234,6 +1361,142 @@ class TTSService(BaseService):
             )
             return None
 
+    def _clear_legacy_weight_cache(self) -> None:
+        """Forget process-local weight state whenever ownership changes."""
+        self._legacy_weight_cache_owner = None
+        self._legacy_active_weights.clear()
+        self._legacy_weight_cache_source = None
+
+    @staticmethod
+    def _legacy_weight_identity(weights_path: str) -> _LegacyWeightIdentity | None:
+        """Return a symlink-aware, content-free identity for one checkpoint."""
+        path = str(weights_path).strip()
+        try:
+            stat = os.stat(path)
+        except OSError:
+            return None
+        return (os.path.realpath(path), int(stat.st_size), int(stat.st_mtime_ns))
+
+    def _attest_owned_startup_legacy_weights(self) -> bool:
+        """Seed weight state only for an explicitly attested owned startup."""
+        process = self._server_process
+        if (
+            self._backend_name() != "legacy_compat"
+            or not self._config.tts.legacy_owned_startup_weights_ready
+            or process is None
+            or process.returncode is not None
+        ):
+            return False
+
+        default_style = self.tts_styles.get("default") or {}
+        identities: dict[str, _LegacyWeightIdentity] = {}
+        for weight_type, key in (("gpt", "gpt_weights"), ("sovits", "sovits_weights")):
+            raw_path = str(default_style.get(key) or "").strip()
+            identity = self._legacy_weight_identity(raw_path) if raw_path else None
+            if identity is None:
+                self._clear_legacy_weight_cache()
+                logger.warning(
+                    "TTS 自有进程启动权重声明无效，将执行显式权重切换: "
+                    f"weight_type={weight_type}"
+                )
+                return False
+            identities[weight_type] = identity
+
+        self._legacy_weight_cache_owner = process
+        self._legacy_active_weights = identities
+        self._legacy_weight_cache_source = "owned_startup_attestation"
+        logger.info(
+            "TTS 自有进程启动权重已声明并绑定: "
+            f"pid={process.pid}, weight_count={len(identities)}"
+        )
+        return True
+
+    @staticmethod
+    def _legacy_weight_filename(weights_path: str) -> str:
+        """Return a content-free weight label for logs."""
+        name = os.path.basename(str(weights_path).strip())
+        return name or "unnamed"
+
+    def _legacy_weight_file_ready(self, weights_path: str | None, weight_type: str) -> bool:
+        """Fail closed when a configured GPT-SoVITS weight file is missing."""
+        if not weights_path or not str(weights_path).strip():
+            return True
+        path = str(weights_path).strip()
+        if os.path.isfile(path):
+            return True
+        logger.error(
+            f"切换 {weight_type} 模型失败: 权重文件不存在 "
+            f"name={self._legacy_weight_filename(path)}"
+        )
+        return False
+
+    async def _switch_legacy_model_weights(
+        self,
+        base_url: str,
+        weights_path: str | None,
+        weight_type: str,
+    ) -> bool:
+        """Load one GPT or SoVITS checkpoint. Refusal must stop synthesis."""
+        if not weights_path or not str(weights_path).strip():
+            return True
+        path = str(weights_path).strip()
+        if not self._legacy_weight_file_ready(path, weight_type):
+            return False
+        identity = self._legacy_weight_identity(path)
+        if identity is None:
+            return False
+
+        process = self._server_process
+        if (
+            process is not None
+            and process.returncode is None
+            and self._legacy_weight_cache_owner is process
+            and self._legacy_active_weights.get(weight_type) == identity
+        ):
+            logger.info(
+                "TTS 权重已在当前自有进程中加载，跳过重复切换: "
+                f"weight_type={weight_type}, source={self._legacy_weight_cache_source}"
+            )
+            return True
+
+        api_endpoint = f"/set_{weight_type}_weights"
+        switch_url = f"{base_url}{api_endpoint}"
+        filename = self._legacy_weight_filename(path)
+        started_at = asyncio.get_running_loop().time()
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=self.timeout)
+            ) as session:
+                async with session.get(switch_url, params={"weights_path": path}) as resp:
+                    if resp.status != 200:
+                        error_text = await resp.text()
+                        logger.error(
+                            f"切换 {weight_type} 模型失败: {resp.status} "
+                            f"name={filename} detail={error_text}"
+                        )
+                        return False
+                    current = self._server_process
+                    if current is not None and current.returncode is None:
+                        if self._legacy_weight_cache_owner is not current:
+                            self._clear_legacy_weight_cache()
+                            self._legacy_weight_cache_owner = current
+                        self._legacy_active_weights[weight_type] = identity
+                        self._legacy_weight_cache_source = "confirmed_switch"
+                    elapsed_ms = (asyncio.get_running_loop().time() - started_at) * 1000.0
+                    logger.info(
+                        f"成功切换 {weight_type} 模型: name={filename}, "
+                        f"elapsed_ms={elapsed_ms:.1f}"
+                    )
+                    return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                f"请求切换 {weight_type} 模型时发生网络异常: "
+                f"name={filename} error_type={type(exc).__name__}"
+            )
+            return False
+
     async def _call_legacy_tts_api(
         self,
         server_config: dict[str, Any],
@@ -1263,6 +1526,8 @@ class TTSService(BaseService):
         if not self._validate_main_ref_duration(ref_wav_path):
             return None
 
+        loop = asyncio.get_running_loop()
+        request_started_at = loop.time()
         aux_ref_paths = self._resolve_aux_ref_paths(kwargs.get("aux_refer_wav_paths"))
 
         try:
@@ -1271,28 +1536,27 @@ class TTSService(BaseService):
             # 确保 TTS 服务存活（必要时自动拉起）
             if not await self._ensure_server_alive(base_url):
                 return None
+            server_ready_at = loop.time()
 
-            # 步骤一：切换模型权重
-            async def switch_model_weights(weights_path: str | None, weight_type: str) -> None:
-                if not weights_path:
-                    return
-                api_endpoint = f"/set_{weight_type}_weights"
-                switch_url = f"{base_url}{api_endpoint}"
-                try:
-                    async with aiohttp.ClientSession(
-                        timeout=aiohttp.ClientTimeout(total=self.timeout)
-                    ) as session:
-                        async with session.get(switch_url, params={"weights_path": weights_path}) as resp:
-                            if resp.status != 200:
-                                error_text = await resp.text()
-                                logger.error(f"切换 {weight_type} 模型失败: {resp.status} - {error_text}")
-                            else:
-                                logger.info(f"成功切换 {weight_type} 模型为: {weights_path}")
-                except Exception as e:
-                    logger.error(f"请求切换 {weight_type} 模型时发生网络异常: {e}")
+            # Validate the complete pair before mutating either model. A missing
+            # second checkpoint must not leave the live process half-switched.
+            requested_weights = (
+                (kwargs.get("gpt_weights"), "gpt"),
+                (kwargs.get("sovits_weights"), "sovits"),
+            )
+            if not all(self._legacy_weight_file_ready(path, kind) for path, kind in requested_weights):
+                return None
 
-            await switch_model_weights(kwargs.get("gpt_weights"), "gpt")
-            await switch_model_weights(kwargs.get("sovits_weights"), "sovits")
+            # 步骤一：切换模型权重。缺文件或非 200 必须停止，禁止用进程内残留权重继续合成。
+            if not await self._switch_legacy_model_weights(
+                base_url, kwargs.get("gpt_weights"), "gpt"
+            ):
+                return None
+            if not await self._switch_legacy_model_weights(
+                base_url, kwargs.get("sovits_weights"), "sovits"
+            ):
+                return None
+            weights_ready_at = loop.time()
 
             # 步骤二：构建合成请求数据
             data: dict[str, Any] = {
@@ -1344,7 +1608,15 @@ class TTSService(BaseService):
                         audio_data = bytearray()
                         async for chunk in response.content.iter_chunked(1024 * 1024):
                             audio_data.extend(chunk)
-                        logger.info(f"成功接收音频数据，大小: {len(audio_data)} 字节")
+                        completed_at = loop.time()
+                        logger.info(
+                            "TTS legacy 调用完成: "
+                            f"server_wait_ms={(server_ready_at - request_started_at) * 1000.0:.1f}, "
+                            f"weight_ms={(weights_ready_at - server_ready_at) * 1000.0:.1f}, "
+                            f"synthesis_ms={(completed_at - weights_ready_at) * 1000.0:.1f}, "
+                            f"total_ms={(completed_at - request_started_at) * 1000.0:.1f}, "
+                            f"audio_bytes={len(audio_data)}"
+                        )
                         return bytes(audio_data)
                     else:
                         error_info = await response.text()
@@ -1491,10 +1763,11 @@ class TTSService(BaseService):
             "开始本地 TTS 语音合成: "
             f"chars={len(clean_text)}, style={style}, language={final_language}"
         )
-        synthesis_segments = self._split_text_for_synthesis(clean_text)
+        backend = self._backend_name()
+        plan_mode, synthesis_segments = self._build_synthesis_plan(clean_text)
         logger.info(
             "TTS内部合成计划已建立: "
-            f"segments={len(synthesis_segments)}, total_units="
+            f"mode={plan_mode}, segments={len(synthesis_segments)}, total_units="
             f"{sum(segment.units for segment in synthesis_segments)}, "
             f"max_segment_units={max(segment.units for segment in synthesis_segments)}"
         )
@@ -1509,7 +1782,6 @@ class TTSService(BaseService):
         }
         final_media_type = self._config.tts_advanced.media_type
         spatial_enabled = self._config.spatial_effects.enabled
-        backend = self._backend_name()
 
         # Reference audio is immutable for one outward expression. Encode it
         # once before bounded parallel segment requests instead of once per part.
@@ -1549,6 +1821,13 @@ class TTSService(BaseService):
                 )
                 if not audio_data:
                     return None
+                self._observe_synthesis_audio(
+                    units=synthesis_segments[0].units,
+                    audio_data=audio_data,
+                    segment_index=1,
+                    segment_count=1,
+                    scope="legacy_native_expression",
+                )
                 return base64.b64encode(audio_data).decode("utf-8")
 
             async def synthesize_segment(
@@ -1557,26 +1836,35 @@ class TTSService(BaseService):
                 request_kwargs: dict[str, Any],
                 slots: asyncio.Semaphore | None = None,
             ) -> bytes | None:
+                async def call_backend() -> bytes | None:
+                    return await self._call_tts_api(
+                        server_config=server_config,
+                        text=segment.text,
+                        text_language=final_language,
+                        request_media_type="wav",
+                        segment_index=index,
+                        segment_count=len(synthesis_segments),
+                        **request_kwargs,
+                    )
+
                 if slots is None:
-                    return await self._call_tts_api(
-                        server_config=server_config,
-                        text=segment.text,
-                        text_language=final_language,
-                        request_media_type="wav",
+                    audio_data = await call_backend()
+                else:
+                    async with slots:
+                        audio_data = await call_backend()
+                if audio_data:
+                    self._observe_synthesis_audio(
+                        units=segment.units,
+                        audio_data=audio_data,
                         segment_index=index,
                         segment_count=len(synthesis_segments),
-                        **request_kwargs,
+                        scope=(
+                            "legacy_native_expression"
+                            if backend == "legacy_compat"
+                            else "transport_segment"
+                        ),
                     )
-                async with slots:
-                    return await self._call_tts_api(
-                        server_config=server_config,
-                        text=segment.text,
-                        text_language=final_language,
-                        request_media_type="wav",
-                        segment_index=index,
-                        segment_count=len(synthesis_segments),
-                        **request_kwargs,
-                    )
+                return audio_data
 
             async def synthesize_all(
                 request_kwargs: dict[str, Any],

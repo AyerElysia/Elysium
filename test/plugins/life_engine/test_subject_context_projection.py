@@ -53,6 +53,27 @@ def _source_hashes(snapshot: dict[str, Any]) -> dict[str, str]:
     }
 
 
+class _RuntimeStore:
+    def __init__(self) -> None:
+        self.states: dict[tuple[str, str], SimpleNamespace] = {}
+
+    async def get_state(self, namespace: str, state_key: str):
+        return self.states.get((namespace, state_key))
+
+    async def put_state(self, **kwargs):
+        key = (str(kwargs["namespace"]), str(kwargs["state_key"]))
+        current = self.states.get(key)
+        expected = int(kwargs["expected_revision"])
+        actual = int(current.revision) if current is not None else 0
+        assert expected == actual
+        record = SimpleNamespace(
+            revision=actual + 1,
+            payload=dict(kwargs["payload"]),
+        )
+        self.states[key] = record
+        return record
+
+
 @pytest.mark.asyncio
 async def test_each_authority_changes_revision_and_per_source_hash(
     tmp_path: Path,
@@ -376,7 +397,7 @@ async def test_corrupt_pinned_content_fails_without_overwriting_version(
     snapshot = await projection.ensure_current_snapshot()
     assert snapshot is not None
     revision = str(snapshot["source_digest"])
-    version_path = projection.versions_dir / f"v1-{revision}.md"
+    version_path = projection.versions_dir / (_version_key("voice_live", revision) + ".md")
     corrupted = version_path.read_text(encoding="utf-8") + "tampered\n"
     version_path.write_text(corrupted, encoding="utf-8")
 
@@ -412,7 +433,7 @@ async def test_missing_or_corrupt_manifest_never_gets_silently_reconstructed(
     snapshot = await projection.ensure_current_snapshot()
     assert snapshot is not None
     revision = str(snapshot["source_digest"])
-    manifest_path = projection.versions_dir / f"v1-{revision}.json"
+    manifest_path = projection.versions_dir / (_version_key("voice_live", revision) + ".json")
     original_manifest = manifest_path.read_text(encoding="utf-8")
     manifest_path.unlink()
 
@@ -532,3 +553,154 @@ async def test_subject_author_tries_next_model_after_per_source_budget_failure(
     assert draft.text == valid
     assert draft.generator.endswith("model:valid-second")
     assert requested_models == ["oversized", "valid-second"]
+
+
+_VERSION_NAMESPACE = "router_context_projection.version"
+
+
+def _version_key(profile: str, source_digest: str) -> str:
+    return f"{profile}.v{SUBJECT_CONTEXT_PROJECTION_VERSION}-{source_digest}"
+
+
+@pytest.mark.asyncio
+async def test_profiles_with_shared_digest_keep_independent_remote_versions(
+    tmp_path: Path,
+) -> None:
+    _write_authorities(tmp_path)
+    runtime_store = _RuntimeStore()
+    calls = {"voice_live": 0, "memory_witness": 0}
+
+    def _author(profile: str):
+        async def author(_digest: str, sources: tuple[Any, ...]) -> SubjectContextDraft:
+            calls[profile] += 1
+            return _draft_from_sources(sources)
+
+        return author
+
+    voice = SubjectContextProjection(
+        str(tmp_path),
+        projection_profile="voice_live",
+        max_bytes=8192,
+        author=_author("voice_live"),
+        runtime_store=runtime_store,
+    )
+    witness = SubjectContextProjection(
+        str(tmp_path),
+        projection_profile="memory_witness",
+        max_bytes=24576,
+        author=_author("memory_witness"),
+        runtime_store=runtime_store,
+    )
+
+    voice_snapshot = await voice.ensure_current_snapshot()
+    witness_snapshot = await witness.ensure_current_snapshot()
+    assert voice_snapshot is not None
+    assert witness_snapshot is not None
+    # Identical authority files mean one shared source digest across profiles.
+    assert voice_snapshot["source_digest"] == witness_snapshot["source_digest"]
+    digest = str(voice_snapshot["source_digest"])
+
+    voice_record = await runtime_store.get_state(
+        _VERSION_NAMESPACE, _version_key("voice_live", digest)
+    )
+    witness_record = await runtime_store.get_state(
+        _VERSION_NAMESPACE, _version_key("memory_witness", digest)
+    )
+    assert voice_record is not None and witness_record is not None
+    assert voice_record.payload["projection_profile"] == "voice_live"
+    assert witness_record.payload["projection_profile"] == "memory_witness"
+
+    # Repeated refreshes restore their own record and never re-author or
+    # overwrite the other profile's version of the same digest.
+    assert await voice.ensure_current_snapshot() == voice_snapshot
+    assert await witness.ensure_current_snapshot() == witness_snapshot
+    assert calls == {"voice_live": 1, "memory_witness": 1}
+
+
+@pytest.mark.asyncio
+async def test_legacy_version_key_is_adopted_only_by_its_owning_profile(
+    tmp_path: Path,
+) -> None:
+    _write_authorities(tmp_path)
+
+    async def author(_digest: str, sources: tuple[Any, ...]) -> SubjectContextDraft:
+        return _draft_from_sources(sources)
+
+    seed_store = _RuntimeStore()
+    seed = SubjectContextProjection(
+        str(tmp_path),
+        projection_profile="voice_live",
+        max_bytes=8192,
+        author=author,
+        runtime_store=seed_store,
+    )
+    seed_snapshot = await seed.ensure_current_snapshot()
+    assert seed_snapshot is not None
+    digest = str(seed_snapshot["source_digest"])
+    legacy_key = f"v{SUBJECT_CONTEXT_PROJECTION_VERSION}-{digest}"
+    legacy_payload = dict(
+        (await seed_store.get_state(_VERSION_NAMESPACE, _version_key("voice_live", digest))).payload
+    )
+
+    # The owning profile adopts the legacy record without re-authoring.
+    owning_store = _RuntimeStore()
+    owning_store.states[(_VERSION_NAMESPACE, legacy_key)] = SimpleNamespace(
+        revision=1, payload=dict(legacy_payload)
+    )
+    owning_calls = 0
+
+    async def owning_author(
+        _digest: str, sources: tuple[Any, ...]
+    ) -> SubjectContextDraft:
+        nonlocal owning_calls
+        owning_calls += 1
+        return _draft_from_sources(sources)
+
+    owning = SubjectContextProjection(
+        str(tmp_path),
+        projection_profile="voice_live",
+        max_bytes=8192,
+        author=owning_author,
+        runtime_store=owning_store,
+    )
+    adopted = await owning.ensure_current_snapshot()
+    assert adopted is not None
+    assert adopted["text"] == seed_snapshot["text"]
+    assert owning_calls == 0
+    assert await owning_store.get_state(
+        _VERSION_NAMESPACE, _version_key("voice_live", digest)
+    ) is not None
+
+    # A foreign profile must not adopt the record; it regenerates its own.
+    foreign_store = _RuntimeStore()
+    foreign_store.states[(_VERSION_NAMESPACE, legacy_key)] = SimpleNamespace(
+        revision=1, payload=dict(legacy_payload)
+    )
+    foreign_calls = 0
+
+    async def foreign_author(
+        _digest: str, sources: tuple[Any, ...]
+    ) -> SubjectContextDraft:
+        nonlocal foreign_calls
+        foreign_calls += 1
+        return _draft_from_sources(sources)
+
+    foreign = SubjectContextProjection(
+        str(tmp_path),
+        projection_profile="memory_witness",
+        max_bytes=24576,
+        author=foreign_author,
+        runtime_store=foreign_store,
+    )
+    regenerated = await foreign.ensure_current_snapshot()
+    assert regenerated is not None
+    assert foreign_calls == 1
+    foreign_record = await foreign_store.get_state(
+        _VERSION_NAMESPACE, _version_key("memory_witness", digest)
+    )
+    assert foreign_record is not None
+    assert foreign_record.payload["projection_profile"] == "memory_witness"
+    # The legacy record is never migrated to a profile it does not belong to.
+    assert await foreign_store.get_state(
+        _VERSION_NAMESPACE, _version_key("voice_live", digest)
+    ) is None

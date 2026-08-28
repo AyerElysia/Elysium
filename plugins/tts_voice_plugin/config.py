@@ -1,7 +1,8 @@
 """TTS Voice 插件配置。
 
 定义本地语音合成插件的配置项，包括基础设置、风格列表、高级参数和空间音效。
-当前生产部署使用 IndexTTS2.5 + vLLM-Omni；历史兼容 HTTP 协议仍可显式选择。
+后端由 ``[tts].backend`` 显式选择 ``legacy_compat``（GPT-SoVITS api_v2）或
+``vllm_omni``（IndexTTS2.5）；本机当前 live 配置以 ignored ``config.toml`` 为准。
 """
 
 from typing import ClassVar, Literal
@@ -93,12 +94,13 @@ class TTSSection(SectionBase):
         description="长文本是否在 TTS 内部按自然句与有界片段顺序合成，再拼成一条音频",
     )
     segment_max_units: int = Field(
-        default=48,
+        default=24,
         ge=16,
         le=200,
         description=(
-            "单个 TTS 片段的近似语音单位硬上限；中日韩字符按一单位、"
-            "连续拉丁数字按约四字符一单位估算"
+            "不具备原生切分合同的 TTS transport 单片段近似语音单位硬上限；"
+            "中日韩字符按一单位、连续拉丁数字按约四字符一单位估算。"
+            "legacy_compat 把完整表达交给后端原生 text_split_method"
         ),
     )
     segment_min_units: int = Field(
@@ -152,6 +154,15 @@ class TTSSection(SectionBase):
     auto_start: bool = Field(
         default=True,
         description="调用前若服务未运行，是否自动拉起 TTS 服务进程",
+    )
+    legacy_owned_startup_weights_ready: bool = Field(
+        default=False,
+        description=(
+            "仅 legacy_compat 可用：部署者声明 start_command 启动的自有进程已经加载"
+            " default 风格配置中的 GPT/SoVITS 权重。只有插件刚启动且仍持有该精确"
+            "进程时才会据此跳过第一次重复加载；外部服务永不信任此声明。"
+            "启动脚本不能保证该条件时必须保持 false"
+        ),
     )
     server_dir: str = Field(
         default="/root/Elysia/GPT-SoVITS",
@@ -209,7 +220,7 @@ class TTSStyle(SectionBase):
     gpt_weights: str = Field(default="C:/path/to/your/gpt_weights.ckpt", description="GPT 模型路径")
     sovits_weights: str = Field(default="C:/path/to/your/sovits_weights.pth", description="SoVITS 模型路径")
     speed_factor: float = Field(
-        default=1.0,
+        default=0.9,
         ge=0.5,
         le=2.0,
         description=(
@@ -231,8 +242,20 @@ class TTSAdvancedSection(SectionBase):
     batch_threshold: float = Field(default=0.75, description="批处理阈值")
     text_split_method: str = Field(default="cut5", description="文本分割方法")
     repetition_penalty: float = Field(default=1.4, description="重复惩罚因子")
-    sample_steps: int = Field(default=150, description="采样步数")
-    super_sampling: bool = Field(default=True, description="是否启用超采样")
+    sample_steps: int = Field(
+        default=32,
+        ge=1,
+        description="GPT-SoVITS V3 采样步数；v2ProPlus 不消费该质量旋钮",
+    )
+    super_sampling: bool = Field(
+        default=False,
+        description="GPT-SoVITS V3 超采样；v2ProPlus 不消费该质量旋钮",
+    )
+    seed: int = Field(
+        default=-1,
+        ge=-1,
+        description="GPT-SoVITS 语义采样种子；-1 表示每次随机",
+    )
     text_normalization: bool = Field(
         default=True,
         description="是否启用 IndexTTS2.5 文本规范化；仅 vLLM-Omni 消费",
