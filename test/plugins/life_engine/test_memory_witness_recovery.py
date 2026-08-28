@@ -35,8 +35,10 @@ from plugins.life_engine.service.memory_witness import (
     MemoryWitnessOccurrencePaginationUnavailable,
     MemoryWitnessProjectionFilesystemChanged,
     MemoryWitnessWindowTooLarge,
+    WitnessRunReport,
     _AuthoringResult,
 )
+from plugins.life_engine.service.world_projection import WorldProjectionConflict
 from plugins.life_engine.service.perception_gateway import (
     PerceptionDeliveryReceipt,
 )
@@ -2024,3 +2026,43 @@ async def test_build_system_prompt_wraps_projection_failure(
             )
         )
     assert "projection manifest profile is incompatible" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_witness_loop_recovers_from_world_projection_conflict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """世界投影追赶的插入竞撞只应退避重试，不能被当致命失败。
+
+    2026-08-23 线上事故：该异常漏捕于可恢复并发白名单之外，见证循环在同一
+    位置连崩三天，无新见证产出；存在确认却仍在跳动，表面看不出故障。
+    """
+
+    coordinator, service = _coordinator(tmp_path, [_event(1)])
+    service._state = SimpleNamespace(running=True)  # type: ignore[attr-defined]
+    service._stop_event = None  # type: ignore[attr-defined]
+
+    calls: list[int] = []
+
+    async def racing_run_once() -> WitnessRunReport:
+        calls.append(len(calls) + 1)
+        if len(calls) == 1:
+            raise WorldProjectionConflict(
+                "concurrent world projection insert at ingest_position=1"
+            )
+        service._state.running = False  # type: ignore[attr-defined]
+        return WitnessRunReport()
+
+    monkeypatch.setattr(coordinator, "run_once", racing_run_once)
+    sleeps: list[float] = []
+
+    async def instant_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", instant_sleep)
+
+    await coordinator.loop()
+
+    assert calls == [1, 2]  # 首轮撞车、次轮恢复，没有永久停摆
+    assert sleeps == [10.0]  # 按 retry_delay 退避，而不是完整间隔

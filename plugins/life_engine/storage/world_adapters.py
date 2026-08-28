@@ -497,7 +497,16 @@ class SQLWorldProjectionStore:
                     raise ValueError(
                         "world projection requires positive ledger positions"
                     )
-                await self._apply_event(session, event)
+                try:
+                    await self._apply_event(session, event)
+                except IntegrityError as exc:
+                    # SELECT-then-INSERT 的幂等检查与并发追赶者之间存在竞争窗口：
+                    # 检查时行为空、插入时撞行。转为领域冲突异常让整批回滚，
+                    # 上层按可恢复并发冲突重试；重放时幂等检查会看到已提交的行并收敛。
+                    raise WorldProjectionConflict(
+                        "concurrent world projection insert at "
+                        f"ingest_position={event.sequence}"
+                    ) from exc
                 current = max(current, event.sequence)
             await self._set_meta(
                 session,
