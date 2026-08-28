@@ -1,7 +1,8 @@
 """TTS Voice 插件配置。
 
 定义本地语音合成插件的配置项，包括基础设置、风格列表、高级参数和空间音效。
-当前生产部署使用 IndexTTS2.5 + vLLM-Omni；历史兼容 HTTP 协议仍可显式选择。
+后端由 ``[tts].backend`` 显式选择 ``legacy_compat``（GPT-SoVITS api_v2）或
+``vllm_omni``（IndexTTS2.5）；本机当前 live 配置以 ignored ``config.toml`` 为准。
 """
 
 from typing import ClassVar, Literal
@@ -154,6 +155,15 @@ class TTSSection(SectionBase):
         default=True,
         description="调用前若服务未运行，是否自动拉起 TTS 服务进程",
     )
+    legacy_owned_startup_weights_ready: bool = Field(
+        default=False,
+        description=(
+            "仅 legacy_compat 可用：部署者声明 start_command 启动的自有进程已经加载"
+            " default 风格配置中的 GPT/SoVITS 权重。只有插件刚启动且仍持有该精确"
+            "进程时才会据此跳过第一次重复加载；外部服务永不信任此声明。"
+            "启动脚本不能保证该条件时必须保持 false"
+        ),
+    )
     server_dir: str = Field(
         default="/root/Elysia/GPT-SoVITS",
         description="TTS 服务的工作目录（启动命令的 cwd）",
@@ -232,8 +242,15 @@ class TTSAdvancedSection(SectionBase):
     batch_threshold: float = Field(default=0.75, description="批处理阈值")
     text_split_method: str = Field(default="cut5", description="文本分割方法")
     repetition_penalty: float = Field(default=1.4, description="重复惩罚因子")
-    sample_steps: int = Field(default=150, description="采样步数")
-    super_sampling: bool = Field(default=True, description="是否启用超采样")
+    sample_steps: int = Field(
+        default=32,
+        ge=1,
+        description="GPT-SoVITS V3 采样步数；v2ProPlus 不消费该质量旋钮",
+    )
+    super_sampling: bool = Field(
+        default=False,
+        description="GPT-SoVITS V3 超采样；v2ProPlus 不消费该质量旋钮",
+    )
     seed: int = Field(
         default=-1,
         ge=-1,

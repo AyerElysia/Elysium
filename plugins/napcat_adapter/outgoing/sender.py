@@ -91,6 +91,7 @@ class OutgoingSender:
         if not self._qq_voice_projection_enabled():
             return file_value
 
+        started_at = asyncio.get_running_loop().time()
         try:
             projection = await asyncio.to_thread(
                 project_inline_qq_voice,
@@ -99,15 +100,17 @@ class OutgoingSender:
         except Exception as exc:  # noqa: BLE001 - platform projection must fail open
             logger.warning(
                 f"QQ 语音清晰度补偿失败，保留原始音频: error_type={type(exc).__name__}"
+                f", elapsed_ms={(asyncio.get_running_loop().time() - started_at) * 1000.0:.1f}"
             )
             return file_value
 
         if projection.applied:
+            elapsed_ms = (asyncio.get_running_loop().time() - started_at) * 1000.0
             logger.info(
                 "QQ 语音清晰度补偿完成: "
                 f"algorithm={QQ_VOICE_PROJECTION_ALGORITHM_VERSION}, "
                 f"input_bytes={projection.input_bytes}, "
-                f"output_bytes={projection.output_bytes}"
+                f"output_bytes={projection.output_bytes}, elapsed_ms={elapsed_ms:.1f}"
             )
         return projection.file_value
 

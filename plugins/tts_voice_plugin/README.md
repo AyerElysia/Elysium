@@ -34,6 +34,7 @@ TTS 不决定正文、情绪或是否表达。Service 缺失、合成失败、�
 - `[tts].backend`：`vllm_omni` 或 `legacy_compat`，不根据 URL 猜测；
 - `[tts].server`、`model`、`api_key_env`：vLLM-Omni 地址、served model name 与可选鉴权环境变量；
 - `[tts].auto_start`、`server_dir`、`start_command`、`startup_timeout`：后端按需启动合同；
+- `[tts].legacy_owned_startup_weights_ready`：仅声明当前插件自有启动器已经加载 `default` 权重对；外部服务永不消费；
 - `[tts].idle_shutdown_seconds`：插件自有后端的闲置关闭时限，默认 1800 秒；设为 0 可保持常驻；
 - `[tts].timeout`：每个内部合成请求的时限；
 - `[tts].max_text_length`：一条完整表达的文本上限，超限显式失败，绝不静默截断；
@@ -41,7 +42,7 @@ TTS 不决定正文、情绪或是否表达。Service 缺失、合成失败、�
 - `[tts].segment_concurrency`：同一长表达在 vLLM-Omni 中的有界并发，默认 2、硬上限 4；GPT-SoVITS 不使用外层片段并发；
 - `[tts].phrase_pause_ms`、`clause_pause_ms`、`sentence_pause_ms`、`paragraph_pause_ms`：拼接时按原标点追加的停顿；
 - `[[tts_styles]]`：必须至少有 `default`，包含参考音频、提示文本、语言、速度与可选 GPT-SoVITS 权重字段；默认 `speed_factor=0.90`，部署值仍须试听验收；
-- `[tts_advanced].text_split_method`、`seed`：GPT-SoVITS 原生切分与语义采样合同；`seed=-1` 表示随机，生产固定值必须来自成对试听；
+- `[tts_advanced].text_split_method`、`seed`：GPT-SoVITS 原生切分与语义采样合同；`seed=-1` 表示随机，生产固定值必须来自成对试听。`sample_steps/super_sampling` 是 V3 参数，当前 v2ProPlus 不以它们调清晰度；
 - `[spatial_effects]`：可选混响与卷积。
 
 vLLM-Omni 模式发送官方字段 `model/input/response_format/speed/ref_audio/extra_params`，不会发送历史 `text_lang/ref_audio_path`。参考音频在一条表达开始时读取并编码一次，各并发片段共享同一不可变 data URL；也可配置预先上传的命名音色，避免每次传输参考音频。客户端不会把历史 GPT-SoVITS 的 3～10 秒限制强加给 IndexTTS2.5。
@@ -62,6 +63,8 @@ vLLM-Omni 模式发送官方字段 `model/input/response_format/speed/ref_audio/
 
 闲置计时使用单调时钟并由项目任务管理器持有。新合成会取消旧计时；到期任务必须取得完整表达的合成锁，并复核仍是同一插件自有进程后才可关闭。关闭后下一次合成沿用按需启动 single-flight。Elysium 卸载时取消计时并回收自有进程；连接到已经存在的外部 TTS 时不建立闲置关闭任务。
 
+本机 WSL GPT-SoVITS 使用 `scripts/tts/start_gpt_sovits_hiely.sh`。脚本保持为进程组 owner 并等待 API 子进程，避免 `exec` 后 interop relay 先结束、真实 API 被挂到 `/init` 的孤儿进程。停止成功必须同时验证子进程、监听端口与模型显存已经释放。
+
 ## 验收
 
 至少验证：
@@ -78,6 +81,9 @@ vLLM-Omni 模式发送官方字段 `model/input/response_format/speed/ref_audio/
 10. vLLM-Omni 的片段并发不超过配置上限，完成顺序变化也不改变最终正文顺序。
 11. 闲置到期只关闭插件自有进程；新合成、长合成和替换后的进程不会被旧计时误杀，关闭后下一次请求可按需重启。
 12. 装饰符号只改变可发音投影，不修改原始表达；固定试听文本必须同时验证标准中文与真实聊天标点。
+13. GPT/SoVITS 权重对在任何网络切换前完整预检，任一缺失不得让进程进入半切换状态。
+14. 同一自有进程复用确认过的权重 identity；外部服务和 replacement process 必须重新确认。
+15. WSL 启动器停止后 9880 不再监听，监督者和 API 子进程都不存在。
 
 完整架构见 [TTS 语音合成](../../docs/architecture/TTS语音合成.md)。
 

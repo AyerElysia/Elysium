@@ -25,6 +25,12 @@ def _service_with_reference(path: Path) -> TTSService:
     config = TTSVoiceConfig()
     config.tts_styles[0].refer_wav_path = str(path)
     config.tts_styles[0].prompt_text = "参考文本"
+    gpt_weights = path.parent / "hiely-gpt.ckpt"
+    sovits_weights = path.parent / "hiely-sovits.pth"
+    gpt_weights.write_bytes(b"stub-gpt")
+    sovits_weights.write_bytes(b"stub-sovits")
+    config.tts_styles[0].gpt_weights = str(gpt_weights)
+    config.tts_styles[0].sovits_weights = str(sovits_weights)
     return TTSService(SimpleNamespace(config=config))  # type: ignore[arg-type]
 
 
@@ -61,6 +67,9 @@ class _FakeHTTPResponse:
     async def read(self) -> bytes:
         return self._body
 
+    async def text(self) -> str:
+        return self._body.decode("utf-8", errors="replace")
+
 
 class _FakeClientSession:
     last: "_FakeClientSession | None" = None
@@ -90,10 +99,13 @@ def test_long_text_config_defaults_and_bounds() -> None:
     assert config.tts.segment_max_units == 24
     assert config.tts_advanced.text_split_method == "cut5"
     assert config.tts_advanced.seed == -1
+    assert config.tts_advanced.sample_steps == 32
+    assert config.tts_advanced.super_sampling is False
     assert config.tts_styles[0].speed_factor == 0.9
     assert config.tts.segment_min_units == 8
     assert config.tts.segment_concurrency == 2
     assert config.tts.idle_shutdown_seconds == 1800.0
+    assert config.tts.legacy_owned_startup_weights_ready is False
     assert config.tts.sentence_pause_ms == 320
     assert config.tts.paragraph_pause_ms == 520
 
@@ -111,6 +123,8 @@ def test_long_text_config_defaults_and_bounds() -> None:
         TTSVoiceConfig.model_validate({"tts": {"idle_shutdown_seconds": 86_401}})
     with pytest.raises(ValueError):
         TTSVoiceConfig.model_validate({"tts_advanced": {"seed": -2}})
+    with pytest.raises(ValueError):
+        TTSVoiceConfig.model_validate({"tts_advanced": {"sample_steps": 0}})
 
 
 def test_tts_spoken_projection_removes_decorative_pause_artifacts(
@@ -135,6 +149,9 @@ def test_tts_spoken_projection_removes_decorative_pause_artifacts(
         ("你好～～世界", "你好，世界。"),
         ("等等……我会回来。", "等等。我会回来。"),
         ("真的嘛～～？", "真的嘛？"),
+        ("我一直都在哦♪ 想我了吗？", "我一直都在哦。想我了吗？"),
+        ("别怕💖我会接住你。", "别怕。我会接住你。"),
+        ("下午过得怎么样呀～✨", "下午过得怎么样呀。"),
     ],
 )
 def test_tts_spoken_projection_has_stable_pause_boundaries(
@@ -390,6 +407,197 @@ async def test_legacy_expression_uses_native_cut_once(
     assert payload["speed_factor"] == 0.9
     assert payload["media_type"] == "wav"
     service._ensure_server_alive.assert_awaited_once()
+
+
+def _recording_legacy_session(
+    calls: list[dict[str, object]],
+    *,
+    get_status: dict[str, int] | None = None,
+):
+    statuses = get_status or {}
+
+    class RecordingSession:
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        def get(self, url: str, **kwargs: object) -> _FakeHTTPResponse:
+            calls.append({"method": "GET", "url": url, **kwargs})
+            status = 200
+            for needle, value in statuses.items():
+                if needle in str(url):
+                    status = value
+                    break
+            body = b'{"message":"failed"}' if status != 200 else b""
+            return _FakeHTTPResponse(body, status=status)
+
+        def post(self, url: str, **kwargs: object) -> _FakeHTTPResponse:
+            calls.append({"method": "POST", "url": url, **kwargs})
+            return _FakeHTTPResponse(_silent_wav())
+
+    return RecordingSession
+
+
+async def test_legacy_missing_sovits_weight_does_not_synthesize(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"RIFF")
+    service = _service_with_reference(reference)
+    service.plugin.config.tts_styles[0].sovits_weights = str(tmp_path / "missing-sovits.pth")
+    service._ensure_server_alive = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    monkeypatch.setattr(service, "_validate_main_ref_duration", lambda _path: True)
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        tts_service_module.aiohttp,
+        "ClientSession",
+        lambda **_kwargs: _recording_legacy_session(calls)(),
+    )
+
+    encoded = await service.generate_voice("第一句话保持连贯。")
+
+    assert encoded is None
+    assert calls == []
+
+
+async def test_legacy_sovits_switch_http_400_does_not_synthesize(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"RIFF")
+    service = _service_with_reference(reference)
+    service._ensure_server_alive = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    monkeypatch.setattr(service, "_validate_main_ref_duration", lambda _path: True)
+    monkeypatch.setattr(
+        tts_service_module.aiohttp,
+        "TCPConnector",
+        lambda **_kwargs: object(),
+    )
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        tts_service_module.aiohttp,
+        "ClientSession",
+        lambda **_kwargs: _recording_legacy_session(
+            calls,
+            get_status={"set_sovits_weights": 400},
+        )(),
+    )
+
+    encoded = await service.generate_voice("第一句话保持连贯。")
+
+    assert encoded is None
+    assert [call["method"] for call in calls] == ["GET", "GET"]
+    assert str(calls[0]["url"]).endswith("/set_gpt_weights")
+    assert str(calls[1]["url"]).endswith("/set_sovits_weights")
+
+
+async def test_legacy_gpt_switch_http_400_skips_sovits_and_tts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"RIFF")
+    service = _service_with_reference(reference)
+    service._ensure_server_alive = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    monkeypatch.setattr(service, "_validate_main_ref_duration", lambda _path: True)
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        tts_service_module.aiohttp,
+        "ClientSession",
+        lambda **_kwargs: _recording_legacy_session(
+            calls,
+            get_status={"set_gpt_weights": 400},
+        )(),
+    )
+
+    encoded = await service.generate_voice("第一句话保持连贯。")
+
+    assert encoded is None
+    assert [call["method"] for call in calls] == ["GET"]
+    assert str(calls[0]["url"]).endswith("/set_gpt_weights")
+
+
+async def test_owned_legacy_process_reuses_confirmed_weight_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"RIFF")
+    service = _service_with_reference(reference)
+    service._config.tts.idle_shutdown_seconds = 0.0
+    service._server_process = SimpleNamespace(pid=801, returncode=None)  # type: ignore[assignment]
+    service._ensure_server_alive = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    monkeypatch.setattr(service, "_validate_main_ref_duration", lambda _path: True)
+    monkeypatch.setattr(tts_service_module.aiohttp, "TCPConnector", lambda **_kwargs: object())
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        tts_service_module.aiohttp,
+        "ClientSession",
+        lambda **_kwargs: _recording_legacy_session(calls)(),
+    )
+
+    first = await service.generate_voice("第一条完整表达。")
+    second = await service.generate_voice("第二条完整表达。")
+
+    assert first and second
+    assert [call["method"] for call in calls] == ["GET", "GET", "POST", "POST"]
+
+
+async def test_external_legacy_process_never_trusts_local_weight_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"RIFF")
+    service = _service_with_reference(reference)
+    service._ensure_server_alive = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    monkeypatch.setattr(service, "_validate_main_ref_duration", lambda _path: True)
+    monkeypatch.setattr(tts_service_module.aiohttp, "TCPConnector", lambda **_kwargs: object())
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        tts_service_module.aiohttp,
+        "ClientSession",
+        lambda **_kwargs: _recording_legacy_session(calls)(),
+    )
+
+    first = await service.generate_voice("第一条完整表达。")
+    second = await service.generate_voice("第二条完整表达。")
+
+    assert first and second
+    assert [call["method"] for call in calls] == [
+        "GET", "GET", "POST", "GET", "GET", "POST"
+    ]
+
+
+async def test_attested_owned_startup_skips_only_matching_default_weights(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"RIFF")
+    service = _service_with_reference(reference)
+    service._config.tts.legacy_owned_startup_weights_ready = True
+    service._config.tts.idle_shutdown_seconds = 0.0
+    service._server_process = SimpleNamespace(pid=802, returncode=None)  # type: ignore[assignment]
+    service._ensure_server_alive = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    monkeypatch.setattr(service, "_validate_main_ref_duration", lambda _path: True)
+    monkeypatch.setattr(tts_service_module.aiohttp, "TCPConnector", lambda **_kwargs: object())
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        tts_service_module.aiohttp,
+        "ClientSession",
+        lambda **_kwargs: _recording_legacy_session(calls)(),
+    )
+
+    assert service._attest_owned_startup_legacy_weights() is True
+    encoded = await service.generate_voice("启动权重已经明确绑定。")
+
+    assert encoded
+    assert [call["method"] for call in calls] == ["POST"]
 
 
 async def test_generate_voice_logs_no_private_synthesis_text(

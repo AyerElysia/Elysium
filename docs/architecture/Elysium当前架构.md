@@ -39,7 +39,8 @@ main.py
           ├── life_engine   爱莉的生命域
           ├── napcat_adapter / lark_adapter
           ├── voice_live / livestream
-          ├── IndexTTS2 task TTS / tts_voice_plugin（遗留）/ neko_surface
+          ├── tts_voice_plugin（当前消息 TTS：GPT-SoVITS api_v2）
+          ├── neko_surface
           └── 其他专用能力插件
 ```
 
@@ -259,8 +260,7 @@ NapCat 适配器已按 `client / events / outgoing / utils` 模块化：
 
 - `voice_live`：全双工实时语音框架；
 - `livestream`：B站原始事件账本、同一意识导演、TTS、OBS 浏览器舞台、真实播放回执与记忆投射；
-- IndexTTS2 任务式 TTS：当前本地消息与舞台语音合成主路径；
-- `tts_voice_plugin`：GPT-SoVITS/Higgs 遗留兼容插件，不是当前主 TTS；
+- `tts_voice_plugin`：当前普通消息与 Surface 自动语音的本地 TTS Service；本机 live 后端是 GPT-SoVITS v2ProPlus `api_v2`（`legacy_compat`）。IndexTTS2.5 + vLLM-Omni 仍是可配置合同，不是本机正在服务的路径；
 - `neko_surface`：桌面/表面呈现；
 - `minecraft/`：视觉输入、Windows 桥接、键鼠输出和场景意识。
 
@@ -315,7 +315,7 @@ NapCat 适配器已按 `client / events / outgoing / utils` 模块化：
 | 使命编排 | 已实现并建立核心契约测试 | DAG、依赖、失败/取消/超时传播与结果账本已覆盖；仍需真实模型端到端验收 |
 | NapCat v3 / QQ | 已实现并持续运行加固 | 模块化与协议健康恢复已接入 |
 | 飞书 platform_action | 已实现，依赖外部环境 | 需要 lark-cli 与认证 |
-| IndexTTS2 任务式 TTS | 当前本地语音主路径 | 通过模型任务接入；各平台和直播仍需分别做真实播放验收 |
+| `tts_voice_plugin`（GPT-SoVITS） | 当前本地消息 TTS | 本机 live 为 `legacy_compat` / `api_v2` `:9880`；IndexTTS2.5 是可配置合同，不是正在服务的路径 |
 | voice_live | 实验性集成 | 依赖实时模型或本地降级链 |
 | livestream | 生产候选 | 核心闭环与故障注入已自动验收；真实 B站、TTS、OBS 环境仍需上线前验收 |
 | Minecraft | 环境依赖型能力 | 依赖 Windows 桥接、视觉和键鼠环境 |

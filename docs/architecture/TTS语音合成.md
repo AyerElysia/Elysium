@@ -2,7 +2,9 @@
 
 > 文档状态：当前生产边界。
 > 当前消息 TTS Service 同时支持 **IndexTTS2.5 + vLLM-Omni** 与 **GPT-SoVITS api_v2**，由部署配置显式选择。
+> 本机 2026-08-28 的 ignored live 配置是 `legacy_compat`：RVC-Boss `api_v2` `/tts`，v2ProPlus 微调权重，端口 `9880`。IndexTTS2.5 + vLLM-Omni 仍是代码合同，但本机启动命令已与当前 CLI 不兼容，不得再写成“当前生产就是 IndexTTS”。
 > `config/models.toml` 不再存在 `tasks.tts`；MiMo TTS 也不属于当前消息语音链。
+> 不得把主体语音或参考音频发到 `tts.ai-hobbyist.org` 一类公共推理平台。AI-Hobbyist `GPT-SoVITS-Inference` 与本机正在使用的 RVC-Boss `api_v2` 是同一套 `/tts` + `/set_*_weights` 合同，换 fork 不能修复缺失权重或失败后继续合成。
 
 ## 1. 定位
 
@@ -74,16 +76,22 @@ IndexTTS2.5 的标准 vLLM-Omni 配置不是即时音频分块流式：Stage 0 �
 
 ## 3. 本地服务与生命周期
 
-部署配置位于被 Git 忽略的 `config/plugins/tts_voice_plugin/config.toml`。当前本机配置至少明确：
+部署配置位于被 Git 忽略的 `config/plugins/tts_voice_plugin/config.toml`。本机当前 live 配置明确：
 
-- 本地服务地址；
-- 明确的 `backend`、相应模型/权重、协议身份与启动命令；
-- `default` 风格与参考音频；
+- `backend = "legacy_compat"`，服务地址为 GPT-SoVITS `api_v2`（`127.0.0.1:9880`）；
+- `scripts/tts/start_gpt_sovits_hiely.sh` 刷新 `latest/` 符号链接，并作为进程组 owner 监督 v2ProPlus `api_v2`；
+- `default` 及其他风格的参考音频、GPT/SoVITS 权重路径；
 - 请求、启动等待与文本长度上限；
-- vLLM-Omni 的外层片段预算/并发上限，或 GPT-SoVITS 的原生切分方法；
+- GPT-SoVITS 原生 `text_split_method`（本机验收基线为 `cut4`）与固定语义采样种子；
 - 插件自有后端的 `idle_shutdown_seconds`，默认 1800 秒，0 表示常驻。
 
-TTS 后端只在真正请求语音且端口未就绪时按配置启动。插件只持有自己通过 `start_command` 创建的新进程组；若端口上已有外部服务，插件只消费、不接管。最后一条完整表达结束后，插件为自有进程建立单调时钟闲置计时；新请求会取消旧计时。计时到期后必须先取得完整表达合成锁，并复核进程 identity 与 owner 未变化，才关闭两阶段进程组并释放显存。下一次请求继续通过现有 single-flight 自动拉起。这个生命周期不得启动、停止或重启 Elysium、NapCat，也不得注册操作系统自启动。
+若要把消息 TTS 切回 IndexTTS2.5 + vLLM-Omni，必须先让本机启动命令与当前 vLLM-Omni CLI 对齐，再用 ignored 配置把 `backend` 改成 `vllm_omni`，并完成真实合成验收。代码支持该协议，不等于它正在服务。
+
+`legacy_compat` 在调用 `/tts` 前必须先验证完整 GPT/SoVITS 权重对；任一文件缺失时不得先改变另一半。本地文件缺失或 `/set_*_weights` 非 200 时整条表达显式失败，禁止用进程内残留的另一套 epoch 继续合成。空权重字段表示沿用服务启动时载入的检查点。
+
+`legacy_owned_startup_weights_ready` 是部署者对**插件自有启动进程**的显式声明：`start_command` 已经加载 `default` 配置指向的同一权重对。只有刚启动、仍由当前 Service 持有、文件 identity 也一致的进程可跳过第一次重复切换；同一自有进程之后只复用已经确认的 identity。端口上预先存在的外部服务永不消费该声明，仍逐次调用权重端点以避免缓存掩盖重启或陌生模型。
+
+TTS 后端只在真正请求语音且端口未就绪时按配置启动。插件只持有自己通过 `start_command` 创建的新进程组；若端口上已有外部服务，插件只消费、不接管。WSL 启动器不得用 `exec` 把监督者交给 interop relay，否则句柄可能先退出而 API 被重新挂到 `/init`，造成“日志说已停、端口与显存仍在”的假成功。受版本控制的启动器保持为进程组 owner，等待并回收精确 API 子进程。最后一条完整表达结束后，插件为自有进程建立单调时钟闲置计时；新请求会取消旧计时。计时到期后必须先取得完整表达合成锁，并复核进程 identity 与 owner 未变化，才关闭完整进程组并释放显存。下一次请求继续通过现有 single-flight 自动拉起。这个生命周期不得启动、停止或重启 Elysium、NapCat，也不得注册操作系统自启动。
 
 闲置关闭使用完整进程退出，而不是依赖当前 IndexTTS2.5 Stage 1 未启用的 vLLM sleep mode。代价是下一次语音承担冷启动；本机 `startup_timeout` 必须覆盖实测最慢冷启动。长合成正在执行、计时已被新活动取消、进程已被替换或服务并非插件所有时，旧计时一律 no-op。
 
@@ -142,5 +150,10 @@ TTS 工程证据应记录模型/声音 revision、输入文本 hash、输出音�
 14. 并发 1/2/4 分别记录端到端耗时、RTF、显存峰值和段间一致性，只有 2 或 4 在质量不退化且无 OOM 时才可成为生产值。
 15. 闲置关闭只命中同一插件自有进程；新活动重置期限，长合成不被中断，陈旧 timer 不关闭 replacement，插件卸载不遗留 timer；关闭后下一次请求可重新拉起。
 16. 可发音投影不改变原始表达；标准文本与真实聊天标点文本都通过固定参数试听，重启后请求合同不漂移。
+17. 配置了 GPT/SoVITS 权重时，缺文件或切换非 200 不得发出 `/tts`，也不得把残留权重的音频当成成功。
+18. 装饰音符或 emoji 位于两个可发音子句之间时派生稳定句界，尾部装饰被移除，权威正文和 trajectory 不变。
+19. 外部服务不复用进程内权重缓存；自有服务只复用绑定到同一进程与同一文件 identity 的确认状态。
+20. 日志分别记录 server wait、weight、synthesis 与 total 毫秒数，不含正文；QQ 投影另记算法、字节数和耗时。
+21. WSL 监督启动器退出后，精确 API 子进程、监听端口和 GPU 资源均必须消失；只看到父句柄退出不算关闭成功。
 
 部署步骤见[部署、配置、测试与使用说明](../operations/deployment_and_usage.md)。
