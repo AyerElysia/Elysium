@@ -11,6 +11,8 @@ gpt_sovits_root="${GPT_SOVITS_ROOT:-/root/GPT-SoVITS}"
 listen_address="${GPT_SOVITS_ADDRESS:-127.0.0.1}"
 listen_port="${GPT_SOVITS_PORT:-9880}"
 stable_age_seconds="${GPT_SOVITS_STABLE_AGE_SECONDS:-180}"
+approved_gpt_checkpoint="${GPT_SOVITS_GPT_CHECKPOINT:-}"
+approved_sovits_checkpoint="${GPT_SOVITS_SOVITS_CHECKPOINT:-}"
 latest_dir="${GPT_SOVITS_LATEST_DIR:-$gpt_sovits_root/latest}"
 infer_config="${GPT_SOVITS_CONFIG:-GPT_SoVITS/configs/tts_infer_hiely.yaml}"
 
@@ -37,8 +39,22 @@ pick_stable_checkpoint() { # $1=directory $2=glob
   readlink -f "$best"
 }
 
-gpt_target=$(pick_stable_checkpoint GPT_weights_v2ProPlus 'hiely-e*.ckpt')
-sovits_target=$(pick_stable_checkpoint SoVITS_weights_v2ProPlus 'hiely_e*_s*.pth')
+resolve_checkpoint() { # $1=approved path $2=fallback directory $3=fallback glob
+  local approved="$1"
+  if [[ -n "$approved" ]]; then
+    if [[ ! -f "$approved" ]]; then
+      echo "[hiely-launcher] approved checkpoint does not exist: $approved" >&2
+      return 1
+    fi
+    readlink -f "$approved"
+    return 0
+  fi
+  echo "[hiely-launcher] no approved checkpoint supplied; using newest stable fallback" >&2
+  pick_stable_checkpoint "$2" "$3"
+}
+
+gpt_target=$(resolve_checkpoint "$approved_gpt_checkpoint" GPT_weights_v2ProPlus 'hiely-e*.ckpt')
+sovits_target=$(resolve_checkpoint "$approved_sovits_checkpoint" SoVITS_weights_v2ProPlus 'hiely_e*_s*.pth')
 gpt_link="$latest_dir/hiely-gpt.ckpt"
 sovits_link="$latest_dir/hiely-sovits.pth"
 ln -sfn "$gpt_target" "$gpt_link"

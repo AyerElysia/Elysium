@@ -613,9 +613,9 @@ retry_failed = true
 - 两个后端只有一个稳定 Service 接口，但切分 owner 不同：展示正文先派生不写回消息/trajectory 的可发音投影；vLLM-Omni 的长表达由 Service 以默认 24 单位上限做有界运输切分，最多并发 2 段、硬上限 4，再按原序拼成一条语音；GPT-SoVITS 的完整投影只发出一次 `/tts`，由部署配置的原生 `text_split_method` 切分，禁止 Elysium 二次拆句。GPT-SoVITS 的切分、速度、seed、参考音频与权重必须作为整体试听，日志只记录完整表达的时长与无正文语速指标。内部片段不形成多次表达，也不分段外发。
 - `[tts].idle_shutdown_seconds` 默认 1800 秒：只对插件通过 `start_command` 创建的后端进程组生效。最后一条完整表达结束并持续闲置到期后释放模型；下一次语音自动按需启动。设为 0 可保持常驻。外部手工服务、正在执行的长表达和 replacement process 不受旧计时影响；不要用定时 kill、端口猜测或 vLLM sleep endpoint 代替 owner 校验。
 - WSL 上的 GPT-SoVITS 使用仓库脚本 `scripts/tts/start_gpt_sovits_hiely.sh`。它保持为进程组 owner 并监督 `api_v2` 子进程，禁止改回会让 relay 与真实监听进程脱钩的裸 `exec`。`legacy_owned_startup_weights_ready=true` 只可用于该脚本确实已加载 `default` 权重对的本机配置；外部端口永不信任该声明。
-- v2ProPlus 不消费 GPT-SoVITS V3 的 `sample_steps` / `super_sampling` 质量旋钮，本机保持 API 默认 `32/false`，不得把这两个字段冒充 v2ProPlus 的清晰度优化。冷启动与合成性能看分阶段日志；2026-08-29 使用仓库正式启动器、同一 32 字真实聊天投影实测冷链 45.7 秒（启动 28.1 秒、权重 0.5 毫秒、合成 17.5 秒），热链 6.5 秒。
+- v2ProPlus 不消费 GPT-SoVITS V3 的 `sample_steps` / `super_sampling` 质量旋钮，本机保持 API 默认 `32/false`，不得把这两个字段冒充 v2ProPlus 的清晰度优化。2026-08-29 按人工批准的 e25/e80、`cut5`、`speed_factor=0.95`、seed `20260826` 复验：冷链约 34.3 秒（启动约 22.1 秒、合成约 12.2 秒），同进程热链约 3.3 秒。
 - N.E.K.O Surface 自动调用同一消息 TTS Service 并按回复顺序播放，显式 TTS 动作在该场景必须抑制。直播使用自己的有界 HTTP TTS 客户端；Voice Live 使用 Realtime Provider，二者都不能冒充消息 TTS 的平台发送回执。
-- QQ/NapCat 与飞书共用核心 `voice` 消息段，但出站协议不同：NapCat 映射为 OneBot `record`，并默认对内联 WAV 应用可关闭的 `qq_voice_presence_v1` 平台投影，再由 QQ 编码为 NT-Silk；飞书转为 Opus 并发送 `audio`。该投影不修改 TTS 原件，失败时原样发送。QQ/NapCat 语音收发仍须在用户手动重启后完成真实端到端验收。
+- QQ/NapCat 与飞书共用核心 `voice` 消息段，但出站协议不同：NapCat 映射为 OneBot `record`，生产默认把 GPT-SoVITS 的 32 kHz WAV 原样交给 NapCat，再由其编码为 NT-Silk；飞书转为 Opus 并发送 `audio`。旧 `qq_voice_presence_v1` 会额外 EQ、限幅并降到 24 kHz，离线 Silk 往返证明它显著偏离人工认可原音，因此默认关闭，只保留为显式 A/B 兼容开关。QQ/NapCat 语音收发仍须在用户手动重启后完成真实端到端验收。
 
 可在不发送平台消息的情况下验证本地合成；脚本只输出字符数、格式、音频字节数与 SHA-256，不落合成正文：
 

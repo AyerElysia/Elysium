@@ -629,11 +629,11 @@ class TTSService(BaseService):
 
     @classmethod
     def _project_decorative_speech_boundaries(cls, text: str) -> str:
-        """Turn an interior decorative run into a stable sentence boundary.
+        """Turn an interior decorative run into a short spoken boundary.
 
         Decorative symbols remain present in the authoritative message. This
         helper only prevents their removal from accidentally joining two spoken
-        clauses, such as ``哦♪ 想`` becoming ``哦 想``.
+        clauses. It must not promote a decorative beat to a sentence break.
         """
         projected: list[str] = []
         index = 0
@@ -654,7 +654,7 @@ class TTSService(BaseService):
             if previous.isalnum() and following.isalnum():
                 while projected and projected[-1].isspace():
                     projected.pop()
-                projected.append("。")
+                projected.append("，")
 
         return "".join(projected)
 
@@ -676,10 +676,11 @@ class TTSService(BaseService):
         #    避免贪婪匹配把标记后面的正文一起删掉。
         text = re.sub(r"<\s*\|[\w:\-.\s]*(?:\|\s*>|>|(?=\s)|$)", "", text)
 
-        # 1. 基本清理。展示文本中的装饰性停顿不能原样进入声学模型：
-        #    GPT-SoVITS 会把单个全角波浪号解释成省略停顿，导致拖音、弱化词尾和吞辅音。
+        # 1. 基本清理。GPT-SoVITS 的全角波浪号与省略号属于已经人工
+        #    验收的韵律合同；只把 ASCII 三点规范为同一省略号，不把
+        #    作者选择的短停顿擅自提升为句号。
         text = re.sub(r"[\(（\[【].*?[\)）\]】]", "", text)
-        text = re.sub(r"\.{3,}|…+", "。", text)
+        text = re.sub(r"\.{3,}", "……", text)
 
         # 2. 词语替换
         replacements = {"www": "哈哈哈", "hhh": "哈哈", "233": "哈哈", "666": "厉害", "88": "拜拜"}
@@ -689,18 +690,16 @@ class TTSService(BaseService):
         text = self._project_decorative_speech_boundaries(text)
         # 3. 移除不必要的字符
         text = re.sub(
-            r"[^\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ffa-zA-Z0-9\s，。！？、；：,.!?;:~～]",
+            r"[^\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ffa-zA-Z0-9\s，。！？、；：,.!?;:~～…]",
             "",
             text,
         )
 
-        # 4. 生成非权威的可发音投影。句尾波浪号表达语气，不应制造额外省略音；
-        #    句中波浪号使用普通短停顿。原始消息和训练轨迹始终保留展示文本。
+        # 4. 生成非权威的可发音投影。保留已人工验收的波浪号和省略号
+        #    韵律；原始消息和训练轨迹始终保留完整展示文本。
         text = re.sub(r"\s+", " ", text).strip()
-        text = re.sub(r"[~～]+(?=\s*$)", "。", text)
         text = re.sub(r"\s*([。！？!?])\s*", r"\1", text)
-        text = re.sub(r"[~～]+", "，", text)
-        text = re.sub(r"[，,]+\s*([。！？.!?])", r"\1", text)
+        text = re.sub(r"\s*([，、；：,;:])\s*", r"\1", text)
         text = re.sub(
             r"([，。！？、；：,.!?;:\-`])\1+",
             r"\1",
@@ -708,7 +707,7 @@ class TTSService(BaseService):
         )
 
         # 5. 确保结尾有标点
-        if text and not text.endswith(tuple("，。！？、；：,.!?;:")):
+        if text and not text.endswith(tuple("，。！？、；：,.!?;:~～…")):
             text += "。"
 
         return text.strip()

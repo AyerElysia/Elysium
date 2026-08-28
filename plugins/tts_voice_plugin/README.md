@@ -12,7 +12,7 @@ Elysium 的本地消息 TTS Service。它用一个稳定接口支持 **IndexTTS2
 
 TTS 不决定正文、情绪或是否表达。Service 缺失、合成失败、返回空音频或平台发送失败时必须如实失败，禁止换成陌生默认音色。
 
-展示文本、trajectory 和记忆保留爱莉真正写出的正文。Service 只为声学模型派生一份非权威的可发音投影：移除不可发音符号，把装饰性波浪号与连续省略号收敛成稳定句界；投影绝不写回正文。
+展示文本、trajectory 和记忆保留爱莉真正写出的正文。Service 只为声学模型派生一份非权威的可发音投影：移除不可发音符号，保留人工验收过的 `～` 与 `……`；不可发音装饰位于两个子句之间时只派生短停顿。投影绝不写回正文。
 
 ## 功能
 
@@ -63,7 +63,7 @@ vLLM-Omni 模式发送官方字段 `model/input/response_format/speed/ref_audio/
 
 闲置计时使用单调时钟并由项目任务管理器持有。新合成会取消旧计时；到期任务必须取得完整表达的合成锁，并复核仍是同一插件自有进程后才可关闭。关闭后下一次合成沿用按需启动 single-flight。Elysium 卸载时取消计时并回收自有进程；连接到已经存在的外部 TTS 时不建立闲置关闭任务。
 
-本机 WSL GPT-SoVITS 使用 `scripts/tts/start_gpt_sovits_hiely.sh`。脚本保持为进程组 owner 并等待 API 子进程，避免 `exec` 后 interop relay 先结束、真实 API 被挂到 `/init` 的孤儿进程。停止成功必须同时验证子进程、监听端口与模型显存已经释放。
+本机 WSL GPT-SoVITS 使用 `scripts/tts/start_gpt_sovits_hiely.sh`。脚本通过 `GPT_SOVITS_GPT_CHECKPOINT` 与 `GPT_SOVITS_SOVITS_CHECKPOINT` 接受人工批准的权重对；仅未提供时才回退最新稳定文件，不能把“最新”冒充“最好”。脚本保持为进程组 owner 并等待 API 子进程，避免 `exec` 后 interop relay 先结束、真实 API 被挂到 `/init` 的孤儿进程。停止成功必须同时验证子进程、监听端口与模型显存已经释放。
 
 ## 验收
 

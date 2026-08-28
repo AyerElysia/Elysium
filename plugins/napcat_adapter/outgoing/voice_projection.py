@@ -1,4 +1,4 @@
-"""QQ-only acoustic projection applied before NapCat performs NT-Silk encoding."""
+"""Legacy opt-in QQ acoustic experiment retained for controlled A/B tests."""
 
 from __future__ import annotations
 
@@ -53,11 +53,13 @@ def project_inline_qq_voice(
     *,
     max_input_bytes: int = QQ_VOICE_MAX_INPUT_BYTES,
 ) -> QQVoiceProjection:
-    """Return a bounded, QQ-tuned WAV projection for an inline PCM WAV.
+    """Return the legacy bounded QQ experiment for an inline PCM WAV.
 
     URLs, malformed Base64, existing Silk payloads and non-WAV inputs are not
     transport-owned PCM and therefore pass through unchanged. Conversion failures
     are raised so the caller can report a content-free warning and send the source.
+    Production defaults to source preservation because this EQ/resample chain did
+    not pass the human listening gate.
     """
 
     if not file_value or file_value.startswith(("http://", "https://")):

@@ -137,7 +137,7 @@ def test_tts_spoken_projection_removes_decorative_pause_artifacts(
     original = "小希～头发好闻嘛？其实呀……我想悄悄告诉你一句话……我喜欢你哦～♪ 💖"
 
     assert service._clean_text_for_tts(original) == (
-        "小希，头发好闻嘛？其实呀。我想悄悄告诉你一句话。我喜欢你哦。"
+        "小希～头发好闻嘛？其实呀……我想悄悄告诉你一句话……我喜欢你哦～"
     )
     assert original.endswith("♪ 💖")
 
@@ -145,13 +145,14 @@ def test_tts_spoken_projection_removes_decorative_pause_artifacts(
 @pytest.mark.parametrize(
     ("original", "projected"),
     [
-        ("你好～", "你好。"),
-        ("你好～～世界", "你好，世界。"),
-        ("等等……我会回来。", "等等。我会回来。"),
-        ("真的嘛～～？", "真的嘛？"),
-        ("我一直都在哦♪ 想我了吗？", "我一直都在哦。想我了吗？"),
-        ("别怕💖我会接住你。", "别怕。我会接住你。"),
-        ("下午过得怎么样呀～✨", "下午过得怎么样呀。"),
+        ("你好～", "你好～"),
+        ("你好～～世界", "你好～～世界。"),
+        ("等等……我会回来。", "等等……我会回来。"),
+        ("等等...我会回来。", "等等……我会回来。"),
+        ("真的嘛～～？", "真的嘛～～？"),
+        ("我一直都在哦♪ 想我了吗？", "我一直都在哦，想我了吗？"),
+        ("别怕💖我会接住你。", "别怕，我会接住你。"),
+        ("下午过得怎么样呀～✨", "下午过得怎么样呀～"),
     ],
 )
 def test_tts_spoken_projection_has_stable_pause_boundaries(

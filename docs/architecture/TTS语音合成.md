@@ -66,9 +66,9 @@ TTS 只把爱莉已经决定表达的文字变成声音。它不替她决定说�
 
 ### 2.2 展示正文与可发音投影
 
-展示正文是爱莉真正选择的表达，允许保留 `～`、`……`、音符和 emoji；trajectory、消息、记忆与后训练样本均保存这份正文。TTS Service 在调用声学模型前派生一份非权威投影：剥离控制标记和不可发音符号，将句中波浪号映射为短停顿、句尾波浪号映射为句界，并把连续省略号收敛为单一句界。该投影只用于发音，禁止写回展示正文或冒充新的主体表达。
+展示正文是爱莉真正选择的表达，允许保留 `～`、`……`、音符和 emoji；trajectory、消息、记忆与后训练样本均保存这份正文。TTS Service 在调用声学模型前派生一份非权威投影：剥离控制标记和不可发音符号，但保留经人工试听确认的 `～` 与 `……` 韵律；不可发音装饰符若位于两个可发音子句之间，只派生逗号级短停顿，禁止提升为句号。该投影只用于发音，禁止写回展示正文或冒充新的主体表达。
 
-GPT-SoVITS 的 `text_split_method`、`speed_factor`、`seed`、参考音频与权重组成一份不可拆分的试听合同。生产参数不能只凭名称或最高 epoch 自动选择，必须同时用标准清晰度文本和包含真实聊天标点的文本成对试听。本机当前验收基线为 `cut4`、`speed_factor=1.0`、固定语义采样种子；这属于部署验收结果，不是对其他模型后端的全局默认值。
+GPT-SoVITS 的 `text_split_method`、`speed_factor`、`seed`、参考音频与权重组成一份不可拆分的试听合同。生产参数不能只凭名称或最高 epoch 自动选择，必须同时用标准清晰度文本和包含真实聊天标点的文本成对试听。本机当前人工验收基线为 GPT `hiely-e25.ckpt`、SoVITS `hiely_e80_s12960.pth`、`cut5`、`speed_factor=0.95`、seed `20260826`；这属于部署验收结果，不是对其他模型后端的全局默认值。
 
 默认风格速度为 `0.90`，用于给辅音和句内停顿保留更多声学时间；它是可配置的工程参数，不改变正文，也不能代替真实平台试听。
 
@@ -79,10 +79,10 @@ IndexTTS2.5 的标准 vLLM-Omni 配置不是即时音频分块流式：Stage 0 �
 部署配置位于被 Git 忽略的 `config/plugins/tts_voice_plugin/config.toml`。本机当前 live 配置明确：
 
 - `backend = "legacy_compat"`，服务地址为 GPT-SoVITS `api_v2`（`127.0.0.1:9880`）；
-- `scripts/tts/start_gpt_sovits_hiely.sh` 刷新 `latest/` 符号链接，并作为进程组 owner 监督 v2ProPlus `api_v2`；
+- `scripts/tts/start_gpt_sovits_hiely.sh` 接受显式批准的 GPT/SoVITS 检查点，刷新 `latest/` 符号链接，并作为进程组 owner 监督 v2ProPlus `api_v2`；只有部署未提供批准路径时才选择最新稳定文件，且该回退不得被称为质量基线；
 - `default` 及其他风格的参考音频、GPT/SoVITS 权重路径；
 - 请求、启动等待与文本长度上限；
-- GPT-SoVITS 原生 `text_split_method`（本机验收基线为 `cut4`）与固定语义采样种子；
+- GPT-SoVITS 原生 `text_split_method`（本机验收基线为 `cut5`）与固定语义采样种子；
 - 插件自有后端的 `idle_shutdown_seconds`，默认 1800 秒，0 表示常驻。
 
 若要把消息 TTS 切回 IndexTTS2.5 + vLLM-Omni，必须先让本机启动命令与当前 vLLM-Omni CLI 对齐，再用 ignored 配置把 `backend` 改成 `vllm_omni`，并完成真实合成验收。代码支持该协议，不等于它正在服务。
@@ -151,9 +151,9 @@ TTS 工程证据应记录模型/声音 revision、输入文本 hash、输出音�
 15. 闲置关闭只命中同一插件自有进程；新活动重置期限，长合成不被中断，陈旧 timer 不关闭 replacement，插件卸载不遗留 timer；关闭后下一次请求可重新拉起。
 16. 可发音投影不改变原始表达；标准文本与真实聊天标点文本都通过固定参数试听，重启后请求合同不漂移。
 17. 配置了 GPT/SoVITS 权重时，缺文件或切换非 200 不得发出 `/tts`，也不得把残留权重的音频当成成功。
-18. 装饰音符或 emoji 位于两个可发音子句之间时派生稳定句界，尾部装饰被移除，权威正文和 trajectory 不变。
+18. 装饰音符或 emoji 位于两个可发音子句之间时只派生稳定短停顿，尾部装饰被移除，`～`/`……` 韵律和权威正文不变。
 19. 外部服务不复用进程内权重缓存；自有服务只复用绑定到同一进程与同一文件 identity 的确认状态。
-20. 日志分别记录 server wait、weight、synthesis 与 total 毫秒数，不含正文；QQ 投影另记算法、字节数和耗时。
+20. 日志分别记录 server wait、weight、synthesis 与 total 毫秒数，不含正文；QQ 默认原样发送 TTS 音频，只有显式启用旧实验投影时才记录其算法、字节数和耗时。
 21. WSL 监督启动器退出后，精确 API 子进程、监听端口和 GPU 资源均必须消失；只看到父句柄退出不算关闭成功。
 
 部署步骤见[部署、配置、测试与使用说明](../operations/deployment_and_usage.md)。
