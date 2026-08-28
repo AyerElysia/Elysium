@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .router_context_projection import (
+    ROUTER_CONTEXT_SCHEMA_VERSION,
     ROUTER_CONTEXT_SOURCE_FILES,
     RouterContextDraft,
     RouterContextProjection,
@@ -127,7 +128,51 @@ class SubjectContextProjection(RouterContextProjection):
         self.health_path = profile_dir / "health.json"
 
     def _version_stem(self, source_digest: str, projection_version: int) -> str:
-        return f"v{projection_version}-{source_digest}"
+        # 共享的 runtime 版本命名空间按 source_digest 建键，而不同 profile
+        # （voice_live/memory_witness）对同一份三份权威文件算出同一 digest：
+        # 2026-08-24 voice_live 的记录覆盖了 memory_witness 的记录，见证系统
+        # 提示词快照自此持续校验失败。键中加入 profile 前缀消除碰撞。
+        return f"{self.projection_profile}.v{projection_version}-{source_digest}"
+
+    async def _restore_remote_version(
+        self,
+        sources: tuple[SubjectContextSource, ...],
+        source_digest: str,
+    ) -> str:
+        restored = await super()._restore_remote_version(sources, source_digest)
+        if restored:
+            return restored
+        if self.runtime_store is None:
+            return ""
+        # 历史键没有 profile 前缀，可能已被别的 profile 覆盖；只有完整校验通过
+        # 才把它迁移到 profile 专属键，否则留给 refresh() 自然重新生成。
+        legacy_key = f"v{self.projection_version}-{source_digest}"
+        record = await self.runtime_store.get_state(
+            "router_context_projection.version",
+            legacy_key,
+        )
+        if record is None:
+            return ""
+        payload = dict(record.payload)
+        rendered = str(payload.pop("text", ""))
+        try:
+            self._validate_remote_snapshot(
+                payload,
+                rendered,
+                sources,
+                source_digest,
+                self.projection_version,
+            )
+            await self.runtime_store.put_state(
+                namespace="router_context_projection.version",
+                state_key=self._version_stem(source_digest, self.projection_version),
+                expected_revision=0,
+                schema_version=ROUTER_CONTEXT_SCHEMA_VERSION,
+                payload={**payload, "text": rendered},
+            )
+        except Exception:  # noqa: BLE001 - adoption is best-effort recovery
+            return ""
+        return rendered
 
     def notify_source_changed(self, path: str | Path) -> bool:
         """Mark on-demand freshness stale without creating a dormant watcher."""
