@@ -868,6 +868,169 @@ async def test_surface_private_message_skips_router_llm(monkeypatch) -> None:
     }
 
 
+def _life_chatter_group_mention_message() -> Message:
+    return Message(
+        message_id="group-mention-1",
+        content="@<爱莉希雅:3427056465> 晚安啦～♪好爱莉",
+        processed_plain_text="@<爱莉希雅:3427056465> 晚安啦～♪好爱莉",
+        message_type=MessageType.TEXT,
+        sender_role="other",
+        stream_id="group-stream",
+        extra={"at_users": [{"user_id": "3427056465"}]},
+        raw_data={"self_id": "3427056465"},
+    )
+
+
+async def test_life_chatter_group_mention_bypasses_router_llm(monkeypatch) -> None:
+    chatter = _life_chatter_for_config(LifeEngineConfig())
+    unread = _life_chatter_group_mention_message()
+    chat_stream = SimpleNamespace(
+        stream_id="group-stream",
+        platform="qq",
+        chat_type="group",
+    )
+
+    async def must_not_read_history(*_args, **_kwargs):
+        raise AssertionError("被 @ 的消息不应先构建路由历史")
+
+    monkeypatch.setattr(chatter, "_build_history_text_async", must_not_read_history)
+
+    decision = await chatter._should_respond(
+        "T9033: @<爱莉希雅:3427056465> 晚安啦～♪好爱莉",
+        [unread],
+        chat_stream,
+    )
+
+    assert decision["should_respond"] is True
+    assert "交给表达层判断如何回应" in decision["reason"]
+    assert decision["force_reply"] is True
+
+
+async def test_life_chatter_execute_backstop_routes_mid_turn_arrivals(
+    monkeypatch,
+) -> None:
+    """回合进行期间到达的消息必须在挂起前被路由，而不是无限期滞留。
+
+    复现 2026-08-29 事故：群消息“晚安各位”触发路由并沉默时，被 @ 的
+    “晚安啦～♪好爱莉”尚未进入未读队列（落库晚于读取）。旧逻辑直接
+    Wait(None) 挂起，其唤醒事件已被本回合消费，消息整夜无人处理。
+    """
+
+    LifeChatter.reset_global_runtime()
+    LifeChatter._GLOBAL_USABLE_MAP = {}
+    message_a = Message(
+        message_id="group-goodnight",
+        content="晚安各位",
+        processed_plain_text="晚安各位",
+        message_type=MessageType.TEXT,
+        sender_role="other",
+        stream_id="stream-a",
+    )
+    message_b = _life_chatter_group_mention_message()
+    unread_pool: list[Message] = [message_a]
+    flushed: list[Message] = []
+    router_calls: list[list[str]] = []
+
+    async def fetch_unreads(*_args, **_kwargs):
+        return "text", list(unread_pool)
+
+    async def flush_unreads(messages):
+        flushed.extend(messages)
+        removed = {msg.message_id for msg in messages}
+        unread_pool[:] = [
+            msg for msg in unread_pool if msg.message_id not in removed
+        ]
+
+    async def router_false(unread_lines, unread_msgs, _chat_stream):
+        router_calls.append([msg.message_id for msg in unread_msgs])
+        if all(msg.message_id != "group-mention-1" for msg in unread_msgs):
+            unread_pool.append(message_b)
+        return {"reason": "普通群晚安", "should_respond": False}
+
+    chat_stream = SimpleNamespace(
+        stream_id="stream-a",
+        stream_name="Test",
+        platform="test",
+        chat_type="group",
+        bot_id="3427056465",
+        context=SimpleNamespace(history_messages=[]),
+    )
+
+    class _FakeStreamManager:
+        async def activate_stream(self, _stream_id):
+            return chat_stream
+
+    async def no_history(*_args, **_kwargs):
+        return ""
+
+    async def no_dynamic_context(*_args, **_kwargs):
+        return "", 0
+
+    async def noop_async(*_args, **_kwargs):
+        return None
+
+    def noop(*_args, **_kwargs):
+        return None
+
+    chatter = _life_chatter_for_config(LifeEngineConfig())
+    rt = _WorkflowRuntime(
+        response=_RouterBranchRequest(flushed, must_not_send=True),
+        phase=_Phase.WAIT_USER,
+        history_merged=False,
+        unreads=[],
+        cross_round_seen_signatures=set(),
+        unread_msgs_to_flush=[],
+    )
+    LifeChatter._GLOBAL_RUNTIME = rt
+
+    monkeypatch.setattr(
+        "src.core.managers.stream_manager.get_stream_manager",
+        lambda: _FakeStreamManager(),
+    )
+    monkeypatch.setattr(chatter, "_get_life_service", lambda: None)
+    monkeypatch.setattr(chatter, "fetch_unreads", fetch_unreads)
+    monkeypatch.setattr(chatter, "flush_unreads", flush_unreads)
+    monkeypatch.setattr(chatter, "_should_respond", router_false)
+    monkeypatch.setattr(chatter, "_build_history_text_async", no_history)
+    monkeypatch.setattr(chatter, "_build_dynamic_context_text", no_dynamic_context)
+    monkeypatch.setattr(
+        chatter, "_collect_completed_background_agent_results", noop_async
+    )
+    monkeypatch.setattr(chatter, "_collect_pending_stream_turns", noop)
+    monkeypatch.setattr(chatter, "_commit_consumed_stream_turns", noop_async)
+    monkeypatch.setattr(
+        "src.kernel.concurrency.get_watchdog",
+        lambda: SimpleNamespace(feed_dog=lambda _stream_id: None),
+    )
+
+    try:
+        generator = chatter.execute()
+        result = await generator.__anext__()
+    finally:
+        LifeChatter.reset_global_runtime()
+
+    assert isinstance(result, Wait)
+    assert router_calls == [
+        ["group-goodnight"],
+        ["group-mention-1"],
+    ]
+    assert [msg.message_id for msg in flushed] == [
+        "group-goodnight",
+        "group-mention-1",
+    ]
+    assert unread_pool == []
+
+
+def test_router_fallback_prompt_hands_direct_mentions_to_expression() -> None:
+    from plugins.life_engine.core.router import _fallback_prompt
+
+    prompt = _fallback_prompt("爱莉希雅", "3427056465")
+
+    assert "直接 @ 她的账号或点名她" in prompt
+    assert "必须交给表达层" in prompt
+    assert "不要写具体回复" in prompt
+
+
 async def test_surface_dynamic_context_includes_realtime_guidance(monkeypatch) -> None:
     chatter = _life_chatter_for_config(LifeEngineConfig())
     monkeypatch.delenv("NEKO_SURFACE_LOW_LATENCY", raising=False)

@@ -6597,6 +6597,53 @@ class LifeEngineService(BaseService):
             max_bytes=max_bytes,
         )
 
+    @staticmethod
+    def _expression_unseen_note(
+        events: list[LifeEngineEvent],
+        stream_lookup: Callable[[str], Any],
+    ) -> str:
+        """Build a factual delivery note for messages the expression layer
+        has not been shown yet.
+
+        The heartbeat drains the pending life-event queue, which is
+        independent of the expression chatter's stream unread queue.  Without
+        this note the consciousness model may wrongly assume the expression
+        layer will handle a message it has never seen.  The note only reports
+        queue facts; whether and how to respond remains the subject's choice.
+        """
+
+        unseen: list[str] = []
+        for event in events:
+            if event.event_type != EventType.MESSAGE:
+                continue
+            message_id = str(event.event_id or "").strip()
+            stream_id = str(event.stream_id or "").strip()
+            if not message_id or not stream_id:
+                continue
+            stream = stream_lookup(stream_id)
+            context = getattr(stream, "context", None)
+            unread = getattr(context, "unread_messages", None) or []
+            still_unread = any(
+                str(getattr(msg, "message_id", "") or "") == message_id
+                for msg in unread
+            )
+            if not still_unread:
+                continue
+            snippet = " ".join(str(event.content or "").split())[:60]
+            unseen.append(
+                f"- 【{event.timestamp}】{event.sender or '未知来源'}："
+                f"{snippet}{'…' if len(' '.join(str(event.content or '').split())) > 60 else ''}"
+            )
+        if not unseen:
+            return ""
+        return (
+            "<expression_delivery_status>\n"
+            "以下消息此刻仍在表达层未读队列，尚未经过表达层处理"
+            "（技术事实记录，不是她的表达；是否回应、如何回应由她决定）：\n"
+            + "\n".join(unseen)
+            + "\n</expression_delivery_status>"
+        )
+
     async def _prepare_heartbeat_context(self) -> PreparedHeartbeatContext:
         """Drain pending events and prepare one fixed heartbeat snapshot."""
         async with self._proactive_actor_gate.hold("presence_reconcile"):
@@ -6634,6 +6681,18 @@ class LifeEngineService(BaseService):
             "</transient_world_perception>\n\n"
             f"{prepared.content}"
         )
+        try:
+            from src.core.managers.stream_manager import get_stream_manager
+
+            delivery_note = self._expression_unseen_note(
+                pending,
+                lambda stream_id: get_stream_manager()._streams.get(stream_id),
+            )
+        except Exception as exc:  # noqa: BLE001 - annotation is additive
+            logger.debug(f"expression delivery status unavailable: {exc}")
+            delivery_note = ""
+        if delivery_note:
+            prepared.content = f"{prepared.content}\n\n{delivery_note}"
         # 标记本轮是否包含外部入站消息（供学习系统判断交互）
         prepared.has_inbound_messages = (
             any(event.event_type == EventType.MESSAGE for event in pending)

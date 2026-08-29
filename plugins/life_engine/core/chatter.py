@@ -113,6 +113,9 @@ _RETIRED_PROACTIVE_ACTIONS = frozenset(
 )
 _SUSPEND_TEXT = "__SUSPEND__"
 _GLOBAL_RUNTIME_BUSY_RETRY_SECONDS = 1.0
+# 挂起前未读背板的连续推进上限：超过后转交下一事件恢复，避免消息洪流
+# 时长期占用全局 runtime。达到上限后消息仍在未读队列，不会被丢弃。
+_UNREAD_BACKSTOP_MAX_CONTINUES = 5
 _PLATFORM_ACTION_MAX_ATTEMPTS = 3
 _TERMINAL_TOOL_OUTCOMES = frozenset(
     {
@@ -3762,6 +3765,21 @@ class LifeChatter(BaseChatter):
 
     # ── response router ──────────────────────────────────────
 
+    @staticmethod
+    def _mentions_bot_account(message: Message) -> bool:
+        """判断消息是否直接指向她的账号（@/点名）。
+
+        与 ``StreamLoopManager._message_mentions_bot`` 使用同一事实判定：
+        ``extra.at_users`` 对照 ``raw_data.self_id``，纯文本兜底匹配
+        ``@<昵称:账号>`` 渲染。这是平台层事实，不是语义推断。
+        """
+
+        from src.core.transport.distribution.stream_loop_manager import (
+            StreamLoopManager,
+        )
+
+        return StreamLoopManager._message_mentions_bot(message)
+
     async def _should_respond(
         self,
         unread_lines: str,
@@ -3801,6 +3819,18 @@ class LifeChatter(BaseChatter):
                 "reason": "外部机会或主体显式外联进入当前表面，交给表达层判断",
                 "should_respond": True,
                 "force_reply": False,
+            }
+
+        # 群聊里被 @ 与私聊同样属于“有人在直接对她说话”。@ 指向她的账号是
+        # 平台层事实，不由路由模型裁量这条消息是否可见；交给表达层后，
+        # 回应什么、是否简短带过仍由她自己的意识决定。
+        if any(self._mentions_bot_account(msg) for msg in unread_msgs):
+            return {
+                "reason": "有消息直接 @ 了她，交给表达层判断如何回应",
+                "should_respond": True,
+                "force_reply": self._should_force_reply_for_unread_batch(
+                    unread_msgs
+                ),
             }
 
         # N.E.K.O 是已认证的一对一表现窗口。用户在这里发出的文字天然就是
@@ -6729,6 +6759,7 @@ class LifeChatter(BaseChatter):
 
         stream_manager = get_stream_manager()
         service = self._get_life_service()
+        backstop_rounds = 0
 
         while True:
             chat_stream = await stream_manager.activate_stream(self.stream_id)
@@ -6754,9 +6785,11 @@ class LifeChatter(BaseChatter):
                     logger.debug(
                         f"[{self.stream_id}] 统一 life_chatter runtime 正由 {active_stream_id} 推进，稍后重试"
                     )
+                    backstop_rounds = 0
                     yield Wait(time=_GLOBAL_RUNTIME_BUSY_RETRY_SECONDS)
                     continue
             elif not unread_msgs:
+                backstop_rounds = 0
                 yield Wait()
                 continue
 
@@ -6810,4 +6843,40 @@ class LifeChatter(BaseChatter):
             # 多写者：本轮驱动结束后，commit 已消费消息对应的 stream turn。
             await self._commit_consumed_stream_turns(chat_stream, service)
 
+            # 挂起前背板：回合进行期间到达、且未被本回合看到的新未读，其
+            # “新消息”唤醒事件已被当前回合消费；Wait(None) 会一直睡到下一
+            # 条消息才恢复，直接挂起会让这些消息被无限期滞留。已被本回合
+            # 处理过（rt.unreads，含 loop 中合并的增量）的消息不算新，避免
+            # 同一批消息被重复呈现。
+            if isinstance(result, Wait) and result.time is None:
+                runtime = self.__class__._GLOBAL_RUNTIME
+                seen_ids = {
+                    str(getattr(msg, "message_id", "") or "")
+                    for msg in (
+                        runtime.unreads if runtime is not None else []
+                    )
+                }
+                _, pending_unreads = await self.fetch_unreads()
+                fresh_unreads = [
+                    msg
+                    for msg in pending_unreads
+                    if str(getattr(msg, "message_id", "") or "") not in seen_ids
+                ]
+                if fresh_unreads and (
+                    backstop_rounds < _UNREAD_BACKSTOP_MAX_CONTINUES
+                ):
+                    backstop_rounds += 1
+                    logger.info(
+                        "life_chatter 挂起前发现 "
+                        f"{len(fresh_unreads)} 条未被本回合处理的新未读，"
+                        "继续推进而不是无限挂起"
+                    )
+                    continue
+                if fresh_unreads:
+                    logger.warning(
+                        "life_chatter 连续多次挂起前仍有未读，"
+                        f"转交下一事件恢复: count={len(fresh_unreads)}"
+                    )
+
+            backstop_rounds = 0
             yield result
