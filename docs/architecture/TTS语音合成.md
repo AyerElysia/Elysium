@@ -79,15 +79,15 @@ IndexTTS2.5 的标准 vLLM-Omni 配置不是即时音频分块流式：Stage 0 �
 部署配置位于被 Git 忽略的 `config/plugins/tts_voice_plugin/config.toml`。本机当前 live 配置明确：
 
 - `backend = "legacy_compat"`，服务地址为 GPT-SoVITS `api_v2`（`127.0.0.1:9880`）；
-- `scripts/tts/start_gpt_sovits_hiely.sh` 接受显式批准的 GPT/SoVITS 检查点，刷新 `latest/` 符号链接，并作为进程组 owner 监督 v2ProPlus `api_v2`；只有部署未提供批准路径时才选择最新稳定文件，且该回退不得被称为质量基线；
-- `default` 及其他风格的参考音频、GPT/SoVITS 权重路径；
+- `scripts/tts/start_gpt_sovits_hiely.sh` 默认固定到人工批准的 e25/e80 检查点，先校验两份 SHA-256，再原子地刷新 `latest/` 符号链接并作为进程组 owner 监督 v2ProPlus `api_v2`；自定义权重必须显式提供路径与匹配摘要，不再自动选择“最新稳定文件”；
+- `default` 及其他风格的参考音频、GPT/SoVITS 权重路径与 SHA-256；
 - 请求、启动等待与文本长度上限；
 - GPT-SoVITS 原生 `text_split_method`（本机验收基线为 `cut5`）与固定语义采样种子；
 - 插件自有后端的 `idle_shutdown_seconds`，默认 1800 秒，0 表示常驻。
 
 若要把消息 TTS 切回 IndexTTS2.5 + vLLM-Omni，必须先让本机启动命令与当前 vLLM-Omni CLI 对齐，再用 ignored 配置把 `backend` 改成 `vllm_omni`，并完成真实合成验收。代码支持该协议，不等于它正在服务。
 
-`legacy_compat` 在调用 `/tts` 前必须先验证完整 GPT/SoVITS 权重对；任一文件缺失时不得先改变另一半。本地文件缺失或 `/set_*_weights` 非 200 时整条表达显式失败，禁止用进程内残留的另一套 epoch 继续合成。空权重字段表示沿用服务启动时载入的检查点。
+`legacy_compat` 在调用任何 `/set_*_weights` 或 `/tts` 前必须先验证完整 GPT/SoVITS 权重合同：路径存在、配置了 SHA-256、实际摘要匹配，且校验期间文件 identity 未变化。摘要按 symlink-aware identity 在进程内缓存，权重被替换后自动失效并重新校验。任一检查失败时整条表达显式失败，禁止用进程内残留的另一套 epoch 继续合成，也禁止把空摘要解释成“信任当前后端”。
 
 `legacy_owned_startup_weights_ready` 是部署者对**插件自有启动进程**的显式声明：`start_command` 已经加载 `default` 配置指向的同一权重对。只有刚启动、仍由当前 Service 持有、文件 identity 也一致的进程可跳过第一次重复切换；同一自有进程之后只复用已经确认的 identity。端口上预先存在的外部服务永不消费该声明，仍逐次调用权重端点以避免缓存掩盖重启或陌生模型。
 
@@ -150,10 +150,10 @@ TTS 工程证据应记录模型/声音 revision、输入文本 hash、输出音�
 14. 并发 1/2/4 分别记录端到端耗时、RTF、显存峰值和段间一致性，只有 2 或 4 在质量不退化且无 OOM 时才可成为生产值。
 15. 闲置关闭只命中同一插件自有进程；新活动重置期限，长合成不被中断，陈旧 timer 不关闭 replacement，插件卸载不遗留 timer；关闭后下一次请求可重新拉起。
 16. 可发音投影不改变原始表达；标准文本与真实聊天标点文本都通过固定参数试听，重启后请求合同不漂移。
-17. 配置了 GPT/SoVITS 权重时，缺文件或切换非 200 不得发出 `/tts`，也不得把残留权重的音频当成成功。
+17. 配置了 GPT/SoVITS 权重时，缺文件、缺 SHA-256、摘要不匹配或切换非 200 均不得发出 `/tts`，也不得把残留权重的音频当成成功。
 18. 装饰音符或 emoji 位于两个可发音子句之间时只派生稳定短停顿，尾部装饰被移除，`～`/`……` 韵律和权威正文不变。
 19. 外部服务不复用进程内权重缓存；自有服务只复用绑定到同一进程与同一文件 identity 的确认状态。
-20. 日志分别记录 server wait、weight、synthesis 与 total 毫秒数，不含正文；QQ 默认原样发送 TTS 音频，只有显式启用旧实验投影时才记录其算法、字节数和耗时。
+20. 日志分别记录权重合同校验、server wait、weight、synthesis 与 total 毫秒数，不含正文；QQ 默认原样发送 TTS 音频，只有显式启用旧实验投影时才记录其算法、字节数和耗时。
 21. WSL 监督启动器退出后，精确 API 子进程、监听端口和 GPU 资源均必须消失；只看到父句柄退出不算关闭成功。
 
 部署步骤见[部署、配置、测试与使用说明](../operations/deployment_and_usage.md)。

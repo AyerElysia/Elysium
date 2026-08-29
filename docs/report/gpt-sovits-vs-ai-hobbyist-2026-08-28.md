@@ -27,7 +27,7 @@ AI-Hobbyist 的 `GPT-SoVITS-Inference` 是 RVC-Boss 的推理向 fork，HTTP 合
 
 `SoVITS_weights_v2ProPlus/` 里 **没有** `hiely_e20_s1980.pth`（现存是 e60/e70/e80）。当时 GPT 切到 e10，SoVITS 切换失败，进程仍带着启动时的 e80，随后 `/tts` 仍返回 200。这是 **GPT/SoVITS 检查点不成对**，不是“换一个 Inference 仓库就能好”。
 
-当前插件在权重切换非 200 时必须 fail closed，不再用残留权重继续合成。本机配置显式固定人工试听通过的 e25/e80；启动器只有未收到批准路径时才回退最新稳定文件，不能按 epoch 或 mtime 自动宣布质量胜出。
+当前插件在权重切换非 200 时必须 fail closed，不再用残留权重继续合成。本机配置显式固定人工试听通过的 e25/e80；2026-08-29 的后续加固又把路径与 SHA-256 绑定成不可拆分合同，启动器不再回退最新 epoch，Service 也会在拉起后端前拒绝缺失、替换或摘要不匹配的权重。
 
 ## 2026-08-29 全链路复盘与修复
 

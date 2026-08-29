@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import io
 import signal
 import wave
@@ -31,6 +32,8 @@ def _service_with_reference(path: Path) -> TTSService:
     sovits_weights.write_bytes(b"stub-sovits")
     config.tts_styles[0].gpt_weights = str(gpt_weights)
     config.tts_styles[0].sovits_weights = str(sovits_weights)
+    config.tts_styles[0].gpt_weights_sha256 = hashlib.sha256(b"stub-gpt").hexdigest()
+    config.tts_styles[0].sovits_weights_sha256 = hashlib.sha256(b"stub-sovits").hexdigest()
     return TTSService(SimpleNamespace(config=config))  # type: ignore[arg-type]
 
 
@@ -462,6 +465,85 @@ async def test_legacy_missing_sovits_weight_does_not_synthesize(
 
     assert encoded is None
     assert calls == []
+
+
+async def test_legacy_weight_hash_mismatch_does_not_touch_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"RIFF")
+    service = _service_with_reference(reference)
+    service._config.tts_styles[0].gpt_weights_sha256 = "0" * 64
+    service._ensure_server_alive = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    monkeypatch.setattr(service, "_validate_main_ref_duration", lambda _path: True)
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        tts_service_module.aiohttp,
+        "ClientSession",
+        lambda **_kwargs: _recording_legacy_session(calls)(),
+    )
+
+    encoded = await service.generate_voice("权重不匹配时不能继续合成。")
+
+    assert encoded is None
+    assert calls == []
+    service._ensure_server_alive.assert_not_awaited()
+
+
+async def test_legacy_missing_weight_hash_does_not_start_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"RIFF")
+    service = _service_with_reference(reference)
+    service._config.tts_styles[0].sovits_weights_sha256 = ""
+    service._ensure_server_alive = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    monkeypatch.setattr(service, "_validate_main_ref_duration", lambda _path: True)
+
+    encoded = await service.generate_voice("缺少摘要时不能启动后端。")
+
+    assert encoded is None
+    service._ensure_server_alive.assert_not_awaited()
+
+
+async def test_legacy_weight_digest_cache_invalidates_after_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"RIFF")
+    service = _service_with_reference(reference)
+    service._config.tts.idle_shutdown_seconds = 0.0
+    service._server_process = SimpleNamespace(pid=803, returncode=None)  # type: ignore[assignment]
+    service._ensure_server_alive = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    monkeypatch.setattr(service, "_validate_main_ref_duration", lambda _path: True)
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        tts_service_module.aiohttp,
+        "ClientSession",
+        lambda **_kwargs: _recording_legacy_session(calls)(),
+    )
+    hash_calls = 0
+    original_hash = service._sha256_file
+
+    def count_hashes(path: str) -> str:
+        nonlocal hash_calls
+        hash_calls += 1
+        return original_hash(path)
+
+    monkeypatch.setattr(service, "_sha256_file", count_hashes)
+
+    first = await service.generate_voice("第一次使用固定权重。")
+    second = await service.generate_voice("第二次复用已校验摘要。")
+    Path(service.tts_styles["default"]["gpt_weights"]).write_bytes(b"changed!")
+    third = await service.generate_voice("权重被替换后必须拒绝。")
+
+    assert first and second
+    assert third is None
+    assert hash_calls == 3
+    assert [call["method"] for call in calls] == ["GET", "GET", "POST", "POST"]
 
 
 async def test_legacy_sovits_switch_http_400_does_not_synthesize(
