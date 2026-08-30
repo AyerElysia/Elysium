@@ -22,7 +22,7 @@ def _voice_envelope(data: str) -> dict:
     }
 
 
-def _config(*, projection_enabled: bool = True) -> SimpleNamespace:
+def _config(*, projection_enabled: bool = False) -> SimpleNamespace:
     return SimpleNamespace(
         features=SimpleNamespace(
             message_send_timeout_seconds=20.0,
@@ -58,7 +58,7 @@ async def test_napcat_sender_applies_qq_projection_to_inline_wav(monkeypatch) ->
         )
 
     monkeypatch.setattr(sender_module, "project_inline_qq_voice", _project)
-    sender = OutgoingSender(client, lambda: _config())
+    sender = OutgoingSender(client, lambda: _config(projection_enabled=True))
 
     await sender.send(_voice_envelope(encoded))
 
@@ -77,7 +77,7 @@ async def test_napcat_sender_preserves_voice_when_projection_fails(monkeypatch) 
         raise RuntimeError("synthetic ffmpeg failure")
 
     monkeypatch.setattr(sender_module, "project_inline_qq_voice", _fail)
-    sender = OutgoingSender(client, lambda: _config())
+    sender = OutgoingSender(client, lambda: _config(projection_enabled=True))
 
     await sender.send(_voice_envelope(encoded))
 
@@ -100,6 +100,21 @@ async def test_napcat_sender_skips_projection_when_disabled(monkeypatch) -> None
     assert sent_message == [{"type": "record", "data": {"file": "base64://UklGRg=="}}]
 
 
+async def test_napcat_sender_preserves_source_when_config_is_absent(monkeypatch) -> None:
+    client = _client("absent-config-1")
+
+    def _unexpected(_file_value: str) -> QQVoiceProjection:
+        raise AssertionError("missing config must keep the source audio unchanged")
+
+    monkeypatch.setattr(sender_module, "project_inline_qq_voice", _unexpected)
+    sender = OutgoingSender(client, lambda: None)
+
+    await sender.send(_voice_envelope("UklGRg=="))
+
+    sent_message = client.call.await_args.args[1]["message"]
+    assert sent_message == [{"type": "record", "data": {"file": "base64://UklGRg=="}}]
+
+
 async def test_napcat_sender_does_not_project_voice_url(monkeypatch) -> None:
     client = _client("voice-url-1")
 
@@ -107,7 +122,7 @@ async def test_napcat_sender_does_not_project_voice_url(monkeypatch) -> None:
         raise AssertionError("URL projection must remain transport-neutral")
 
     monkeypatch.setattr(sender_module, "project_inline_qq_voice", _unexpected)
-    sender = OutgoingSender(client, lambda: _config())
+    sender = OutgoingSender(client, lambda: _config(projection_enabled=True))
 
     await sender.send(_voice_envelope("https://example.invalid/voice.wav"))
 

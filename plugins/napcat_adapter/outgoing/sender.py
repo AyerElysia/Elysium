@@ -76,10 +76,10 @@ class OutgoingSender:
     def _qq_voice_projection_enabled(self) -> bool:
         config = self._config()
         features = getattr(config, "features", None)
-        return bool(getattr(features, "qq_voice_projection_enabled", True))
+        return bool(getattr(features, "qq_voice_projection_enabled", False))
 
     async def _prepare_qq_voice_file(self, voice_data: str) -> str:
-        """Project inline WAV for QQ while preserving every unsupported input."""
+        """Apply the legacy opt-in experiment or preserve the source audio."""
 
         if voice_data.startswith(("http://", "https://")):
             return voice_data
@@ -99,7 +99,7 @@ class OutgoingSender:
             )
         except Exception as exc:  # noqa: BLE001 - platform projection must fail open
             logger.warning(
-                f"QQ 语音清晰度补偿失败，保留原始音频: error_type={type(exc).__name__}"
+                f"旧版 QQ 语音投影失败，保留原始音频: error_type={type(exc).__name__}"
                 f", elapsed_ms={(asyncio.get_running_loop().time() - started_at) * 1000.0:.1f}"
             )
             return file_value
@@ -107,7 +107,7 @@ class OutgoingSender:
         if projection.applied:
             elapsed_ms = (asyncio.get_running_loop().time() - started_at) * 1000.0
             logger.info(
-                "QQ 语音清晰度补偿完成: "
+                "旧版 QQ 语音投影完成: "
                 f"algorithm={QQ_VOICE_PROJECTION_ALGORITHM_VERSION}, "
                 f"input_bytes={projection.input_bytes}, "
                 f"output_bytes={projection.output_bytes}, elapsed_ms={elapsed_ms:.1f}"

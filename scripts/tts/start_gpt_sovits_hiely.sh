@@ -10,35 +10,39 @@ set -euo pipefail
 gpt_sovits_root="${GPT_SOVITS_ROOT:-/root/GPT-SoVITS}"
 listen_address="${GPT_SOVITS_ADDRESS:-127.0.0.1}"
 listen_port="${GPT_SOVITS_PORT:-9880}"
-stable_age_seconds="${GPT_SOVITS_STABLE_AGE_SECONDS:-180}"
+approved_gpt_checkpoint="${GPT_SOVITS_GPT_CHECKPOINT:-$gpt_sovits_root/GPT_weights_v2ProPlus/hiely-e25.ckpt}"
+approved_sovits_checkpoint="${GPT_SOVITS_SOVITS_CHECKPOINT:-$gpt_sovits_root/SoVITS_weights_v2ProPlus/hiely_e80_s12960.pth}"
+approved_gpt_sha256="${GPT_SOVITS_GPT_SHA256:-061f0a8a1658f0b61a0654c976fd7e137284d5deefb24219c4b99337ef80ea68}"
+approved_sovits_sha256="${GPT_SOVITS_SOVITS_SHA256:-52cb12ae0c2140c54e7e20d4c3cf5c785dc78d03d99eb1f96299a0c6c2331486}"
 latest_dir="${GPT_SOVITS_LATEST_DIR:-$gpt_sovits_root/latest}"
 infer_config="${GPT_SOVITS_CONFIG:-GPT_SoVITS/configs/tts_infer_hiely.yaml}"
 
 cd "$gpt_sovits_root"
 mkdir -p "$latest_dir"
 
-now=$(date +%s)
-pick_stable_checkpoint() { # $1=directory $2=glob
-  local best="" best_time=0 candidate candidate_time
-  while IFS= read -r candidate; do
-    [[ -z "$candidate" ]] && continue
-    candidate_time=$(stat -c %Y "$candidate")
-    (( now - candidate_time < stable_age_seconds )) && continue
-    if (( candidate_time > best_time )); then
-      best_time=$candidate_time
-      best="$candidate"
-    fi
-  done < <(find "$1" -maxdepth 1 -type f -name "$2" -printf '%T@ %p\n' 2>/dev/null \
-    | sort -nr | cut -d' ' -f2-)
-  if [[ -z "$best" ]]; then
-    echo "[hiely-launcher] no stable checkpoint in $1/$2" >&2
+resolve_checkpoint() { # $1=approved path $2=approved sha256 $3=weight kind
+  local approved="$1" expected_sha256="${2,,}" weight_kind="$3"
+  local resolved actual_sha256
+  if [[ -z "$approved" || -z "$expected_sha256" ]]; then
+    echo "[hiely-launcher] $weight_kind checkpoint path and SHA-256 are required" >&2
     return 1
   fi
-  readlink -f "$best"
+  if [[ ! -f "$approved" ]]; then
+    echo "[hiely-launcher] approved $weight_kind checkpoint does not exist: $approved" >&2
+    return 1
+  fi
+  resolved=$(readlink -f "$approved")
+  actual_sha256=$(sha256sum -- "$resolved")
+  actual_sha256="${actual_sha256%% *}"
+  if [[ "${actual_sha256,,}" != "$expected_sha256" ]]; then
+    echo "[hiely-launcher] approved $weight_kind checkpoint SHA-256 mismatch" >&2
+    return 1
+  fi
+  printf '%s\n' "$resolved"
 }
 
-gpt_target=$(pick_stable_checkpoint GPT_weights_v2ProPlus 'hiely-e*.ckpt')
-sovits_target=$(pick_stable_checkpoint SoVITS_weights_v2ProPlus 'hiely_e*_s*.pth')
+gpt_target=$(resolve_checkpoint "$approved_gpt_checkpoint" "$approved_gpt_sha256" gpt)
+sovits_target=$(resolve_checkpoint "$approved_sovits_checkpoint" "$approved_sovits_sha256" sovits)
 gpt_link="$latest_dir/hiely-gpt.ckpt"
 sovits_link="$latest_dir/hiely-sovits.pth"
 ln -sfn "$gpt_target" "$gpt_link"

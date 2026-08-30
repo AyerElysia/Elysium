@@ -775,6 +775,7 @@ async def test_storage_authority_loop_renews_current_writer(
 
 async def test_storage_authority_loop_invalidates_writer_on_renew_failure(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = _selected_service(tmp_path, BackendKind.MYSQL)
     runtime = _FakeRuntime(BackendKind.MYSQL)
@@ -786,12 +787,21 @@ async def test_storage_authority_loop_invalidates_writer_on_renew_failure(
         authority_lease_seconds=3,
         authority_renew_interval_seconds=1,
     )
+    # 权威确定丢失后进程必须退出交给守护重启（os._exit(30)）；测试用记录器
+    # 替换真实退出，只验证写者失效与退出请求都发生。
+    exit_reasons: list[str] = []
+    monkeypatch.setattr(
+        service,
+        "_exit_for_lost_storage_authority",
+        lambda reason: exit_reasons.append(str(reason)),
+    )
 
     await service._renew_storage_authority_loop()
 
     assert runtime.renew_calls == [3]
     assert runtime.invalidated is True
     assert service.health()["storage_runtime"]["status"] == "failed"
+    assert exit_reasons == ["renewal loop exited"]
 
 
 async def test_storage_authority_loop_retries_connectivity_unknown_without_invalidation(
@@ -873,6 +883,7 @@ async def test_storage_authority_loop_exposes_connectivity_unknown_health(
 
 async def test_storage_authority_loop_propagates_cancellation_without_invalidation(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = _selected_service(tmp_path, BackendKind.MYSQL)
     runtime = _FakeRuntime(BackendKind.MYSQL)
@@ -882,6 +893,14 @@ async def test_storage_authority_loop_propagates_cancellation_without_invalidati
         service._storage_factory_settings,
         authority_lease_seconds=3,
         authority_renew_interval_seconds=0,
+    )
+    # 非关停取消视为权威丢失并请求守护重启；测试替换真实退出，验证取消
+    # 仍向上传播且写者不被失效。
+    exit_reasons: list[str] = []
+    monkeypatch.setattr(
+        service,
+        "_exit_for_lost_storage_authority",
+        lambda reason: exit_reasons.append(str(reason)),
     )
 
     async def _renew(*, lease_seconds: int) -> None:
@@ -895,6 +914,7 @@ async def test_storage_authority_loop_propagates_cancellation_without_invalidati
 
     assert runtime.invalidated is False
     assert runtime.invalidated_claims == []
+    assert exit_reasons == ["renewal task cancelled"]
 
 
 async def test_learning_claim_loss_quiesces_only_projector_and_keeps_events(
@@ -967,12 +987,20 @@ async def test_learning_claim_loss_quiesces_only_projector_and_keeps_events(
 
 async def test_learning_claim_loss_snapshot_mismatch_quiesces_worker_too(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """removed=False (snapshot mismatch) must quiesce the learning worker as
     well as failing closed, so worker and renewal loop die together (F1-A)."""
 
     service = _selected_service(tmp_path, BackendKind.MYSQL)
     runtime = _FakeRuntime(BackendKind.MYSQL)
+    # fail-closed 后循环退出会请求守护重启（os._exit(30)）；测试替换真实退出。
+    exit_reasons: list[str] = []
+    monkeypatch.setattr(
+        service,
+        "_exit_for_lost_storage_authority",
+        lambda reason: exit_reasons.append(str(reason)),
+    )
 
     def _refuse_invalidation(claim: Any) -> bool:
         runtime.invalidated_claims.append(claim)
@@ -1028,6 +1056,7 @@ async def test_learning_claim_loss_snapshot_mismatch_quiesces_worker_too(
     assert not hasattr(service._learning_scheduler, "store")
     health = service.health()["storage_runtime"]
     assert health["status"] == "failed"
+    assert exit_reasons == ["renewal loop exited"]
     learning_health = health["learning"]
     assert learning_health["status"] == "degraded"
     assert learning_health["projector_owner"] is False

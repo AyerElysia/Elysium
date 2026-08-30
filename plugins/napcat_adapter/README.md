@@ -135,25 +135,26 @@ ban_user_id = ["333333333", "444444444"]
 
 ### QQ 语音清晰度投影
 
-核心 `voice` 消息段保存 TTS Service 生成的原始音频；NapCat 适配器只在发送到 QQ
-的最后一跳，为内联 WAV 派生一份平台专用投影。当前 `qq_voice_presence_v1`
-固定执行：
+核心 `voice` 消息段保存 TTS Service 生成的原始音频。生产默认把这份音频原样交给
+NapCat/QQ NT 内核编码，不在 Elysium 内重复 EQ、限幅或重采样。2026-08-29 的人工
+回归发现：历史认可的 32 kHz GPT-SoVITS 原件与当前原件波形相关系数为
+`0.99999992`，而旧 `qq_voice_presence_v1` 投影会额外执行：
 
 - 以 SOXR 重采样为 QQ/NT-Silk 实际使用的 24 kHz 单声道 PCM；
-- 在 2.8 kHz 增益 2.5 dB，并从 4.5 kHz 起提升 3 dB，补偿实测 Silk
-  往返造成的辅音频段衰减；
+- 在 2.8 kHz 增益 2.5 dB，并从 4.5 kHz 起提升 3 dB；
 - 预留 2 dB 电平空间并限幅，避免补偿后削波；
-- 再交给 NapCat/QQ NT 内核完成最终 Silk 编码。
+- 再交给 NapCat/QQ NT 内核二次编码。
 
-这份投影不覆盖 TTS 原件，也不进入训练数据、飞书、Surface、直播或 Voice Live。
-URL、已有 Silk、非 WAV 与超过输入硬上限的内容保持原样。FFmpeg 或投影失败时同样
-保留原始语音继续发送，只记录不含正文和音频内容的错误类型。
+这层处理损坏了已由用户试听认可的声学合同，因此不再是生产默认。它只作为旧实验
+兼容开关保留：不覆盖 TTS 原件，也不进入训练数据、飞书、Surface、直播或 Voice
+Live；URL、已有 Silk、非 WAV 与超过输入硬上限的内容保持原样；FFmpeg 或投影失败
+时保留原始语音继续发送。
 
-默认启用；需要对照排查时可在本机配置关闭：
+默认关闭。只有做明确的受控 A/B 实验时才可临时启用：
 
 ```toml
 [features]
-qq_voice_projection_enabled = false
+qq_voice_projection_enabled = true
 ```
 
 #### 📊 日志信息

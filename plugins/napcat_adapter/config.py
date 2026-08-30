@@ -251,12 +251,12 @@ class NapcatAdapterConfig(BaseConfig):
             order=14,
         )
         qq_voice_projection_enabled: bool = Field(
-            default=True,
+            default=False,
             description=(
-                "发送内联 WAV 语音到 QQ 前应用平台专用清晰度补偿；"
-                "不修改 TTS 原始音频、URL 或已有 Silk"
+                "旧版实验性 QQ 语音投影；会对内联 WAV 做 EQ、限幅和 24 kHz "
+                "重采样。默认关闭，保持 TTS 原始音频交由 QQ 编码"
             ),
-            label="QQ 语音清晰度补偿",
+            label="旧版 QQ 语音投影",
             tag="performance",
             order=15,
         )

@@ -36,11 +36,11 @@ def _inline(audio_bytes: bytes) -> str:
     return "base64://" + base64.b64encode(audio_bytes).decode("ascii")
 
 
-def test_qq_voice_projection_defaults_to_enabled() -> None:
-    assert NapcatAdapterConfig.FeaturesSection().qq_voice_projection_enabled is True
+def test_qq_voice_projection_defaults_to_disabled() -> None:
+    assert NapcatAdapterConfig.FeaturesSection().qq_voice_projection_enabled is False
 
 
-def test_qq_voice_projection_uses_approved_medium_profile(monkeypatch) -> None:
+def test_legacy_qq_voice_projection_remains_available_for_explicit_ab(monkeypatch) -> None:
     source = _sine_wav()
     output = _sine_wav(sample_rate=QQ_VOICE_TARGET_SAMPLE_RATE)
     captured: dict[str, object] = {}

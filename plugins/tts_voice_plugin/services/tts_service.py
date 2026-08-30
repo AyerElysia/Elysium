@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
+import hmac
 import io
 import math
 import mimetypes
@@ -51,7 +53,7 @@ class _SynthesisSegment:
     units: int
 
 
-_LegacyWeightIdentity = tuple[str, int, int]
+_LegacyWeightIdentity = tuple[str, int, int, int, int]
 
 
 _TTS_CLARITY_WARNING_UNITS_PER_SECOND = 4.8
@@ -89,6 +91,7 @@ class TTSService(BaseService):
         self._idle_shutdown_task: TaskInfo | None = None
         self._legacy_weight_cache_owner: asyncio.subprocess.Process | None = None
         self._legacy_active_weights: dict[str, _LegacyWeightIdentity] = {}
+        self._legacy_weight_digests: dict[_LegacyWeightIdentity, str] = {}
         self._legacy_weight_cache_source: str | None = None
         self._idle_generation = 0
         # A complete outward expression owns one lane so two user-visible voices
@@ -320,6 +323,8 @@ class TTSService(BaseService):
         default_prompt_text = default_cfg.prompt_text
         default_gpt_weights = default_cfg.gpt_weights
         default_sovits_weights = default_cfg.sovits_weights
+        default_gpt_weights_sha256 = default_cfg.gpt_weights_sha256
+        default_sovits_weights_sha256 = default_cfg.sovits_weights_sha256
 
         if not default_refer_wav:
             logger.warning("TTS 'default' style is missing 'refer_wav_path'.")
@@ -340,6 +345,12 @@ class TTSService(BaseService):
                 "prompt_language": style_cfg.prompt_language or "zh",
                 "gpt_weights": style_cfg.gpt_weights or default_gpt_weights,
                 "sovits_weights": style_cfg.sovits_weights or default_sovits_weights,
+                "gpt_weights_sha256": (
+                    style_cfg.gpt_weights_sha256 or default_gpt_weights_sha256
+                ),
+                "sovits_weights_sha256": (
+                    style_cfg.sovits_weights_sha256 or default_sovits_weights_sha256
+                ),
                 "speed_factor": style_cfg.speed_factor,
                 "text_language": style_cfg.text_language or "auto",
             }
@@ -629,11 +640,11 @@ class TTSService(BaseService):
 
     @classmethod
     def _project_decorative_speech_boundaries(cls, text: str) -> str:
-        """Turn an interior decorative run into a stable sentence boundary.
+        """Turn an interior decorative run into a short spoken boundary.
 
         Decorative symbols remain present in the authoritative message. This
         helper only prevents their removal from accidentally joining two spoken
-        clauses, such as ``哦♪ 想`` becoming ``哦 想``.
+        clauses. It must not promote a decorative beat to a sentence break.
         """
         projected: list[str] = []
         index = 0
@@ -654,7 +665,7 @@ class TTSService(BaseService):
             if previous.isalnum() and following.isalnum():
                 while projected and projected[-1].isspace():
                     projected.pop()
-                projected.append("。")
+                projected.append("，")
 
         return "".join(projected)
 
@@ -676,10 +687,11 @@ class TTSService(BaseService):
         #    避免贪婪匹配把标记后面的正文一起删掉。
         text = re.sub(r"<\s*\|[\w:\-.\s]*(?:\|\s*>|>|(?=\s)|$)", "", text)
 
-        # 1. 基本清理。展示文本中的装饰性停顿不能原样进入声学模型：
-        #    GPT-SoVITS 会把单个全角波浪号解释成省略停顿，导致拖音、弱化词尾和吞辅音。
+        # 1. 基本清理。GPT-SoVITS 的全角波浪号与省略号属于已经人工
+        #    验收的韵律合同；只把 ASCII 三点规范为同一省略号，不把
+        #    作者选择的短停顿擅自提升为句号。
         text = re.sub(r"[\(（\[【].*?[\)）\]】]", "", text)
-        text = re.sub(r"\.{3,}|…+", "。", text)
+        text = re.sub(r"\.{3,}", "……", text)
 
         # 2. 词语替换
         replacements = {"www": "哈哈哈", "hhh": "哈哈", "233": "哈哈", "666": "厉害", "88": "拜拜"}
@@ -689,18 +701,16 @@ class TTSService(BaseService):
         text = self._project_decorative_speech_boundaries(text)
         # 3. 移除不必要的字符
         text = re.sub(
-            r"[^\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ffa-zA-Z0-9\s，。！？、；：,.!?;:~～]",
+            r"[^\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ffa-zA-Z0-9\s，。！？、；：,.!?;:~～…]",
             "",
             text,
         )
 
-        # 4. 生成非权威的可发音投影。句尾波浪号表达语气，不应制造额外省略音；
-        #    句中波浪号使用普通短停顿。原始消息和训练轨迹始终保留展示文本。
+        # 4. 生成非权威的可发音投影。保留已人工验收的波浪号和省略号
+        #    韵律；原始消息和训练轨迹始终保留完整展示文本。
         text = re.sub(r"\s+", " ", text).strip()
-        text = re.sub(r"[~～]+(?=\s*$)", "。", text)
         text = re.sub(r"\s*([。！？!?])\s*", r"\1", text)
-        text = re.sub(r"[~～]+", "，", text)
-        text = re.sub(r"[，,]+\s*([。！？.!?])", r"\1", text)
+        text = re.sub(r"\s*([，、；：,;:])\s*", r"\1", text)
         text = re.sub(
             r"([，。！？、；：,.!?;:\-`])\1+",
             r"\1",
@@ -708,7 +718,7 @@ class TTSService(BaseService):
         )
 
         # 5. 确保结尾有标点
-        if text and not text.endswith(tuple("，。！？、；：,.!?;:")):
+        if text and not text.endswith(tuple("，。！？、；：,.!?;:~～…")):
             text += "。"
 
         return text.strip()
@@ -1375,7 +1385,81 @@ class TTSService(BaseService):
             stat = os.stat(path)
         except OSError:
             return None
-        return (os.path.realpath(path), int(stat.st_size), int(stat.st_mtime_ns))
+        return (
+            os.path.realpath(path),
+            int(stat.st_size),
+            int(stat.st_mtime_ns),
+            int(stat.st_ctime_ns),
+            int(stat.st_ino),
+        )
+
+    @staticmethod
+    def _sha256_file(weights_path: str) -> str:
+        """Hash one checkpoint without loading it into memory."""
+        digest = hashlib.sha256()
+        with open(weights_path, "rb") as checkpoint:
+            for chunk in iter(lambda: checkpoint.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    async def _validate_legacy_weight_contract(
+        self,
+        weights_path: str | None,
+        expected_sha256: str | None,
+        weight_type: str,
+    ) -> bool:
+        """Verify one immutable checkpoint contract before touching the backend."""
+        path = str(weights_path or "").strip()
+        expected = str(expected_sha256 or "").strip().lower()
+        if not path:
+            logger.error(f"校验 {weight_type} 权重失败: 未配置权重路径")
+            return False
+        if not self._legacy_weight_file_ready(path, weight_type):
+            return False
+        if not expected:
+            logger.error(
+                f"校验 {weight_type} 权重失败: 未配置 SHA-256 "
+                f"name={self._legacy_weight_filename(path)}"
+            )
+            return False
+
+        identity = self._legacy_weight_identity(path)
+        if identity is None:
+            return False
+        actual = self._legacy_weight_digests.get(identity)
+        digest_was_cached = actual is not None
+        if actual is None:
+            try:
+                actual = await asyncio.to_thread(self._sha256_file, path)
+            except asyncio.CancelledError:
+                raise
+            except OSError as exc:
+                logger.error(
+                    f"校验 {weight_type} 权重失败: "
+                    f"name={self._legacy_weight_filename(path)} "
+                    f"error_type={type(exc).__name__}"
+                )
+                return False
+            if self._legacy_weight_identity(path) != identity:
+                logger.error(
+                    f"校验 {weight_type} 权重失败: 校验期间文件发生变化 "
+                    f"name={self._legacy_weight_filename(path)}"
+                )
+                return False
+            self._legacy_weight_digests[identity] = actual
+
+        if not hmac.compare_digest(actual, expected):
+            logger.error(
+                f"校验 {weight_type} 权重失败: SHA-256 不匹配 "
+                f"name={self._legacy_weight_filename(path)}"
+            )
+            return False
+        if not digest_was_cached:
+            logger.info(
+                f"TTS 权重摘要校验通过: weight_type={weight_type}, "
+                f"name={self._legacy_weight_filename(path)}"
+            )
+        return True
 
     def _attest_owned_startup_legacy_weights(self) -> bool:
         """Seed weight state only for an explicitly attested owned startup."""
@@ -1533,19 +1617,34 @@ class TTSService(BaseService):
         try:
             base_url = server_config["url"].rstrip("/")
 
+            # Validate the complete immutable pair before starting or mutating
+            # the backend. Invalid deployment state must not consume GPU time.
+            requested_weights = (
+                (
+                    kwargs.get("gpt_weights"),
+                    kwargs.get("gpt_weights_sha256"),
+                    "gpt",
+                ),
+                (
+                    kwargs.get("sovits_weights"),
+                    kwargs.get("sovits_weights_sha256"),
+                    "sovits",
+                ),
+            )
+            weight_contracts_valid = await asyncio.gather(
+                *(
+                    self._validate_legacy_weight_contract(path, digest, kind)
+                    for path, digest, kind in requested_weights
+                )
+            )
+            if not all(weight_contracts_valid):
+                return None
+            contract_ready_at = loop.time()
+
             # 确保 TTS 服务存活（必要时自动拉起）
             if not await self._ensure_server_alive(base_url):
                 return None
             server_ready_at = loop.time()
-
-            # Validate the complete pair before mutating either model. A missing
-            # second checkpoint must not leave the live process half-switched.
-            requested_weights = (
-                (kwargs.get("gpt_weights"), "gpt"),
-                (kwargs.get("sovits_weights"), "sovits"),
-            )
-            if not all(self._legacy_weight_file_ready(path, kind) for path, kind in requested_weights):
-                return None
 
             # 步骤一：切换模型权重。缺文件或非 200 必须停止，禁止用进程内残留权重继续合成。
             if not await self._switch_legacy_model_weights(
@@ -1611,7 +1710,8 @@ class TTSService(BaseService):
                         completed_at = loop.time()
                         logger.info(
                             "TTS legacy 调用完成: "
-                            f"server_wait_ms={(server_ready_at - request_started_at) * 1000.0:.1f}, "
+                            f"contract_ms={(contract_ready_at - request_started_at) * 1000.0:.1f}, "
+                            f"server_wait_ms={(server_ready_at - contract_ready_at) * 1000.0:.1f}, "
                             f"weight_ms={(weights_ready_at - server_ready_at) * 1000.0:.1f}, "
                             f"synthesis_ms={(completed_at - weights_ready_at) * 1000.0:.1f}, "
                             f"total_ms={(completed_at - request_started_at) * 1000.0:.1f}, "
@@ -1779,6 +1879,8 @@ class TTSService(BaseService):
             "aux_refer_wav_paths": server_config.get("aux_refer_wav_paths"),
             "gpt_weights": server_config.get("gpt_weights"),
             "sovits_weights": server_config.get("sovits_weights"),
+            "gpt_weights_sha256": server_config.get("gpt_weights_sha256"),
+            "sovits_weights_sha256": server_config.get("sovits_weights_sha256"),
         }
         final_media_type = self._config.tts_advanced.media_type
         spatial_enabled = self._config.spatial_effects.enabled

@@ -219,6 +219,16 @@ class TTSStyle(SectionBase):
     prompt_language: str = Field(default="zh", description="参考音频语言")
     gpt_weights: str = Field(default="C:/path/to/your/gpt_weights.ckpt", description="GPT 模型路径")
     sovits_weights: str = Field(default="C:/path/to/your/sovits_weights.pth", description="SoVITS 模型路径")
+    gpt_weights_sha256: str = Field(
+        default="",
+        pattern=r"^(?:|[0-9a-fA-F]{64})$",
+        description="GPT 权重的 SHA-256；legacy_compat 合成前必须匹配",
+    )
+    sovits_weights_sha256: str = Field(
+        default="",
+        pattern=r"^(?:|[0-9a-fA-F]{64})$",
+        description="SoVITS 权重的 SHA-256；legacy_compat 合成前必须匹配",
+    )
     speed_factor: float = Field(
         default=0.9,
         ge=0.5,
