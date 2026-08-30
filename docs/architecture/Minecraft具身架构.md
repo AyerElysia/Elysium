@@ -4,13 +4,16 @@
 
 让爱莉以同一个主体在 Minecraft 中持续感知、形成意图、行动、核验结果并恢复失败。系统不替她规定“应该做什么”，只提供可观察、可中断、可审计的身体能力。
 
-核心原则是“一份意识，两类身体，统一证据契约”：
+核心原则是“一个持续主体、一个专属场景意识、多类身体、统一证据契约”：
 
 ```text
-爱莉的意识与记忆
-        │ 自由形成意图
+爱莉的持续主体 / 统一记忆
+        │ 固定主体投影 + 近期潜意识
         ▼
-模型规划器 ── 动态能力清单、当前世界事实、最近画面
+Minecraft 专属意识 ── 自己观察、形成意图、等待或离场
+        │ 开放文本意图
+        ▼
+具身模型规划器 ── 动态能力清单、当前世界事实
         │ ActionIntent
         ▼
 具身运行时 ── 租约、去重、超时、中断、证据链
@@ -51,13 +54,23 @@ Minecraft 是 `LifeEngineService` 独立持有的可选场景，不属于 Learni
 
 “已经启动”不等于“身体就绪”。Agent Body 必须通过固定版本和摘要预检、共享令牌认证、Bridge/能力匹配、两条连续观察，并明确报告正确单人世界、`world_loaded=true`、`client_paused=false` 和玩家 UUID。标题页、暂停菜单、错误世界、过期桥接、静止观察或多个候选窗口都是显式失败。
 
+### 专属 Minecraft 意识
+
+Minecraft 不再借用核心 heartbeat 充当游戏回合。身体就绪、Presence 注册和场景打开后，session 才启动独立的 `MinecraftConsciousnessRuntime`；核心 heartbeat 的周期与载荷不因 MC 活跃而改变。这个运行时属于同一个爱莉主体，但拥有自己的 session、stream、即时观察、运行阶段和受管任务。
+
+它在启动身体前先固定一份 `projection_kind=minecraft` 的统一主体投影，并对 `SOUL.md`、`USER.md`、`MEMORY.md` 的派生摘要、版本、哈希和 UTF-8 字节数做 fail-closed 校验。没有可证明的主体投影就不启动身体，不回退到平行 persona。每个真实轮次都重新取得结构化游戏观察、可用时的第一人称 JPEG 像素、有界近期潜意识和最近结果引用；模型请求必须证明主体与观察正文被完整、精确送达，裁剪、重复或错配均不允许行动。
+
+场景模型只选择技术生命周期形状：形成一个开放文本意图、按自己选择的时长继续观察，或结束本次游戏。代码不按关键词替她规定情绪、目标或“应该回应谁”。`wait` 的时间只是她选择的下一次重新观察时间，并受技术上下限约束；新观察、动作结果、外部中断和停止信号可以提前唤醒。模型失败按有界退避重试，不把空响应写成主体决定，也不阻塞核心意识。
+
+每个决定先以 `minecraft_consciousness_decision` 归属到当前 `minecraft` instance/session/stream 的不可变 Life Event，再允许具身规划器执行。高层意识决定“做什么”，原有 evidence-driven planner 只决定“如何做”；终态回执和动作后新观察回到下一轮。状态接口公开 phase、turn count、当前 decision、最近错误、连续失败、主体引用和剩余会话时间，便于现场判断是主动等待、模型退避、身体执行还是故障。
+
 ### 重放与完成语义
 
 命令账本以 command ID 和规范化载荷摘要去重。完全相同的重试复用已有 ack/终态；若重试发生在原命令仍 pending 时，新连接先得到 ack，并在原执行完成后收到同一份终态，不会重复执行或永久停在“处理中”；相同 ID 配不同载荷被拒绝；pending 不会因有界终态缓存淘汰而丢失。接单回执不代表任务完成，结论必须引用终态回执及其后的新观察。每个 session 将这些证据写成追加式哈希链。
 
 ### 潜意识近期上下文、Trace 与 World 的单向边界
 
-Minecraft 每次意图直接从 `LifeEngineService` 只读获取有界的 `RecentSubconsciousContext`，作为跨意识连续性的默认来源。它只投影已经提交的近期 HEARTBEAT、TOOL_CALL、TOOL_RESULT 和 AGENT_RESULT 因果组，不包含 MESSAGE、私有 rolling payload 或工具原始参数，也不 drain、不推进游标、不写回事件。模型必须把它视为同一主体过去活动的归属上下文，而不是新指令或当前 Minecraft 世界事实。游戏 Bridge 的结构化观察、动作后新观察和第一人称画面仍是当前世界证据，不受这条链路影响。
+Minecraft 专属意识的每个高层轮次从 `LifeEngineService` 只读获取一次有界的 `RecentSubconsciousContext`，作为跨意识连续性的默认来源。它只投影已经提交的近期 HEARTBEAT、TOOL_CALL、TOOL_RESULT 和 AGENT_RESULT 因果组，不包含 MESSAGE、私有 rolling payload 或工具原始参数，也不 drain、不推进游标、不写回事件。模型必须把它视为同一主体过去活动的归属上下文，而不是新指令或当前 Minecraft 世界事实。由这个场景意识随后发出的具身意图不会再次注入同一正文；外部工具直接发起的独立意图仍按自身边界读取一次。游戏 Bridge 的结构化观察、动作后新观察和第一人称画面仍是当前世界证据，不受这条链路影响。
 
 Minecraft 意图上下文在结构上分为 `durable_context` 与 `transient_prompt_context`。session、stream 和目标等耐久运行身份进入前者；`recent_subconscious_context` 正文只进入后者，并且只有规划器的 `to_prompt()` 可以读取。`to_wire()` 和追加式 trace 不复制正文，只保存 content-free `minecraft.recent_subconscious_reference.v1`：算法版本、内容哈希、事件序列窗口、因果组计数、截断状态和 UTF-8 字节数。模型请求把正文作为单独的动态 `Text` part 发送，明确标注为过去上下文。
 
@@ -100,8 +113,10 @@ OBS 使用 Game Capture。当前 Java 客户端在窗口枚举中不可选时，
 
 ## 验收门槛
 
+- 意识测试：统一主体投影 fail-closed；观察和像素精确送达；无聊天输入仍能形成决定；决定先落账再行动；模型空响应只触发有界退避；
 - 契约测试：认证、重放拒绝、序号、去重、租约、超时、中断和恢复；
 - 执行测试：真实类型化动作或 Baritone 位移有世界证据，停止和释放有终态回执；
+- 连续陪玩测试：保持聊天静默时专属 scene 的 turn 仍按自身选择推进，核心 heartbeat 不加速；与用户同服 15–30 分钟并完成观察、决定、动作、回执、新观察闭环；
 - 仿生测试：真实鼠标视角变化，同时游戏结构化观测交叉确认，前后帧摘要不同；
 - 直播测试：OBS 预览无黑屏，并产生可播放的本地录制；
 - 故障测试：死亡、窗口丢失、连接重建和观测积压不会留下卡键或伪造成功。

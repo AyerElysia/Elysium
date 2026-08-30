@@ -6,8 +6,10 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
-from datetime import datetime, time as dtime, timezone
+from datetime import datetime, timezone
+from datetime import time as dtime
 from enum import Enum
 from typing import Any
 
@@ -515,6 +517,77 @@ class EventBuilder:
             sender=sender_display,
             chat_type=chat_type_name,
             stream_id=target_stream_id or None,
+        )
+
+    def build_minecraft_consciousness_decision_event(
+        self,
+        decision: dict[str, Any],
+        context_reference: dict[str, Any],
+    ) -> LifeEngineEvent:
+        """Build an attributed, idempotent scene decision before body action."""
+
+        decision_id = str(decision.get("decision_id") or "").strip()
+        if not decision_id:
+            raise ValueError("Minecraft consciousness decision_id must not be empty")
+        if decision.get("schema") != "minecraft.consciousness_decision.v1":
+            raise ValueError("unknown Minecraft consciousness decision schema")
+        if (
+            context_reference.get("schema")
+            != "minecraft.consciousness_turn_reference.v1"
+        ):
+            raise ValueError("unknown Minecraft consciousness context schema")
+        stream_id = str(context_reference.get("stream_id") or "").strip()
+        instance_id = str(context_reference.get("instance_id") or "").strip()
+        session_id = str(context_reference.get("session_id") or "").strip()
+        if not stream_id or not instance_id or not session_id:
+            raise ValueError(
+                "Minecraft consciousness decision attribution is incomplete"
+            )
+        authored_at = str(decision.get("authored_at") or "").strip()
+        if not authored_at:
+            raise ValueError("Minecraft consciousness authored_at must not be empty")
+        raw = json.dumps(
+            {
+                "decision": dict(decision),
+                "context_reference": dict(context_reference),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        kind = str(decision.get("kind") or "").strip()
+        intention = str(decision.get("intention") or "").strip()
+        reason = str(decision.get("reason") or "").strip()
+        visible = json.dumps(
+            {
+                "decision_id": decision_id,
+                "kind": kind,
+                "intention": intention,
+                "reason": reason,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        seq = self._next_sequence()
+        return LifeEngineEvent(
+            event_id=decision_id,
+            event_type=EventType.HEARTBEAT,
+            timestamp=authored_at,
+            sequence=seq,
+            source="minecraft_consciousness",
+            source_detail=(
+                "Minecraft 场景意识 | "
+                f"session={session_id} | instance={instance_id} | kind={kind}"
+            ),
+            content=_shorten_text(visible, max_length=1200),
+            content_type="minecraft_consciousness_decision",
+            stream_id=stream_id,
+            occurrence_id=decision_id,
+            source_instance_id=instance_id,
+            correlation_id=session_id,
+            content_ref=f"minecraft-consciousness-decision:{decision_id}",
+            raw_content=raw,
         )
 
     def build_tool_call_event(

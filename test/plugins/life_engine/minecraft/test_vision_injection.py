@@ -1,8 +1,4 @@
-"""Contract tests: her game frame reaches her LLM as a native image payload.
-
-The frame must never be reduced to a textual retelling before entering her
-natively multimodal model — the heartbeat request carries the raw image.
-"""
+"""Vision and cadence boundaries for the dedicated Minecraft consciousness."""
 
 from __future__ import annotations
 
@@ -60,28 +56,8 @@ class TestVisionFrameBytes:
         assert await session.grab_vision_frame_bytes() is None
 
 
-class TestHeartbeatVisionPayload:
-    async def test_payload_carries_media_part(self) -> None:
-        from src.kernel.llm.payload.media import MediaPart
-
-        service = SimpleNamespace(minecraft_session=None)
-        image = PILImage.open(io.BytesIO(_jpeg_bytes()))
-        frame = Frame(image=image, width=image.width, height=image.height)
-        service.minecraft_session = _bare_session(active=True, frame=frame)
-
-        payload = await LifeEngineService._build_minecraft_vision_payload(service)
-
-        assert payload is not None
-        parts = list(payload.content)
-        assert any(isinstance(part, MediaPart) for part in parts)
-
-    async def test_no_session_means_no_vision(self) -> None:
-        service = SimpleNamespace(minecraft_session=None)
-        assert await LifeEngineService._build_minecraft_vision_payload(service) is None
-
-
-class TestContinuousPlayCadence:
-    """While she is in game, heartbeat turns accelerate into continuous play."""
+class TestIndependentCoreCadence:
+    """Minecraft must not hijack the core heartbeat's thought chain or rhythm."""
 
     def _service(self, session: object | None, game_interval: int | None) -> object:
         minecraft = None
@@ -97,10 +73,10 @@ class TestContinuousPlayCadence:
         service = self._service(session=None, game_interval=5)
         assert LifeEngineService._effective_heartbeat_interval(service) == 30
 
-    def test_active_session_accelerates_to_game_turns(self) -> None:
+    def test_active_session_keeps_base_interval(self) -> None:
         session = _bare_session(active=True, frame=None)
         service = self._service(session=session, game_interval=5)
-        assert LifeEngineService._effective_heartbeat_interval(service) == 5
+        assert LifeEngineService._effective_heartbeat_interval(service) == 30
 
     def test_inactive_session_keeps_base_interval(self) -> None:
         session = _bare_session(active=False, frame=None)

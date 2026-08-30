@@ -39,7 +39,9 @@ class _FakeConsumer:
         self.close_calls += 1
 
 
-def _config(tmp_path: Path, *, minecraft: bool, learning: bool = True) -> LifeEngineConfig:
+def _config(
+    tmp_path: Path, *, minecraft: bool, learning: bool = True
+) -> LifeEngineConfig:
     config = LifeEngineConfig()
     config.settings.enabled = True
     config.settings.workspace_path = str(tmp_path)
@@ -103,6 +105,78 @@ def test_minecraft_session_uses_recent_subconscious_provider(
     callback = session._get_recent_subconscious_context
     assert callback.__self__ is service
     assert callback.__func__ is LifeEngineService.get_recent_subconscious_context
+
+    subject_callback = session._get_subject_context_projection_snapshot
+    assert subject_callback.__self__ is service
+    assert (
+        subject_callback.__func__
+        is LifeEngineService.get_subject_context_projection_snapshot
+    )
+
+    record_callback = session._record_minecraft_consciousness_decision
+    assert record_callback.__self__ is service
+    assert (
+        record_callback.__func__
+        is LifeEngineService.record_minecraft_consciousness_decision
+    )
+
+
+async def test_minecraft_decision_record_retry_is_exact_and_not_duplicated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raw-write ambiguity retries the same event before body execution."""
+
+    service = LifeEngineService(_DummyPlugin(_config(tmp_path, minecraft=True)))
+    published: list[Any] = []
+    saves = 0
+
+    async def publish(events: list[Any]) -> None:
+        published.append(events[0])
+        if len(published) == 1:
+            raise OSError("temporary event backend failure")
+
+    async def save(*_: Any, **__: Any) -> None:
+        nonlocal saves
+        saves += 1
+
+    monkeypatch.setattr(service, "_publish_raw_events", publish)
+    monkeypatch.setattr(service, "_save_runtime_context", save)
+    decision = {
+        "schema": "minecraft.consciousness_decision.v1",
+        "decision_id": "minecraft_decision_" + "a" * 64,
+        "kind": "pursue",
+        "turn_index": 1,
+        "authored_at": "2026-08-30T12:00:00+00:00",
+        "intention": "去看看山后面",
+        "reason": "我想知道那里有什么",
+        "reconsider_after_seconds": None,
+    }
+    context = {
+        "schema": "minecraft.consciousness_turn_reference.v1",
+        "session_id": "session-1",
+        "stream_id": "game.minecraft.session-1",
+        "instance_id": "minecraft-session-1",
+        "body_name": "agent",
+        "turn_index": 1,
+        "wake_reasons": ["session_started"],
+        "subject": {"projection_sha256": "b" * 64},
+        "perception": {"observation": {"observation_id": "observation-1"}},
+        "recent_outcome_decision_ids": [],
+    }
+
+    with pytest.raises(OSError, match="temporary event backend failure"):
+        await service.record_minecraft_consciousness_decision(decision, context)
+    event = await service.record_minecraft_consciousness_decision(decision, context)
+    replayed = await service.record_minecraft_consciousness_decision(decision, context)
+
+    assert published == [event, event]
+    assert replayed is event
+    assert saves == 1
+    assert [item.event_id for item in service._pending_events] == [event.event_id]
+    assert event.source_instance_id == "minecraft-session-1"
+    assert event.occurrence_id == decision["decision_id"]
+    assert "去看看山后面" in str(event.raw_content)
 
 
 async def test_minecraft_session_initializes_when_learning_is_disabled(

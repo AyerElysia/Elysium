@@ -70,12 +70,25 @@ class MCConfig:
     # When disabled she launches the configured singleplayer world instead.
     shared_world_enabled: bool = True
     agent_shared_username: str = "Elysia"
-    # Her continuous play cadence while a session is active; the service
-    # heartbeat loop accelerates to this interval during play.
+    # Deprecated compatibility value. Minecraft no longer changes the core
+    # heartbeat cadence; its scene consciousness chooses its own wait rhythm.
     game_turn_interval_seconds: int = 5
     bot_observation_interval_ms: int = 1000
     bot_entity_radius_blocks: int = 32
     planner_task_name: str = "agent"
+    consciousness_enabled: bool = True
+    consciousness_task_name: str = "agent"
+    consciousness_subject_context_max_bytes: int = 16384
+    consciousness_observation_max_bytes: int = 16384
+    consciousness_subconscious_max_bytes: int = 8192
+    consciousness_subconscious_group_limit: int = 5
+    consciousness_min_wait_seconds: float = 2.0
+    consciousness_max_wait_seconds: float = 45.0
+    consciousness_retry_base_seconds: float = 2.0
+    consciousness_retry_max_seconds: float = 30.0
+    consciousness_recent_turn_limit: int = 6
+    consciousness_stop_timeout_seconds: float = 10.0
+    max_session_minutes: int = 60
     bridge_ready_timeout_seconds: float = 240.0
     world_ready_timeout_seconds: float = 120.0
     intent_timeout_seconds: float | None = 300.0
@@ -104,7 +117,9 @@ class MCConfig:
         ):
             raise ValueError("bot_token_file must remain workspace-relative")
         if not re.fullmatch(r"[A-Za-z0-9_]{1,16}", self.bot_username):
-            raise ValueError("bot_username must match the Minecraft account-name contract")
+            raise ValueError(
+                "bot_username must match the Minecraft account-name contract"
+            )
         if not 1 <= self.bot_server_port <= 65535:
             raise ValueError("bot_server_port must be between 1 and 65535")
         if self.bot_observation_interval_ms <= 0:
@@ -113,6 +128,39 @@ class MCConfig:
             raise ValueError("bot_entity_radius_blocks must be positive")
         if self.game_turn_interval_seconds <= 0:
             raise ValueError("game_turn_interval_seconds must be positive")
+        if not self.consciousness_task_name.strip():
+            raise ValueError("consciousness_task_name must not be empty")
+        if self.consciousness_subject_context_max_bytes < 8192:
+            raise ValueError(
+                "consciousness_subject_context_max_bytes must be at least 8192"
+            )
+        if self.consciousness_observation_max_bytes < 4096:
+            raise ValueError(
+                "consciousness_observation_max_bytes must be at least 4096"
+            )
+        if self.consciousness_subconscious_max_bytes < 1024:
+            raise ValueError(
+                "consciousness_subconscious_max_bytes must be at least 1024"
+            )
+        if self.consciousness_subconscious_group_limit <= 0:
+            raise ValueError("consciousness_subconscious_group_limit must be positive")
+        if (
+            self.consciousness_min_wait_seconds <= 0
+            or self.consciousness_max_wait_seconds < self.consciousness_min_wait_seconds
+        ):
+            raise ValueError("Minecraft consciousness wait bounds are invalid")
+        if (
+            self.consciousness_retry_base_seconds <= 0
+            or self.consciousness_retry_max_seconds
+            < self.consciousness_retry_base_seconds
+        ):
+            raise ValueError("Minecraft consciousness retry bounds are invalid")
+        if self.consciousness_recent_turn_limit <= 0:
+            raise ValueError("consciousness_recent_turn_limit must be positive")
+        if self.consciousness_stop_timeout_seconds <= 0:
+            raise ValueError("consciousness_stop_timeout_seconds must be positive")
+        if self.max_session_minutes <= 0:
+            raise ValueError("max_session_minutes must be positive")
 
 
 @dataclass(slots=True)
@@ -343,7 +391,9 @@ class MinecraftLauncher:
         pure = PureWindowsPath(windows_path)
         drive = pure.drive[:1].lower()
         if not drive:
-            raise ValueError(f"launch_bat must be an absolute drive path: {windows_path}")
+            raise ValueError(
+                f"launch_bat must be an absolute drive path: {windows_path}"
+            )
         return Path(f"/mnt/{drive}") / Path(*pure.parts[1:])
 
     def prepare_shared_world_bat(self) -> PureWindowsPath:
@@ -362,7 +412,7 @@ class MinecraftLauncher:
         address = f"{host}:{self._cfg.bot_server_port}"
 
         multiplayer, replaced = re.subn(
-            r'''--quickPlaySingleplayer(?:=|\s+)(?:"[^"]*"|'[^']*'|\S+)''',
+            r"""--quickPlaySingleplayer(?:=|\s+)(?:"[^"]*"|'[^']*'|\S+)""",
             f'--quickPlayMultiplayer "{address}"',
             template,
             count=1,

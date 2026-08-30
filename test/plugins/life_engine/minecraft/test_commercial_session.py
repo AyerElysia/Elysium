@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import plugins.life_engine.minecraft.session as session_module
+from plugins.life_engine.minecraft.consciousness import (
+    MinecraftConsciousnessDecision,
+    MinecraftConsciousnessTurnContext,
+)
 from plugins.life_engine.minecraft.embodiment_contracts import (
     ActionCommand,
     ActionReceipt,
@@ -27,6 +33,12 @@ from plugins.life_engine.service.consciousness import ConsciousnessRegistry
 from plugins.life_engine.service.subconscious_context import RecentSubconsciousContext
 
 
+def _body_only_config(**kwargs: Any) -> MCConfig:
+    """Keep legacy body tests separate from the new scene-runtime contract."""
+
+    return MCConfig(consciousness_enabled=False, **kwargs)
+
+
 def _recent_subconscious(content: str) -> RecentSubconsciousContext:
     """Create one bounded recent-subconscious projection for session tests."""
 
@@ -44,6 +56,31 @@ def _recent_subconscious(content: str) -> RecentSubconsciousContext:
         projection_sha256=digest,
         truncated=True,
     )
+
+
+def _minecraft_subject_snapshot() -> dict[str, Any]:
+    """Return one valid immutable subject projection for integration tests."""
+
+    text = "# Subject Context Projection\n\nElysia stays one continuing subject."
+    encoded = text.encode("utf-8")
+    return {
+        "text": text,
+        "source_digest": "1" * 64,
+        "projection_sha256": sha256(encoded).hexdigest(),
+        "projection_version": 4,
+        "projection_algorithm": "llm_semantic_subject_continuity",
+        "projection_profile": "minecraft",
+        "authority": "derived_non_authoritative",
+        "sources": [
+            {"path": "SOUL.md", "sha256": "2" * 64},
+            {"path": "USER.md", "sha256": "3" * 64},
+            {"path": "MEMORY.md", "sha256": "4" * 64},
+        ],
+        "budget": {
+            "max_bytes": 16384,
+            "delivered_bytes": len(encoded),
+        },
+    }
 
 
 class _Launcher:
@@ -247,6 +284,36 @@ class _Planner:
         )
 
 
+class _AutonomousDecisionSource:
+    """Choose one intention without waiting for an external chat turn."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def decide(
+        self,
+        context: MinecraftConsciousnessTurnContext,
+    ) -> MinecraftConsciousnessDecision:
+        self.calls += 1
+        if self.calls == 1:
+            return MinecraftConsciousnessDecision(
+                decision_id="minecraft_decision_" + "a" * 64,
+                kind="pursue",
+                turn_index=context.turn_index,
+                authored_at=utc_now(),
+                intention="走到附近高处看看，然后确认同伴还在身边",
+                reason="我想先熟悉我们周围的地方",
+            )
+        return MinecraftConsciousnessDecision(
+            decision_id=f"minecraft_wait_{context.turn_index}",
+            kind="wait",
+            turn_index=context.turn_index,
+            authored_at=utc_now(),
+            reason="刚完成一件事，先看看世界接下来有什么变化",
+            reconsider_after_seconds=30.0,
+        )
+
+
 class _AsyncRegistry:
     """Expose the synchronous registry through awaitable Presence callbacks."""
 
@@ -296,7 +363,7 @@ async def _started_session(
         return _recent_subconscious("shared-subconscious")
 
     bridge = _Bridge()
-    config = MCConfig(mc_home=tmp_path, bridge_ready_timeout_seconds=1)
+    config = _body_only_config(mc_home=tmp_path, bridge_ready_timeout_seconds=1)
     session = MinecraftSession(
         workspace=tmp_path,
         mc_config=config,
@@ -315,6 +382,138 @@ async def _started_session(
     result = await session.start(goal="walk together", body_name="agent")
     assert result["success"] is True
     return session, bridge, registry, observations
+
+
+async def test_dedicated_consciousness_runs_observe_decide_act_without_chat(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    """The production session closes a full autonomous scene loop on its own."""
+
+    order: list[str] = []
+    decisions: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    world_receipts: list[dict[str, Any]] = []
+    acted = asyncio.Event()
+
+    class _RecordingBridge(_Bridge):
+        async def act(self, command: ActionCommand) -> ActionReceipt:
+            order.append(f"act:{command.operation}")
+            acted.set()
+            return await super().act(command)
+
+    async def subject_projection(**kwargs: Any) -> dict[str, Any]:
+        assert kwargs == {"projection_kind": "minecraft", "max_bytes": 16384}
+        return _minecraft_subject_snapshot()
+
+    async def recent_subconscious(**kwargs: Any) -> RecentSubconsciousContext:
+        assert kwargs == {"group_limit": 5, "max_bytes": 8192}
+        return _recent_subconscious("刚才还在聊天，现在我来到 Minecraft。")
+
+    async def record_decision(
+        decision: dict[str, Any],
+        context_reference: dict[str, Any],
+    ) -> None:
+        order.append(f"record:{decision['decision_id']}")
+        decisions.append((decision, context_reference))
+
+    async def report_world(report: str, **kwargs: Any) -> dict[str, str]:
+        world_receipts.append({"report": report, **kwargs})
+        return {"assertion_id": f"assertion-{len(world_receipts)}"}
+
+    bridge = _RecordingBridge()
+    planner = _Planner()
+    decision_source = _AutonomousDecisionSource()
+    monkeypatch.setattr(session_module, "JsonIntentPlanner", lambda *_args: planner)
+    config = MCConfig(
+        mc_home=tmp_path,
+        bridge_ready_timeout_seconds=1,
+        consciousness_retry_base_seconds=0.01,
+        consciousness_retry_max_seconds=0.02,
+    )
+    session = MinecraftSession(
+        workspace=tmp_path,
+        mc_config=config,
+        consciousness_registry=ConsciousnessRegistry(),
+        get_recent_subconscious_context=recent_subconscious,
+        get_subject_context_projection_snapshot=subject_projection,
+        record_minecraft_consciousness_decision=record_decision,
+        report_world_observation=report_world,
+        consciousness_decision_source=decision_source,
+    )
+    session._launcher = _Launcher()
+
+    async def wait_for_bridge(_profile: Any) -> _RecordingBridge:
+        return bridge
+
+    session._wait_for_bridge = wait_for_bridge
+    started = await session.start(goal="一起随便探索", body_name="agent")
+    assert started["success"] is True, started
+    try:
+        await asyncio.wait_for(acted.wait(), timeout=2.0)
+    except TimeoutError as exception:
+        raise AssertionError(
+            {"status": await session.get_status(), "order": order}
+        ) from exception
+    for _ in range(100):
+        status = await session.get_status()
+        if status["consciousness"]["recent_outcome_count"] >= 1:
+            break
+        await asyncio.sleep(0.01)
+    stopped = await session.stop()
+
+    assert stopped["success"] is True
+    assert decisions
+    assert order[0].startswith("record:minecraft_decision_")
+    assert order[1] == "act:modded.operation"
+    assert decisions[0][0]["intention"] == ("走到附近高处看看，然后确认同伴还在身边")
+    context_json = json.dumps(decisions[0][1], ensure_ascii=False)
+    assert "Subject Context Projection" not in context_json
+    assert "刚才还在聊天" not in context_json
+    assert decisions[0][1]["perception"]["observation"]["observation_id"]
+    records = await session._trace.verify()
+    kinds = [record.kind for record in records]
+    assert "observation" in kinds
+    assert "intent.issued" in kinds
+    assert "command.receipt" in kinds
+    assert "intent.conclusion" in kinds
+    trace_receipts = [
+        item["value"]
+        for item in world_receipts
+        if item.get("predicate") == "embodied_trace"
+    ]
+    assert trace_receipts
+    assert all(
+        len(json.dumps(item, ensure_ascii=False).encode("utf-8")) <= 8192
+        for item in trace_receipts
+    )
+
+
+async def test_subject_binding_failure_happens_before_body_launch(
+    tmp_path: Path,
+) -> None:
+    """A scene without the unified subject authority must not acquire a body."""
+
+    class _CountingLauncher(_Launcher):
+        launch_calls = 0
+
+        async def launch(self) -> LaunchResult:
+            self.launch_calls += 1
+            return await super().launch()
+
+    launcher = _CountingLauncher()
+    session = MinecraftSession(
+        workspace=tmp_path,
+        mc_config=MCConfig(mc_home=tmp_path),
+        consciousness_registry=ConsciousnessRegistry(),
+    )
+    session._launcher = launcher
+
+    result = await session.start(goal="一起玩", body_name="agent")
+
+    assert result["success"] is False
+    assert "requires the subject projection service" in result["error"]
+    assert launcher.launch_calls == 0
+    assert session.state.active is False
 
 
 async def test_session_registers_and_terminates_independent_consciousness(
@@ -374,7 +573,7 @@ async def test_session_awaits_async_presence_lifecycle_callbacks(
     bridge = _Bridge()
     session = MinecraftSession(
         workspace=tmp_path,
-        mc_config=MCConfig(mc_home=tmp_path, bridge_ready_timeout_seconds=1),
+        mc_config=_body_only_config(mc_home=tmp_path, bridge_ready_timeout_seconds=1),
         consciousness_registry=registry,
         save_consciousness_registry=save_registry,
     )
@@ -416,7 +615,7 @@ async def test_session_resumes_expired_presence_on_real_body_activity(
     bridge = _Bridge()
     session = MinecraftSession(
         workspace=tmp_path,
-        mc_config=MCConfig(mc_home=tmp_path, bridge_ready_timeout_seconds=1),
+        mc_config=_body_only_config(mc_home=tmp_path, bridge_ready_timeout_seconds=1),
         consciousness_registry=registry,
         save_consciousness_registry=save_registry,
     )
@@ -450,7 +649,7 @@ async def test_session_reports_async_presence_touch_failure(
     bridge = _Bridge()
     session = MinecraftSession(
         workspace=tmp_path,
-        mc_config=MCConfig(mc_home=tmp_path, bridge_ready_timeout_seconds=1),
+        mc_config=_body_only_config(mc_home=tmp_path, bridge_ready_timeout_seconds=1),
         consciousness_registry=registry,
     )
     session._launcher = _Launcher()
@@ -484,7 +683,7 @@ async def test_session_cleans_up_when_async_presence_save_fails(
 
     session = MinecraftSession(
         workspace=tmp_path,
-        mc_config=MCConfig(mc_home=tmp_path, bridge_ready_timeout_seconds=1),
+        mc_config=_body_only_config(mc_home=tmp_path, bridge_ready_timeout_seconds=1),
         consciousness_registry=registry,
         save_consciousness_registry=save_registry,
     )
@@ -517,7 +716,7 @@ async def test_session_awaits_async_recent_subconscious_context(
     bridge = _Bridge()
     session = MinecraftSession(
         workspace=tmp_path,
-        mc_config=MCConfig(mc_home=tmp_path, bridge_ready_timeout_seconds=1),
+        mc_config=_body_only_config(mc_home=tmp_path, bridge_ready_timeout_seconds=1),
         get_recent_subconscious_context=get_recent_subconscious_context,
     )
     session._launcher = _Launcher()
@@ -553,7 +752,7 @@ async def test_session_reports_recent_subconscious_failure(
     bridge = _Bridge()
     session = MinecraftSession(
         workspace=tmp_path,
-        mc_config=MCConfig(mc_home=tmp_path, bridge_ready_timeout_seconds=1),
+        mc_config=_body_only_config(mc_home=tmp_path, bridge_ready_timeout_seconds=1),
         get_recent_subconscious_context=get_recent_subconscious_context,
     )
     session._launcher = _Launcher()
@@ -585,7 +784,7 @@ async def test_session_rejects_invalid_recent_subconscious_contract(
     bridge = _Bridge()
     session = MinecraftSession(
         workspace=tmp_path,
-        mc_config=MCConfig(mc_home=tmp_path, bridge_ready_timeout_seconds=1),
+        mc_config=_body_only_config(mc_home=tmp_path, bridge_ready_timeout_seconds=1),
         get_recent_subconscious_context=get_recent_subconscious_context,
     )
     session._launcher = _Launcher()
@@ -615,7 +814,7 @@ async def test_preflight_rejects_launcher_without_exact_quick_play(
     token_file.write_text('{"authentication_token":"secret"}', encoding="utf-8")
     session = MinecraftSession(
         workspace=tmp_path,
-        mc_config=MCConfig(
+        mc_config=_body_only_config(
             mc_home=tmp_path,
             agent_token_file=token_file,
             shared_world_enabled=False,
@@ -638,7 +837,7 @@ async def test_agent_preflight_allows_first_launch_to_create_token(
     token_file = tmp_path / "not-created-yet.json"
     session = MinecraftSession(
         workspace=tmp_path,
-        mc_config=MCConfig(mc_home=tmp_path, agent_token_file=token_file),
+        mc_config=_body_only_config(mc_home=tmp_path, agent_token_file=token_file),
     )
     session._launcher = _Launcher()
 
@@ -656,7 +855,7 @@ async def test_preflight_reports_windows_bridge_failure(tmp_path: Path) -> None:
     token_file.write_text('{"authentication_token":"secret"}', encoding="utf-8")
     session = MinecraftSession(
         workspace=tmp_path,
-        mc_config=MCConfig(mc_home=tmp_path, agent_token_file=token_file),
+        mc_config=_body_only_config(mc_home=tmp_path, agent_token_file=token_file),
     )
     session._launcher = _BrokenWindowLauncher()
 
@@ -672,7 +871,7 @@ async def test_session_rejects_authenticated_title_screen(tmp_path: Path) -> Non
     bridge = _TitleScreenBridge()
     session = MinecraftSession(
         workspace=tmp_path,
-        mc_config=MCConfig(
+        mc_config=_body_only_config(
             mc_home=tmp_path,
             bridge_ready_timeout_seconds=1,
             world_ready_timeout_seconds=0.01,
@@ -700,7 +899,7 @@ async def test_session_rejects_wrong_singleplayer_world(tmp_path: Path) -> None:
     bridge = _WrongWorldBridge()
     session = MinecraftSession(
         workspace=tmp_path,
-        mc_config=MCConfig(
+        mc_config=_body_only_config(
             mc_home=tmp_path,
             bridge_ready_timeout_seconds=1,
             world_ready_timeout_seconds=0.01,
@@ -726,7 +925,7 @@ async def test_session_rejects_paused_singleplayer_world(tmp_path: Path) -> None
     bridge = _PausedWorldBridge()
     session = MinecraftSession(
         workspace=tmp_path,
-        mc_config=MCConfig(
+        mc_config=_body_only_config(
             mc_home=tmp_path,
             bridge_ready_timeout_seconds=1,
             world_ready_timeout_seconds=0.01,
@@ -758,7 +957,7 @@ async def test_session_rejects_missing_capability_and_bridge_version(
     )
     session = MinecraftSession(
         workspace=tmp_path,
-        mc_config=MCConfig(mc_home=tmp_path, bridge_ready_timeout_seconds=1),
+        mc_config=_body_only_config(mc_home=tmp_path, bridge_ready_timeout_seconds=1),
     )
     session._launcher = _Launcher()
 
@@ -774,7 +973,7 @@ async def test_session_rejects_missing_capability_and_bridge_version(
     stale.hello_metadata = {"bridge_version": "0.1.0"}
     session = MinecraftSession(
         workspace=tmp_path,
-        mc_config=MCConfig(mc_home=tmp_path, bridge_ready_timeout_seconds=1),
+        mc_config=_body_only_config(mc_home=tmp_path, bridge_ready_timeout_seconds=1),
     )
     session._launcher = _Launcher()
 
@@ -809,7 +1008,7 @@ async def test_failed_body_release_remains_retryable(tmp_path: Path) -> None:
     bridge = _FlakyCloseBridge()
     session = MinecraftSession(
         workspace=tmp_path,
-        mc_config=MCConfig(mc_home=tmp_path, bridge_ready_timeout_seconds=1),
+        mc_config=_body_only_config(mc_home=tmp_path, bridge_ready_timeout_seconds=1),
     )
     session._launcher = _Launcher()
 
@@ -933,7 +1132,7 @@ async def test_shared_world_preflight_skips_singleplayer_quick_play(
     token_file.write_text('{"authentication_token":"secret"}', encoding="utf-8")
     session = MinecraftSession(
         workspace=tmp_path,
-        mc_config=MCConfig(
+        mc_config=_body_only_config(
             mc_home=tmp_path,
             agent_token_file=token_file,
             shared_world_enabled=True,
@@ -955,12 +1154,12 @@ async def test_shared_world_agent_readiness_uses_server_semantics(
 
     session = MinecraftSession(
         workspace=tmp_path,
-        mc_config=MCConfig(mc_home=tmp_path, shared_world_enabled=True),
+        mc_config=_body_only_config(mc_home=tmp_path, shared_world_enabled=True),
     )
     assert session._body_profiles()["agent"].readiness_kind == "server_world"
 
     solo = MinecraftSession(
         workspace=tmp_path,
-        mc_config=MCConfig(mc_home=tmp_path, shared_world_enabled=False),
+        mc_config=_body_only_config(mc_home=tmp_path, shared_world_enabled=False),
     )
     assert solo._body_profiles()["agent"].readiness_kind == "structured_world"

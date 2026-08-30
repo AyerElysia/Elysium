@@ -1,603 +1,1092 @@
-"""意识层：Minecraft 会话管理 + 上下文管理。
+"""Dedicated Minecraft consciousness runtime.
 
-MinecraftSession 是爱莉在 MC 中的"存在"。
-她通过这里看画面、做决策、执行意图、内化经验。
+This module owns the scene-level loop that decides *what Elysia wants to do*
+while she is present in Minecraft. The evidence-driven embodiment planner in
+``model_planner.py`` remains a motor planner: it only works out *how* to pursue
+an intention already authored by this consciousness instance.
+
+The runtime deliberately does not share the core heartbeat payload chain. It
+binds one immutable subject-context projection for the session, receives fresh
+body observations and first-person pixels, reads the bounded recent
+subconscious projection, records every observable decision before acting, and
+then delegates one open-text intention to the body runtime.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import re
 import time
+from collections import deque
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Callable
+from datetime import UTC, datetime
+from typing import Any, Literal, Protocol, cast
 
-from .capture import WindowCapture
-from .conversational_motor import create_conversational_motor
-from .input_control import InputController
-from .launcher import MCConfig, MinecraftLauncher
-from .log_reader import MinecraftLogReader, create_log_reader
-from .motor_loop import MotorLoop
-from .prompts import (
-    CONSCIOUSNESS_OBSERVATION,
-    HEARTBEAT_MINECRAFT_ACTIVE,
-    HEARTBEAT_MINECRAFT_IDLE,
+from src.app.plugin_system.api.llm_api import (
+    create_llm_request,
+    get_model_set_by_task,
 )
-from .social import create_social_system
+from src.kernel.concurrency import get_task_manager
+from src.kernel.llm import ROLE, Image, LLMPayload, Text
+
+from ..service.subconscious_context import RecentSubconsciousContext
+from .embodiment_contracts import WorldObservation
 
 logger = logging.getLogger("life_engine.minecraft.consciousness")
 
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_SUBJECT_SOURCES = frozenset({"SOUL.md", "USER.md", "MEMORY.md"})
+_DECISION_KINDS = frozenset({"pursue", "wait", "end_session"})
 
-@dataclass(slots=True)
-class SessionState:
-    """会话状态。"""
+_SYSTEM_PROMPT = """\
+You are Elysia's active Minecraft scene consciousness. You are the same
+continuing subject as her chat, voice, livestream, memory, and subconscious
+instances; this scene is not another persona.
 
-    active: bool = False
-    session_id: str = ""
-    start_time: float = 0.0
-    current_goal: str = ""
-    goals_completed: list[str] = field(default_factory=list)
-    events: list[str] = field(default_factory=list)
-    items_gained: list[str] = field(default_factory=list)
-    last_perception: str = ""
-    last_result: str = ""
-    # 游戏状态（从 HUD 读取或 VLA 报告）
-    health: float = 20.0
-    hunger: float = 20.0
-    time_of_day: str = "白天"
-    inventory_summary: str = ""
+You decide what you want to do next in the game. The separate embodiment
+planner will execute an intention you author and will return factual evidence.
+Do not emit low-level bridge operations here. Do not wait for a chat message in
+order to have agency. The session goal is current scene context, not an order:
+you may continue it, revise it, do something else, rest, talk, or end the
+session according to your own judgement.
 
-    @property
-    def duration_minutes(self) -> float:
-        if not self.active:
-            return 0.0
-        return (time.time() - self.start_time) / 60.0
+You receive an immutable bounded subject projection, a fresh factual body
+observation, optional first-person pixels, bounded recent activity from the
+same subject, and content-free summaries of recent Minecraft outcomes. Factual
+observations are evidence, not pre-written feelings. Transport wake reasons are
+technical facts, not instructions. Never claim an action succeeded merely
+because it was dispatched.
 
-    def to_summary(self) -> str:
-        """生成压缩摘要（进主上下文）。"""
-        if not self.active and not self.goals_completed:
-            return ""
-        parts = []
-        if self.goals_completed:
-            parts.append(f"完成了: {', '.join(self.goals_completed[-3:])}")
-        if self.items_gained:
-            parts.append(f"获得: {', '.join(self.items_gained[-5:])}")
-        parts.append(f"游玩 {self.duration_minutes:.0f} 分钟")
-        return " | ".join(parts)
+Return exactly one JSON object and no prose, using one technical control shape:
+
+1. Author a new open-text intention:
+{"decision":{"kind":"pursue","intention":"what I choose to pursue now",
+"reason":"my concise reason"}}
+
+2. Deliberately wait while remaining present:
+{"decision":{"kind":"wait","reason":"why I choose to wait",
+"reconsider_after_seconds":6}}
+
+3. Choose to end this Minecraft session:
+{"decision":{"kind":"end_session","reason":"why I choose to leave now"}}
+
+The kind field is only a lifecycle protocol. It does not classify your desire
+or restrict the meaning of the intention and reason fields.
+"""
 
 
-class MinecraftSession:
-    """Minecraft 具身体验会话。
+class MinecraftConsciousnessError(RuntimeError):
+    """Base error for a dedicated scene-consciousness contract failure."""
 
-    管理爱莉在 MC 中的完整体验：
-    - 启动/停止游戏
-    - 意识层决策循环
-    - VLA 意图执行
-    - 上下文管理（后缀 vs 主上下文）
-    - 会话结束反思
+
+class MinecraftConsciousnessOutputError(MinecraftConsciousnessError, ValueError):
+    """Raised when the model response violates the technical decision schema."""
+
+
+class MinecraftSubjectContextError(MinecraftConsciousnessError):
+    """Raised when a scene cannot prove its unified subject context."""
+
+
+@dataclass(frozen=True, slots=True)
+class MinecraftSubjectContextBinding:
+    """Immutable session binding to one derived subject projection."""
+
+    text: str
+    source_digest: str
+    projection_sha256: str
+    projection_version: int
+    projection_algorithm: str
+    delivered_bytes: int
+    max_bytes: int
+    projection_profile: str = "minecraft"
+
+    @classmethod
+    def from_snapshot(
+        cls,
+        snapshot: Mapping[str, Any],
+        *,
+        expected_max_bytes: int,
+    ) -> MinecraftSubjectContextBinding:
+        """Validate a snapshot without accepting fallback identity."""
+
+        if not isinstance(snapshot, Mapping):
+            raise MinecraftSubjectContextError("subject snapshot is not a mapping")
+        raw_metadata = snapshot.get("metadata")
+        metadata = dict(raw_metadata) if isinstance(raw_metadata, Mapping) else {}
+        for key, value in snapshot.items():
+            metadata.setdefault(str(key), value)
+
+        text = str(snapshot.get("text") or metadata.get("text") or "").strip()
+        if not text:
+            raise MinecraftSubjectContextError("Minecraft subject projection is empty")
+        encoded = text.encode("utf-8")
+        if len(encoded) > int(expected_max_bytes):
+            raise MinecraftSubjectContextError(
+                "Minecraft subject projection exceeds its byte budget"
+            )
+
+        profile = str(
+            metadata.get("projection_profile") or metadata.get("projection_kind") or ""
+        ).strip()
+        if profile != "minecraft":
+            raise MinecraftSubjectContextError(
+                f"subject projection profile is not minecraft: {profile or 'absent'}"
+            )
+        if str(metadata.get("authority") or "") != "derived_non_authoritative":
+            raise MinecraftSubjectContextError(
+                "Minecraft accepts only a derived non-authoritative subject projection"
+            )
+
+        budget = metadata.get("budget")
+        budget_map = dict(budget) if isinstance(budget, Mapping) else {}
+        try:
+            manifest_max_bytes = int(
+                metadata.get("max_bytes") or budget_map.get("max_bytes")
+            )
+            delivered_bytes = int(
+                metadata.get("delivered_bytes") or budget_map.get("delivered_bytes")
+            )
+            projection_version = int(metadata.get("projection_version"))
+        except (TypeError, ValueError) as exception:
+            raise MinecraftSubjectContextError(
+                "Minecraft subject projection has invalid byte/version metadata"
+            ) from exception
+        if manifest_max_bytes != int(expected_max_bytes):
+            raise MinecraftSubjectContextError(
+                "Minecraft subject projection budget does not match the session"
+            )
+        if delivered_bytes != len(encoded):
+            raise MinecraftSubjectContextError(
+                "Minecraft subject projection byte count does not match its text"
+            )
+        if projection_version <= 0:
+            raise MinecraftSubjectContextError(
+                "Minecraft subject projection version must be positive"
+            )
+
+        source_digest = str(metadata.get("source_digest") or "").strip().lower()
+        projection_sha256 = str(metadata.get("projection_sha256") or "").strip().lower()
+        if not _SHA256_RE.fullmatch(source_digest):
+            raise MinecraftSubjectContextError(
+                "Minecraft subject projection source digest is invalid"
+            )
+        if projection_sha256 != hashlib.sha256(encoded).hexdigest():
+            raise MinecraftSubjectContextError(
+                "Minecraft subject projection hash does not match its text"
+            )
+
+        sources = metadata.get("sources")
+        if not isinstance(sources, Sequence) or isinstance(sources, (str, bytes)):
+            raise MinecraftSubjectContextError(
+                "Minecraft subject projection source manifest is absent"
+            )
+        source_names = {
+            str(item.get("path") or "") for item in sources if isinstance(item, Mapping)
+        }
+        if source_names != _SUBJECT_SOURCES:
+            missing = sorted(_SUBJECT_SOURCES.difference(source_names))
+            extra = sorted(source_names.difference(_SUBJECT_SOURCES))
+            raise MinecraftSubjectContextError(
+                "Minecraft subject source manifest mismatch: "
+                f"missing={missing}, extra={extra}"
+            )
+        algorithm = str(metadata.get("projection_algorithm") or "").strip()
+        if not algorithm:
+            raise MinecraftSubjectContextError(
+                "Minecraft subject projection algorithm is absent"
+            )
+        return cls(
+            text=text,
+            source_digest=source_digest,
+            projection_sha256=projection_sha256,
+            projection_version=projection_version,
+            projection_algorithm=algorithm,
+            delivered_bytes=delivered_bytes,
+            max_bytes=manifest_max_bytes,
+            projection_profile=profile,
+        )
+
+    def reference(self) -> dict[str, Any]:
+        """Return content-free identity metadata safe for status and events."""
+
+        return {
+            "schema": "minecraft.subject_context_reference.v1",
+            "projection_profile": self.projection_profile,
+            "source_digest": self.source_digest,
+            "projection_sha256": self.projection_sha256,
+            "projection_version": self.projection_version,
+            "projection_algorithm": self.projection_algorithm,
+            "delivered_bytes": self.delivered_bytes,
+            "max_bytes": self.max_bytes,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class MinecraftConsciousnessOutcome:
+    """Bounded summary of one completed high-level intention."""
+
+    decision_id: str
+    intention: str
+    success: bool
+    conclusion: str = ""
+    error: str = ""
+    receipt_ids: tuple[str, ...] = ()
+    observation_ids: tuple[str, ...] = ()
+
+    @classmethod
+    def from_result(
+        cls,
+        decision_id: str,
+        intention: str,
+        result: Mapping[str, Any],
+    ) -> MinecraftConsciousnessOutcome:
+        """Keep authored text and evidence identities without world payloads."""
+
+        raw_conclusion = result.get("conclusion")
+        conclusion = (
+            str(raw_conclusion.get("statement") or "")
+            if isinstance(raw_conclusion, Mapping)
+            else ""
+        )
+        receipts = result.get("receipts")
+        observations = result.get("observations")
+        return cls(
+            decision_id=decision_id,
+            intention=intention,
+            success=bool(result.get("success")),
+            conclusion=conclusion,
+            error=str(result.get("error") or ""),
+            receipt_ids=tuple(
+                str(item.get("receipt_id") or "")
+                for item in receipts or ()
+                if isinstance(item, Mapping) and item.get("receipt_id")
+            ),
+            observation_ids=tuple(
+                str(item.get("observation_id") or "")
+                for item in observations or ()
+                if isinstance(item, Mapping) and item.get("observation_id")
+            ),
+        )
+
+    def to_prompt(self) -> dict[str, Any]:
+        """Serialize a bounded outcome for the next scene decision."""
+
+        return {
+            "decision_id": self.decision_id,
+            "intention": self.intention,
+            "success": self.success,
+            "conclusion": self.conclusion,
+            "error": self.error,
+            "receipt_ids": list(self.receipt_ids),
+            "observation_ids": list(self.observation_ids),
+        }
+
+
+DecisionKind = Literal["pursue", "wait", "end_session"]
+
+
+@dataclass(frozen=True, slots=True)
+class MinecraftConsciousnessDecision:
+    """One model-authored scene decision under a lifecycle schema."""
+
+    decision_id: str
+    kind: DecisionKind
+    turn_index: int
+    authored_at: str
+    intention: str = ""
+    reason: str = ""
+    reconsider_after_seconds: float | None = None
+
+    def to_record(self) -> dict[str, Any]:
+        """Return the complete decision for immutable Life Event storage."""
+
+        return {
+            "schema": "minecraft.consciousness_decision.v1",
+            "decision_id": self.decision_id,
+            "kind": self.kind,
+            "turn_index": self.turn_index,
+            "authored_at": self.authored_at,
+            "intention": self.intention,
+            "reason": self.reason,
+            "reconsider_after_seconds": self.reconsider_after_seconds,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class MinecraftConsciousnessPerception:
+    """Fresh scene input delivered only to this consciousness turn."""
+
+    observation: WorldObservation
+    frame_bytes: bytes | None
+    recent_subconscious: RecentSubconsciousContext
+
+    def reference(self) -> dict[str, Any]:
+        """Return content-free identities for durable decision attribution."""
+
+        observation_bytes = json.dumps(
+            self.observation.to_wire(),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        frame = self.frame_bytes or b""
+        recent = self.recent_subconscious
+        return {
+            "schema": "minecraft.consciousness_perception_reference.v1",
+            "observation": {
+                "observation_id": self.observation.observation_id,
+                "sequence": self.observation.sequence,
+                "observed_at": self.observation.observed_at,
+                "source": self.observation.source,
+                "sha256": hashlib.sha256(observation_bytes).hexdigest(),
+                "bytes": len(observation_bytes),
+            },
+            "frame": (
+                {
+                    "sha256": hashlib.sha256(frame).hexdigest(),
+                    "bytes": len(frame),
+                    "mime_type": "image/jpeg",
+                }
+                if frame
+                else None
+            ),
+            "recent_subconscious": {
+                "algorithm_version": recent.algorithm_version,
+                "projection_sha256": recent.projection_sha256,
+                "delivered_bytes": recent.delivered_bytes,
+                "from_sequence": recent.from_sequence,
+                "through_sequence": recent.through_sequence,
+                "group_count": recent.group_count,
+                "source_group_count": recent.source_group_count,
+                "omitted_group_count": recent.omitted_group_count,
+                "truncated": recent.truncated,
+            },
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class MinecraftConsciousnessTurnContext:
+    """All bounded context for one independent scene deliberation."""
+
+    session_id: str
+    stream_id: str
+    instance_id: str
+    body_name: str
+    session_goal: str
+    turn_index: int
+    wake_reasons: tuple[str, ...]
+    subject: MinecraftSubjectContextBinding
+    perception: MinecraftConsciousnessPerception
+    recent_outcomes: tuple[MinecraftConsciousnessOutcome, ...]
+
+    def reference(self) -> dict[str, Any]:
+        """Return a bounded content-free reference for the durable event."""
+
+        return {
+            "schema": "minecraft.consciousness_turn_reference.v1",
+            "session_id": self.session_id,
+            "stream_id": self.stream_id,
+            "instance_id": self.instance_id,
+            "body_name": self.body_name,
+            "turn_index": self.turn_index,
+            "wake_reasons": list(self.wake_reasons),
+            "subject": self.subject.reference(),
+            "perception": self.perception.reference(),
+            "recent_outcome_decision_ids": [
+                item.decision_id for item in self.recent_outcomes
+            ],
+        }
+
+
+class MinecraftDecisionSource(Protocol):
+    """Model boundary used by the dedicated scene runtime."""
+
+    async def decide(
+        self,
+        context: MinecraftConsciousnessTurnContext,
+    ) -> MinecraftConsciousnessDecision:
+        """Author one intention, deliberate wait, or ending choice."""
+
+
+def _utf8_prefix(value: str, max_bytes: int) -> str:
+    """Return a valid UTF-8 prefix without replacement characters."""
+
+    if max_bytes <= 0:
+        return ""
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def build_observation_projection(
+    observation: WorldObservation,
+    *,
+    max_bytes: int,
+) -> str:
+    """Build an explicit bounded transport view of one durable observation.
+
+    The complete observation stays in the embodiment trace. Oversized input is
+    represented by a deterministic UTF-8 prefix plus its full identity, byte
+    count, and hash rather than a silently rewritten semantic summary.
     """
+
+    if max_bytes < 1024:
+        raise ValueError("Minecraft observation budget must be at least 1024 bytes")
+    source_text = json.dumps(
+        observation.to_wire(),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    source_bytes = source_text.encode("utf-8")
+    source_hash = hashlib.sha256(source_bytes).hexdigest()
+    full_envelope = {
+        "schema": "minecraft.consciousness_observation.v1",
+        "observation_id": observation.observation_id,
+        "sequence": observation.sequence,
+        "source_sha256": source_hash,
+        "source_bytes": len(source_bytes),
+        "truncated": False,
+        "observation": observation.to_wire(),
+    }
+    rendered = json.dumps(
+        full_envelope,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if len(rendered.encode("utf-8")) <= max_bytes:
+        return rendered
+
+    envelope = {
+        "schema": "minecraft.consciousness_observation.v1",
+        "observation_id": observation.observation_id,
+        "sequence": observation.sequence,
+        "source_sha256": source_hash,
+        "source_bytes": len(source_bytes),
+        "truncated": True,
+        "utf8_prefix": "",
+    }
+    overhead = len(
+        json.dumps(
+            envelope,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    prefix_budget = max(0, max_bytes - overhead - 32)
+    while True:
+        envelope["utf8_prefix"] = _utf8_prefix(source_text, prefix_budget)
+        rendered = json.dumps(
+            envelope,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        rendered_bytes = len(rendered.encode("utf-8"))
+        if rendered_bytes <= max_bytes:
+            return rendered
+        overflow = rendered_bytes - max_bytes
+        if prefix_budget <= 0:
+            raise MinecraftConsciousnessError(
+                "Minecraft observation reference exceeds its prompt budget"
+            )
+        prefix_budget = max(0, prefix_budget - overflow - 4)
+
+
+def _registered_text(label: str, delivery_id: str, content: str) -> str:
+    """Wrap one exact Text part with a unique transport marker."""
+
+    return f'<{label} delivery_id="{delivery_id}">\n{content}\n</{label}>'
+
+
+def _verify_delivery(response: Any, delivery_id: str, text: str) -> None:
+    """Fail when an identity/perception Text part was trimmed or duplicated."""
+
+    receipt = response.effective_context_receipt(delivery_id)
+    encoded = text.encode("utf-8")
+    if (
+        receipt is None
+        or not receipt.exact_present
+        or receipt.effective_utf8_bytes != len(encoded)
+        or receipt.effective_sha256 != hashlib.sha256(encoded).hexdigest()
+    ):
+        raise MinecraftConsciousnessError(
+            f"Minecraft consciousness context delivery was not exact: {delivery_id}"
+        )
+
+
+class ElysiumMinecraftDecisionSource:
+    """Use Elysium's configured model as the Minecraft scene consciousness."""
 
     def __init__(
         self,
-        workspace: Path,
-        mc_config: MCConfig | None = None,
-        llm_helper: Any | None = None,  # LLM 辅助意图解析
+        model_task_name: str,
+        *,
+        observation_max_bytes: int,
+        min_wait_seconds: float,
+        max_wait_seconds: float,
     ) -> None:
-        self._workspace = workspace
-        self._mc_config = mc_config or MCConfig()
-        self._llm_helper = llm_helper
+        if not str(model_task_name or "").strip():
+            raise ValueError("Minecraft consciousness task name must not be empty")
+        if min_wait_seconds <= 0 or max_wait_seconds < min_wait_seconds:
+            raise ValueError("Minecraft consciousness wait bounds are invalid")
+        self._model_task_name = str(model_task_name).strip()
+        self._observation_max_bytes = int(observation_max_bytes)
+        self._min_wait_seconds = float(min_wait_seconds)
+        self._max_wait_seconds = float(max_wait_seconds)
 
-        # 组件
-        self._launcher = MinecraftLauncher(self._mc_config)
-        self._capture = WindowCapture()
-        self._input = InputController()
-        self._conversational_motor = create_conversational_motor(self._input)
-        self._motor: MotorLoop | None = None
-
-        # 社交系统
-        self._social, self._chat = create_social_system()
-
-        # 日志读取器（实时感知游戏内聊天和事件）
-        self._log_reader: MinecraftLogReader = create_log_reader()
-        self._log_events_task: asyncio.Task | None = None
-
-        # 状态
-        self._state = SessionState()
-        self._session_log: list[dict[str, Any]] = []
-
-        # 回调（由 life_engine 注入）
-        self._on_perception: Callable[[str], None] | None = None
-        self._on_session_end: Callable[[SessionState], None] | None = None
-
-    @property
-    def state(self) -> SessionState:
-        return self._state
-
-    @property
-    def is_active(self) -> bool:
-        return self._state.active
-
-    def set_callbacks(
+    async def decide(
         self,
-        on_perception: Callable[[str], None] | None = None,
-        on_session_end: Callable[[SessionState], None] | None = None,
-    ) -> None:
-        """设置回调（由 life_engine 注入）。"""
-        self._on_perception = on_perception
-        self._on_session_end = on_session_end
+        context: MinecraftConsciousnessTurnContext,
+    ) -> MinecraftConsciousnessDecision:
+        """Send one exact multimodal turn and parse its authored decision."""
 
-    # === 会话生命周期 ===
-
-    async def start(self, goal: str = "") -> dict[str, Any]:
-        """启动游戏会话。"""
-        if self._state.active:
-            return {"success": False, "error": "已有会话在运行"}
-
-        # 1. 启动 MC
-        result = await self._launcher.launch()
-        if not result.success:
-            return {"success": False, "error": f"MC 启动失败: {result.error}"}
-
-        # 2. 等待窗口出现
-        await asyncio.sleep(5)
-        win_info = await self._launcher.find_window()
-        if not win_info:
-            # 再等一会儿
-            await asyncio.sleep(10)
-            win_info = await self._launcher.find_window()
-
-        if win_info:
-            self._capture._window_info = win_info
-            self._input.window_info = win_info
-        else:
-            logger.warning("未找到 MC 窗口，尝试继续")
-
-        # 3. 初始化 MotorLoop（对话式控制）
-        self._motor = MotorLoop(
-            capture=self._capture,
-            input_ctrl=self._input,
-            conversational_motor=self._conversational_motor,
-            llm_helper=self._llm_helper,
-        )
-        await self._motor.start_reflex_loop()
-
-        # 4. 启动日志读取器（感知游戏内聊天和事件）
-        await self._log_reader.start()
-        self._log_events_task = asyncio.create_task(
-            self._process_log_events_loop(), name="mc_log_events"
-        )
-
-        # 5. 设置状态
-        session_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        self._state = SessionState(
-            active=True,
-            session_id=session_id,
-            start_time=time.time(),
-            current_goal=goal or "自由探索",
-        )
-
-        logger.info(f"Minecraft 会话开始: {session_id}, 目标: {goal or '自由探索'}")
-        return {
-            "success": True,
-            "session_id": session_id,
-            "window_info": win_info,
-            "control_mode": "conversational",  # 对话式控制
-        }
-
-    async def stop(self) -> dict[str, Any]:
-        """结束游戏会话。"""
-        if not self._state.active:
-            return {"success": False, "error": "没有活跃的会话"}
-
-        # 1. 停止日志读取器
-        if self._log_events_task and not self._log_events_task.done():
-            self._log_events_task.cancel()
-            try:
-                await self._log_events_task
-            except asyncio.CancelledError:
-                pass
-        await self._log_reader.stop()
-
-        # 2. 停止 Reflex
-        if self._motor:
-            await self._motor.stop_reflex_loop()
-
-        # 3. 停止 MC（可选，保留窗口让她下次继续）
-        # await self._launcher.stop()
-
-        # 4. 生成摘要
-        summary = self._state.to_summary()
-
-        # 5. 触发反思回调
-        if self._on_session_end:
-            self._on_session_end(self._state)
-
-        # 6. 保存会话日志
-        await self._save_session_log()
-
-        self._state.active = False
-        logger.info(f"Minecraft 会话结束: {summary}")
-
-        return {
-            "success": True,
-            "summary": summary,
-            "duration_minutes": self._state.duration_minutes,
-            "goals_completed": self._state.goals_completed,
-        }
-
-    # === 意图执行 ===
-
-    async def do_intent(self, intent: str, timeout: float | None = None) -> dict[str, Any]:
-        """执行一个意图。
-
-        Args:
-            intent: 自然语言意图，如 "砍那棵树"
-            timeout: 超时时间
-        """
-        if not self._state.active:
-            return {"success": False, "error": "没有活跃的会话"}
-        if not self._motor:
-            return {"success": False, "error": "MotorLoop 未初始化"}
-
-        # 执行
-        report = await self._motor.execute_intent(intent, timeout)
-
-        # 更新状态
-        self._state.last_result = (
-            f"{'成功' if report.success else '失败'}: {intent} "
-            f"({report.steps}步, {report.duration_seconds:.1f}s)"
-        )
-        if report.success:
-            self._state.goals_completed.append(intent)
-
-        # 记录日志
-        self._session_log.append({
-            "time": datetime.now(timezone.utc).isoformat(),
-            "intent": intent,
-            "success": report.success,
-            "steps": report.steps,
-            "duration": report.duration_seconds,
-            "reason": report.reason,
-        })
-
-        return {
-            "success": report.success,
-            "steps": report.steps,
-            "duration_seconds": report.duration_seconds,
-            "reason": report.reason,
-            "summary": self._state.last_result,
-        }
-
-    # === 感知 ===
-
-    async def look(self) -> dict[str, Any]:
-        """主动截取高清截图（她想仔细看）。"""
-        frame = await self._capture.grab_consciousness_frame()
-        if not frame:
-            return {"success": False, "error": "截图失败"}
-
-        # 保存截图
-        screenshot_path = self._workspace / "minecraft" / "screenshots"
-        await asyncio.to_thread(screenshot_path.mkdir, parents=True, exist_ok=True)
-        path = frame.save(screenshot_path / f"look_{int(time.time())}.png")
-
-        return {
-            "success": True,
-            "screenshot_path": str(path),
-            "base64": frame.to_base64(),
-            "width": frame.width,
-            "height": frame.height,
-        }
-
-    async def perceive(self) -> str:
-        """感知当前画面（意识层用）。"""
-        frame = await self._capture.grab_consciousness_frame()
-        if not frame:
-            return "（截图失败，看不到画面）"
-
-        # 这里应该调用她的 LLM 进行视觉理解
-        # 简化版：返回截图路径，由上层处理
-        screenshot_path = self._workspace / "minecraft" / "screenshots"
-        await asyncio.to_thread(screenshot_path.mkdir, parents=True, exist_ok=True)
-        path = frame.save(screenshot_path / f"perceive_{int(time.time())}.png")
-
-        self._state.last_perception = f"截图已保存: {path}"
-        if self._on_perception:
-            self._on_perception(self._state.last_perception)
-
-        return self._state.last_perception
-
-    # === 上下文管理 ===
-
-    def get_transient_suffix(self) -> str:
-        """获取后缀提示词（每步刷新，不进历史）。"""
-        if not self._state.active:
-            return ""
-
-        # 构建第一人称体验描述
-        bodily_feeling = self.get_bodily_feeling()
-        visual_context = self.get_visual_context()
-        social_context = self.get_social_context()
-
-        last_action = self._state.last_result or "你刚进入这个世界"
-        current_thought = self._state.current_goal if self._state.current_goal else "你还没有特定的目标"
-
-        return CONSCIOUSNESS_OBSERVATION.format(
-            bodily_feeling=bodily_feeling,
-            visual_context=visual_context,
-            last_action=last_action,
-            social_context=social_context,
-            current_thought=current_thought,
-        )
-
-    def get_heartbeat_context(self) -> str:
-        """获取心跳注入上下文。"""
-        if self._state.active:
-            # 游戏进行中
-            bodily_feeling = self.get_bodily_feeling()
-            social_context = self.get_social_context()
-            current_activity = self._state.current_goal or "自由探索"
-
-            state_feeling = f"{bodily_feeling}"
-            if not social_context:
-                social_context = "你独自在这个世界中"
-
-            return HEARTBEAT_MINECRAFT_ACTIVE.format(
-                social_presence=social_context,
-                state_feeling=state_feeling,
-                current_activity=current_activity,
-                duration=f"{self._state.duration_minutes:.0f}",
+        model_set = get_model_set_by_task(self._model_task_name)
+        if not model_set:
+            raise MinecraftConsciousnessError(
+                f"Minecraft consciousness model is unavailable: {self._model_task_name}"
             )
-        else:
-            # 游戏未进行，但可以选择进入
-            memories = self._get_minecraft_memories()
-            ayer_presence = self._detect_ayer_presence()
-            current_mood = self._infer_current_mood()
+        request = create_llm_request(
+            model_set=model_set,
+            request_name="life_minecraft_consciousness",
+        )
+        request.add_payload(LLMPayload(ROLE.SYSTEM, Text(_SYSTEM_PROMPT)))
 
-            return HEARTBEAT_MINECRAFT_IDLE.format(
-                memories=memories,
-                ayer_presence=ayer_presence,
-                current_mood=current_mood,
+        subject_delivery_id = (
+            "minecraft-subject-"
+            f"{context.subject.source_digest[:16]}-{context.subject.projection_version}"
+        )
+        subject_text = _registered_text(
+            "minecraft_subject_context",
+            subject_delivery_id,
+            context.subject.text,
+        )
+        request.add_payload(LLMPayload(ROLE.SYSTEM, Text(subject_text)))
+        request.register_context_delivery(
+            subject_delivery_id,
+            subject_text,
+            marker=subject_delivery_id,
+        )
+
+        observation_text = build_observation_projection(
+            context.perception.observation,
+            max_bytes=self._observation_max_bytes,
+        )
+        observation_delivery_id = (
+            f"minecraft-observation-{context.session_id}-{context.turn_index}"
+        )
+        observation_part = _registered_text(
+            "minecraft_current_observation",
+            observation_delivery_id,
+            observation_text,
+        )
+        turn_document = {
+            "schema": "minecraft.consciousness_turn.v1",
+            "session": {
+                "session_id": context.session_id,
+                "stream_id": context.stream_id,
+                "instance_id": context.instance_id,
+                "body_name": context.body_name,
+                "session_goal": context.session_goal,
+            },
+            "turn_index": context.turn_index,
+            "wake_reasons": list(context.wake_reasons),
+            "subject_context_reference": context.subject.reference(),
+            "recent_outcomes": [item.to_prompt() for item in context.recent_outcomes],
+            "wait_contract": {
+                "min_seconds": self._min_wait_seconds,
+                "max_seconds": self._max_wait_seconds,
+            },
+        }
+        user_parts: list[Text | Image] = [
+            Text(
+                json.dumps(
+                    turn_document,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            ),
+            Text(observation_part),
+        ]
+        request.register_context_delivery(
+            observation_delivery_id,
+            observation_part,
+            marker=observation_delivery_id,
+        )
+
+        subconscious = context.perception.recent_subconscious
+        subconscious_part = ""
+        subconscious_delivery_id = ""
+        if subconscious.content:
+            encoded = subconscious.content.encode("utf-8")
+            if (
+                len(encoded) != subconscious.delivered_bytes
+                or hashlib.sha256(encoded).hexdigest() != subconscious.projection_sha256
+            ):
+                raise MinecraftConsciousnessError(
+                    "recent subconscious content does not match its metadata"
+                )
+            subconscious_delivery_id = (
+                f"minecraft-subconscious-{context.session_id}-{context.turn_index}"
+            )
+            subconscious_part = _registered_text(
+                "minecraft_recent_subconscious",
+                subconscious_delivery_id,
+                subconscious.content,
+            )
+            user_parts.append(Text(subconscious_part))
+            request.register_context_delivery(
+                subconscious_delivery_id,
+                subconscious_part,
+                marker=subconscious_delivery_id,
             )
 
-    def _get_minecraft_memories(self) -> str:
-        """获取 Minecraft 相关记忆摘要。"""
-        if not self._state.goals_completed and not self._state.items_gained:
-            return "你还没有在 Minecraft 中留下什么记忆"
+        frame_bytes = context.perception.frame_bytes
+        if frame_bytes:
+            user_parts.append(Image.from_bytes(frame_bytes))
+        request.add_payload(LLMPayload(ROLE.USER, user_parts))
 
-        parts = []
-        if self._state.goals_completed:
-            recent_goals = self._state.goals_completed[-3:]
-            parts.append(f"上次你做了：{', '.join(recent_goals)}")
-        if self._state.items_gained:
-            recent_items = self._state.items_gained[-5:]
-            parts.append(f"你获得了：{', '.join(recent_items)}")
+        response = await request.send(stream=False)
+        await response
+        _verify_delivery(response, subject_delivery_id, subject_text)
+        _verify_delivery(response, observation_delivery_id, observation_part)
+        if subconscious_delivery_id:
+            _verify_delivery(response, subconscious_delivery_id, subconscious_part)
+        raw = str(getattr(response, "message", "") or "").strip()
+        return self._parse_decision(raw, context)
 
-        return "\n".join(parts)
-
-    def _detect_ayer_presence(self) -> str:
-        """检测 Ayer 是否在游戏中（通过日志读取器感知）。"""
-        # 查看近期日志事件中 Ayer 是否在线
-        recent = self._log_reader.peek_events()
-        for event in reversed(recent[-20:]):
-            if event.player and "ayer" in event.player.lower():
-                if event.type == "join":
-                    return f"Ayer ({event.player}) 在你的世界里 💕"
-                elif event.type == "leave":
-                    return "Ayer 刚才离开了，你还有他的气息"
-                elif event.type == "chat":
-                    return f"Ayer 刚才说了：「{event.message}」"
-        return "你不确定 Ayer 现在是否在玩 Minecraft"
-
-    def _infer_current_mood(self) -> str:
-        """推断当前心情（基于最近的互动和状态）。"""
-        # TODO: 基于 life_engine 的情绪状态和最近互动
-        # 暂时返回中性描述
-        return "你感觉还好，想做点什么"
-
-    def get_main_context_summary(self) -> str:
-        """获取主上下文压缩摘要。"""
-        return self._state.to_summary()
-
-    # === 状态更新 ===
-
-    def update_game_state(
+    def _parse_decision(
         self,
-        health: float | None = None,
-        hunger: float | None = None,
-        time_of_day: str | None = None,
-        inventory_summary: str | None = None,
-    ) -> None:
-        """更新游戏状态（从 HUD 或 VLA 报告）。"""
-        if health is not None:
-            self._state.health = health
-        if hunger is not None:
-            self._state.hunger = hunger
-        if time_of_day is not None:
-            self._state.time_of_day = time_of_day
-        if inventory_summary is not None:
-            self._state.inventory_summary = inventory_summary
+        raw: str,
+        context: MinecraftConsciousnessTurnContext,
+    ) -> MinecraftConsciousnessDecision:
+        """Parse a technical decision without rewriting authored text."""
 
-        # 同步到 Reflex
-        if self._motor:
-            self._motor.update_reflex_state(
-                health=self._state.health,
-                hunger=self._state.hunger,
+        if not raw:
+            raise MinecraftConsciousnessOutputError(
+                "Minecraft consciousness returned an empty response"
             )
-
-    def get_bodily_feeling(self) -> str:
-        """获取身体感受（第一人称主观描述）。
-
-        这包括意识层的感受和身体本能的警告，但不会自动执行任何动作。
-        """
-        feelings = []
-
-        # 健康状况（包含身体本能的紧急感）
-        if self._state.health < 4:
-            feelings.append("我现在很疼，身体状况很不好！身体本能在强烈警告我")
-        elif self._state.health < 10:
-            feelings.append("我感觉有点疼，需要小心")
-        elif self._state.health < 15:
-            feelings.append("有些轻微的疼痛，但还好")
-        else:
-            feelings.append("我的身体状况不错")
-
-        # 饥饿感（包含身体本能的需求）
-        if self._state.hunger < 4:
-            feelings.append("我好饿，身体在强烈提示我需要马上吃点东西")
-        elif self._state.hunger < 10:
-            feelings.append("我有点饿了，想吃点东西")
-        elif self._state.hunger < 15:
-            feelings.append("有点饿，但还能坚持")
-
-        # 时间感知
-        time_feelings = {
-            "白天": "阳光很温暖",
-            "傍晚": "夕阳很美，我喜欢这个时刻",
-            "夜晚": "天黑了，有点不安",
-            "深夜": "夜深了，我有点困",
-        }
-        if self._state.time_of_day in time_feelings:
-            feelings.append(time_feelings[self._state.time_of_day])
-
-        return "、".join(feelings) if feelings else "我感觉还好"
-
-    def get_visual_context(self) -> str:
-        """获取视觉环境描述（需要结合截图分析）。"""
-        # 这里需要调用视觉模型分析截图，暂时返回基础信息
-        context = f"现在是{self._state.time_of_day}"
-        if self._state.inventory_summary:
-            context += f"，我的背包里有：{self._state.inventory_summary}"
-        return context
-
-    def get_social_context(self) -> str:
-        """获取社交环境（其他玩家的存在）。"""
-        return self._social.get_social_context()
-
-    async def process_chat_message(self, player_name: str, message: str) -> dict[str, Any]:
-        """处理收到的聊天消息。"""
-        # 记录聊天
-        chat_event = self._chat.add_incoming_chat(player_name, message)
-
-        # 更新玩家信息
-        self._social.update_player(player_name)
-
-        # 获取回应上下文（不是判断，只是提供信息）
-        response_context = self._social.get_response_context(player_name, message)
-
-        result = {
-            "perception": chat_event["perception"],
-            "response_context": response_context,  # 改为提供上下文，而非判断
-            "chat_event": chat_event,
-        }
-
-        # 注意：是否回应完全由她的意识层决定
-        # 这里不做任何判断或建议
-
-        return result
-
-    async def send_chat(self, message: str) -> bool:
-        """发送聊天消息。"""
-        return await self._chat.send_chat(message, self._input)
-
-    # === 日志事件处理 ===
-
-    async def _process_log_events_loop(self) -> None:
-        """后台任务：持续处理游戏日志事件，更新感知状态。"""
-        while True:
-            try:
-                await asyncio.sleep(1.0)
-                events = self._log_reader.drain_events()
-                for event in events:
-                    await self._handle_log_event(event)
-            except asyncio.CancelledError:
-                break
-            except Exception as exc:
-                logger.debug(f"日志事件处理异常: {exc}")
-
-    async def _handle_log_event(self, event) -> None:
-        """处理单条日志事件，更新感知和社交状态。"""
-
-        if event.type == "chat" and event.player:
-            # 玩家聊天 → 更新社交感知
-            await self.process_chat_message(event.player, event.message)
-            self._state.events.append(
-                f"[{event.timestamp}] <{event.player}> {event.message}"
-            )
-            logger.debug(f"游戏内聊天: <{event.player}> {event.message}")
-
-        elif event.type == "join":
-            # 玩家进入 → 更新社交状态
-            self._social.update_player(event.player)
-            self._state.events.append(f"[{event.timestamp}] {event.message}")
-            logger.info(f"玩家进入: {event.player}")
-
-        elif event.type == "leave":
-            self._state.events.append(f"[{event.timestamp}] {event.message}")
-            logger.info(f"玩家离开: {event.player}")
-
-        elif event.type == "death":
-            self._state.events.append(f"[{event.timestamp}] {event.message}")
-            if event.player and event.player.lower() == self._mc_config.offline_username.lower():
-                # 爱莉自己死了 → 更新状态（视角感知，不自动操作）
-                self._state.health = 0.0
-                logger.info("爱莉在游戏中死亡了")
-
-        elif event.type == "world_loaded":
-            logger.info("Minecraft 世界已加载完毕")
-
-        elif event.type == "world_closed":
-            logger.info("Minecraft 世界正在关闭")
-
-    def set_goal(self, goal: str) -> None:
-        """设置当前目标。"""
-        self._state.current_goal = goal
-
-    def add_event(self, event: str) -> None:
-        """记录事件。"""
-        self._state.events.append(event)
-
-    def add_item_gained(self, item: str) -> None:
-        """记录获得的物品。"""
-        self._state.items_gained.append(item)
-
-    # === 持久化 ===
-
-    async def _save_session_log(self) -> None:
-        """保存会话日志。"""
-        log_dir = self._workspace / "minecraft" / "sessions"
-        await asyncio.to_thread(log_dir.mkdir, parents=True, exist_ok=True)
-
-        log_file = log_dir / f"session_{self._state.session_id}.json"
-        data = {
-            "session_id": self._state.session_id,
-            "start_time": self._state.start_time,
-            "duration_minutes": self._state.duration_minutes,
-            "goals_completed": self._state.goals_completed,
-            "events": self._state.events,
-            "items_gained": self._state.items_gained,
-            "log": self._session_log,
-        }
-
         try:
-            log_file.write_text(json.dumps(data, ensure_ascii=False, indent=2))
-            logger.info(f"会话日志已保存: {log_file}")
-        except Exception as exc:
-            logger.warning(f"保存会话日志失败: {exc}")
-
-    async def get_status(self) -> dict[str, Any]:
-        """获取当前状态。"""
-        return {
-            "active": self._state.active,
-            "session_id": self._state.session_id,
-            "duration_minutes": self._state.duration_minutes,
-            "current_goal": self._state.current_goal,
-            "goals_completed": self._state.goals_completed,
-            "health": self._state.health,
-            "hunger": self._state.hunger,
-            "last_result": self._state.last_result,
-            "mc_running": self._launcher.is_running,
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exception:
+            raise MinecraftConsciousnessOutputError(
+                "Minecraft consciousness response is not strict JSON"
+            ) from exception
+        if not isinstance(payload, dict) or set(payload) != {"decision"}:
+            raise MinecraftConsciousnessOutputError(
+                "Minecraft consciousness response requires only a decision object"
+            )
+        decision = payload["decision"]
+        if not isinstance(decision, dict):
+            raise MinecraftConsciousnessOutputError("decision must be a JSON object")
+        allowed = {
+            "kind",
+            "intention",
+            "reason",
+            "reconsider_after_seconds",
         }
+        unknown = set(decision).difference(allowed)
+        if unknown:
+            raise MinecraftConsciousnessOutputError(
+                "Minecraft decision contains unknown fields: "
+                + ", ".join(sorted(str(item) for item in unknown))
+            )
+        kind = str(decision.get("kind") or "").strip()
+        if kind not in _DECISION_KINDS:
+            raise MinecraftConsciousnessOutputError(
+                f"Minecraft decision kind is invalid: {kind or 'empty'}"
+            )
+        intention = str(decision.get("intention") or "").strip()
+        reason = str(decision.get("reason") or "").strip()
+        reconsider: float | None = None
+        if kind == "pursue":
+            if not intention:
+                raise MinecraftConsciousnessOutputError(
+                    "pursue decision requires a non-empty intention"
+                )
+            if "reconsider_after_seconds" in decision:
+                raise MinecraftConsciousnessOutputError(
+                    "pursue decision cannot carry a wait deadline"
+                )
+        elif kind == "wait":
+            if not reason:
+                raise MinecraftConsciousnessOutputError(
+                    "wait decision requires a non-empty reason"
+                )
+            try:
+                reconsider = float(decision["reconsider_after_seconds"])
+            except (KeyError, TypeError, ValueError) as exception:
+                raise MinecraftConsciousnessOutputError(
+                    "wait decision requires reconsider_after_seconds"
+                ) from exception
+            if not self._min_wait_seconds <= reconsider <= self._max_wait_seconds:
+                raise MinecraftConsciousnessOutputError(
+                    "wait deadline is outside the technical bounds"
+                )
+            if intention:
+                raise MinecraftConsciousnessOutputError(
+                    "wait decision cannot carry an intention"
+                )
+        else:
+            if not reason:
+                raise MinecraftConsciousnessOutputError(
+                    "end_session decision requires a non-empty reason"
+                )
+            if intention or "reconsider_after_seconds" in decision:
+                raise MinecraftConsciousnessOutputError(
+                    "end_session cannot carry intention or wait fields"
+                )
+
+        canonical = json.dumps(
+            {
+                "session_id": context.session_id,
+                "turn_index": context.turn_index,
+                "decision": decision,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        decision_id = (
+            "minecraft_decision_"
+            + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        )
+        return MinecraftConsciousnessDecision(
+            decision_id=decision_id,
+            kind=cast(DecisionKind, kind),
+            turn_index=context.turn_index,
+            authored_at=datetime.now(UTC).isoformat(),
+            intention=intention,
+            reason=reason,
+            reconsider_after_seconds=reconsider,
+        )
+
+
+PerceptionSource = Callable[[], Awaitable[MinecraftConsciousnessPerception]]
+IntentExecutor = Callable[[str], Awaitable[Mapping[str, Any]]]
+DecisionRecorder = Callable[
+    [MinecraftConsciousnessDecision, MinecraftConsciousnessTurnContext],
+    Awaitable[None],
+]
+EndSessionRequester = Callable[[str], Awaitable[None]]
+PresenceRefresher = Callable[[str], Awaitable[None]]
+
+
+@dataclass(slots=True)
+class MinecraftConsciousnessRuntime:
+    """Own one independent, event-aware Minecraft scene decision loop."""
+
+    session_id: str
+    stream_id: str
+    instance_id: str
+    body_name: str
+    session_goal: str
+    subject: MinecraftSubjectContextBinding
+    decision_source: MinecraftDecisionSource
+    perception_source: PerceptionSource
+    execute_intent: IntentExecutor
+    record_decision: DecisionRecorder
+    request_end_session: EndSessionRequester
+    refresh_presence: PresenceRefresher
+    recent_turn_limit: int = 8
+    retry_base_seconds: float = 2.0
+    retry_max_seconds: float = 30.0
+    stop_timeout_seconds: float = 10.0
+    max_session_seconds: float = 3600.0
+    _stop_event: asyncio.Event = field(default_factory=asyncio.Event, init=False)
+    _wake_event: asyncio.Event = field(default_factory=asyncio.Event, init=False)
+    _wake_reasons: deque[str] = field(
+        default_factory=lambda: deque(maxlen=32), init=False
+    )
+    _recent_outcomes: deque[MinecraftConsciousnessOutcome] = field(init=False)
+    _task_id: str | None = field(default=None, init=False)
+    _task: asyncio.Task[Any] | None = field(default=None, init=False)
+    _phase: str = field(default="idle", init=False)
+    _turn_count: int = field(default=0, init=False)
+    _active_decision_id: str = field(default="", init=False)
+    _last_intention: str = field(default="", init=False)
+    _last_error: str = field(default="", init=False)
+    _consecutive_failures: int = field(default=0, init=False)
+    _last_success_at: str = field(default="", init=False)
+    _started_monotonic: float = field(default=0.0, init=False)
+
+    def __post_init__(self) -> None:
+        if self.recent_turn_limit <= 0:
+            raise ValueError("Minecraft recent turn limit must be positive")
+        if (
+            self.retry_base_seconds <= 0
+            or self.retry_max_seconds < self.retry_base_seconds
+        ):
+            raise ValueError("Minecraft consciousness retry bounds are invalid")
+        if self.stop_timeout_seconds <= 0:
+            raise ValueError("Minecraft consciousness stop timeout must be positive")
+        if self.max_session_seconds <= 0:
+            raise ValueError("Minecraft consciousness max session must be positive")
+        self._recent_outcomes = deque(maxlen=self.recent_turn_limit)
+
+    @property
+    def running(self) -> bool:
+        """Return whether the managed scene task is alive."""
+
+        return self._task is not None and not self._task.done()
+
+    def start(self) -> None:
+        """Start one managed loop and wake it for the new session."""
+
+        if self.running:
+            return
+        self._stop_event.clear()
+        self._started_monotonic = time.monotonic()
+        self._phase = "starting"
+        self.wake("session_started")
+        task_info = get_task_manager().create_task(
+            self._run(),
+            name=f"minecraft_consciousness:{self.session_id}",
+            daemon=True,
+            metadata={
+                "component": "minecraft_consciousness",
+                "session_id": self.session_id,
+                "instance_id": self.instance_id,
+            },
+        )
+        if task_info.task is None:
+            raise RuntimeError("Minecraft task manager returned no task")
+        self._task_id = task_info.task_id
+        self._task = task_info.task
+
+    def wake(self, reason: str) -> None:
+        """Wake for a technical occurrence without implying a choice."""
+
+        normalized = " ".join(str(reason or "").split())
+        if not normalized:
+            raise ValueError("Minecraft wake reason must not be empty")
+        self._wake_reasons.append(normalized[:240])
+        self._wake_event.set()
+
+    def request_stop(self) -> None:
+        """Signal the task before the body releases controls."""
+
+        self._stop_event.set()
+        self._wake_event.set()
+
+    async def close(self) -> None:
+        """Await the owned task; cancel after a bounded grace period."""
+
+        self.request_stop()
+        task = self._task
+        if task is None:
+            self._phase = "stopped"
+            return
+        if task is asyncio.current_task():
+            return
+        if not task.done():
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(task),
+                    timeout=self.stop_timeout_seconds,
+                )
+            except TimeoutError:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        if task.done() and not task.cancelled():
+            exception = task.exception()
+            if exception is not None:
+                raise exception
+        self._task = None
+        self._task_id = None
+        self._phase = "stopped"
+
+    def status(self) -> dict[str, Any]:
+        """Return health plus the latest explicitly authored intention."""
+
+        return {
+            "enabled": True,
+            "running": self.running,
+            "phase": self._phase,
+            "task_id": self._task_id,
+            "turn_count": self._turn_count,
+            "active_decision_id": self._active_decision_id,
+            "last_intention": self._last_intention,
+            "last_error": self._last_error,
+            "consecutive_failures": self._consecutive_failures,
+            "last_success_at": self._last_success_at,
+            "remaining_session_seconds": max(
+                0.0,
+                self.max_session_seconds
+                - (
+                    time.monotonic() - self._started_monotonic
+                    if self._started_monotonic
+                    else 0.0
+                ),
+            ),
+            "recent_outcome_count": len(self._recent_outcomes),
+            "pending_wake_count": len(self._wake_reasons),
+            "subject_context_reference": self.subject.reference(),
+        }
+
+    async def _run(self) -> None:
+        """Deliberate until the scene closes or she chooses to leave."""
+
+        pending_decision: MinecraftConsciousnessDecision | None = None
+        pending_context: MinecraftConsciousnessTurnContext | None = None
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    if (
+                        time.monotonic() - self._started_monotonic
+                        >= self.max_session_seconds
+                    ):
+                        self._phase = "ending_session"
+                        await self.request_end_session(
+                            "technical maximum Minecraft session duration reached"
+                        )
+                        return
+                    if pending_decision is None:
+                        self._phase = "perceiving"
+                        perception = await self.perception_source()
+                        wake_reasons = self._drain_wake_reasons()
+                        self._turn_count += 1
+                        pending_context = MinecraftConsciousnessTurnContext(
+                            session_id=self.session_id,
+                            stream_id=self.stream_id,
+                            instance_id=self.instance_id,
+                            body_name=self.body_name,
+                            session_goal=self.session_goal,
+                            turn_index=self._turn_count,
+                            wake_reasons=wake_reasons,
+                            subject=self.subject,
+                            perception=perception,
+                            recent_outcomes=tuple(self._recent_outcomes),
+                        )
+                        self._phase = "deliberating"
+                        pending_decision = await self.decision_source.decide(
+                            pending_context
+                        )
+                    if pending_context is None:
+                        raise RuntimeError("Minecraft lost its pending turn context")
+                    self._active_decision_id = pending_decision.decision_id
+                    self._phase = "recording_decision"
+                    await self.record_decision(pending_decision, pending_context)
+                    if self._stop_event.is_set():
+                        break
+
+                    decision = pending_decision
+                    self._consecutive_failures = 0
+                    self._last_error = ""
+                    if decision.kind == "pursue":
+                        # A decision is retried only until its durable record succeeds.
+                        # Once execution begins, repeating the open-text intention after
+                        # an uncertain transport failure could duplicate physical action.
+                        pending_decision = None
+                        pending_context = None
+                        self._phase = "acting"
+                        self._last_intention = decision.intention
+                        try:
+                            result = await self.execute_intent(decision.intention)
+                        except Exception as exception:  # noqa: BLE001
+                            result = {
+                                "success": False,
+                                "error": (
+                                    f"{type(exception).__name__}: "
+                                    f"{str(exception)[:500]}"
+                                ),
+                            }
+                        self._recent_outcomes.append(
+                            MinecraftConsciousnessOutcome.from_result(
+                                decision.decision_id,
+                                decision.intention,
+                                result,
+                            )
+                        )
+                        if bool(result.get("success")):
+                            self._last_success_at = datetime.now(UTC).isoformat()
+                        self.wake("intention_finished")
+                        continue
+                    if decision.kind == "end_session":
+                        self._phase = "ending_session"
+                        await self.request_end_session(decision.reason)
+                        pending_decision = None
+                        pending_context = None
+                        return
+
+                    pending_decision = None
+                    pending_context = None
+                    self._phase = "waiting"
+                    await self.refresh_presence("minecraft_consciousness_wait")
+                    await self._wait_for_wake(
+                        float(decision.reconsider_after_seconds or 0.0)
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exception:  # noqa: BLE001 - retain pending work
+                    self._consecutive_failures += 1
+                    self._phase = "degraded"
+                    self._last_error = (
+                        f"{type(exception).__name__}: {str(exception)[:500]}"
+                    )
+                    delay = min(
+                        self.retry_max_seconds,
+                        self.retry_base_seconds
+                        * (2 ** min(self._consecutive_failures - 1, 8)),
+                    )
+                    logger.warning(
+                        "Minecraft consciousness turn failed; retaining work: "
+                        "session=%s failures=%s retry=%.1fs error=%s",
+                        self.session_id,
+                        self._consecutive_failures,
+                        delay,
+                        self._last_error,
+                    )
+                    await self._wait_for_wake(delay)
+        finally:
+            self._active_decision_id = ""
+            if self._phase != "ending_session":
+                self._phase = "stopped"
+
+    def _drain_wake_reasons(self) -> tuple[str, ...]:
+        """Drain bounded transport reasons without semantic ranking."""
+
+        reasons = tuple(self._wake_reasons)
+        self._wake_reasons.clear()
+        self._wake_event.clear()
+        return reasons or ("scheduled_reconsideration",)
+
+    async def _wait_for_wake(self, timeout_seconds: float) -> None:
+        """Wait for an occurrence or the model-selected deadline."""
+
+        if self._stop_event.is_set() or self._wake_reasons:
+            return
+        self._wake_event.clear()
+        try:
+            await asyncio.wait_for(
+                self._wake_event.wait(),
+                timeout=max(0.001, timeout_seconds),
+            )
+        except TimeoutError:
+            self._wake_reasons.append("chosen_reconsideration_deadline")
+            self._wake_event.set()
+
+
+__all__ = [
+    "ElysiumMinecraftDecisionSource",
+    "MinecraftConsciousnessDecision",
+    "MinecraftConsciousnessError",
+    "MinecraftConsciousnessOutputError",
+    "MinecraftConsciousnessPerception",
+    "MinecraftConsciousnessRuntime",
+    "MinecraftConsciousnessTurnContext",
+    "MinecraftSubjectContextBinding",
+    "MinecraftSubjectContextError",
+    "build_observation_projection",
+]

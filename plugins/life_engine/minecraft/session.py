@@ -7,11 +7,14 @@ import hashlib
 import inspect
 import json
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
+
+from src.kernel.concurrency import get_task_manager
 
 from ..service.subconscious_context import RecentSubconsciousContext
 from .bot_launcher import MinecraftBotLauncher
@@ -22,6 +25,15 @@ from .bridge_client import (
     MinecraftBridgeClient,
 )
 from .capture import WindowCapture
+from .consciousness import (
+    ElysiumMinecraftDecisionSource,
+    MinecraftConsciousnessDecision,
+    MinecraftConsciousnessPerception,
+    MinecraftConsciousnessRuntime,
+    MinecraftConsciousnessTurnContext,
+    MinecraftDecisionSource,
+    MinecraftSubjectContextBinding,
+)
 from .embodiment_contracts import (
     EmbodiedIntent,
     ExecutionResult,
@@ -134,7 +146,10 @@ class MinecraftSession:
         resume_consciousness_instance: Any | None = None,
         terminate_consciousness_instance: Any | None = None,
         get_recent_subconscious_context: Any | None = None,
+        get_subject_context_projection_snapshot: Any | None = None,
+        record_minecraft_consciousness_decision: Any | None = None,
         report_world_observation: Any | None = None,
+        consciousness_decision_source: MinecraftDecisionSource | None = None,
     ) -> None:
         """Create an inactive session with optional shared-world integrations."""
 
@@ -150,13 +165,23 @@ class MinecraftSession:
         self._resume_presence = resume_consciousness_instance
         self._terminate_presence = terminate_consciousness_instance
         self._get_recent_subconscious_context = get_recent_subconscious_context
+        self._get_subject_context_projection_snapshot = (
+            get_subject_context_projection_snapshot
+        )
+        self._record_minecraft_consciousness_decision = (
+            record_minecraft_consciousness_decision
+        )
         self._report_world_observation = report_world_observation
+        self._injected_consciousness_decision_source = consciousness_decision_source
         self._state = SessionState()
         self._runtime: EmbodimentRuntime | None = None
         self._bridge_client: MinecraftBridgeClient | None = None
         self._planner: JsonIntentPlanner | None = None
         self._trace: EmbodimentTrace | None = None
         self._execution_task: asyncio.Task[ExecutionResult] | None = None
+        self._consciousness_runtime: MinecraftConsciousnessRuntime | None = None
+        self._subject_context_binding: MinecraftSubjectContextBinding | None = None
+        self._intent_lock = asyncio.Lock()
         self._lifecycle_lock = asyncio.Lock()
         self._trace_projection_lock = asyncio.Lock()
         self._projected_trace_receipts: set[str] = set()
@@ -448,6 +473,24 @@ class MinecraftSession:
                 "installation": installation,
             }
 
+        if self._config.consciousness_enabled:
+            try:
+                self._subject_context_binding = (
+                    await self._load_subject_context_binding()
+                )
+            except Exception as exception:  # noqa: BLE001 - identity fails closed
+                self._subject_context_binding = None
+                self._state.readiness = ReadinessState.FAILED
+                self._state.readiness_detail = (
+                    "Minecraft subject context binding failed: " + str(exception)
+                )
+                self._state.last_error = self._state.readiness_detail
+                return {
+                    "success": False,
+                    "error": self._state.readiness_detail,
+                    "body_name": selected_name,
+                }
+
         self._state.readiness = ReadinessState.LAUNCHING
         session_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S_%fZ")
         if selected_name == "bot":
@@ -468,16 +511,12 @@ class MinecraftSession:
                 launch = await self._launcher.launch()
             except Exception as exception:  # noqa: BLE001 - public lifecycle boundary
                 self._state.readiness = ReadinessState.FAILED
-                self._state.readiness_detail = (
-                    f"Minecraft launch failed: {exception}"
-                )
+                self._state.readiness_detail = f"Minecraft launch failed: {exception}"
                 self._state.last_error = self._state.readiness_detail
                 return {"success": False, "error": self._state.readiness_detail}
             if not launch.success:
                 self._state.readiness = ReadinessState.FAILED
-                self._state.readiness_detail = (
-                    launch.error or "launch dispatch failed"
-                )
+                self._state.readiness_detail = launch.error or "launch dispatch failed"
                 self._state.last_error = self._state.readiness_detail
                 return {"success": False, "error": launch.error}
             self._state.launch_pid = launch.pid
@@ -576,8 +615,20 @@ class MinecraftSession:
             await self._register_consciousness()
             await self._report_scene("body connected")
             self._scene_open = True
+            if self._config.consciousness_enabled:
+                self._consciousness_runtime = self._create_consciousness_runtime()
+                self._consciousness_runtime.start()
         except Exception as exception:  # noqa: BLE001 - lifecycle must not look ready
             cleanup_errors: list[str] = []
+            if self._consciousness_runtime is not None:
+                try:
+                    await self._consciousness_runtime.close()
+                except Exception as cleanup_exception:  # noqa: BLE001
+                    cleanup_errors.append(
+                        f"consciousness cleanup failed: {cleanup_exception}"
+                    )
+                else:
+                    self._consciousness_runtime = None
             try:
                 await runtime.close()
             except Exception as cleanup_exception:  # noqa: BLE001
@@ -599,6 +650,7 @@ class MinecraftSession:
             self._state.readiness_detail = str(exception)
             self._state.last_error = str(exception)
             self._planner = None
+            self._subject_context_binding = None
             error = f"Minecraft session lifecycle initialization failed: {exception}"
             if cleanup_errors:
                 error = f"{error}; {'; '.join(cleanup_errors)}"
@@ -621,6 +673,11 @@ class MinecraftSession:
             "advertised_operations": list(client.capabilities),
             "observation": observation.to_wire(),
             "trace_path": str(trace.path),
+            "consciousness": (
+                self._consciousness_runtime.status()
+                if self._consciousness_runtime is not None
+                else {"enabled": False, "running": False, "phase": "disabled"}
+            ),
         }
 
     async def stop(self) -> dict[str, Any]:
@@ -639,10 +696,24 @@ class MinecraftSession:
         self._state.readiness = ReadinessState.CLOSING
         self._state.readiness_detail = "releasing controls and ending the scene"
         runtime = self._runtime
+        consciousness_runtime = self._consciousness_runtime
         errors: list[str] = []
+        if consciousness_runtime is not None:
+            consciousness_runtime.request_stop()
         if runtime is not None:
             try:
                 await runtime.interrupt("Minecraft session stopped")
+            except Exception as exception:  # noqa: BLE001
+                errors.append(f"body interrupt failed: {exception}")
+        if consciousness_runtime is not None:
+            try:
+                await consciousness_runtime.close()
+            except Exception as exception:  # noqa: BLE001
+                errors.append(f"consciousness cleanup failed: {exception}")
+            else:
+                self._consciousness_runtime = None
+        if runtime is not None:
+            try:
                 await runtime.close()
             except Exception as exception:  # noqa: BLE001
                 errors.append(f"body cleanup failed: {exception}")
@@ -671,6 +742,8 @@ class MinecraftSession:
         self._state.active = False
         self._planner = None
         self._execution_task = None
+        if self._consciousness_runtime is None:
+            self._subject_context_binding = None
         self._state.readiness = (
             ReadinessState.DEGRADED if errors else ReadinessState.IDLE
         )
@@ -697,7 +770,48 @@ class MinecraftSession:
         intent: str,
         timeout: float | None = None,
     ) -> dict[str, Any]:
-        """Let the selected model planner pursue one exact intention."""
+        """Serialize an external intention with the dedicated scene runtime."""
+
+        async with self._intent_lock:
+            result = await self._do_intent_locked(
+                intent,
+                timeout,
+                include_recent_subconscious=True,
+            )
+        consciousness = self._consciousness_runtime
+        if consciousness is not None and consciousness.running:
+            consciousness.wake("external_intention_finished")
+        return result
+
+    async def _execute_consciousness_intent(
+        self,
+        intent: str,
+    ) -> dict[str, Any]:
+        """Execute one scene-authored intention without manufacturing a wake."""
+
+        async with self._intent_lock:
+            runtime = self._consciousness_runtime
+            decision_id = (
+                str(runtime.status().get("active_decision_id") or "")
+                if runtime is not None
+                else ""
+            )
+            return await self._do_intent_locked(
+                intent,
+                None,
+                include_recent_subconscious=False,
+                consciousness_decision_id=decision_id,
+            )
+
+    async def _do_intent_locked(
+        self,
+        intent: str,
+        timeout: float | None,
+        *,
+        include_recent_subconscious: bool,
+        consciousness_decision_id: str = "",
+    ) -> dict[str, Any]:
+        """Pursue one exact intention while the caller owns the intent lock."""
 
         if not self._state.active or self._runtime is None or self._planner is None:
             return {"success": False, "error": "no Minecraft session is active"}
@@ -713,9 +827,14 @@ class MinecraftSession:
             "session_goal": self._state.session_goal,
             "stream_id": self._state.stream_id,
         }
+        if consciousness_decision_id:
+            durable_context["consciousness_decision_id"] = consciousness_decision_id
         transient_prompt_context: dict[str, Any] = {}
         try:
-            if self._get_recent_subconscious_context is not None:
+            if (
+                include_recent_subconscious
+                and self._get_recent_subconscious_context is not None
+            ):
                 recent_subconscious = await _invoke_callback(
                     self._get_recent_subconscious_context,
                 )
@@ -865,7 +984,7 @@ class MinecraftSession:
             return None
         try:
             frame = await self._capture.grab_consciousness_frame()
-        except Exception:  # noqa: BLE001 - vision must never break heartbeat
+        except Exception:  # noqa: BLE001 - vision must not break the scene loop
             return None
         if frame is None:
             return None
@@ -891,6 +1010,149 @@ class MinecraftSession:
             return await asyncio.to_thread(_encode)
         except Exception:  # noqa: BLE001
             return None
+
+    async def _load_subject_context_binding(
+        self,
+    ) -> MinecraftSubjectContextBinding:
+        """Pin one unified subject projection before acquiring a game body."""
+
+        callback = self._get_subject_context_projection_snapshot
+        if callback is None:
+            raise RuntimeError(
+                "Minecraft consciousness requires the subject projection service"
+            )
+        snapshot = await _invoke_callback(
+            callback,
+            projection_kind="minecraft",
+            max_bytes=self._config.consciousness_subject_context_max_bytes,
+        )
+        if not isinstance(snapshot, Mapping):
+            raise TypeError(
+                "Minecraft subject projection callback must return a mapping"
+            )
+        return MinecraftSubjectContextBinding.from_snapshot(
+            snapshot,
+            expected_max_bytes=(self._config.consciousness_subject_context_max_bytes),
+        )
+
+    def _create_consciousness_runtime(self) -> MinecraftConsciousnessRuntime:
+        """Construct the independent scene loop after body and Presence are ready."""
+
+        binding = self._subject_context_binding
+        if binding is None:
+            raise RuntimeError("Minecraft subject context was not pinned")
+        if self._record_minecraft_consciousness_decision is None:
+            raise RuntimeError(
+                "Minecraft consciousness requires a durable decision recorder"
+            )
+        decision_source = self._injected_consciousness_decision_source
+        if decision_source is None:
+            decision_source = ElysiumMinecraftDecisionSource(
+                self._config.consciousness_task_name,
+                observation_max_bytes=(
+                    self._config.consciousness_observation_max_bytes
+                ),
+                min_wait_seconds=self._config.consciousness_min_wait_seconds,
+                max_wait_seconds=self._config.consciousness_max_wait_seconds,
+            )
+        return MinecraftConsciousnessRuntime(
+            session_id=self._state.session_id,
+            stream_id=self._state.stream_id,
+            instance_id=self._state.consciousness_instance_id,
+            body_name=self._state.body_name,
+            session_goal=self._state.session_goal,
+            subject=binding,
+            decision_source=decision_source,
+            perception_source=self._perceive_for_consciousness,
+            execute_intent=self._execute_consciousness_intent,
+            record_decision=self._record_consciousness_decision,
+            request_end_session=self._request_consciousness_session_end,
+            refresh_presence=self._refresh_consciousness,
+            recent_turn_limit=self._config.consciousness_recent_turn_limit,
+            retry_base_seconds=self._config.consciousness_retry_base_seconds,
+            retry_max_seconds=self._config.consciousness_retry_max_seconds,
+            stop_timeout_seconds=self._config.consciousness_stop_timeout_seconds,
+            max_session_seconds=float(self._config.max_session_minutes) * 60.0,
+        )
+
+    async def _perceive_for_consciousness(
+        self,
+    ) -> MinecraftConsciousnessPerception:
+        """Persist a fresh structured observation and collect bounded scene input."""
+
+        async with self._intent_lock:
+            if (
+                not self._state.active
+                or self._bridge_client is None
+                or self._trace is None
+            ):
+                raise RuntimeError("Minecraft consciousness body is not active")
+            latest = self._state.latest_observation
+            observation = await self._bridge_client.observe(
+                latest.sequence if latest is not None else None
+            )
+            record = await self._trace.append("observation", observation.to_wire())
+            await self._on_trace(record)
+            frame_bytes = await self.grab_vision_frame_bytes()
+
+        recent_subconscious = RecentSubconsciousContext.empty()
+        if self._get_recent_subconscious_context is not None:
+            recent_subconscious = await _invoke_callback(
+                self._get_recent_subconscious_context,
+                group_limit=self._config.consciousness_subconscious_group_limit,
+                max_bytes=self._config.consciousness_subconscious_max_bytes,
+            )
+        if not isinstance(recent_subconscious, RecentSubconsciousContext):
+            raise TypeError(
+                "Minecraft recent subconscious callback must return "
+                "RecentSubconsciousContext"
+            )
+        encoded = recent_subconscious.content.encode("utf-8")
+        if (
+            len(encoded) != recent_subconscious.delivered_bytes
+            or hashlib.sha256(encoded).hexdigest()
+            != recent_subconscious.projection_sha256
+        ):
+            raise RuntimeError(
+                "Minecraft recent subconscious content does not match its metadata"
+            )
+        return MinecraftConsciousnessPerception(
+            observation=observation,
+            frame_bytes=frame_bytes,
+            recent_subconscious=recent_subconscious,
+        )
+
+    async def _record_consciousness_decision(
+        self,
+        decision: MinecraftConsciousnessDecision,
+        context: MinecraftConsciousnessTurnContext,
+    ) -> None:
+        """Require an attributed Life Event before physical execution."""
+
+        callback = self._record_minecraft_consciousness_decision
+        if callback is None:
+            raise RuntimeError("Minecraft consciousness decision recorder is absent")
+        await _invoke_callback(
+            callback,
+            decision.to_record(),
+            context.reference(),
+        )
+
+    async def _request_consciousness_session_end(self, reason: str) -> None:
+        """Schedule lifecycle closure outside the consciousness task itself."""
+
+        task_info = get_task_manager().create_task(
+            self.stop(),
+            name=f"minecraft_consciousness_end:{self._state.session_id}",
+            daemon=True,
+            metadata={
+                "component": "minecraft_consciousness",
+                "session_id": self._state.session_id,
+                "reason": str(reason or "")[:240],
+            },
+        )
+        if task_info.task is None:
+            raise RuntimeError("Minecraft end-session task was not created")
 
     async def get_status(self) -> dict[str, Any]:
         """Return session, body, planner, and latest evidence status."""
@@ -921,6 +1183,19 @@ class MinecraftSession:
             "latest_observation": observation.to_wire() if observation else None,
             "conclusions": list(self._state.conclusions),
             "last_error": self._state.last_error,
+            "consciousness": (
+                self._consciousness_runtime.status()
+                if self._consciousness_runtime is not None
+                else {
+                    "enabled": bool(self._config.consciousness_enabled),
+                    "running": False,
+                    "phase": (
+                        "not_started"
+                        if self._config.consciousness_enabled
+                        else "disabled"
+                    ),
+                }
+            ),
             "cleanup_pending": self._has_cleanup_pending(),
         }
 
@@ -1304,6 +1579,7 @@ class MinecraftSession:
 
         return (
             self._runtime is not None
+            or self._consciousness_runtime is not None
             or self._presence_registered
             or self._scene_open
             or (

@@ -298,7 +298,6 @@ async def test_followup_retry_then_repeated_protocol_failure_stops_third_turn(
     monkeypatch.setattr(service, "_build_heartbeat_system_prompt", _system_prompt)
     monkeypatch.setattr(service, "_build_memory_maintenance_prompt_if_due", _empty_text)
     monkeypatch.setattr(service, "_render_heartbeat_sections", _sections)
-    monkeypatch.setattr(service, "_build_minecraft_vision_payload", _no_maintenance)
     monkeypatch.setattr(service, "_run_learning_heartbeat_maintenance", _no_maintenance)
     monkeypatch.setattr(service, "_get_nucleus_tools", lambda: [FailingReadTool])
     monkeypatch.setattr(service, "record_tool_call", _record)

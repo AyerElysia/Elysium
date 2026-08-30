@@ -20,6 +20,13 @@ def test_production_minecraft_defaults_are_version_and_world_pinned() -> None:
     assert len(minecraft.expected_bridge_sha256) == 64
     assert len(minecraft.expected_baritone_sha256) == 64
     assert minecraft.intent_timeout_seconds == 300.0
+    assert minecraft.consciousness_enabled is True
+    assert minecraft.consciousness_task_name == "agent"
+    assert minecraft.consciousness_subject_context_max_bytes == 16384
+    assert minecraft.consciousness_observation_max_bytes == 16384
+    assert minecraft.consciousness_subconscious_max_bytes == 8192
+    assert minecraft.consciousness_min_wait_seconds == 2.0
+    assert minecraft.consciousness_max_wait_seconds == 45.0
 
 
 def test_zero_intent_timeout_is_normalized_to_unset() -> None:
@@ -37,3 +44,16 @@ def test_negative_intent_timeout_remains_invalid() -> None:
 
     with pytest.raises(ValidationError):
         LifeEngineConfig.model_validate({"minecraft": {"intent_timeout_seconds": -1.0}})
+
+
+def test_consciousness_transport_budgets_fail_closed() -> None:
+    """Identity, observation, and subconscious projections stay explicitly bounded."""
+
+    for field, value in (
+        ("consciousness_subject_context_max_bytes", 8191),
+        ("consciousness_observation_max_bytes", 4095),
+        ("consciousness_subconscious_max_bytes", 1023),
+        ("consciousness_subconscious_group_limit", 0),
+    ):
+        with pytest.raises(ValidationError):
+            LifeEngineConfig.model_validate({"minecraft": {field: value}})

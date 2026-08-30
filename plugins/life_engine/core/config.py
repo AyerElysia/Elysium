@@ -1862,7 +1862,91 @@ class LifeEngineConfig(BaseConfig):
             default=6.0,
             ge=2.0,
             le=30.0,
-            description="意识层决策间隔（秒）。",
+            description=(
+                "兼容旧配置；专属 Minecraft 意识不使用固定轮询间隔，"
+                "每轮由模型在技术上下限内选择复思时间。"
+            ),
+        )
+
+        consciousness_enabled: bool = Field(
+            default=True,
+            description="会话就绪后是否启动独立 Minecraft 场景意识。",
+        )
+
+        consciousness_task_name: str = Field(
+            default="agent",
+            min_length=1,
+            description="Minecraft 场景意识使用的模型任务名。",
+        )
+
+        consciousness_subject_context_max_bytes: int = Field(
+            default=16384,
+            ge=8192,
+            le=65536,
+            description="每个 MC episode 固定主体投影的 UTF-8 字节上限。",
+        )
+
+        consciousness_observation_max_bytes: int = Field(
+            default=16384,
+            ge=4096,
+            le=65536,
+            description="每轮结构化游戏观察投影的 UTF-8 字节上限。",
+        )
+
+        consciousness_subconscious_max_bytes: int = Field(
+            default=8192,
+            ge=1024,
+            le=32768,
+            description="每轮只读近期潜意识投影的 UTF-8 字节上限。",
+        )
+
+        consciousness_subconscious_group_limit: int = Field(
+            default=5,
+            ge=1,
+            le=20,
+            description="每轮近期潜意识因果组上限。",
+        )
+
+        consciousness_min_wait_seconds: float = Field(
+            default=2.0,
+            gt=0,
+            le=30.0,
+            description="模型可选择的最短复思等待时间。",
+        )
+
+        consciousness_max_wait_seconds: float = Field(
+            default=45.0,
+            ge=2.0,
+            le=300.0,
+            description="模型可选择的最长复思等待时间。",
+        )
+
+        consciousness_retry_base_seconds: float = Field(
+            default=2.0,
+            gt=0,
+            le=30.0,
+            description="场景意识暂时失败后的基础退避。",
+        )
+
+        consciousness_retry_max_seconds: float = Field(
+            default=30.0,
+            ge=2.0,
+            le=300.0,
+            description="场景意识暂时失败后的最大退避。",
+        )
+
+        consciousness_recent_turn_limit: int = Field(
+            default=6,
+            ge=1,
+            le=24,
+            description="下一轮携带的有界 MC 结果摘要数量。",
+        )
+
+        consciousness_stop_timeout_seconds: float = Field(
+            default=10.0,
+            gt=0,
+            le=60.0,
+            description="关闭场景意识任务的技术宽限时间。",
         )
 
         vla_model: str = Field(
@@ -2011,9 +2095,8 @@ class LifeEngineConfig(BaseConfig):
             default=5,
             ge=1,
             description=(
-                "Her continuous play cadence while a Minecraft session is "
-                "active; the heartbeat loop accelerates to this interval so "
-                "she keeps playing instead of waiting between chat turns."
+                "兼容旧配置；不再改变核心心跳频率。专属 Minecraft 意识"
+                "通过独立任务和模型选择的复思时间维持游玩节奏。"
             ),
         )
 

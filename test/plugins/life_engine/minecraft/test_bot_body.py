@@ -27,6 +27,12 @@ from plugins.life_engine.minecraft.session import MinecraftSession
 from plugins.life_engine.minecraft.tools import LifeEngineMinecraftTool
 
 
+def _body_only_config(**kwargs: Any) -> MCConfig:
+    """Keep body-process tests independent from scene-consciousness fixtures."""
+
+    return MCConfig(consciousness_enabled=False, **kwargs)
+
+
 class _ServerWorldBridge:
     """In-memory body endpoint reporting a playable shared server world."""
 
@@ -170,7 +176,7 @@ def _session(
 ) -> MinecraftSession:
     """Build one bot-routed session with injected fakes."""
 
-    config = MCConfig(bridge_ready_timeout_seconds=1)
+    config = _body_only_config(bridge_ready_timeout_seconds=1)
     session = MinecraftSession(workspace=tmp_path, mc_config=config)
     session._bot_launcher = launcher
 
@@ -184,7 +190,7 @@ def _session(
 def test_bot_profile_contract() -> None:
     """The bot body keeps the exact shared protocol and readiness route."""
 
-    session = MinecraftSession(workspace=Path("/tmp"), mc_config=MCConfig())
+    session = MinecraftSession(workspace=Path("/tmp"), mc_config=_body_only_config())
     profile = session._body_profiles()["bot"]
     assert profile.readiness_kind == "server_world"
     assert profile.listen_uri == "ws://127.0.0.1:18767/elysium"
@@ -216,7 +222,7 @@ def test_bot_token_path_cannot_escape_workspace(token_path: str) -> None:
     """The generated bridge secret never follows an absolute or parent path."""
 
     with pytest.raises(ValueError, match="workspace-relative"):
-        MCConfig(bot_token_file=token_path)
+        _body_only_config(bot_token_file=token_path)
 
 
 async def test_node_body_speaks_the_python_bridge_protocol(
@@ -391,7 +397,7 @@ async def test_bot_start_fails_without_playable_server_world(
         launcher,
         _ServerWorldBridge(world_loaded=False),
     )
-    session._config = MCConfig(
+    session._config = _body_only_config(
         bridge_ready_timeout_seconds=1,
         world_ready_timeout_seconds=1,
     )
@@ -414,7 +420,7 @@ async def test_bot_start_cleanup_failure_remains_retryable(tmp_path: Path) -> No
         launcher,
         _ServerWorldBridge(world_loaded=False),
     )
-    session._config = MCConfig(
+    session._config = _body_only_config(
         bridge_ready_timeout_seconds=1,
         world_ready_timeout_seconds=1,
     )

@@ -65,20 +65,34 @@
    expected_bridge_version = "0.2.1"
    shared_world_enabled = true
    agent_shared_username = "Elysia"
-   game_turn_interval_seconds = 5
+   consciousness_enabled = true
+   consciousness_task_name = "agent"
+   consciousness_subject_context_max_bytes = 16384
+   consciousness_observation_max_bytes = 16384
+   consciousness_subconscious_max_bytes = 8192
+   consciousness_subconscious_group_limit = 5
+   consciousness_min_wait_seconds = 2
+   consciousness_max_wait_seconds = 45
+   consciousness_retry_base_seconds = 2
+   consciousness_retry_max_seconds = 30
+   consciousness_recent_turn_limit = 6
+   consciousness_stop_timeout_seconds = 10
+   max_session_minutes = 60
    ```
 
    其余摘要、文件名、监听地址和超时使用代码中的已验证默认值。令牌由桥接首次启动写入 `config/elysium_bridge.json`，不得复制到仓库或日志。
 
 5. 由用户手动重启 Elysium。AI 和部署脚本均不得替用户停止、重启或拉起 Elysium，也不得停止或重启已有 Minecraft 进程。NapCat/QQNT 的自动恢复按根目录 `AGENTS.md` 的独立生命周期规范执行，本手册中的 Minecraft 脚本不管理它。
 
-## agent 身体共享世界与原生视觉
+## 专属 Minecraft 意识、共享世界与原生视觉
 
 - `shared_world_enabled = true`（默认）时，agent 身体不再进入本地单人世界，而是通过自动生成的 `LaunchElysiaShared.bat` 以 `--quickPlayMultiplayer "<WSL网关>:<bot_server_port>"` 直连人类玩家开放的局域网世界；游戏内用户名为 `agent_shared_username`（默认 `Elysia`，必须与人类玩家区分）。
 - 该模式下 preflight 跳过单人世界与 `--quickPlaySingleplayer` 校验（改为共享世界语义）。
-- 她拥有自己的客户端窗口，即她自己的眼睛：心跳轮次中 `session.grab_vision_frame_bytes()` 截取第一人称画面，`core._build_minecraft_vision_payload()` 将其作为原生图像 payload（MediaPart）注入她的多模态大脑请求。**不做任何文字转述——画面以像素直接进入她的模型**；想法来自她，执行层（bridge 命令 / VLA）只忠实执行。
-- 无窗口可截时（如 bot 身体）静默降级为无视觉，不影响心跳。
-- 她在游戏中时是连续游玩而不是等待聊天：心跳循环检测到 Minecraft session 活跃后自动加速到 `game_turn_interval_seconds`（默认 5 秒）一个回合，每个回合带着新鲜的第一人称画面直接进入她的大脑；退出游戏（session 停止）后自动恢复普通心跳节奏。回合严格串行：上一回合模型请求未完成时不会并发下一回合，模型变慢只会拉长单回合而不是堆积请求。
+- 身体完成预检和 playable 判定后，session 启动独立 `minecraft` 意识实例。它不是核心 heartbeat 的“加速模式”：核心 heartbeat 始终保持原周期和原载荷，专属实例拥有自己的串行模型轮次、Presence、phase、失败退避、session 上限与停止信号。
+- 她拥有自己的客户端窗口，即她自己的眼睛：每个专属意识轮次调用 `session.grab_vision_frame_bytes()` 截取第一人称 JPEG，并作为原生 `Image` part 直接进入多模态请求，不做文字转述。无窗口可截时（如 bot 身体）保留结构化观察并显式没有像素；不会伪造画面。
+- 每轮还读取新的 Bridge 结构化观察、同一主体的固定身份投影、有界近期潜意识和 content-free 最近结果。agent 能从像素与 `players/entities` 感知同服玩家；bot 额外提供最近 16 条游戏聊天/私聊/系统/加入/离开事件的结构化环形缓冲。
+- 场景模型可以形成开放文本意图、主动等待一段自己选择的时间，或离开本次游戏。新动作结果和外部中断会提前唤醒；无弹幕、无聊天消息时仍会按自己的节奏继续观察与选择。模型空响应只让该 scene 有界退避，不会卡住核心 heartbeat，也不会被伪装成一次有效决定。
+- `game_turn_interval_seconds` 与 `consciousness_interval_seconds` 仅为旧配置兼容项，已不改变任何运行节奏。不要再通过缩短核心 heartbeat 获得“连续游玩”。
 
 ## 无头 bot 身体（共享世界）
 
@@ -155,7 +169,9 @@ data/life_engine_workspace/minecraft/traces/<session_id>.jsonl
 
 `intent.issued` 的 trace 保存完整耐久意图与 content-free `minecraft.recent_subconscious_reference.v1`，不会保存本轮 `recent_subconscious_context` 或其他 `transient_prompt_context` 正文。每条已落盘 trace 向 World 只投影 `minecraft.embodied_trace_projection.v1` 回执；规范 JSON 必须不超过 8192 UTF-8 字节，并且不得出现原始 payload、context、帧、facts、parameters 或潜意识正文。相同 trace record 的 projection ID 必须稳定并作为 World `occurrence_id`；World 写失败时当前意图显式失败，随后按同一 record 重试会复用既有事件/断言/位置而不是重复落账。
 
-每次意图从 Life Engine 读取一份有界、只读的近期潜意识因果组作为跨意识连续性上下文。正文只进入本轮模型请求；session 会先核对 UTF-8 bytes 与 SHA-256，再把 content-free 引用写入耐久意图。该读取没有 cursor、commit 或 drain 语义，也不会回写 Life Event。工具调用只携带 tool name/call ID，不携带原始参数。Bridge 的结构化观察和第一人称画面仍是游戏当前状态的权威证据。
+每个专属意识高层轮次从 Life Engine 读取一份有界、只读的近期潜意识因果组作为跨意识连续性上下文。正文只进入该轮模型请求；同一高层决定交给具身 planner 时不会再次注入正文，只在耐久意图中留下 decision ID 与 content-free 引用。外部工具绕过专属意识直接发起的独立意图才会在自身轮次读取一次。该读取没有 cursor、commit 或 drain 语义，也不会回写 Life Event。工具调用只携带 tool name/call ID，不携带原始参数。Bridge 的结构化观察和第一人称画面仍是游戏当前状态的权威证据。
+
+专属意识的可观察决定先写入不可变 Life Event，`content_type=minecraft_consciousness_decision`，并归属当前 instance/session/stream；只有落账成功才会执行 `pursue` 意图。重试复用同一 decision ID、事件 sequence 与时间，不会因为存储结果不确定而重复物理动作。trace 中随后出现的 `intent.issued` 应通过 `consciousness_decision_id` 引用这个高层决定。
 
 ## 独立真实烟雾测试
 
@@ -197,3 +213,18 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
 - 真实 `观察→意图→动作→终态回执→新观察→证据结论` 闭环通过；
 - 用户手动重启 Elysium 后，再从正式 `nucleus_minecraft` 工具执行一次 start/status/intent/stop；
 - stop/close 只释放 Elysium 的控制与 Presence/scene，默认不关闭游戏进程。
+
+### 专属意识真实端到端验收
+
+自动化测试不能代替现场陪玩。发布结论必须保存以下同一次 session 的证据：
+
+1. 用户手动启动或重启 Elysium，并用自己的客户端进入目标世界；一起玩使用 bot 时，用户手动以固定端口 `25565` 对局域网开放。AI 不代替用户操作这些进程。
+2. 从正式 `nucleus_minecraft` 执行 `preflight → start → status`。`status` 必须显示身体 playable、`consciousness.phase` 正常、固定 subject reference 存在，且 scene/session/stream identity 一致。
+3. 用户至少 10 分钟不发聊天指令。期间 `turn_count` 仍增加，模型可以自主 `pursue` 或 `wait`；核心 heartbeat cadence 不变化，也不出现并发堆积。
+4. 至少完成一次真实 `新观察 → 高层决定落 Life Event → 意图 → bridge 命令 → 终态回执 → 更高序号新观察 → 结论`。每个物理动作前都能找到对应 decision ID，不能以 accepted 代替完成。
+5. 与用户同服连续 15–30 分钟，验证玩家实体或 bot 的结构化聊天可见、能够同行/交谈/做事，并且她的行动不依赖用户逐轮催促。
+6. 检查专属请求的主体、观察正文均有 exact delivery receipt；agent 路线有 JPEG 原生图像 part；观察和潜意识投影分别不超过配置预算。
+7. 检查 World 仅收到不超过 8 KiB 的 content-free trace receipt，连续多轮不出现 prompt/World 递归增长；完整原始证据仍留在 session trace。
+8. 在一个正在执行的意图中调用 `interrupt`，证明释放控制、返回可诊断终态，并能继续下一轮；最后调用 `stop`，Presence/scene 结束而用户游戏保持运行（bot 身体只结束其受管 bot）。
+
+任何一步缺少真实证据都只能标记为“自动化就绪、现场待验收”，不能写成生产已跑通。详细设计与可扩展边界见[《Minecraft 专属意识运行时》](../architecture/Minecraft专属意识运行时.md)。

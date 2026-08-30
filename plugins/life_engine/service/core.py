@@ -860,6 +860,8 @@ class LifeEngineService(BaseService):
         # Minecraft 是独立具身运行时，不从属于学习系统。
         self._minecraft_session: Any | None = None
         self._minecraft_session_close_lock = asyncio.Lock()
+        self._minecraft_decision_event_cache: dict[str, LifeEngineEvent] = {}
+        self._minecraft_recorded_decision_ids: set[str] = set()
 
         # 状态持久化
         self._state_persistence: StatePersistence | None = None
@@ -3556,8 +3558,66 @@ class LifeEngineService(BaseService):
             resume_consciousness_instance=self.resume_consciousness_instance,
             terminate_consciousness_instance=self.terminate_consciousness_instance,
             get_recent_subconscious_context=self.get_recent_subconscious_context,
+            get_subject_context_projection_snapshot=(
+                self.get_subject_context_projection_snapshot
+            ),
+            record_minecraft_consciousness_decision=(
+                self.record_minecraft_consciousness_decision
+            ),
             report_world_observation=self.report_world_observation,
         )
+
+    async def record_minecraft_consciousness_decision(
+        self,
+        decision: Mapping[str, Any],
+        context_reference: Mapping[str, Any],
+    ) -> LifeEngineEvent:
+        """Durably append one attributed MC choice before its body may act.
+
+        A retry reuses the exact same ``LifeEngineEvent`` object, including its
+        source sequence and timestamp. This keeps the raw occurrence idempotent
+        when persistence succeeded but the local pending checkpoint failed.
+        """
+
+        decision_payload = dict(decision)
+        context_payload = dict(context_reference)
+        decision_id = str(decision_payload.get("decision_id") or "").strip()
+        if not decision_id:
+            raise ValueError("Minecraft consciousness decision_id must not be empty")
+        expected_raw = json.dumps(
+            {
+                "decision": decision_payload,
+                "context_reference": context_payload,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        event = self._minecraft_decision_event_cache.get(decision_id)
+        if event is None:
+            event = self._event_builder.build_minecraft_consciousness_decision_event(
+                decision_payload,
+                context_payload,
+            )
+            self._minecraft_decision_event_cache[decision_id] = event
+        elif event.raw_content != expected_raw:
+            raise ValueError(
+                "Minecraft consciousness decision retry changed its payload"
+            )
+        if decision_id in self._minecraft_recorded_decision_ids:
+            return event
+
+        async with self._get_lock():
+            if not any(
+                pending.event_id == event.event_id
+                for pending in self._pending_events
+            ):
+                self._pending_events.append(event)
+                self._state.pending_event_count = len(self._pending_events)
+        await self._publish_raw_events([event])
+        await self._save_runtime_context(recoverable_on_shared_conflict=True)
+        self._minecraft_recorded_decision_ids.add(decision_id)
+        return event
 
     async def _initialize_minecraft_session(self) -> None:
         """Acquire the optional service-owned session exactly once."""
@@ -8954,9 +9014,6 @@ class LifeEngineService(BaseService):
         request.add_payload(LLMPayload(ROLE.TOOL, tools))
 
         request.add_payload(LLMPayload(ROLE.USER, Text(user_prompt)))
-        vision_payload = await self._build_minecraft_vision_payload()
-        if vision_payload is not None:
-            request.add_payload(vision_payload)
         if world_perception is not None:
             request.register_context_delivery(
                 world_perception.delivery_id,
@@ -9339,43 +9396,6 @@ class LifeEngineService(BaseService):
             last_text = ""
 
         return HeartbeatModelResult(last_text, perception_receipt)
-
-    async def _build_minecraft_vision_payload(self) -> Any | None:
-        """Attach her live first-person game frame to the heartbeat request.
-
-        Her LLM is natively multimodal: the frame is attached as an image
-        payload so she truly sees the game.  Any failure degrades silently to
-        "no vision this round" — the heartbeat must never break because of it.
-        """
-        session = self.minecraft_session
-        if session is None:
-            return None
-        try:
-            frame_bytes = await session.grab_vision_frame_bytes()
-        except Exception:  # noqa: BLE001
-            return None
-        if not frame_bytes:
-            return None
-        try:
-            from src.kernel.llm.payload.media import MediaPart, MediaRef
-
-            media_ref = MediaRef.from_bytes(
-                frame_bytes,
-                kind="image",
-                mime_type="image/jpeg",
-                origin="minecraft_vision",
-            )
-            return LLMPayload(
-                ROLE.USER,
-                [
-                    Text(
-                        "（这是你此刻在 Minecraft 里亲眼看到的画面。你正在游戏中，这是你连续游玩的一个回合。）"
-                    ),
-                    MediaPart(media_ref),
-                ],
-            )
-        except Exception:  # noqa: BLE001 - never fail the heartbeat for vision
-            return None
 
     async def _run_learning_heartbeat_maintenance(self) -> None:
         """Wake derived learning without spending foreground heartbeat budget."""
@@ -10449,17 +10469,9 @@ class LifeEngineService(BaseService):
             logger.info("life_engine 记忆索引循环已停止")
 
     def _effective_heartbeat_interval(self) -> int:
-        """Accelerate heartbeat turns into continuous play while in game."""
+        """Keep the core heartbeat independent from scene consciousnesses."""
 
-        base_interval = max(1, int(self._cfg().settings.heartbeat_interval_seconds))
-        session = self.minecraft_session
-        if session is None or not getattr(session, "is_active", False):
-            return base_interval
-        mc_section = getattr(self._cfg(), "minecraft", None)
-        game_interval = getattr(mc_section, "game_turn_interval_seconds", None)
-        if game_interval is None:
-            return base_interval
-        return max(1, int(game_interval))
+        return max(1, int(self._cfg().settings.heartbeat_interval_seconds))
 
     async def _heartbeat_loop(self) -> None:
         """心跳循环。"""
