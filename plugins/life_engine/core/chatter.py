@@ -99,6 +99,9 @@ _SEND_IMAGE = "action-life_send_image"
 _SEND_VOICE = "action-life_send_voice"
 _SEND_FILE = "action-life_send_file"
 _SEND_EMOJI_MEME = "action-send_emoji_meme"
+_MINECRAFT_CAUSAL_TOOL_NAMES = frozenset(
+    {"nucleus_minecraft", "tool-nucleus_minecraft"}
+)
 _RETIRED_THINK_ACTION = "action-think"
 _RETIRED_PROACTIVE_ACTIONS = frozenset(
     {
@@ -6117,6 +6120,18 @@ class LifeChatter(BaseChatter):
                 self._ensure_unique_tool_call_ids(call_list)
                 logger.debug(f"本轮调用: {[c.name for c in call_list]}")
 
+                # Minecraft is an embodied, stateful boundary. A visible reply
+                # emitted in the same assistant turn cannot have observed the
+                # status/start/do receipt yet, so executing it would let the
+                # model promise success before the body actually moved. Run the
+                # embodied call, append every tool result, and force one causal
+                # follow-up before any user-visible claim is delivered.
+                minecraft_result_before_visible_reply = any(
+                    str(getattr(item, "name", "") or "").strip().lower()
+                    in _MINECRAFT_CAUSAL_TOOL_NAMES
+                    for item in call_list
+                )
+
                 should_wait = False
                 suppressed_recent_reply = False
                 seen_sigs: set[str] = set()
@@ -6346,6 +6361,31 @@ class LifeChatter(BaseChatter):
                     logger.debug(
                         f"LLM 调用 {call_name}，原因: {reason}，参数: {log_args}"
                     )
+
+                    if (
+                        minecraft_result_before_visible_reply
+                        and self._is_visible_reply_action(str(call_name or ""))
+                    ):
+                        await flush_parallel_calls()
+                        llm_response.add_payload(
+                            LLMPayload(
+                                ROLE.TOOL_RESULT,
+                                ToolResult(
+                                    value=(
+                                        "本轮同时包含 Minecraft 具身调用；这条可见回复未发送。"
+                                        "请先读取本轮全部 Minecraft 工具回执，再在下一轮基于"
+                                        "真实结果行动或回复：未启动就调用 start，启动成功后再"
+                                        "确认已进入，失败则说明精确阻断。"
+                                    ),
+                                    call_id=call.id,
+                                    name=call_name,
+                                ),
+                            )
+                        )
+                        logger.info(
+                            "life_chatter 已延后同轮可见回复，等待 Minecraft 回执续轮"
+                        )
+                        continue
 
                     if should_wait and self._is_visible_reply_action(
                         str(call_name or "")

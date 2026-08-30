@@ -47,6 +47,14 @@
 | 连续轮次 prompt/World 体积不递归增长，receipt ≤ 8 KiB | 待现场 |  |
 | stop 后 Presence/scene 结束；用户游戏保持运行 | 待现场 |  |
 
+### 现场尝试记录：03:17 的 status-only 假启动
+
+- 用户客户端已进入 `Elysian Realm` 并以固定端口 `25565` 对局域网开放；宿主端口 owner 为用户的 Minecraft 进程，WSL 连通检查成功。
+- KOOK 邀请进入表达层后，请求检查器记录到 `tool-nucleus_minecraft` 与 `action-life_send_text` 同轮调用。Minecraft 参数实际是 `action=status`，回执明确为 `active=false`、`readiness=idle`、`bridge_connected=false`、`consciousness.phase=not_started`；当时只有用户的一个 Java 进程，18765/18766/18767 均未监听。
+- 同轮可见消息却说“我这就启动身体”，随后表达层因已经发送可见回复而结束本轮，没有让模型读取 status 回执并继续 `start`。因此该次尝试判定为失败，不能计入端到端验收。
+- 已增加 Minecraft 专用因果门禁：同轮 Minecraft 调用与可见消息不能并行闭合；可见消息会被延后，模型必须先读取完整回执再行动或回复。status 回执也显式标记 `status_query_only=true`、`started_by_this_call=false`，inactive 时给出正式 bot start 提示；工具说明禁止用 status 代替 start 或提前宣称成功。
+- 新增回归证明 status 会执行而同轮假承诺不会发送，运行态进入 follow-up；Minecraft 工具定向测试共 8 项通过。03:30 之后的 Elysium 实例已加载该修复，真实 `start → playable → 专属意识` 仍按下表继续取证。
+
 现场证据应从这些正式位置提取：
 
 - `nucleus_minecraft(status)` 的 body/consciousness 状态；

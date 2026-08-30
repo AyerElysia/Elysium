@@ -84,7 +84,13 @@ async def test_status_query_succeeds_when_body_is_inactive() -> None:
     success, payload = await tool.execute(action="status")
 
     assert success is True
-    assert json.loads(payload) == {"active": False, "readiness": "ready"}
+    result = json.loads(payload)
+    assert result["active"] is False
+    assert result["readiness"] == "ready"
+    assert result["status_query_only"] is True
+    assert result["started_by_this_call"] is False
+    assert "action='start'" in result["start_hint"]
+    assert "body_name='bot'" in result["start_hint"]
     assert session.calls == [("status", {})]
 
 

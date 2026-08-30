@@ -123,6 +123,7 @@ bot 身体用于和人一起玩同一个世界：人类用自己的客户端进�
 
 1. 用户在自己的 Minecraft 客户端进入世界；若是单人存档，先"对局域网开放"，在端口号框里**固定填写 `25565`**（红字为无效端口，白字才能创建；必须与 `bot_server_port` 一致），配置只需设置一次；专用服务器则填服务器地址与端口。
 2. 通过正式工具调用 `nucleus_minecraft(action="start", body_name="bot")`。该工具同时注册在 chat 意识清单中，她在聊天对话里就能直接调用，不需要切换到其他意识。session 负责唯一的 bot 进程生命周期：启动 node 子进程、等待桥接认证、等待服务器世界就绪。
+   `status` 是纯只读查询，永远不会代替 `start`。表达层若在同一模型轮同时给出 Minecraft 调用和可见消息，运行时会先执行 Minecraft 调用、延后可见消息，并强制下一轮读取真实回执；只有 `start` 成功后才能告诉用户已经进入，失败则必须报告精确阻断。
 3. 就绪判定为 `server_world`：`world_loaded=true`、存在 `world` 事实（mode/server_address）且玩家有 UUID。与 `agent` 不同，它不校验单人世界名称和客户端暂停状态。
 4. `stop` 由 session 终止其拥有的 bot 进程并断开桥接；`game_left_running` 对 bot 恒为 `false`，人类的游戏客户端不受任何影响。
 

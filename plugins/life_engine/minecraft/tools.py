@@ -245,6 +245,20 @@ class LifeEngineMinecraftTool(BaseTool):
         )
         result = await _execute_turn_once(session, operation_key, run_operation)
 
+        if action == "status":
+            # Make the read-only nature explicit in the model-visible receipt.
+            # This prevents an inactive status check from being mistaken for a
+            # successful entrance into the world.
+            result = dict(result)
+            result["status_query_only"] = True
+            result["started_by_this_call"] = False
+            if not bool(result.get("active")):
+                result["start_hint"] = (
+                    "status 不会启动身体；要进入 Ayer 已开放的共享世界，请调用 "
+                    "nucleus_minecraft(action='start', body_name='bot', "
+                    "goal='和 Ayer 一起玩')"
+                )
+
         # A successful status query may legitimately report an inactive body;
         # inactivity is state, not a tool execution failure. Other actions
         # expose the session result through the standard BaseTool contract.
