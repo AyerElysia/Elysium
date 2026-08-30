@@ -174,3 +174,6 @@ services/visual_embedding/.venv/
 services/visual_embedding/*.log
 elysia_credential.json
 plugins/napcat_adapter/utils/media.py.bak-noretry
+
+# Playwright MCP 测试工具产物（截图/snapshot）
+.playwright-mcp/
