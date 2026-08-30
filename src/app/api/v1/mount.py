@@ -118,7 +118,7 @@ def mount_api_v1(
 
     if any(getattr(route, "name", None) == MOUNT_NAME for route in parent.routes):
         raise RuntimeError("/api/v1 is already mounted")
-    environment = environ or os.environ
+    environment = os.environ if environ is None else environ
     signing_secret = environment.get(SIGNING_SECRET_ENV, "")
     installation_id = environment.get(INSTALLATION_ID_ENV, "")
     if len(signing_secret.encode("utf-8")) < 32:

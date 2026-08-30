@@ -179,7 +179,10 @@ async def test_napcat_fetch_does_not_bypass_proxy_after_http_status_error(
     )
 
     with pytest.raises(httpx.HTTPStatusError):
-        await napcat_utils.download_image_base64(str(request.url))
+        await napcat_utils._download_image_once(
+            str(request.url),
+            httpx.Timeout(timeout=6.0, connect=3.0),
+        )
 
     assert len(_FakeAsyncClient.calls) == 1
 
