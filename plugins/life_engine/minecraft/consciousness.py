@@ -120,8 +120,11 @@ class MinecraftSubjectContextBinding:
         for key, value in snapshot.items():
             metadata.setdefault(str(key), value)
 
-        text = str(snapshot.get("text") or metadata.get("text") or "").strip()
-        if not text:
+        raw_text = snapshot.get("text")
+        if raw_text is None:
+            raw_text = metadata.get("text")
+        text = str(raw_text or "")
+        if not text.strip():
             raise MinecraftSubjectContextError("Minecraft subject projection is empty")
         encoded = text.encode("utf-8")
         if len(encoded) > int(expected_max_bytes):

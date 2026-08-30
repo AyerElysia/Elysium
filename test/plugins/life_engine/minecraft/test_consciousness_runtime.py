@@ -174,6 +174,20 @@ def test_subject_binding_fails_closed_on_wrong_identity_profile() -> None:
         )
 
 
+def test_subject_binding_preserves_exact_utf8_snapshot_bytes() -> None:
+    text = "爱莉的 Minecraft 主体投影\n"
+    snapshot = _subject_snapshot(text)
+
+    binding = MinecraftSubjectContextBinding.from_snapshot(
+        snapshot,
+        expected_max_bytes=16384,
+    )
+
+    assert binding.text == text
+    assert binding.delivered_bytes == len(text.encode("utf-8"))
+    assert binding.projection_sha256 == hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def test_large_observation_projection_is_explicit_and_bounded() -> None:
     observation = _observation(7, {"world_loaded": True, "large": "世界" * 500_000})
 

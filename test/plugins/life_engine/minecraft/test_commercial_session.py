@@ -61,7 +61,7 @@ def _recent_subconscious(content: str) -> RecentSubconsciousContext:
 def _minecraft_subject_snapshot() -> dict[str, Any]:
     """Return one valid immutable subject projection for integration tests."""
 
-    text = "# Subject Context Projection\n\nElysia stays one continuing subject."
+    text = "# Subject Context Projection\n\n爱莉作为同一主体继续进入 Minecraft。\n"
     encoded = text.encode("utf-8")
     return {
         "text": text,

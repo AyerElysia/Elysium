@@ -195,6 +195,7 @@ PYTHONPATH=. uv run --frozen --no-sync python \
 - 多个匹配窗口或 sidecar：由用户手动关闭多余实例；系统不会猜测、抢占或终止进程。
 - 游戏先断开：客户端清理会释放等待者并幂等结束；断线不能被写成动作成功。
 - 模组崩溃：以 crash report 的首个业务栈为准，只隔离有直接证据的模组，并保留可恢复副本。不要批量禁用模组。
+- `Minecraft subject projection byte count does not match its text`：这表示身体尚未启动，主体投影的正文与元数据不再逐字节一致。消费端必须保留快照原始 UTF-8（包括渲染器固定写入的末尾换行），再校验 `delivered_bytes` 与 `projection_sha256`；不得对正文 `strip()` 后比较，也不得跳过该 fail-closed 门。修复后需要用户手动重启 Elysium，再重新执行 `start`。
 - life_chatter 后缀突然变大：检查 World 中 `domain=minecraft/predicate=embodied_trace` 的 value schema。新记录必须是 8 KiB 内的 `minecraft.embodied_trace_projection.v1`；若看到完整 `payload.context`、`transient_world_perception` 或 `recent_subconscious_context`，这是旧递归投影或新的边界违约证据。不要删除或重写历史数据库；保留原文并交由 World owner 做有来源隔离、分页或 superseding projection。
 
 2026-08-04 的真实启动发现 `InventoryProfilesNext 2.2.5`/`libIPN 6.6.3` 在渲染阶段自身空指针崩溃。已验证构建可用以下脚本做精确、可恢复隔离：

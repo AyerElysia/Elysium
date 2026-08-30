@@ -20,8 +20,8 @@
 
 | 门 | 结果 |
 |---|---|
-| Minecraft Python + service 接线 | 105 passed |
-| 专属意识与商业 session 精确测试 | 32 passed |
+| Minecraft Python + service 接线 | 107 passed |
+| 专属意识与商业 session 精确测试 | 33 passed |
 | Life Engine 全集 | 1851 passed / 14 skipped |
 | Mineflayer bot | 3 passed |
 | NeoForge Bridge | Gradle test build successful |
@@ -54,6 +54,13 @@
 - 同轮可见消息却说“我这就启动身体”，随后表达层因已经发送可见回复而结束本轮，没有让模型读取 status 回执并继续 `start`。因此该次尝试判定为失败，不能计入端到端验收。
 - 已增加 Minecraft 专用因果门禁：同轮 Minecraft 调用与可见消息不能并行闭合；可见消息会被延后，模型必须先读取完整回执再行动或回复。status 回执也显式标记 `status_query_only=true`、`started_by_this_call=false`，inactive 时给出正式 bot start 提示；工具说明禁止用 status 代替 start 或提前宣称成功。
 - 新增回归证明 status 会执行而同轮假承诺不会发送，运行态进入 follow-up；Minecraft 工具定向测试共 8 项通过。03:30 之后的 Elysium 实例已加载该修复，真实 `start → playable → 专属意识` 仍按下表继续取证。
+
+### 现场尝试记录：03:55 的主体投影逐字节拒绝
+
+- 用户再次发送明确的 `action=start, body_name=bot` 后，请求检查器证明正式 `nucleus_minecraft` start 已执行；因果门也正确延后了同轮“身体启动中”文本，没有伪报成功。
+- 工具终态为 `success=false`，精确错误是 `Minecraft subject context binding failed: Minecraft subject projection byte count does not match its text`。当时 session 仍 inactive，bot、Bridge 与 sidecar 均未启动，因此游戏内没有反应是启动前置门的真实结果。
+- 根因是共享投影渲染器按规范保留末尾换行并据此计算 UTF-8 字节数与 SHA-256，而 Minecraft 绑定层先对正文调用 `strip()`，删除换行后再与原元数据比较。生产投影因此稳定相差 1 字节；旧测试使用无末尾换行的 ASCII 假快照，未覆盖真实格式。
+- 修复后绑定层保留快照原始正文，只用 `text.strip()` 判断“是否全空白”，预算、字节数、哈希、来源清单和 profile 校验仍全部 fail closed。新增中文 UTF-8 + 末尾换行回归，并把商业 session 夹具改成生产同形快照。该修复必须在用户手动重启 Elysium 后重新执行真实 start 才能计入现场闭环。
 
 现场证据应从这些正式位置提取：
 
