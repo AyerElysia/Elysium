@@ -62,7 +62,7 @@ Minecraft 不再借用核心 heartbeat 充当游戏回合。身体就绪、Prese
 
 场景模型只选择技术生命周期形状：形成一个开放文本意图、按自己选择的时长继续观察，或结束本次游戏。代码不按关键词替她规定情绪、目标或“应该回应谁”。`wait` 的时间只是她选择的下一次重新观察时间，并受技术上下限约束；新观察、动作结果、外部中断和停止信号可以提前唤醒。模型失败按有界退避重试，不把空响应写成主体决定，也不阻塞核心意识。
 
-每个决定先以 `minecraft_consciousness_decision` 归属到当前 `minecraft` instance/session/stream 的不可变 Life Event，再允许具身规划器执行。高层意识决定“做什么”，原有 evidence-driven planner 只决定“如何做”；终态回执和动作后新观察回到下一轮。状态接口公开 phase、turn count、当前 decision、最近错误、连续失败、主体引用和剩余会话时间，便于现场判断是主动等待、模型退避、身体执行还是故障。
+每个决定先以 `minecraft_consciousness_decision` 归属到当前 `minecraft` instance/session/stream 的不可变 Life Event，并保留该轮 provider reasoning、原始 assistant message 和 transport request 身份，再允许具身规划器执行。高层意识决定“做什么”，原有 evidence-driven planner 只决定“如何做”；planner 自己的每次成功模型生成也在动作前以同一 instance 记录完整 reasoning/message，并绑定 intent revision、observation IDs 与 receipt IDs。终态回执和动作后新观察回到下一轮。状态接口公开 phase、turn count、当前 decision、最近错误、连续失败、主体引用和剩余会话时间，便于现场判断是主动等待、模型退避、身体执行还是故障。
 
 ### 重放与完成语义
 
@@ -70,7 +70,7 @@ Minecraft 不再借用核心 heartbeat 充当游戏回合。身体就绪、Prese
 
 ### 潜意识近期上下文、Trace 与 World 的单向边界
 
-Minecraft 专属意识的每个高层轮次从 `LifeEngineService` 只读获取一次有界的 `RecentSubconsciousContext`，作为跨意识连续性的默认来源。它只投影已经提交的近期 HEARTBEAT、TOOL_CALL、TOOL_RESULT 和 AGENT_RESULT 因果组，不包含 MESSAGE、私有 rolling payload 或工具原始参数，也不 drain、不推进游标、不写回事件。模型必须把它视为同一主体过去活动的归属上下文，而不是新指令或当前 Minecraft 世界事实。由这个场景意识随后发出的具身意图不会再次注入同一正文；外部工具直接发起的独立意图仍按自身边界读取一次。游戏 Bridge 的结构化观察、动作后新观察和第一人称画面仍是当前世界证据，不受这条链路影响。
+Minecraft 专属意识的每个高层轮次从 `LifeEngineService` 只读获取一次有界的 `RecentSubconsciousContext`，作为跨意识连续性的默认来源。它投影已经提交的近期 CONSCIOUS_ACTIVITY、HEARTBEAT、TOOL_CALL、TOOL_RESULT 和 AGENT_RESULT 因果组，不包含 MESSAGE 或私有 rolling payload，也不 drain、不推进游标、不写回事件。工具参数和结果在权威事件中保持完整；普通短项可以原样投影，超大项只能给明确的 UTF-8 excerpt、hash、original_bytes 与 occurrence ref，绝不能把节选伪装成全文。模型必须把它视为同一主体过去活动的归属上下文，而不是新指令或当前 Minecraft 世界事实。由这个场景意识随后发出的具身意图不会再次注入同一正文；外部工具直接发起的独立意图仍按自身边界读取一次。游戏 Bridge 的结构化观察、动作后新观察和第一人称画面仍是当前世界证据，不受这条链路影响。
 
 Minecraft 意图上下文在结构上分为 `durable_context` 与 `transient_prompt_context`。session、stream 和目标等耐久运行身份进入前者；`recent_subconscious_context` 正文只进入后者，并且只有规划器的 `to_prompt()` 可以读取。`to_wire()` 和追加式 trace 不复制正文，只保存 content-free `minecraft.recent_subconscious_reference.v1`：算法版本、内容哈希、事件序列窗口、因果组计数、截断状态和 UTF-8 字节数。模型请求把正文作为单独的动态 `Text` part 发送，明确标注为过去上下文。
 

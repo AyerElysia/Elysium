@@ -10,12 +10,13 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from src.app.plugin_system.api.llm_api import create_llm_request, get_model_set_by_task
-from src.kernel.llm import LLMPayload, ROLE, Text
+from src.kernel.llm import ROLE, LLMPayload, Text
 from src.kernel.logger import get_logger
 
+from .activity import DelegatedActivityRecorder
 from .contracts import (
     MissionBudget,
     PlanOutput,
@@ -23,9 +24,6 @@ from .contracts import (
     TaskContract,
     TaskKind,
 )
-
-if TYPE_CHECKING:
-    pass
 
 logger = get_logger("life_engine.orchestration.planner")
 
@@ -88,9 +86,16 @@ class Planner:
         self,
         model_task_name: str = "agent",
         max_tasks: int = 12,
+        *,
+        plugin: Any | None = None,
+        stream_id: str = "",
+        trigger_message: Any | None = None,
     ) -> None:
         self.model_task_name = model_task_name
         self.max_tasks = max_tasks
+        self.plugin = plugin
+        self.stream_id = str(stream_id or "").strip()
+        self.trigger_message = trigger_message
 
     async def plan_auto(
         self,
@@ -116,6 +121,19 @@ class Planner:
         response = await request.send(stream=False)
         response_text = await response
         raw = str(response_text or "").strip()
+        if self.plugin is not None:
+            recorder = DelegatedActivityRecorder(
+                plugin=self.plugin,
+                stream_id=self.stream_id,
+                trigger_message=self.trigger_message,
+                surface="life_engine_orchestration_planner",
+                run_occurrence_id=f"orchestration-mission:{mission_id}",
+            )
+            await recorder.record_model_turn(
+                response,
+                [],
+                turn_index=0,
+            )
 
         return self._parse_plan(raw, mission_id, budget)
 
@@ -127,7 +145,6 @@ class Planner:
     ) -> PlanOutput:
         """手动模式：从结构化字典列表构建 TaskContract。"""
         contracts: list[TaskContract] = []
-        effective_budget = budget or MissionBudget()
 
         for i, raw in enumerate(tasks_raw):
             if i >= self.max_tasks:

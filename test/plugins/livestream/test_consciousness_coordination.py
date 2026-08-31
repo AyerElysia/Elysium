@@ -43,6 +43,11 @@ class _Service:
         self.lifecycle_calls: list[str] = []
         self.pending_delivery: Any | None = None
         self.committed_delivery_ids: set[str] = set()
+        self.activity_turns: list[dict[str, Any]] = []
+
+    async def record_conscious_model_turn(self, **kwargs: Any) -> dict[str, str]:
+        self.activity_turns.append(dict(kwargs))
+        return {}
 
     async def register_consciousness_instance(
         self,
@@ -412,6 +417,9 @@ async def test_perception_is_transient_and_committed_after_durable_decision(
     assert decision.chatter_runtime.perception.delivery_id == "world-delivery-1"
     assert await ledger.get_record(f"director:{decision.decision_id}") is not None
     assert await ledger.get_cursor("session-1", "livestream.director.v1") == 1
+    assert len(service.activity_turns) == 1
+    assert service.activity_turns[0]["surface"] == "livestream"
+    assert service.activity_turns[0]["source_instance_id"] == manager.instance_id
     await ledger.stop()
     await manager.suspend(reason="test-ended")
 

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import time
-from typing import Protocol, TypedDict
+from collections.abc import Awaitable, Callable
+from typing import Any, Protocol, TypedDict
 
 import json_repair
 
@@ -39,6 +40,9 @@ class SupportsRequestCreation(Protocol):
         *,
         with_reminder: str = "",
     ) -> LLMRequest: ...
+
+
+RouterActivityRecorder = Callable[[Any, str], Awaitable[None]]
 
 
 class _SafeFormatDict(dict[str, str]):
@@ -248,6 +252,7 @@ async def route_should_respond(
     history_text: str = "",
     prefix_prompt: str = "",
     fallback_prompt: str | None = None,
+    activity_recorder: RouterActivityRecorder | None = None,
 ) -> SubAgentDecision:
     """Route through cloud-first tasks and preserve work on degraded failure.
 
@@ -355,6 +360,20 @@ async def route_should_respond(
             continue
 
         content = str(response.message or awaited_text or "").strip()
+        if activity_recorder is not None:
+            try:
+                await activity_recorder(response, task)
+            except Exception as exc:  # noqa: BLE001 - unrecorded choice is unusable
+                last_error = (
+                    f"{task} 活动落账失败: {type(exc).__name__}"
+                )
+                logger.warning(
+                    f"Router[{task}] 生成结果未能进入统一意识活动账本，"
+                    "不使用该次决策"
+                )
+                if task == "router":
+                    _circuit_record_failure()
+                continue
         if not content:
             last_error = f"{task} 返回空正文"
             logger.warning(f"Router[{task}] 返回空正文，尝试下一个云端任务")

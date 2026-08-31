@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from hashlib import sha256
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -21,6 +22,7 @@ from plugins.life_engine.minecraft.model_planner import (
     JsonIntentPlanner,
     PlannerOutputError,
 )
+from plugins.life_engine.minecraft.session import MinecraftSession, SessionState
 from src.kernel.llm import EffectiveContextReceipt, Text
 
 
@@ -45,6 +47,7 @@ class _ModelResponse:
     ) -> None:
         self.message = '{"conclusion":{"statement":"observed","evidence_ids":[]}}'
         self.request_record_id = 47
+        self.reasoning_content = "根据观察与动作回执选择下一步"
         self._receipt = receipt
 
     def __await__(self):
@@ -266,6 +269,91 @@ async def test_model_source_proves_exact_transient_perception_delivery(
     assert proof.projection_sha256 == sha256(projection.encode("utf-8")).hexdigest()
     assert proof.delivered_bytes == len(projection.encode("utf-8"))
     assert proof.transport_request_id == "47"
+
+
+async def test_model_source_records_full_generation_before_returning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """具身 planner 的原始生成必须先进入统一活动链。"""
+
+    request = _ModelRequest(exact=True)
+    monkeypatch.setattr(
+        model_planner_module,
+        "get_model_set_by_task",
+        lambda _name: [{"model_identifier": "test"}],
+    )
+    monkeypatch.setattr(
+        model_planner_module,
+        "create_llm_request",
+        lambda **_kwargs: request,
+    )
+    recorded: list[tuple[Any, dict[str, Any]]] = []
+
+    async def record_activity(
+        response: Any,
+        document: dict[str, Any],
+    ) -> None:
+        recorded.append((response, document))
+
+    intent = _perception_intent("bounded perception")
+    document = _decision_document(intent)
+    source = ElysiumModelDecisionSource(
+        "minecraft",
+        activity_recorder=record_activity,
+    )
+
+    await source(document)
+
+    assert len(recorded) == 1
+    assert recorded[0][0].reasoning_content == (
+        "根据观察与动作回执选择下一步"
+    )
+    assert recorded[0][0].message == (
+        '{"conclusion":{"statement":"observed","evidence_ids":[]}}'
+    )
+    assert recorded[0][1] is document
+
+
+async def test_session_attributes_embodiment_planner_turn_to_active_instance(
+    tmp_path: Path,
+) -> None:
+    """具身规划生成必须保留 Minecraft instance/stream 与稳定 intent 身份。"""
+
+    turns: list[dict[str, Any]] = []
+
+    async def record_turn(**kwargs: Any) -> dict[str, str]:
+        turns.append(dict(kwargs))
+        return {}
+
+    session = MinecraftSession(
+        tmp_path,
+        record_conscious_model_turn=record_turn,
+    )
+    session._state = SessionState(
+        active=True,
+        session_id="session-1",
+        stream_id="game.minecraft.session-1",
+        consciousness_instance_id="minecraft_session-1",
+    )
+    intent = _perception_intent("bounded perception")
+
+    await session._record_minecraft_planner_activity(
+        _ModelResponse(None),
+        _decision_document(intent),
+    )
+
+    assert len(turns) == 1
+    assert turns[0]["stream_id"] == "game.minecraft.session-1"
+    assert turns[0]["source_instance_id"] == "minecraft_session-1"
+    assert turns[0]["transport_request_id"] == "47"
+    assert turns[0]["provider_reasoning_content"] == (
+        "根据观察与动作回执选择下一步"
+    )
+    assert turns[0]["assistant_message"] == (
+        '{"conclusion":{"statement":"observed","evidence_ids":[]}}'
+    )
+    assert turns[0]["surface"] == "minecraft_embodiment_planner"
+    assert intent.intent_id in turns[0]["turn_occurrence_id"]
 
 
 async def test_model_source_sends_recent_subconscious_as_transient_text(

@@ -3880,6 +3880,54 @@ class LifeChatter(BaseChatter):
         try:
             from .router import route_should_respond
 
+            router_turn_key = self._unread_turn_key(
+                unread_msgs,
+                str(getattr(chat_stream, "stream_id", "") or self.stream_id or ""),
+            )
+            router_source_instance_id = str(self.instance_id or "").strip()
+            if not router_source_instance_id and service is not None:
+                resolver = getattr(
+                    service,
+                    "resolve_consciousness_instance",
+                    None,
+                )
+                if callable(resolver):
+                    router_source_instance_id = str(
+                        resolver(str(getattr(chat_stream, "stream_id", "") or ""))
+                        or ""
+                    ).strip()
+            router_source_instance_id = router_source_instance_id or "chat_global"
+
+            async def record_router_activity(response: Any, task: str) -> None:
+                recorder = getattr(
+                    service,
+                    "record_conscious_model_turn",
+                    None,
+                )
+                if not callable(recorder):
+                    return
+                transport_request_id = str(
+                    getattr(response, "request_record_id", "")
+                    or getattr(getattr(response, "_upper", None), "request_id", "")
+                    or f"{router_turn_key}:router:{task}"
+                ).strip()
+                await recorder(
+                    stream_id=str(
+                        getattr(chat_stream, "stream_id", "") or self.stream_id or ""
+                    ),
+                    source_instance_id=router_source_instance_id,
+                    turn_occurrence_id=f"{router_turn_key}:router",
+                    transport_request_id=transport_request_id,
+                    provider_reasoning_content=str(
+                        getattr(response, "reasoning_content", "") or ""
+                    ),
+                    assistant_message=str(
+                        getattr(response, "message", "") or ""
+                    ),
+                    calls=[],
+                    surface="life_chatter_router",
+                )
+
             result = await self._await_with_watchdog_keepalive(
                 route_should_respond(
                     chatter=self,
@@ -3888,6 +3936,7 @@ class LifeChatter(BaseChatter):
                     chat_stream=chat_stream,
                     history_text=history_text,
                     prefix_prompt=prefix_prompt,
+                    activity_recorder=record_router_activity,
                 )
             )
             return result
@@ -5494,6 +5543,138 @@ class LifeChatter(BaseChatter):
         )
         return str(signature or "") in blocked_signatures
 
+    @staticmethod
+    def _tool_results_for_calls(
+        response: Any,
+        call_ids: set[str],
+    ) -> dict[str, ToolResult]:
+        """Return the final ToolResult part for each call in one model turn."""
+
+        results: dict[str, ToolResult] = {}
+        for payload in list(getattr(response, "payloads", []) or []):
+            for part in list(getattr(payload, "content", []) or []):
+                if not isinstance(part, ToolResult):
+                    continue
+                call_id = str(part.call_id or "").strip()
+                if call_id in call_ids:
+                    results[call_id] = part
+        return results
+
+    async def _record_conscious_tool_calls(
+        self,
+        service: LifeEngineService | None,
+        calls: list[Any],
+        response: Any,
+        *,
+        stream_id: str,
+        turn_occurrence_id: str,
+        source_instance_id: str,
+        fallback_model_turn_id: str,
+    ) -> dict[str, str]:
+        """Persist the complete model generation before any side effect."""
+
+        recorder = getattr(service, "record_conscious_model_turn", None)
+        legacy_recorder = getattr(service, "record_conscious_tool_calls", None)
+        if not callable(recorder) and callable(legacy_recorder):
+            recorder = legacy_recorder
+        if not callable(recorder):
+            return {}
+        payloads: list[dict[str, Any]] = []
+        for call in calls:
+            call_id = str(getattr(call, "id", "") or "").strip()
+            tool_name = str(getattr(call, "name", "") or "").strip()
+            args = getattr(call, "args", None)
+            if not call_id or not tool_name or not isinstance(args, dict):
+                raise ValueError("life_chatter tool call attribution is incomplete")
+            payloads.append(
+                {
+                    "call_id": call_id,
+                    "tool_name": tool_name,
+                    "arguments": dict(args),
+                }
+            )
+        if recorder is legacy_recorder:
+            return await recorder(
+                stream_id=stream_id,
+                source_instance_id=source_instance_id,
+                turn_occurrence_id=turn_occurrence_id,
+                calls=payloads,
+            )
+        transport_request_id = str(
+            getattr(response, "request_record_id", "")
+            or getattr(getattr(response, "_upper", None), "request_id", "")
+            or fallback_model_turn_id
+        ).strip()
+        return await recorder(
+            stream_id=stream_id,
+            source_instance_id=source_instance_id,
+            turn_occurrence_id=turn_occurrence_id,
+            transport_request_id=transport_request_id,
+            provider_reasoning_content=str(
+                getattr(response, "reasoning_content", "") or ""
+            ),
+            assistant_message=str(getattr(response, "message", "") or ""),
+            calls=payloads,
+        )
+
+    async def _record_conscious_tool_results(
+        self,
+        service: LifeEngineService | None,
+        calls: list[Any],
+        response: Any,
+        *,
+        stream_id: str,
+        turn_occurrence_id: str,
+        source_instance_id: str,
+        activity_ids: dict[str, str],
+        outcomes: dict[str, dict[str, Any]],
+    ) -> None:
+        """Persist every real, failed, blocked, or suppressed tool outcome."""
+
+        recorder = getattr(service, "record_conscious_tool_results", None)
+        if not callable(recorder) or not activity_ids:
+            return
+        call_ids = set(activity_ids)
+        returned = self._tool_results_for_calls(response, call_ids)
+        results: list[dict[str, Any]] = []
+        for call in calls:
+            call_id = str(getattr(call, "id", "") or "").strip()
+            if call_id not in activity_ids:
+                continue
+            part = returned.get(call_id)
+            outcome = dict(outcomes.get(call_id) or {})
+            results.append(
+                {
+                    "call_id": call_id,
+                    "tool_name": str(getattr(call, "name", "") or ""),
+                    "result": (
+                        part.value
+                        if part is not None
+                        else "工具轮结束时没有对应结果"
+                    ),
+                    "success": bool(outcome.get("success", False)),
+                    "technical_outcome": str(
+                        outcome.get("technical_outcome") or ""
+                    ),
+                    "delivery_receipt_sha256": str(
+                        outcome.get("delivery_receipt_sha256") or ""
+                    ),
+                    "delivery_message_id": str(
+                        outcome.get("delivery_message_id") or ""
+                    ),
+                    "delivery_proof_status": str(
+                        outcome.get("delivery_proof_status") or ""
+                    ),
+                }
+            )
+        await recorder(
+            stream_id=stream_id,
+            source_instance_id=source_instance_id,
+            turn_occurrence_id=turn_occurrence_id,
+            activity_ids=activity_ids,
+            results=results,
+        )
+
     async def run_tool_call(
         self,
         call: Any,
@@ -6037,6 +6218,40 @@ class LifeChatter(BaseChatter):
                 response_msg = getattr(llm_response, "message", None)
                 self._print_life_decision_panel(chat_stream, llm_response)
 
+                # Stable activity identity requires unique call ids before the
+                # immutable model-turn/call group is appended.  Do this before
+                # any tool side effect, not later in the executor path.
+                if call_list:
+                    self._ensure_unique_tool_call_ids(call_list)
+
+                source_instance_id = str(self.instance_id or "").strip()
+                if not source_instance_id and service is not None:
+                    resolver = getattr(
+                        service,
+                        "resolve_consciousness_instance",
+                        None,
+                    )
+                    if callable(resolver):
+                        source_instance_id = str(resolver(stream_id) or "").strip()
+                source_instance_id = source_instance_id or "chat_global"
+                authoritative_model_turn_recorded = bool(
+                    callable(
+                        getattr(service, "record_conscious_model_turn", None)
+                    )
+                )
+                activity_ids = await self._record_conscious_tool_calls(
+                    service,
+                    call_list,
+                    llm_response,
+                    stream_id=stream_id,
+                    turn_occurrence_id=rt.active_unread_turn_key,
+                    source_instance_id=source_instance_id,
+                    fallback_model_turn_id=(
+                        f"{rt.active_unread_turn_key}:model-turn:"
+                        f"{rt.follow_up_rounds}"
+                    ),
+                )
+
                 # 空 call_list：纯文本是内心独白；空响应继续 loop（当作模型在想）。
                 if not call_list:
                     response_text = str(response_msg or "").strip()
@@ -6053,10 +6268,11 @@ class LifeChatter(BaseChatter):
                         if self._strip_suspend_echo_from_tail(llm_response):
                             logger.debug("已清除模型 echo 的 __SUSPEND__ 占位")
                     elif response_text:
-                        await self._record_plain_text_inner_monologue(
-                            chat_stream,
-                            response_text,
-                        )
+                        if not authoritative_model_turn_recorded:
+                            await self._record_plain_text_inner_monologue(
+                                chat_stream,
+                                response_text,
+                            )
                         recorded_monologue = True
                         logger.info(
                             f"life_chatter 记录纯文本独白，继续 loop: "
@@ -6117,7 +6333,6 @@ class LifeChatter(BaseChatter):
                         continue
                     return Success("follow-up scheduled")
 
-                self._ensure_unique_tool_call_ids(call_list)
                 logger.debug(f"本轮调用: {[c.name for c in call_list]}")
 
                 # Minecraft is an embodied, stateful boundary. A visible reply
@@ -6151,10 +6366,13 @@ class LifeChatter(BaseChatter):
                 terminal_tool_failure = ""
                 terminal_tool_failure_action_id = ""
                 terminal_initiative_outcome = "failed"
+                activity_outcomes: dict[str, dict[str, Any]] = {}
                 if trigger_msg is not None:
                     trigger_msg.extra["life_turn_scope"] = {
                         "stream_id": stream_id,
                         "turn_key": rt.active_unread_turn_key,
+                        "consciousness_instance_id": source_instance_id,
+                        "conscious_activity_ids": dict(activity_ids),
                         "autonomy_occurrences": autonomy_occurrences,
                         "initiative_outreach_occurrences": (
                             initiative_outreach_occurrences
@@ -6191,6 +6409,13 @@ class LifeChatter(BaseChatter):
                     )
                     executed_name = str(getattr(executed_call, "name", "") or "")
                     action_id = str(getattr(executed_call, "id", "") or "")
+                    activity_outcomes[action_id] = {
+                        "success": bool(success),
+                        "technical_outcome": technical_outcome,
+                        "delivery_receipt_sha256": delivery_receipt_sha256,
+                        "delivery_message_id": delivery_message_id,
+                        "delivery_proof_status": delivery_proof_status,
+                    }
                     lineage_key = self._tool_failure_lineage_key(executed_call)
                     failure_count = 0
                     if lineage_key:
@@ -6494,6 +6719,10 @@ class LifeChatter(BaseChatter):
                     # pass：唯一的退出信号
                     if call_name == _PASS_AND_WAIT:
                         await flush_parallel_calls()
+                        activity_outcomes[str(getattr(call, "id", "") or "")] = {
+                            "success": True,
+                            "technical_outcome": "passed",
+                        }
                         if service is not None and autonomy_occurrences:
                             await service.complete_autonomy_occurrences(
                                 autonomy_occurrences,
@@ -6675,6 +6904,16 @@ class LifeChatter(BaseChatter):
                     await handle_tool_execution_result(call, execution_result)
 
                 await flush_parallel_calls()
+                await self._record_conscious_tool_results(
+                    service,
+                    call_list,
+                    llm_response,
+                    stream_id=stream_id,
+                    turn_occurrence_id=rt.active_unread_turn_key,
+                    source_instance_id=source_instance_id,
+                    activity_ids=activity_ids,
+                    outcomes=activity_outcomes,
+                )
 
                 if terminal_tool_failure:
                     if service is not None and autonomy_occurrences:
@@ -6848,6 +7087,51 @@ class LifeChatter(BaseChatter):
                     if rt is not None and (
                         not active_stream_id or active_stream_id == self.stream_id
                     ):
+                        turn_occurrence_id = str(
+                            getattr(rt, "active_unread_turn_key", "") or ""
+                        ).strip()
+                        activity_recorder = getattr(
+                            service,
+                            "record_conscious_activity_state",
+                            None,
+                        )
+                        if callable(activity_recorder) and turn_occurrence_id:
+                            source_instance_id = str(
+                                getattr(self, "instance_id", "") or ""
+                            ).strip()
+                            if not source_instance_id:
+                                resolver = getattr(
+                                    service,
+                                    "resolve_consciousness_instance",
+                                    None,
+                                )
+                                if callable(resolver):
+                                    source_instance_id = str(
+                                        resolver(self.stream_id) or ""
+                                    ).strip()
+                            try:
+                                await activity_recorder(
+                                    stream_id=self.stream_id,
+                                    source_instance_id=(
+                                        source_instance_id or "chat_global"
+                                    ),
+                                    occurrence_id=(
+                                        f"{turn_occurrence_id}:stream-step-cancelled"
+                                    ),
+                                    state_kind="chatter_interrupted",
+                                    payload={
+                                        "phase": str(
+                                            getattr(rt.phase, "value", rt.phase)
+                                        ),
+                                    },
+                                    surface="life_chatter",
+                                    causation_id=turn_occurrence_id,
+                                )
+                            except Exception as record_error:  # noqa: BLE001
+                                logger.warning(
+                                    "life_chatter 中断活动落账失败: "
+                                    f"error_type={type(record_error).__name__}"
+                                )
                         if rt.phase == _Phase.MODEL_TURN:
                             self._recover_failed_model_turn(
                                 rt,

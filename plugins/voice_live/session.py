@@ -771,9 +771,25 @@ class CallSession:
     async def _on_response_done(self, success: bool) -> None:
         """Open the next turn frontier after transient context has expired."""
 
-        del success
+        record = await self._store.append_async(
+            "provider.response_done",
+            {"success": bool(success)},
+        )
+        # Open and refresh the next provider-context frontier before the durable
+        # Life activity write.  The audit write must not delay turn readiness.
         self._dynamic_context_frontier += 1
         self._schedule_dynamic_context_refresh()
+        record_state = getattr(self._bridge, "record_activity_state", None)
+        if callable(record_state):
+            await record_state(
+                occurrence_id=(
+                    f"voice:{self.episode_id}:response-done:{record.sequence}"
+                ),
+                state_kind=(
+                    "response_completed" if success else "response_cancelled"
+                ),
+                payload={"success": bool(success)},
+            )
 
     async def _on_transcript(self, event: TranscriptEvent) -> None:
         await self._send_json_safe(
@@ -809,7 +825,7 @@ class CallSession:
             await self._fail(f"上游实时模型异常: {message}")
 
     async def _on_interruption(self, event: InterruptionEvent) -> None:
-        await self._store.append_async(
+        record = await self._store.append_async(
             "provider.interruption",
             {
                 "source": event.source,
@@ -825,11 +841,28 @@ class CallSession:
         # Browser-originated barge-in already cleared playback, reset conversion,
         # and incremented the counter in handle_message().  The provider callback
         # is an acknowledgement, not a second interruption.
-        if event.source == "client":
-            return
-        self._interruptions += 1
-        await self._reset_voice_conversion()
-        await self._send_json_safe({"type": "playback.clear", "reason": event.source})
+        if event.source != "client":
+            # Playback safety is latency-sensitive.  Clear it before the durable
+            # Life activity write so storage cannot hold audible stale output.
+            self._interruptions += 1
+            await self._reset_voice_conversion()
+            await self._send_json_safe(
+                {"type": "playback.clear", "reason": event.source}
+            )
+        record_state = getattr(self._bridge, "record_activity_state", None)
+        if callable(record_state):
+            await record_state(
+                occurrence_id=(
+                    f"voice:{self.episode_id}:interruption:{record.sequence}"
+                ),
+                state_kind="response_interrupted",
+                payload={
+                    "source": event.source,
+                    "response_id": event.response_id,
+                    "item_id": event.item_id,
+                },
+                causation_id=str(event.response_id or ""),
+            )
 
     async def _on_metrics(self, event: ProviderMetrics) -> None:
         await self._store.append_async("provider.metrics", event.values)
@@ -838,12 +871,52 @@ class CallSession:
         )
 
     async def _on_tool_call(self, event: ToolCallEvent) -> None:
+        await self._store.append_async(
+            "tool.call",
+            {
+                "call_id": event.call_id,
+                "name": event.name,
+                "arguments_json": event.arguments_json,
+            },
+        )
+        turn_occurrence_id = ""
+        activity_ids: dict[str, str] = {}
+        record_call = getattr(self._bridge, "record_tool_call_activity", None)
+        if callable(record_call):
+            turn_occurrence_id, activity_ids = await record_call(
+                call_id=event.call_id,
+                name=event.name,
+                arguments_json=event.arguments_json,
+            )
         try:
             result = await self._tool_broker.execute(event.name, event.arguments_json)
+            tool_succeeded = bool(
+                not isinstance(result, dict) or result.get("success", True)
+            )
         except Exception as exc:  # noqa: BLE001 - tool adapter boundary
             result = {"success": False, "error": str(exc)}
+            tool_succeeded = False
             await self._store.append_async(
                 "tool.failed", {"name": event.name, "error": str(exc)}
+            )
+        await self._store.append_async(
+            "tool.result",
+            {
+                "call_id": event.call_id,
+                "name": event.name,
+                "success": tool_succeeded,
+                "result": result,
+            },
+        )
+        record_result = getattr(self._bridge, "record_tool_result_activity", None)
+        if callable(record_result) and activity_ids:
+            await record_result(
+                call_id=event.call_id,
+                name=event.name,
+                result=result,
+                success=tool_succeeded,
+                turn_occurrence_id=turn_occurrence_id,
+                activity_ids=activity_ids,
             )
         projector = getattr(self._bridge, "project_tool_result", None)
         if callable(projector):

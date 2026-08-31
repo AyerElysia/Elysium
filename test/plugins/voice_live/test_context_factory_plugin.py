@@ -115,6 +115,8 @@ class FakeLifeService:
         self.subconscious = subconscious or _subconscious_projection()
         self.projection_calls: list[dict[str, Any]] = []
         self.subconscious_calls: list[dict[str, Any]] = []
+        self.model_turns: list[dict[str, Any]] = []
+        self.tool_results: list[dict[str, Any]] = []
 
     async def get_subject_context_projection_snapshot(
         self, **kwargs: Any
@@ -130,6 +132,17 @@ class FakeLifeService:
 
     async def record_message(self, message: Any, *, direction: str) -> None:
         self.messages.append((message, direction))
+
+    async def record_conscious_model_turn(self, **kwargs: Any) -> dict[str, str]:
+        self.model_turns.append(dict(kwargs))
+        calls = list(kwargs["calls"])
+        if not calls:
+            return {}
+        call_id = str(calls[0]["call_id"])
+        return {call_id: "voice-activity-1"}
+
+    async def record_conscious_tool_results(self, **kwargs: Any) -> None:
+        self.tool_results.append(dict(kwargs))
 
 
 @pytest.mark.asyncio
@@ -194,9 +207,81 @@ async def test_context_bridge_separates_identity_and_recent_subconscious_context
     assert [direction for _, direction in service.messages] == ["received", "sent"]
     assert service.messages[0][0].stream_id == consciousness.stream_id
     assert service.messages[1][0].sender_id == consciousness.instance_id
+    assistant_episode_record = [
+        record
+        for record in store.read_all()
+        if record.event == "transcript.final"
+        and record.payload.get("role") == "assistant"
+        and record.payload.get("provider_event_id") == "a1"
+    ][-1]
+    assert service.model_turns == [
+        {
+            "stream_id": consciousness.stream_id,
+            "source_instance_id": consciousness.instance_id,
+            "turn_occurrence_id": (
+                "voice:episode:transcript:"
+                f"{assistant_episode_record.sequence}"
+            ),
+            "transport_request_id": "a1",
+            "provider_reasoning_content": "",
+            "assistant_message": "你好呀",
+            "calls": [],
+            "surface": "voice_live",
+        }
+    ]
     await bridge.record_transcript("assistant", "")
     with pytest.raises(ValueError):
         await bridge.record_transcript("system", "invalid")
+
+
+@pytest.mark.asyncio
+async def test_voice_tool_activity_keeps_full_args_and_result_in_shared_ledger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = VoiceLiveConfig()
+    config.session.record_to_life = True
+    config.session.require_life_engine = True
+    store = VoiceEpisodeStore(tmp_path, "voice_tool_activity", "episode")
+    consciousness = FakeConsciousness()
+    service = FakeLifeService()
+    monkeypatch.setattr(
+        "plugins.voice_live.context_bridge.get_running_life_service",
+        lambda: service,
+    )
+    bridge = ContextBridge(config, consciousness, store)
+
+    turn_id, activity_ids = await bridge.record_tool_call_activity(
+        call_id="voice-call-1",
+        name="action-life_send_text",
+        arguments_json=json.dumps(
+            {
+                "mood": "温柔",
+                "decision": "回应她",
+                "expected_response": "她知道我听见了",
+                "thought": "这是我这一刻真实形成的想法",
+                "content": "我听见啦",
+            },
+            ensure_ascii=False,
+        ),
+    )
+    exact_result = {"success": True, "blob": "完整结果" * 5000}
+    await bridge.record_tool_result_activity(
+        call_id="voice-call-1",
+        name="action-life_send_text",
+        result=exact_result,
+        success=True,
+        turn_occurrence_id=turn_id,
+        activity_ids=activity_ids,
+    )
+
+    assert service.model_turns[0]["surface"] == "voice_live"
+    assert service.model_turns[0]["source_instance_id"] == consciousness.instance_id
+    assert service.model_turns[0]["calls"][0]["arguments"]["thought"] == (
+        "这是我这一刻真实形成的想法"
+    )
+    assert service.tool_results[0]["surface"] == "voice_live"
+    assert service.tool_results[0]["results"][0]["result"] == exact_result
 
 
 @pytest.mark.asyncio

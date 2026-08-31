@@ -5,6 +5,7 @@ import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -172,6 +173,11 @@ class _FakeLifeService:
         self.ledger = ledger
         self.mark_calls = 0
         self.saved = 0
+        self.activity_turns: list[dict[str, Any]] = []
+
+    async def record_conscious_model_turn(self, **kwargs: Any) -> dict[str, str]:
+        self.activity_turns.append(dict(kwargs))
+        return {}
 
     def get_pending_chatter_runtime_delivery(
         self,
@@ -234,6 +240,7 @@ class _FakeResponse:
             '"addressed_event_ids":["event-0"]}'
         )
         self.request_record_id = 91
+        self.reasoning_content = "我选择先认真听完"
 
     def __await__(self):
         async def consume():
@@ -318,6 +325,7 @@ class _FakeChatter:
 
 class _FakeConsciousness:
     is_active = True
+    instance_id = "livestream_42"
 
     def __init__(self, service: _FakeLifeService) -> None:
         self.service = service
@@ -375,3 +383,10 @@ async def test_life_context_cursor_replays_after_durable_decision(tmp_path) -> N
     assert chatter.runtime_context_text == ""
     assert "suffix-delivery-1" in chatter.request.deliveries
     assert cursor == 1
+    assert len(service.activity_turns) == 1
+    assert service.activity_turns[0]["surface"] == "livestream"
+    assert service.activity_turns[0]["source_instance_id"] == "livestream_42"
+    assert service.activity_turns[0]["provider_reasoning_content"] == (
+        "我选择先认真听完"
+    )
+    assert service.activity_turns[0]["assistant_message"].startswith("{")

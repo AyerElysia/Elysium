@@ -56,7 +56,7 @@ Agent / Bot / Biomimetic Body
 
 ## 决策与动作一致性
 
-一个可观察决定必须先写入不可变 Life Event，之后才允许产生物理动作。事件包含 decision ID、开放文本决定、当前 instance/session/stream 归属，以及 content-free 的 turn/subject/observation/subconscious 引用。
+一个可观察决定必须先写入不可变 Life Event，之后才允许产生物理动作。事件包含 decision ID、开放文本决定、当前 instance/session/stream 归属、该轮实际生成的 provider reasoning/assistant message/transport request，以及 content-free 的 turn/subject/observation/subconscious 引用。具身 planner 的成功模型轮同样在动作前落入统一意识活动链；它的输入世界证据仍保留外部来源，不会因为进入 planner Prompt 就自动成为主体信念。
 
 如果落账结果不确定，运行时重试完全相同的决定；service 以 decision ID 幂等复用相同事件。进入物理执行后则绝不自动重放未知动作。具身 trace 的耐久 context 保存 `consciousness_decision_id`，用于把 `intent.issued` 与高层决定连接起来。
 

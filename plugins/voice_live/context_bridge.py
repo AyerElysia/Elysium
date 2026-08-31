@@ -7,7 +7,6 @@ import hashlib
 import inspect
 import json
 import re
-import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -441,6 +440,137 @@ class ContextBridge:
         self._last_dynamic_context_stats: dict[str, Any] = {}
         self._prompt_bundle: VoicePromptBundle | None = None
 
+    def _life_service_for_activity(self) -> Any | None:
+        """Resolve the shared activity ledger without inventing a fallback."""
+
+        if not self._config.session.record_to_life:
+            return None
+        service = get_running_life_service()
+        if service is None and self._config.session.require_life_engine:
+            raise RuntimeError("Voice 工具活动无法写入统一 Life Event 谱系")
+        return service
+
+    async def record_tool_call_activity(
+        self,
+        *,
+        call_id: str,
+        name: str,
+        arguments_json: str,
+    ) -> tuple[str, dict[str, str]]:
+        """Append one realtime model tool choice before executing its side effect."""
+
+        raw_arguments = str(arguments_json or "")
+        try:
+            decoded = json.loads(raw_arguments)
+        except json.JSONDecodeError:
+            arguments: dict[str, Any] = {
+                "raw_arguments_json": raw_arguments,
+                "decode_status": "invalid_json",
+            }
+        else:
+            if isinstance(decoded, Mapping):
+                arguments = {str(key): value for key, value in decoded.items()}
+            else:
+                arguments = {
+                    "raw_arguments_json": raw_arguments,
+                    "decoded_value": decoded,
+                    "decode_status": "non_object_json",
+                }
+
+        turn_occurrence_id = (
+            f"voice:{self._store.episode_id}:tool:{str(call_id or '').strip()}"
+        )
+        service = self._life_service_for_activity()
+        recorder = getattr(service, "record_conscious_model_turn", None)
+        if not callable(recorder):
+            if service is not None and self._config.session.require_life_engine:
+                raise RuntimeError("LifeEngine 未提供统一意识活动记录 API")
+            return turn_occurrence_id, {}
+        activity_ids = await recorder(
+            stream_id=self._consciousness.stream_id,
+            source_instance_id=self._consciousness.instance_id,
+            turn_occurrence_id=turn_occurrence_id,
+            transport_request_id=(
+                f"voice-provider:{self._store.episode_id}:{str(call_id or '').strip()}"
+            ),
+            provider_reasoning_content="",
+            assistant_message="",
+            calls=[
+                {
+                    "call_id": str(call_id or "").strip(),
+                    "tool_name": str(name or "").strip(),
+                    "arguments": arguments,
+                }
+            ],
+            surface="voice_live",
+        )
+        return turn_occurrence_id, dict(activity_ids)
+
+    async def record_tool_result_activity(
+        self,
+        *,
+        call_id: str,
+        name: str,
+        result: Any,
+        success: bool,
+        turn_occurrence_id: str,
+        activity_ids: Mapping[str, str],
+    ) -> None:
+        """Append the exact tool outcome before producing a provider projection."""
+
+        service = self._life_service_for_activity()
+        recorder = getattr(service, "record_conscious_tool_results", None)
+        if not callable(recorder):
+            if service is not None and self._config.session.require_life_engine:
+                raise RuntimeError("LifeEngine 未提供统一工具结果记录 API")
+            return
+        await recorder(
+            stream_id=self._consciousness.stream_id,
+            source_instance_id=self._consciousness.instance_id,
+            turn_occurrence_id=turn_occurrence_id,
+            activity_ids=activity_ids,
+            results=[
+                {
+                    "call_id": str(call_id or "").strip(),
+                    "tool_name": str(name or "").strip(),
+                    "result": result,
+                    "success": bool(success),
+                    "technical_outcome": (
+                        "completed" if success else "failed"
+                    ),
+                }
+            ],
+            surface="voice_live",
+        )
+
+    async def record_activity_state(
+        self,
+        *,
+        occurrence_id: str,
+        state_kind: str,
+        payload: Mapping[str, Any],
+        causation_id: str = "",
+    ) -> None:
+        """Append one content-neutral realtime completion/interruption state."""
+
+        service = self._life_service_for_activity()
+        recorder = getattr(service, "record_conscious_activity_state", None)
+        if not callable(recorder):
+            if service is not None and self._config.session.require_life_engine:
+                raise RuntimeError(
+                    "LifeEngine 未提供统一意识状态活动记录 API"
+                )
+            return
+        await recorder(
+            stream_id=self._consciousness.stream_id,
+            source_instance_id=self._consciousness.instance_id,
+            occurrence_id=str(occurrence_id or "").strip(),
+            state_kind=str(state_kind or "").strip(),
+            payload={str(key): value for key, value in payload.items()},
+            surface="voice_live",
+            causation_id=str(causation_id or "").strip(),
+        )
+
     def _bound_subject_context(self) -> dict[str, Any]:
         bound: dict[str, Any] = {}
         for record in self._store.read_all():
@@ -744,7 +874,7 @@ class ContextBridge:
             "text": text,
             "provider_event_id": provider_event_id,
         }
-        await self._store.append_async("transcript.final", payload)
+        episode_record = await self._store.append_async("transcript.final", payload)
         if not self._config.session.record_to_life:
             return
         service = get_running_life_service()
@@ -753,13 +883,39 @@ class ContextBridge:
                 raise RuntimeError("最终转写无法写入 LifeEngine")
             return
         is_user = role == "user"
+        message_id = (
+            provider_event_id
+            or f"voice-{self._store.episode_id}-{episode_record.sequence}"
+        )
+        if not is_user:
+            recorder = getattr(service, "record_conscious_model_turn", None)
+            if not callable(recorder):
+                if self._config.session.require_life_engine:
+                    raise RuntimeError(
+                        "LifeEngine 未提供统一意识活动记录 API"
+                    )
+            else:
+                turn_occurrence_id = (
+                    f"voice:{self._store.episode_id}:transcript:"
+                    f"{episode_record.sequence}"
+                )
+                await recorder(
+                    stream_id=self._consciousness.stream_id,
+                    source_instance_id=self._consciousness.instance_id,
+                    turn_occurrence_id=turn_occurrence_id,
+                    transport_request_id=message_id,
+                    provider_reasoning_content="",
+                    assistant_message=text,
+                    calls=[],
+                    surface="voice_live",
+                )
         instance = getattr(self._consciousness, "instance", None)
         sender_name = (
             str(getattr(instance, "display_name", "") or "")
             or str(self._config.session.display_name)
         )
         message = Message(
-            message_id=provider_event_id or f"voice-{uuid.uuid4().hex}",
+            message_id=message_id,
             content=text,
             processed_plain_text=text,
             message_type=MessageType.VOICE,

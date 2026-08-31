@@ -317,9 +317,9 @@ def test_runner_does_not_load_mcp_for_read_only_agent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """绕过工具层直接构造 runner 也不能向只读类型注入 MCP。"""
+    import plugins.life_engine.agents.runner as runner_module
     from plugins.life_engine.agents.definitions import AgentTypeDefinition
     from plugins.life_engine.agents.runner import AgentRunner
-    import plugins.life_engine.agents.runner as runner_module
 
     class _FakeResponse:
         call_list: list[object] = []
@@ -382,12 +382,11 @@ def test_runner_uses_unified_executor_for_reason_and_chat_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """runner 应剥离自动 reason，并把当前流与触发消息绑定到 fetch 工具。"""
-    from src.core.components.base.tool import BaseTool
-    from src.kernel.llm import ToolCall
-
+    import plugins.life_engine.agents.runner as runner_module
     from plugins.life_engine.agents.definitions import AgentTypeDefinition
     from plugins.life_engine.agents.runner import AgentRunner
-    import plugins.life_engine.agents.runner as runner_module
+    from src.core.components.base.tool import BaseTool
+    from src.kernel.llm import ToolCall
 
     trigger_message = SimpleNamespace(stream_id="current-stream")
     chat_stream = SimpleNamespace(stream_id="current-stream")
@@ -489,6 +488,102 @@ def test_runner_uses_unified_executor_for_reason_and_chat_context(
         "current_stream_id": "current-stream",
     }
     assert fake_request.response.payloads[0].content[0].value == "当前会话"
+
+
+def test_delegated_activity_recorder_keeps_complete_model_and_tool_material() -> None:
+    """子代理每轮生成、参数与结果必须进入同一主体活动账本。"""
+    from plugins.life_engine.agents.activity import DelegatedActivityRecorder
+
+    class _ActivityService:
+        def __init__(self) -> None:
+            self.turns: list[dict[str, Any]] = []
+            self.results: list[dict[str, Any]] = []
+
+        async def record_conscious_model_turn(
+            self, **kwargs: Any
+        ) -> dict[str, str]:
+            self.turns.append(dict(kwargs))
+            return {"delegated-call": "activity-1"}
+
+        async def record_conscious_tool_results(self, **kwargs: Any) -> None:
+            self.results.append(dict(kwargs))
+
+        def resolve_consciousness_instance(self, _stream_id: str) -> str:
+            return "must-not-override-trigger-scope"
+
+    service = _ActivityService()
+    trigger = SimpleNamespace(
+        extra={
+            "life_turn_scope": {
+                "consciousness_instance_id": "chat_personal_1",
+            }
+        }
+    )
+    recorder = DelegatedActivityRecorder(
+        plugin=SimpleNamespace(_service=service),
+        stream_id="chat-stream-1",
+        trigger_message=trigger,
+        surface="life_engine_agent",
+        run_occurrence_id="delegated-run:stable",
+    )
+    response = SimpleNamespace(
+        request_record_id="request-1",
+        reasoning_content="完整的子代理推理",
+        message="我决定读取文件。",
+    )
+    call = SimpleNamespace(
+        id="delegated-call",
+        name="nucleus_read_file",
+        args={"path": "notes/关系.md", "reason": "核对原始记录"},
+    )
+
+    activity_ids = _run_sync(
+        recorder.record_model_turn(response, [call], turn_index=2)
+    )
+    _run_sync(
+        recorder.record_tool_results(
+            turn_index=2,
+            activity_ids=activity_ids,
+            results=[
+                {
+                    "call_id": "delegated-call",
+                    "tool_name": "nucleus_read_file",
+                    "result": {"text": "完整工具结果", "bytes": 18},
+                    "success": True,
+                    "technical_outcome": "delegated_tool_completed",
+                }
+            ],
+        )
+    )
+
+    assert service.turns == [
+        {
+            "stream_id": "chat-stream-1",
+            "source_instance_id": "chat_personal_1",
+            "turn_occurrence_id": "delegated-run:stable:model-turn:2",
+            "transport_request_id": "request-1",
+            "provider_reasoning_content": "完整的子代理推理",
+            "assistant_message": "我决定读取文件。",
+            "calls": [
+                {
+                    "call_id": "delegated-call",
+                    "tool_name": "nucleus_read_file",
+                    "arguments": {
+                        "path": "notes/关系.md",
+                        "reason": "核对原始记录",
+                    },
+                }
+            ],
+            "surface": "life_engine_agent",
+        }
+    ]
+    assert service.results[0]["activity_ids"] == {
+        "delegated-call": "activity-1"
+    }
+    assert service.results[0]["results"][0]["result"] == {
+        "text": "完整工具结果",
+        "bytes": 18,
+    }
 
 
 def test_agent_coordinator_preserves_background_runtime_context(

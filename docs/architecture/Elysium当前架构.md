@@ -232,7 +232,10 @@ Life Event（追加式发生历史）
 - `life_mission_status`
 - `life_mission_cancel`
 
-子代理负责重活和搜集证据，不拥有主体的最终判断权，也不能用结果覆盖主体记忆。
+子代理负责重活和搜集证据，不拥有主体的最终判断权，也不能用结果覆盖主体记忆。由主体显式发起的
+planner/worker 模型轮会以发起意识实例和当前 stream 为 actor/source 归因，完整保存每轮
+provider reasoning、assistant message、工具参数与真实结果，再把最终 AgentResult 作为完成证据回注。
+系统 Prompt、外部工具材料和未被主体采用的候选仍保持各自来源，不能因为经过子代理就冒充人格监督。
 
 ---
 

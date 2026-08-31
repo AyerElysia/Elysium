@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict, deque
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -30,6 +31,88 @@ from plugins.life_engine.service.tool_manifests import (
     CONSCIOUSNESS_TOOL_MANIFESTS,
     get_tool_manifest,
 )
+
+
+@pytest.mark.asyncio
+async def test_auto_planner_records_full_generation_before_parsing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from plugins.life_engine.agents import planner as planner_module
+    from plugins.life_engine.agents.planner import Planner
+
+    class _Response:
+        message = (
+            '{"reasoning":"拆成一个可验证任务","tasks":['
+            '{"id":"t1","kind":"verify","brief":"核对结果","depends_on":[],'
+            '"priority":5}]}'
+        )
+        reasoning_content = "先保持任务图最小且可验证"
+        request_record_id = "planner-request-1"
+
+        def __await__(self):  # type: ignore[no-untyped-def]
+            async def collect() -> str:
+                return self.message
+
+            return collect().__await__()
+
+    class _Request:
+        def add_payload(self, _payload: Any) -> None:
+            return None
+
+        async def send(self, *, stream: bool = False) -> _Response:
+            assert stream is False
+            return _Response()
+
+    class _Service:
+        def __init__(self) -> None:
+            self.turns: list[dict[str, Any]] = []
+
+        async def record_conscious_model_turn(
+            self, **kwargs: Any
+        ) -> dict[str, str]:
+            self.turns.append(dict(kwargs))
+            return {}
+
+    service = _Service()
+    trigger = SimpleNamespace(
+        extra={
+            "life_turn_scope": {
+                "consciousness_instance_id": "chat_global",
+            }
+        }
+    )
+    monkeypatch.setattr(
+        planner_module,
+        "get_model_set_by_task",
+        lambda _task: [{"model_identifier": "test"}],
+    )
+    monkeypatch.setattr(
+        planner_module,
+        "create_llm_request",
+        lambda **_kwargs: _Request(),
+    )
+
+    plan = await Planner(
+        plugin=SimpleNamespace(_service=service),
+        stream_id="chat-stream-1",
+        trigger_message=trigger,
+    ).plan_auto("核对系统", "mission-1")
+
+    assert [task.task_id for task in plan.tasks] == ["t1"]
+    assert service.turns == [
+        {
+            "stream_id": "chat-stream-1",
+            "source_instance_id": "chat_global",
+            "turn_occurrence_id": (
+                "orchestration-mission:mission-1:model-turn:0"
+            ),
+            "transport_request_id": "planner-request-1",
+            "provider_reasoning_content": "先保持任务图最小且可验证",
+            "assistant_message": _Response.message,
+            "calls": [],
+            "surface": "life_engine_orchestration_planner",
+        }
+    ]
 
 
 def _task(

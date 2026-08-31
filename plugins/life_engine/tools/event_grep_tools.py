@@ -10,19 +10,41 @@ from src.app.plugin_system.base import BaseTool
 
 from ..service import LifeEngineService
 from ..service.event_builder import EventType
-from .bounded_projection import project_bounded_items, sha256_json
+from .bounded_projection import (
+    project_bounded_items,
+    project_bounded_text,
+    sha256_json,
+)
 
 logger = log_api.get_logger("life_engine.event_grep")
 
 _DEFAULT_LIMIT = 12
 _MAX_LIMIT = 80
-_TEXT_FIELDS = ("content", "sender", "source", "source_detail", "tool_name", "stream_id", "content_type")
+_TEXT_FIELDS = (
+    "content",
+    "sender",
+    "source",
+    "source_detail",
+    "tool_name",
+    "stream_id",
+    "content_type",
+)
 
 
 def _event_type_value(event: Any) -> str:
     event_type = getattr(event, "event_type", "")
     value = getattr(event_type, "value", event_type)
     return str(value or "").strip().lower()
+
+
+def _authoritative_event_content(event: Any) -> str:
+    """Return the complete immutable body instead of its display summary."""
+
+    return str(
+        getattr(event, "raw_content", None)
+        or getattr(event, "content", "")
+        or ""
+    )
 
 
 def _event_to_payload(event: Any) -> dict[str, Any]:
@@ -33,7 +55,7 @@ def _event_to_payload(event: Any) -> dict[str, Any]:
         "sequence": int(getattr(event, "sequence", 0) or 0),
         "source": str(getattr(event, "source", "") or ""),
         "source_detail": str(getattr(event, "source_detail", "") or ""),
-        "content": str(getattr(event, "content", "") or ""),
+        "content": _authoritative_event_content(event),
         "content_type": str(getattr(event, "content_type", "") or ""),
         "sender": str(getattr(event, "sender", "") or ""),
         "chat_type": str(getattr(event, "chat_type", "") or ""),
@@ -42,6 +64,13 @@ def _event_to_payload(event: Any) -> dict[str, Any]:
         "tool_name": str(getattr(event, "tool_name", "") or ""),
         "tool_args": getattr(event, "tool_args", None) or {},
         "tool_success": getattr(event, "tool_success", None),
+        "occurrence_id": str(getattr(event, "occurrence_id", "") or ""),
+        "source_instance_id": str(
+            getattr(event, "source_instance_id", "") or ""
+        ),
+        "causation_id": str(getattr(event, "causation_id", "") or ""),
+        "correlation_id": str(getattr(event, "correlation_id", "") or ""),
+        "content_ref": str(getattr(event, "content_ref", "") or ""),
     }
 
 
@@ -195,11 +224,11 @@ async def grep_life_events(
 
 
 class LifeEngineGrepEventsTool(BaseTool):
-    """Search life_engine's full event ledger from the internal life mode."""
+    """Search the bounded recent runtime projection of the Life Event ledger."""
 
     tool_name: str = "nucleus_grep_events"
     tool_description: str = (
-        "搜索你的完整事件流，包括外部消息、心跳、工具调用和工具结果。\n\n"
+        "搜索当前运行时保留的近期事件投影，包括外部消息、心跳、工具调用和工具结果。\n\n"
         "何时用：回忆“我之前看见/做过/想过什么”；查找某段对话或某次工具调用的上下文；"
         "追溯某件事的来龙去脉。\n"
         "何时不用：查找文件内容用 nucleus_grep_file；查询 TODO 用 nucleus_todo；"
@@ -325,6 +354,133 @@ class LifeEngineGrepEventsTool(BaseTool):
             return False, f"搜索事件流失败: {exc}"
 
 
+async def _read_authoritative_event(
+    service: LifeEngineService,
+    occurrence_id: str,
+) -> tuple[Any | None, dict[str, Any]]:
+    """Read one immutable occurrence from either local or selected storage."""
+
+    identity = str(occurrence_id or "").strip()
+    if identity.startswith("life-event-occurrence:"):
+        identity = identity.removeprefix("life-event-occurrence:").strip()
+    if not identity:
+        raise ValueError("occurrence_id 不能为空")
+    store = service._get_life_event_store()
+    get_by_event_id = getattr(store, "get_by_event_id", None)
+    if callable(get_by_event_id):
+        event = await get_by_event_id(identity)
+        if event is None:
+            return None, {"occurrence_id": identity}
+        return event, {
+            "occurrence_id": str(getattr(event, "occurrence_id", "") or identity),
+            "position": int(getattr(event, "sequence", 0) or 0),
+            "content_sha256": sha256_json(
+                {"content": _authoritative_event_content(event)}
+            ),
+        }
+
+    digest_lookup = getattr(store, "occurrence_digest", None)
+    read_since = getattr(store, "read_since", None)
+    if not callable(digest_lookup) or not callable(read_since):
+        raise RuntimeError("authoritative Life Event store is not readable")
+    digest = await digest_lookup(identity)
+    if digest is None:
+        return None, {"occurrence_id": identity}
+    position = int(getattr(digest, "position", 0) or 0)
+    rows = await read_since(max(0, position - 1), limit=1)
+    event = rows[0] if rows else None
+    if (
+        event is None
+        or int(getattr(event, "sequence", 0) or 0) != position
+        or str(getattr(event, "occurrence_id", "") or "") != identity
+    ):
+        raise RuntimeError("authoritative Life Event occurrence read mismatch")
+    return event, {
+        "occurrence_id": identity,
+        "position": position,
+        "payload_hash": str(getattr(digest, "payload_hash", "") or ""),
+    }
+
+
+class LifeEngineReadEventTool(BaseTool):
+    """Read one complete immutable Life Event through stable UTF-8 chunks."""
+
+    tool_name: str = "nucleus_read_event"
+    tool_description: str = (
+        "按潜意识投影给出的 occurrence_id 精确读取一条完整 Life Event。"
+        "当事件投影显示 excerpt_ref、content_ref 或原文过长时使用；"
+        "continuation 用于继续读取同一不可变事件，不能跨事件复用。"
+    )
+    chatter_allow: list[str] = ["life_engine_internal", "life_chatter"]
+
+    async def execute(
+        self,
+        occurrence_id: Annotated[
+            str,
+            "不可变 Life Event occurrence_id；可从 life-event-occurrence: 引用中取得",
+        ],
+        continuation: Annotated[
+            str,
+            "上一页返回的 continuation；第一页留空",
+        ] = "",
+        max_bytes: Annotated[
+            int | None,
+            "可选结果字节预算；不能突破当前任务硬上限",
+        ] = None,
+    ) -> tuple[bool, dict[str, Any] | str]:
+        try:
+            service = LifeEngineService.get_instance()
+            if service is None:
+                raise RuntimeError("life_engine 服务不可用")
+            event, frontier = await _read_authoritative_event(
+                service,
+                occurrence_id,
+            )
+            if event is None:
+                return False, "未找到对应的 Life Event occurrence"
+            identity = str(getattr(event, "occurrence_id", "") or occurrence_id)
+            content = _authoritative_event_content(event)
+            projected = project_bounded_text(
+                projection_name="life-event-authority-read",
+                task_name=getattr(self, "_runtime_task_name", ""),
+                requested_max_bytes=max_bytes,
+                binding={"occurrence_id": identity},
+                frontier=frontier,
+                base_payload={
+                    "action": "read_life_event",
+                    "occurrence_id": identity,
+                    "event_id": str(getattr(event, "event_id", "") or ""),
+                    "event_type": str(getattr(event, "event_type", "") or ""),
+                    "channel": str(getattr(event, "channel", "") or ""),
+                    "source": str(getattr(event, "source", "") or ""),
+                    "stream_id": str(getattr(event, "stream_id", "") or ""),
+                    "source_instance_id": str(
+                        getattr(event, "source_instance_id", "") or ""
+                    ),
+                    "causation_id": str(
+                        getattr(event, "causation_id", "") or ""
+                    ),
+                    "correlation_id": str(
+                        getattr(event, "correlation_id", "") or ""
+                    ),
+                },
+                content=content,
+                content_ref=(
+                    str(getattr(event, "content_ref", "") or "").strip()
+                    or f"life-event-occurrence:{identity}"
+                ),
+                continuation=continuation,
+            )
+            return True, projected
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "读取 Life Event occurrence 失败: "
+                f"error_type={type(exc).__name__}"
+            )
+            return False, f"读取 Life Event 失败: {type(exc).__name__}"
+
+
 EVENT_GREP_TOOLS = [
     LifeEngineGrepEventsTool,
+    LifeEngineReadEventTool,
 ]

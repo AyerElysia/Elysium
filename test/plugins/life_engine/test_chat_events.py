@@ -105,11 +105,29 @@ def test_send_requested_fact_never_claims_delivery_success() -> None:
 def test_delivery_fact_requires_delivered_direction_and_keeps_receipt() -> None:
     message = _message()
     message.extra["api_actor_id"] = "api-actor-1"
+    message.extra.update(
+        {
+            "consciousness_instance_id": "chat-instance-1",
+            "conscious_activity_id": "activity-1",
+            "tool_call_id": "call-1",
+            "origin_turn_key": "turn-1",
+            "origin_stream_id": "feishu:private:user-1",
+        }
+    )
     event = build_chat_message_event(message, direction="delivered")
 
     assert event.event_type == "chat.message.delivery_confirmed"
     assert event.metadata["actor_id"] == "api-actor-1"
     assert event.metadata["provider_receipt"]["message_id"] == "provider-msg-1"
+    assert event.source_instance_id == "chat-instance-1"
+    assert event.causation_id == "activity-1"
+    assert event.correlation_id == "turn-1"
+    assert event.metadata["conscious_activity_lineage"] == {
+        "conscious_activity_id": "activity-1",
+        "tool_call_id": "call-1",
+        "origin_turn_key": "turn-1",
+        "origin_stream_id": "feishu:private:user-1",
+    }
 
 
 def test_failed_and_unknown_delivery_are_not_confirmed() -> None:

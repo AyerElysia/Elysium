@@ -38,6 +38,7 @@ from src.core.components.utils import should_strip_auto_reason_argument
 from src.core.models.message import Message, MessageType
 from src.kernel.concurrency import get_task_manager
 from src.kernel.llm import ROLE, LLMPayload, Text, ToolRegistry, ToolResult
+from src.kernel.llm.context_delivery import EffectiveContextReceipt
 
 _STORAGE_RENEWAL_BACKOFF_BASE_SECONDS = 1.0
 _STORAGE_RENEWAL_BACKOFF_MAX_SECONDS = 30.0
@@ -210,6 +211,7 @@ from .audit import (
 from .chat_events import build_chat_message_event, build_chat_provider_notice_event
 from .consciousness import ConsciousnessInstance, ConsciousnessRegistry
 from .event_builder import (
+    INTERNAL_STREAM_ID,
     EventBuilder,
     EventType,
     LifeEngineEvent,
@@ -409,6 +411,7 @@ class HeartbeatModelResult:
 
     text: str
     perception_receipt: PerceptionDeliveryReceipt | None
+    subconscious_receipt: EffectiveContextReceipt | None = None
 
 
 HEARTBEAT_TOTAL_BUDGET_MAX_SECONDS = 300.0
@@ -3564,6 +3567,7 @@ class LifeEngineService(BaseService):
             record_minecraft_consciousness_decision=(
                 self.record_minecraft_consciousness_decision
             ),
+            record_conscious_model_turn=self.record_conscious_model_turn,
             report_world_observation=self.report_world_observation,
         )
 
@@ -3607,15 +3611,11 @@ class LifeEngineService(BaseService):
         if decision_id in self._minecraft_recorded_decision_ids:
             return event
 
-        async with self._get_lock():
-            if not any(
-                pending.event_id == event.event_id
-                for pending in self._pending_events
-            ):
-                self._pending_events.append(event)
-                self._state.pending_event_count = len(self._pending_events)
-        await self._publish_raw_events([event])
-        await self._save_runtime_context(recoverable_on_shared_conflict=True)
+        # Use the same ledger-first path as every other conscious activity.
+        # A rejected durable append must never leave a phantom MC decision in
+        # the compatibility pending queue; a retry remains idempotent because
+        # both event_id and occurrence_id are the stable decision_id.
+        await self._queue_pending_event(event)
         self._minecraft_recorded_decision_ids.add(decision_id)
         return event
 
@@ -4592,6 +4592,40 @@ class LifeEngineService(BaseService):
         if self._world_projection is not None:
             await self.catch_up_world_projection()
 
+    async def _queue_pending_events(
+        self,
+        events: list[LifeEngineEvent],
+        *,
+        persist: bool = True,
+    ) -> None:
+        """Append one ordered activity batch with one durable checkpoint."""
+
+        if not events:
+            return
+        # The append-only ledger is authoritative.  Publish first so a storage
+        # rejection cannot leave an in-memory activity that never happened.
+        await self._publish_raw_events(events)
+        async with self._get_lock():
+            known_occurrences = {
+                str(event.occurrence_id or event.event_id or "").strip()
+                for event in [*self._event_history, *self._pending_events]
+                if str(event.occurrence_id or event.event_id or "").strip()
+            }
+            queued: list[LifeEngineEvent] = []
+            for event in events:
+                identity = str(event.occurrence_id or event.event_id or "").strip()
+                if identity and identity in known_occurrences:
+                    continue
+                queued.append(event)
+                if identity:
+                    known_occurrences.add(identity)
+            self._pending_events.extend(queued)
+            self._state.pending_event_count = len(self._pending_events)
+        if persist:
+            # Event facts are already durable in the raw ledger.  This is the
+            # recoverable compatibility pending-queue checkpoint.
+            await self._save_runtime_context(recoverable_on_shared_conflict=True)
+
     async def _queue_pending_event(
         self,
         event: LifeEngineEvent,
@@ -4599,14 +4633,7 @@ class LifeEngineService(BaseService):
         persist: bool = True,
     ) -> None:
         """Append an event to the compatibility pending queue and raw bus."""
-        async with self._get_lock():
-            self._pending_events.append(event)
-            self._state.pending_event_count = len(self._pending_events)
-        await self._publish_raw_events([event])
-        if persist:
-            # 事件事实已通过 raw bus / multi-writer bridge 持久化，这里只是本地
-            # pending 队列 checkpoint；共享多写者模式下冲突属合法竞争，可恢复。
-            await self._save_runtime_context(recoverable_on_shared_conflict=True)
+        await self._queue_pending_events([event], persist=persist)
 
     def _serialize_stream_message(
         self,
@@ -6486,6 +6513,234 @@ class LifeEngineService(BaseService):
             "channel": "chatter_think_snapshot",
         }
 
+    @staticmethod
+    def _conscious_tool_activity_id(
+        *,
+        model_turn_activity_id: str,
+        source_instance_id: str,
+        stream_id: str,
+        turn_occurrence_id: str,
+        call_id: str,
+        tool_name: str,
+        surface: str = "life_chatter",
+    ) -> str:
+        """Derive one stable, content-free identity for a model-chosen action."""
+
+        identity = "\x1f".join(
+            (
+                str(model_turn_activity_id or "").strip(),
+                str(source_instance_id or "").strip(),
+                str(stream_id or "").strip(),
+                str(turn_occurrence_id or "").strip(),
+                str(call_id or "").strip(),
+                str(tool_name or "").strip(),
+                str(surface or "life_chatter").strip(),
+            )
+        )
+        return "conscious_activity_" + hashlib.sha256(
+            identity.encode("utf-8")
+        ).hexdigest()
+
+    @staticmethod
+    def _conscious_model_turn_activity_id(
+        *,
+        source_instance_id: str,
+        stream_id: str,
+        turn_occurrence_id: str,
+        transport_request_id: str,
+        surface: str = "life_chatter",
+    ) -> str:
+        """Derive one stable identity for a successful model generation."""
+
+        identity = "\x1f".join(
+            (
+                str(source_instance_id or "").strip(),
+                str(stream_id or "").strip(),
+                str(turn_occurrence_id or "").strip(),
+                str(transport_request_id or "").strip(),
+                str(surface or "life_chatter").strip(),
+            )
+        )
+        return "conscious_model_turn_" + hashlib.sha256(
+            identity.encode("utf-8")
+        ).hexdigest()
+
+    async def record_conscious_model_turn(
+        self,
+        *,
+        stream_id: str,
+        source_instance_id: str,
+        turn_occurrence_id: str,
+        transport_request_id: str,
+        provider_reasoning_content: str,
+        assistant_message: str,
+        calls: list[Mapping[str, Any]],
+        surface: str = "life_chatter",
+    ) -> dict[str, str]:
+        """Persist one complete generation and its chosen tools atomically."""
+
+        model_turn_activity_id = self._conscious_model_turn_activity_id(
+            source_instance_id=source_instance_id,
+            stream_id=stream_id,
+            turn_occurrence_id=turn_occurrence_id,
+            transport_request_id=transport_request_id,
+            surface=surface,
+        )
+        events = [
+            self._event_builder.build_conscious_model_turn_event(
+                activity_id=model_turn_activity_id,
+                transport_request_id=transport_request_id,
+                stream_id=stream_id,
+                source_instance_id=source_instance_id,
+                turn_occurrence_id=turn_occurrence_id,
+                provider_reasoning_content=provider_reasoning_content,
+                assistant_message=assistant_message,
+                tool_call_ids=[str(call.get("call_id") or "") for call in calls],
+                surface=surface,
+            )
+        ]
+        activity_ids: dict[str, str] = {}
+        for call in calls:
+            call_id = str(call.get("call_id") or "").strip()
+            tool_name = str(call.get("tool_name") or "").strip()
+            raw_args = call.get("arguments")
+            if not call_id or not tool_name or not isinstance(raw_args, Mapping):
+                raise ValueError("conscious tool call attribution is incomplete")
+            args = {str(key): value for key, value in raw_args.items()}
+            activity_id = self._conscious_tool_activity_id(
+                model_turn_activity_id=model_turn_activity_id,
+                source_instance_id=source_instance_id,
+                stream_id=stream_id,
+                turn_occurrence_id=turn_occurrence_id,
+                call_id=call_id,
+                tool_name=tool_name,
+                surface=surface,
+            )
+            activity_ids[call_id] = activity_id
+            events.append(
+                self._event_builder.build_conscious_tool_call_event(
+                    tool_name,
+                    args,
+                    activity_id=activity_id,
+                    model_turn_activity_id=model_turn_activity_id,
+                    call_id=call_id,
+                    stream_id=stream_id,
+                    source_instance_id=source_instance_id,
+                    turn_occurrence_id=turn_occurrence_id,
+                    surface=surface,
+                )
+            )
+        await self._queue_pending_events(events)
+        return activity_ids
+
+    async def record_conscious_activity_state(
+        self,
+        *,
+        stream_id: str,
+        source_instance_id: str,
+        occurrence_id: str,
+        state_kind: str,
+        payload: Mapping[str, Any],
+        surface: str,
+        causation_id: str = "",
+        correlation_id: str = "",
+    ) -> LifeEngineEvent:
+        """Persist one attributed wait/interruption/completion state."""
+
+        identity_material = "\x1f".join(
+            (
+                str(surface or "").strip(),
+                str(source_instance_id or "").strip(),
+                str(stream_id or "").strip(),
+                str(occurrence_id or "").strip(),
+                str(state_kind or "").strip(),
+            )
+        )
+        activity_id = "conscious_state_" + hashlib.sha256(
+            identity_material.encode("utf-8")
+        ).hexdigest()
+        event = self._event_builder.build_conscious_activity_state_event(
+            activity_id=activity_id,
+            stream_id=stream_id,
+            source_instance_id=source_instance_id,
+            occurrence_id=occurrence_id,
+            state_kind=state_kind,
+            payload={str(key): value for key, value in payload.items()},
+            surface=surface,
+            causation_id=causation_id,
+            correlation_id=correlation_id,
+        )
+        await self._queue_pending_events([event])
+        return event
+
+    async def record_conscious_tool_calls(
+        self,
+        *,
+        stream_id: str,
+        source_instance_id: str,
+        turn_occurrence_id: str,
+        calls: list[Mapping[str, Any]],
+        surface: str = "life_chatter",
+    ) -> dict[str, str]:
+        """Compatibility wrapper for callers without model-turn material."""
+
+        return await self.record_conscious_model_turn(
+            stream_id=stream_id,
+            source_instance_id=source_instance_id,
+            turn_occurrence_id=turn_occurrence_id,
+            transport_request_id=f"legacy-tool-turn:{turn_occurrence_id}",
+            provider_reasoning_content="",
+            assistant_message="",
+            calls=calls,
+            surface=surface,
+        )
+
+    async def record_conscious_tool_results(
+        self,
+        *,
+        stream_id: str,
+        source_instance_id: str,
+        turn_occurrence_id: str,
+        activity_ids: Mapping[str, str],
+        results: list[Mapping[str, Any]],
+        surface: str = "life_chatter",
+    ) -> None:
+        """Persist each real/suppressed tool outcome with its chosen activity."""
+
+        events: list[LifeEngineEvent] = []
+        for result in results:
+            call_id = str(result.get("call_id") or "").strip()
+            tool_name = str(result.get("tool_name") or "").strip()
+            activity_id = str(activity_ids.get(call_id) or "").strip()
+            if not call_id or not tool_name or not activity_id:
+                raise ValueError("conscious tool result attribution is incomplete")
+            events.append(
+                self._event_builder.build_conscious_tool_result_event(
+                    tool_name,
+                    result.get("result"),
+                    bool(result.get("success")),
+                    activity_id=activity_id,
+                    call_id=call_id,
+                    stream_id=stream_id,
+                    source_instance_id=source_instance_id,
+                    turn_occurrence_id=turn_occurrence_id,
+                    technical_outcome=str(
+                        result.get("technical_outcome") or ""
+                    ),
+                    delivery_receipt_sha256=str(
+                        result.get("delivery_receipt_sha256") or ""
+                    ),
+                    delivery_message_id=str(
+                        result.get("delivery_message_id") or ""
+                    ),
+                    delivery_proof_status=str(
+                        result.get("delivery_proof_status") or ""
+                    ),
+                    surface=surface,
+                )
+            )
+        await self._queue_pending_events(events)
+
     async def record_tool_call(
         self,
         tool_name: str,
@@ -6511,7 +6766,7 @@ class LifeEngineService(BaseService):
     async def record_tool_result(
         self,
         tool_name: str,
-        result: str,
+        result: Any,
         success: bool,
         *,
         heartbeat_run_id: str | None = None,
@@ -6639,6 +6894,7 @@ class LifeEngineService(BaseService):
         *,
         group_limit: int | None = None,
         max_bytes: int | None = None,
+        include_tool_payloads: bool = True,
     ) -> RecentSubconsciousContext:
         """Return the same bounded recent subconscious activity to any instance.
 
@@ -6655,6 +6911,7 @@ class LifeEngineService(BaseService):
             history,
             group_limit=group_limit,
             max_bytes=max_bytes,
+            include_tool_payloads=include_tool_payloads,
         )
 
     @staticmethod
@@ -6703,6 +6960,31 @@ class LifeEngineService(BaseService):
             + "\n".join(unseen)
             + "\n</expression_delivery_status>"
         )
+
+    @staticmethod
+    def _seal_subconscious_activity_delivery(
+        prepared: PreparedHeartbeatContext,
+    ) -> None:
+        """Bind one immutable identity to the final heartbeat wake projection."""
+
+        body = str(prepared.content or "")
+        body_sha256 = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        delivery_id = (
+            "subconscious_activity:"
+            f"{int(prepared.snapshot_high_water or 0)}:{body_sha256[:24]}"
+        )
+        marker = (
+            '<subconscious_activity_projection delivery_id="'
+            f'{delivery_id}">'
+        )
+        sealed = f"{marker}\n{body}\n</subconscious_activity_projection>"
+        prepared.content = sealed
+        prepared.delivery_id = delivery_id
+        prepared.delivery_marker = marker
+        prepared.delivery_sha256 = hashlib.sha256(
+            sealed.encode("utf-8")
+        ).hexdigest()
+        prepared.delivery_bytes = len(sealed.encode("utf-8"))
 
     async def _prepare_heartbeat_context(self) -> PreparedHeartbeatContext:
         """Drain pending events and prepare one fixed heartbeat snapshot."""
@@ -6753,6 +7035,7 @@ class LifeEngineService(BaseService):
             delivery_note = ""
         if delivery_note:
             prepared.content = f"{prepared.content}\n\n{delivery_note}"
+        self._seal_subconscious_activity_delivery(prepared)
         # 标记本轮是否包含外部入站消息（供学习系统判断交互）
         prepared.has_inbound_messages = (
             any(event.event_type == EventType.MESSAGE for event in pending)
@@ -6770,7 +7053,12 @@ class LifeEngineService(BaseService):
             source_count=len({event.source for event in snapshot_events}),
             content_chars=len(prepared.content),
         )
-        logger.debug(f"潜意识上下文全文:\n{prepared.content}")
+        logger.debug(
+            "潜意识上下文投影已封装: "
+            f"delivery_id={prepared.delivery_id} "
+            f"bytes={prepared.delivery_bytes} "
+            f"sha256={prepared.delivery_sha256}"
+        )
         logger.info(
             "life_engine 已准备唤醒上下文: "
             f"count={len(prepared.selected_event_ids)} drained={len(pending)} "
@@ -6785,8 +7073,22 @@ class LifeEngineService(BaseService):
         model_reply: str,
         heartbeat_run_id: str,
         perception_receipt: PerceptionDeliveryReceipt | None,
+        subconscious_receipt: EffectiveContextReceipt | None = None,
     ) -> None:
         """Commit one successful heartbeat snapshot and advance its cursor."""
+        if prepared.delivery_id:
+            if (
+                subconscious_receipt is None
+                or subconscious_receipt.delivery_id != prepared.delivery_id
+                or not subconscious_receipt.exact_present
+                or subconscious_receipt.effective_utf8_bytes
+                != subconscious_receipt.expected_utf8_bytes
+                or subconscious_receipt.effective_sha256
+                != subconscious_receipt.expected_sha256
+            ):
+                raise PerceptionDeliveryUnverified(
+                    "heartbeat commit requires exact subconscious activity delivery proof"
+                )
         if isinstance(prepared.world_perception, PreparedPerception):
             if perception_receipt is None:
                 raise PerceptionDeliveryUnverified(
@@ -6996,6 +7298,9 @@ class LifeEngineService(BaseService):
                 line += f"\n    └─ {event.content}"
             elif event.event_type == EventType.HEARTBEAT:
                 line = f"[{time_display}] 💭 心跳#{event.heartbeat_index}"
+                line += f"\n    └─ {event.content}"
+            elif event.event_type == EventType.CONSCIOUS_ACTIVITY:
+                line = f"[{time_display}] 🧠 意识活动"
                 line += f"\n    └─ {event.content}"
             elif event.event_type == EventType.AGENT_RESULT:
                 status = "✅" if event.tool_success else "❌"
@@ -7782,7 +8087,14 @@ class LifeEngineService(BaseService):
 
         sections: list[str] = []
 
-        recent_subconscious = await self.get_recent_subconscious_context()
+        # Chatter already carries its own live tool chain in rolling context.  Its
+        # cross-instance suffix therefore uses the content-neutral activity view:
+        # the authoritative subconscious ledger remains complete, while raw tool
+        # arguments/results stay available to Heartbeat and exact event readers
+        # without being duplicated into an unrelated expression prompt.
+        recent_subconscious = await self.get_recent_subconscious_context(
+            include_tool_payloads=False,
+        )
         if recent_subconscious.content:
             sections.append(recent_subconscious.content)
             selected_events = [
@@ -8709,22 +9021,29 @@ class LifeEngineService(BaseService):
         registry: ToolRegistry,
         *,
         heartbeat_run_id: str | None = None,
+        model_turn_event_id: str | None = None,
+        call_id_override: str = "",
     ) -> LifeEngineEvent | None:
         """执行一次心跳 tool call。"""
         tool_name, args = self._heartbeat_tool_call_metadata(call)
-        log_args = {k: v for k, v in args.items() if k != "reason"}
-        call_id = str(getattr(call, "id", "") or "")
+        recorded_args = dict(args)
+        call_id = str(call_id_override or getattr(call, "id", "") or "")
         if heartbeat_run_id:
             call_id = call_id or f"{heartbeat_run_id}:call:{uuid4().hex[:12]}"
             call_event = await self.record_tool_call(
                 tool_name or "<unknown>",
-                log_args,
+                recorded_args,
                 heartbeat_run_id=heartbeat_run_id,
                 call_id=call_id,
-                parent_event_id=f"heartbeat_run:{heartbeat_run_id}",
+                parent_event_id=(
+                    model_turn_event_id or f"heartbeat_run:{heartbeat_run_id}"
+                ),
+                causation_id=model_turn_event_id,
             )
         else:
-            call_event = await self.record_tool_call(tool_name or "<unknown>", log_args)
+            call_event = await self.record_tool_call(
+                tool_name or "<unknown>", recorded_args
+            )
 
         call_id = call_id or str(getattr(call_event, "event_id", "") or "")
         source_occurrence_id = str(
@@ -8746,11 +9065,10 @@ class LifeEngineService(BaseService):
         self._append_heartbeat_tool_result_payload(
             response, call, tool_name, result_value
         )
-        result_text = str(result_value)
         if heartbeat_run_id:
             await self.record_tool_result(
                 tool_name or "<unknown>",
-                result_text,
+                result_value,
                 success,
                 heartbeat_run_id=heartbeat_run_id,
                 call_id=call_id,
@@ -8759,7 +9077,7 @@ class LifeEngineService(BaseService):
             )
         else:
             await self.record_tool_result(
-                tool_name or "<unknown>", result_text, success
+                tool_name or "<unknown>", result_value, success
             )
         return call_event
 
@@ -8770,6 +9088,8 @@ class LifeEngineService(BaseService):
         registry: ToolRegistry,
         *,
         heartbeat_run_id: str | None = None,
+        model_turn_event_id: str | None = None,
+        call_id_overrides: Mapping[int, str] | None = None,
     ) -> int:
         """并行执行一组已判定安全的心跳 tool call，并按原顺序写回结果。"""
         prepared: list[
@@ -8777,20 +9097,27 @@ class LifeEngineService(BaseService):
         ] = []
         for call in calls:
             tool_name, args = self._heartbeat_tool_call_metadata(call)
-            log_args = {k: v for k, v in args.items() if k != "reason"}
-            call_id = str(getattr(call, "id", "") or "")
+            recorded_args = dict(args)
+            call_id = str(
+                (call_id_overrides or {}).get(id(call))
+                or getattr(call, "id", "")
+                or ""
+            )
             if heartbeat_run_id:
                 call_id = call_id or f"{heartbeat_run_id}:call:{uuid4().hex[:12]}"
                 call_event = await self.record_tool_call(
                     tool_name or "<unknown>",
-                    log_args,
+                    recorded_args,
                     heartbeat_run_id=heartbeat_run_id,
                     call_id=call_id,
-                    parent_event_id=f"heartbeat_run:{heartbeat_run_id}",
+                    parent_event_id=(
+                        model_turn_event_id or f"heartbeat_run:{heartbeat_run_id}"
+                    ),
+                    causation_id=model_turn_event_id,
                 )
             else:
                 call_event = await self.record_tool_call(
-                    tool_name or "<unknown>", log_args
+                    tool_name or "<unknown>", recorded_args
                 )
             call_id = call_id or str(getattr(call_event, "event_id", "") or "")
             prepared.append((call, tool_name, args, call_event, call_id))
@@ -8834,11 +9161,10 @@ class LifeEngineService(BaseService):
             self._append_heartbeat_tool_result_payload(
                 response, call, tool_name, result_value
             )
-            result_text = str(result_value)
             if heartbeat_run_id:
                 await self.record_tool_result(
                     tool_name or "<unknown>",
-                    result_text,
+                    result_value,
                     success,
                     heartbeat_run_id=heartbeat_run_id,
                     call_id=call_id,
@@ -8847,10 +9173,63 @@ class LifeEngineService(BaseService):
                 )
             else:
                 await self.record_tool_result(
-                    tool_name or "<unknown>", result_text, success
+                    tool_name or "<unknown>", result_value, success
                 )
 
         return len(prepared) * 2
+
+    async def _record_heartbeat_model_turn_activity(
+        self,
+        response: Any,
+        call_list: list[Any],
+        *,
+        heartbeat_run_id: str | None,
+        turn_index: int,
+    ) -> tuple[LifeEngineEvent, dict[int, str]]:
+        """Append the complete generated heartbeat turn before its tools run."""
+
+        run_identity = str(
+            heartbeat_run_id or f"heartbeat:{self._state.heartbeat_count}"
+        )
+        turn_occurrence_id = f"{run_identity}:model-turn:{turn_index}"
+        transport_request_id = str(
+            getattr(response, "request_record_id", "")
+            or f"{turn_occurrence_id}:transport"
+        )
+        call_id_overrides: dict[int, str] = {}
+        call_ids: list[str] = []
+        for call_index, call in enumerate(call_list):
+            call_id = str(getattr(call, "id", "") or "").strip()
+            if not call_id:
+                call_id = f"{turn_occurrence_id}:call:{call_index}"
+            call_id_overrides[id(call)] = call_id
+            call_ids.append(call_id)
+        activity_id = self._conscious_model_turn_activity_id(
+            source_instance_id="life_engine_subconscious",
+            stream_id=INTERNAL_STREAM_ID,
+            turn_occurrence_id=turn_occurrence_id,
+            transport_request_id=transport_request_id,
+            surface="life_engine_subconscious",
+        )
+        event = self._event_builder.build_conscious_model_turn_event(
+            activity_id=activity_id,
+            transport_request_id=transport_request_id,
+            stream_id=INTERNAL_STREAM_ID,
+            source_instance_id="life_engine_subconscious",
+            turn_occurrence_id=turn_occurrence_id,
+            provider_reasoning_content=str(
+                getattr(response, "reasoning_content", "") or ""
+            ),
+            assistant_message=str(getattr(response, "message", "") or ""),
+            tool_call_ids=call_ids,
+            surface="life_engine_subconscious",
+            heartbeat_run_id=heartbeat_run_id,
+        )
+        await self._queue_pending_event(
+            event,
+            persist=heartbeat_run_id is None,
+        )
+        return event, call_id_overrides
 
     async def _build_memory_maintenance_prompt_if_due(self) -> str:
         """Expose structural pressure as a review signal, never a write task."""
@@ -8917,6 +9296,44 @@ class LifeEngineService(BaseService):
             exact=True,
             transport_request_id=str(getattr(response, "request_record_id", "") or ""),
         )
+
+    @staticmethod
+    def _subconscious_delivery_identity(
+        wake_context: str,
+    ) -> tuple[str, str]:
+        """Read the sealed delivery identity without retaining prompt content."""
+
+        first_line = str(wake_context or "").splitlines()[0].strip()
+        prefix = '<subconscious_activity_projection delivery_id="'
+        suffix = '">'
+        if not first_line.startswith(prefix) or not first_line.endswith(suffix):
+            return "", ""
+        delivery_id = first_line[len(prefix) : -len(suffix)].strip()
+        if not delivery_id:
+            return "", ""
+        return delivery_id, first_line
+
+    @staticmethod
+    def _heartbeat_subconscious_receipt(
+        response: Any,
+        delivery_id: str,
+    ) -> EffectiveContextReceipt | None:
+        """Return proof that the final successful attempt saw the exact wake text."""
+
+        identity = str(delivery_id or "").strip()
+        lookup = getattr(response, "effective_context_receipt", None)
+        effective = lookup(identity) if identity and callable(lookup) else None
+        if (
+            effective is None
+            or str(getattr(effective, "delivery_id", "") or "") != identity
+            or not bool(getattr(effective, "exact_present", False))
+            or getattr(effective, "effective_utf8_bytes", None)
+            != getattr(effective, "expected_utf8_bytes", None)
+            or getattr(effective, "effective_sha256", None)
+            != getattr(effective, "expected_sha256", None)
+        ):
+            return None
+        return effective
 
     @staticmethod
     def _heartbeat_tool_call_counts_as_activity(
@@ -9005,6 +9422,10 @@ class LifeEngineService(BaseService):
             memory_maintenance_prompt=memory_maintenance_prompt,
             section_texts=section_texts,
         )
+        (
+            subconscious_delivery_id,
+            subconscious_delivery_marker,
+        ) = self._subconscious_delivery_identity(wake_context)
         request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
 
         tools = self._get_nucleus_tools()
@@ -9014,6 +9435,12 @@ class LifeEngineService(BaseService):
         request.add_payload(LLMPayload(ROLE.TOOL, tools))
 
         request.add_payload(LLMPayload(ROLE.USER, Text(user_prompt)))
+        if subconscious_delivery_id:
+            request.register_context_delivery(
+                subconscious_delivery_id,
+                user_prompt,
+                marker=subconscious_delivery_marker,
+            )
         if world_perception is not None:
             request.register_context_delivery(
                 world_perception.delivery_id,
@@ -9065,6 +9492,12 @@ class LifeEngineService(BaseService):
                     # 复制 payloads 到 fallback request
                     for payload in request.payloads:
                         fallback_request.add_payload(payload)
+                    if subconscious_delivery_id:
+                        fallback_request.register_context_delivery(
+                            subconscious_delivery_id,
+                            user_prompt,
+                            marker=subconscious_delivery_marker,
+                        )
                     if world_perception is not None:
                         fallback_request.register_context_delivery(
                             world_perception.delivery_id,
@@ -9113,6 +9546,18 @@ class LifeEngineService(BaseService):
             if world_perception is not None
             else None
         )
+        subconscious_receipt = (
+            self._heartbeat_subconscious_receipt(
+                response,
+                subconscious_delivery_id,
+            )
+            if subconscious_delivery_id
+            else None
+        )
+        if subconscious_delivery_id and subconscious_receipt is None:
+            raise PerceptionDeliveryUnverified(
+                "heartbeat model did not receive the exact subconscious activity projection"
+            )
         if world_perception is not None and perception_receipt is None:
             raise PerceptionDeliveryUnverified(
                 "heartbeat model did not receive the exact World projection"
@@ -9159,6 +9604,14 @@ class LifeEngineService(BaseService):
 
             turn_text = str(response_text or "").strip()
             call_list = list(getattr(response, "call_list", []) or [])
+            model_turn_event, call_id_overrides = (
+                await self._record_heartbeat_model_turn_activity(
+                    response,
+                    call_list,
+                    heartbeat_run_id=heartbeat_run_id,
+                    turn_index=turn_index,
+                )
+            )
 
             logger.debug(
                 f"life_engine heartbeat turn: "
@@ -9198,6 +9651,8 @@ class LifeEngineService(BaseService):
                         response,
                         registry,
                         heartbeat_run_id=heartbeat_run_id,
+                        model_turn_event_id=model_turn_event.event_id,
+                        call_id_overrides=call_id_overrides,
                     )
                     continue
 
@@ -9207,6 +9662,8 @@ class LifeEngineService(BaseService):
                         response,
                         registry,
                         heartbeat_run_id=heartbeat_run_id,
+                        model_turn_event_id=model_turn_event.event_id,
+                        call_id_override=call_id_overrides.get(id(call), ""),
                     )
 
             round_results = _heartbeat_tool_results(response)[result_count_before:]
@@ -9268,6 +9725,12 @@ class LifeEngineService(BaseService):
                     user_prompt,
                     marker=world_perception.delivery_marker,
                 )
+            if subconscious_delivery_id:
+                current_response.register_context_delivery(
+                    subconscious_delivery_id,
+                    user_prompt,
+                    marker=subconscious_delivery_marker,
+                )
 
             async def _send_followup_request() -> Any:
                 from src.kernel.llm.exceptions import LLMModelsCoolingDownError
@@ -9324,6 +9787,15 @@ class LifeEngineService(BaseService):
                     if perception_receipt is None:
                         raise PerceptionDeliveryUnverified(
                             "heartbeat follow-up lost the exact World projection"
+                        )
+                if subconscious_delivery_id:
+                    subconscious_receipt = self._heartbeat_subconscious_receipt(
+                        response,
+                        subconscious_delivery_id,
+                    )
+                    if subconscious_receipt is None:
+                        raise PerceptionDeliveryUnverified(
+                            "heartbeat follow-up lost the exact subconscious activity projection"
                         )
             except HeartbeatBudgetExhausted as exc:
                 self._discard_pending_heartbeat_memory_deliveries(
@@ -9395,7 +9867,11 @@ class LifeEngineService(BaseService):
             # in the event ledger; this heartbeat simply has no final text.
             last_text = ""
 
-        return HeartbeatModelResult(last_text, perception_receipt)
+        return HeartbeatModelResult(
+            last_text,
+            perception_receipt,
+            subconscious_receipt,
+        )
 
     async def _run_learning_heartbeat_maintenance(self) -> None:
         """Wake derived learning without spending foreground heartbeat budget."""
@@ -10272,6 +10748,7 @@ class LifeEngineService(BaseService):
                     model_reply,
                     heartbeat_run_id,
                     model_result.perception_receipt,
+                    model_result.subconscious_receipt,
                 )
                 # 多写者：提交 heartbeat checkpoint（失败不推进 frontier，
                 # 已完成的重试返回既有结果）。

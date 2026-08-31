@@ -148,7 +148,6 @@ class LifeDispatchMissionTool(BaseTool):
             FailurePolicy,
             Mission,
             MissionBudget,
-            MissionStatus,
             TaskStatus,
         )
         from .guardrails import check_input, check_task_count
@@ -192,6 +191,9 @@ class LifeDispatchMissionTool(BaseTool):
         planner = Planner(
             model_task_name=getattr(cfg, "planner_task_name", "agent"),
             max_tasks=budget.max_tasks,
+            plugin=self.plugin,
+            stream_id=self.get_current_stream_id(),
+            trigger_message=self.trigger_message,
         )
 
         if mode == "auto":

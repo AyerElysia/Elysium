@@ -111,6 +111,7 @@ class _WitnessService:
     ) -> None:
         self._perception = perception
         self._recent_subconscious = recent_subconscious
+        self.model_turns: list[dict[str, Any]] = []
         self._config = SimpleNamespace(
             memory_witness=SimpleNamespace(
                 model_task_name="witness-kernel-test",
@@ -162,9 +163,18 @@ synthetic MEMORY projection
         self,
         *,
         max_bytes: int,
+        include_tool_payloads: bool = True,
     ) -> Any | None:
         assert 0 < max_bytes < 8 * 1024
+        assert include_tool_payloads is False
         return self._recent_subconscious
+
+    async def record_conscious_model_turn(
+        self,
+        **kwargs: Any,
+    ) -> dict[str, str]:
+        self.model_turns.append(dict(kwargs))
+        return {}
 
 
 def _model(
@@ -383,6 +393,7 @@ async def test_witness_marks_recent_subconscious_as_non_evidence_and_redacts_arg
     projection = SubconsciousContextManager().project_recent(
         [tool_call],
         max_bytes=4096,
+        include_tool_payloads=False,
     )
     service = _WitnessService(
         perception,
@@ -419,6 +430,21 @@ async def test_witness_marks_recent_subconscious_as_non_evidence_and_redacts_arg
     assert "call-recent" in combined
     assert "RAW_TOOL_ARGUMENT_MUST_NOT_LEAK" not in combined
     assert _marker_parts(client.attempts[0], perception) == (perception.content,)
+    assert len(service.model_turns) == 1
+    recorded_turn = service.model_turns[0]
+    assert recorded_turn == {
+        "stream_id": "stream-kernel-delivery",
+        "source_instance_id": MEMORY_WITNESS_INSTANCE_ID,
+        "turn_occurrence_id": recorded_turn["turn_occurrence_id"],
+        "transport_request_id": "111",
+        "provider_reasoning_content": "",
+        "assistant_message": "synthetic witness",
+        "calls": [],
+        "surface": "memory_witness",
+    }
+    assert recorded_turn["turn_occurrence_id"].startswith(
+        "memory-witness:window-"
+    )
 
 
 @pytest.mark.asyncio

@@ -34,6 +34,7 @@ from plugins.life_engine.service.perception_gateway import (
 from plugins.life_engine.service.world_projection import PerceptionCursorConflict
 from src.core.config.core_config import CoreConfig
 from src.kernel.llm import ROLE, ToolRegistry
+from src.kernel.llm.context_delivery import EffectiveContextReceipt
 
 
 @dataclass
@@ -140,7 +141,26 @@ async def test_proactive_delivery_proof_hook_binds_transport_to_authority(
         hooks._outbound_delivery_proof_hook = saved
 
 
-def _heartbeat_result(text: str, world_perception: Any) -> HeartbeatModelResult:
+def _heartbeat_result(
+    text: str,
+    world_perception: Any,
+    wake_context: str,
+) -> HeartbeatModelResult:
+    delivery_id, _ = LifeEngineService._subconscious_delivery_identity(
+        wake_context
+    )
+    subconscious_receipt = (
+        EffectiveContextReceipt(
+            delivery_id=delivery_id,
+            exact_present=True,
+            expected_utf8_bytes=1,
+            expected_sha256="a" * 64,
+            effective_utf8_bytes=1,
+            effective_sha256="a" * 64,
+        )
+        if delivery_id
+        else None
+    )
     return HeartbeatModelResult(
         text=text,
         perception_receipt=PerceptionDeliveryReceipt(
@@ -150,6 +170,7 @@ def _heartbeat_result(text: str, world_perception: Any) -> HeartbeatModelResult:
             exact=True,
             transport_request_id="test-heartbeat",
         ),
+        subconscious_receipt=subconscious_receipt,
     )
 
 
@@ -851,6 +872,132 @@ async def test_heartbeat_tool_batch_executes_parallel_and_preserves_payload_orde
     ]
 
 
+async def test_heartbeat_records_complete_model_turn_args_and_structured_result(
+    tmp_path: Path,
+) -> None:
+    service = _make_service(tmp_path)
+
+    class FullActivityTool:
+        def __init__(self, plugin: object) -> None:
+            self.plugin = plugin
+
+        async def execute(self, note: str, reason: str = "") -> tuple[bool, dict]:
+            return True, {"note": note, "reason": reason, "detail": "完整结果"}
+
+    registry = ToolRegistry()
+    registry.register(FullActivityTool, name="nucleus_full_activity")
+    call = SimpleNamespace(
+        id="heartbeat-call-1",
+        name="nucleus_full_activity",
+        args={"note": "保留全部参数", "reason": "这是实际生成的选择理由"},
+    )
+    response = _FakeResponse()
+    response.message = "我决定先调用工具核对"
+    response.reasoning_content = "完整的 provider reasoning"
+    response.request_record_id = "heartbeat-request-1"
+
+    model_event, call_ids = await service._record_heartbeat_model_turn_activity(
+        response,
+        [call],
+        heartbeat_run_id="heartbeat-run-1",
+        turn_index=0,
+    )
+    await service._execute_heartbeat_tool_call(
+        call,
+        response,
+        registry,
+        heartbeat_run_id="heartbeat-run-1",
+        model_turn_event_id=model_event.event_id,
+        call_id_override=call_ids[id(call)],
+    )
+
+    pending = list(service._pending_events)
+    assert [event.content_type for event in pending] == [
+        "conscious_activity_model_turn",
+        "tool_call",
+        "tool_result",
+    ]
+    model_raw = json.loads(pending[0].raw_content or "{}")
+    call_raw = json.loads(pending[1].raw_content or "{}")
+    result_raw = json.loads(pending[2].raw_content or "{}")
+    assert model_raw["surface"] == "life_engine_subconscious"
+    assert model_raw["provider_reasoning_content"] == (
+        "完整的 provider reasoning"
+    )
+    assert model_raw["assistant_message"] == "我决定先调用工具核对"
+    assert call_raw["arguments"]["reason"] == "这是实际生成的选择理由"
+    assert pending[1].parent_event_id == model_event.event_id
+    assert result_raw["result"] == {
+        "note": "保留全部参数",
+        "reason": "这是实际生成的选择理由",
+        "detail": "完整结果",
+    }
+
+
+async def test_conscious_activity_state_preserves_attribution_and_payload(
+    tmp_path: Path,
+) -> None:
+    service = _make_service(tmp_path)
+
+    event = await service.record_conscious_activity_state(
+        stream_id="voice-stream-1",
+        source_instance_id="voice_live_episode",
+        occurrence_id="voice:episode:interruption:7",
+        state_kind="response_interrupted",
+        payload={
+            "source": "client",
+            "response_id": "response-1",
+            "item_id": "item-1",
+        },
+        surface="voice_live",
+        causation_id="response-1",
+    )
+
+    raw = json.loads(event.raw_content or "{}")
+    assert event.event_type == EventType.CONSCIOUS_ACTIVITY
+    assert event.content_type == "conscious_activity_state"
+    assert event.source_instance_id == "voice_live_episode"
+    assert event.stream_id == "voice-stream-1"
+    assert event.causation_id == "response-1"
+    assert raw["state_kind"] == "response_interrupted"
+    assert raw["payload"] == {
+        "source": "client",
+        "response_id": "response-1",
+        "item_id": "item-1",
+    }
+
+
+async def test_conscious_activity_queue_is_authoritative_first_and_idempotent(
+    tmp_path: Path,
+) -> None:
+    service = _make_service(tmp_path)
+    event = service._event_builder.build_conscious_activity_state_event(
+        activity_id="activity-state-1",
+        stream_id="voice-stream-1",
+        source_instance_id="voice-instance-1",
+        occurrence_id="voice:episode:wait:1",
+        state_kind="waiting",
+        payload={"reason": "subject_wait"},
+        surface="voice_live",
+    )
+    service._publish_raw_events = AsyncMock(  # type: ignore[method-assign]
+        side_effect=RuntimeError("ledger rejected")
+    )
+
+    with pytest.raises(RuntimeError, match="ledger rejected"):
+        await service._queue_pending_events([event], persist=False)
+    assert service._pending_events == []
+
+    service._publish_raw_events = AsyncMock()  # type: ignore[method-assign]
+    await service._queue_pending_events([event], persist=False)
+    await service._queue_pending_events([event], persist=False)
+
+    assert [item.occurrence_id for item in service._pending_events] == [
+        event.occurrence_id
+    ]
+    assert service._publish_raw_events.await_count == 2
+
+
 async def test_heartbeat_tool_execution_strips_auto_reason_when_signature_rejects_it(
     tmp_path: Path,
 ) -> None:
@@ -1116,6 +1263,111 @@ async def test_chatter_think_snapshot_persists_across_restart(tmp_path: Path) ->
     assert snapshot["recorded_at"]
 
 
+async def test_conscious_tool_activity_is_durable_and_paired(tmp_path: Path) -> None:
+    service = _make_service(tmp_path)
+    arguments = {
+        "mood": "温柔",
+        "decision": "直接回应",
+        "expected_response": "对方感到被看见",
+        "thought": "先理解，再表达。",
+        "content": "我在听。",
+    }
+
+    activity_ids = await service.record_conscious_model_turn(
+        stream_id="stream-1",
+        source_instance_id="chat-instance-1",
+        turn_occurrence_id="turn-1",
+        transport_request_id="request-1",
+        provider_reasoning_content="provider reasoning 原文",
+        assistant_message="同轮独白原文",
+        calls=[
+            {
+                "call_id": "call-1",
+                "tool_name": "action-life_send_text",
+                "arguments": arguments,
+            }
+        ],
+    )
+    await service.record_conscious_tool_results(
+        stream_id="stream-1",
+        source_instance_id="chat-instance-1",
+        turn_occurrence_id="turn-1",
+        activity_ids=activity_ids,
+        results=[
+            {
+                "call_id": "call-1",
+                "tool_name": "action-life_send_text",
+                "result": {"status": "delivered"},
+                "success": True,
+                "technical_outcome": "delivered",
+                "delivery_receipt_sha256": "a" * 64,
+                "delivery_message_id": "provider-1",
+                "delivery_proof_status": "durable",
+            }
+        ],
+    )
+
+    activity_id = activity_ids["call-1"]
+    model_turn_activity_id = service._conscious_model_turn_activity_id(
+        source_instance_id="chat-instance-1",
+        stream_id="stream-1",
+        turn_occurrence_id="turn-1",
+        transport_request_id="request-1",
+    )
+    model_turn = next(
+        item
+        for item in service._pending_events
+        if item.event_id == f"{model_turn_activity_id}:generated"
+    )
+    chosen = next(
+        item
+        for item in service._pending_events
+        if item.event_id == f"{activity_id}:chosen"
+    )
+    outcome = next(
+        item
+        for item in service._pending_events
+        if item.event_id == f"{activity_id}:result"
+    )
+    chosen_payload = json.loads(chosen.raw_content or "{}")
+    outcome_payload = json.loads(outcome.raw_content or "{}")
+    model_turn_payload = json.loads(model_turn.raw_content or "{}")
+
+    assert model_turn.event_type == EventType.CONSCIOUS_ACTIVITY
+    assert model_turn_payload["provider_reasoning_content"] == (
+        "provider reasoning 原文"
+    )
+    assert model_turn_payload["assistant_message"] == "同轮独白原文"
+    assert model_turn_payload["tool_call_ids"] == ["call-1"]
+    assert chosen_payload["arguments"] == arguments
+    assert chosen.source_instance_id == "chat-instance-1"
+    assert chosen.stream_id == "stream-1"
+    assert chosen.correlation_id == "turn-1"
+    assert chosen.parent_event_id == model_turn.event_id
+    assert chosen.causation_id == model_turn.event_id
+    assert outcome.parent_event_id == chosen.event_id
+    assert outcome.causation_id == chosen.event_id
+    assert outcome_payload["result"] == {"status": "delivered"}
+    assert outcome_payload["delivery_proof_status"] == "durable"
+
+    repeated_call_id = await service.record_conscious_model_turn(
+        stream_id="stream-1",
+        source_instance_id="chat-instance-1",
+        turn_occurrence_id="turn-1",
+        transport_request_id="request-2",
+        provider_reasoning_content="第二个 follow-up",
+        assistant_message="",
+        calls=[
+            {
+                "call_id": "call-1",
+                "tool_name": "action-life_send_text",
+                "arguments": arguments,
+            }
+        ],
+    )
+    assert repeated_call_id["call-1"] != activity_id
+
+
 async def test_enqueue_dfc_message_rejects_when_disabled(tmp_path: Path) -> None:
     """life_engine 禁用时不应接受 DFC 留言。"""
     config = LifeEngineConfig()
@@ -1185,7 +1437,7 @@ async def test_heartbeat_success_consumes_delta_without_replay(
     ) -> HeartbeatModelResult:
         contexts.append(wake_context)
         assert heartbeat_run_id
-        return _heartbeat_result("已处理", world_perception)
+        return _heartbeat_result("已处理", world_perception, wake_context)
 
     monkeypatch.setattr(service, "_run_heartbeat_model", _fake_model)
 
@@ -1243,7 +1495,11 @@ async def test_heartbeat_perception_cursor_conflict_keeps_model_output(
         world_perception: Any = None,
         heartbeat_deadline: float | None = None,
     ) -> HeartbeatModelResult:
-        return _heartbeat_result("竞争时保留的独白", world_perception)
+        return _heartbeat_result(
+            "竞争时保留的独白",
+            world_perception,
+            wake_context,
+        )
 
     monkeypatch.setattr(service, "_run_heartbeat_model", _fake_model)
 
@@ -1292,7 +1548,7 @@ async def test_heartbeat_failure_keeps_delta_for_retry(
         if attempts == 1:
             raise RuntimeError("model unavailable")
         retry_contexts.append(wake_context)
-        return _heartbeat_result("重试成功", world_perception)
+        return _heartbeat_result("重试成功", world_perception, wake_context)
 
     monkeypatch.setattr(service, "_run_heartbeat_model", _fake_model)
 
@@ -1344,6 +1600,54 @@ async def test_heartbeat_without_exact_world_receipt_keeps_delta_pending(
     assert any(item.event_id == event.event_id for item in service._event_history)
 
 
+async def test_heartbeat_without_exact_subconscious_receipt_keeps_delta_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _make_service(tmp_path)
+    event = service._event_builder.build_dfc_message_event(
+        "World 已送达也不能替代整份潜意识投递证明",
+        stream_id="stream-1",
+    )
+    await service._queue_pending_event(event)
+
+    async def _missing_subconscious_receipt(
+        wake_context: str,
+        *,
+        heartbeat_run_id: str | None = None,
+        world_perception: Any = None,
+        heartbeat_deadline: float | None = None,
+    ) -> HeartbeatModelResult:
+        assert wake_context and heartbeat_run_id and world_perception is not None
+        return HeartbeatModelResult(
+            text="看似成功",
+            perception_receipt=PerceptionDeliveryReceipt(
+                delivery_id=world_perception.delivery_id,
+                projection_sha256=world_perception.projection_sha256,
+                delivered_bytes=world_perception.delivered_bytes,
+                exact=True,
+                transport_request_id="test-world-only",
+            ),
+            subconscious_receipt=None,
+        )
+
+    monkeypatch.setattr(
+        service,
+        "_run_heartbeat_model",
+        _missing_subconscious_receipt,
+    )
+
+    with pytest.raises(
+        PerceptionDeliveryUnverified,
+        match="exact subconscious activity delivery proof",
+    ):
+        await service._run_heartbeat_round(collect_background_agents=False)
+
+    assert service._state.heartbeat_context_cursor == 0
+    assert event.heartbeat_context_consumed is False
+    assert any(item.event_id == event.event_id for item in service._event_history)
+
+
 async def test_heartbeat_arrival_during_model_is_deferred_to_next_round(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1375,7 +1679,11 @@ async def test_heartbeat_arrival_during_model_is_deferred_to_next_round(
         contexts.append(wake_context)
         if calls == 1:
             await service._queue_pending_event(arriving_event)
-        return _heartbeat_result(f"reply-{calls}", world_perception)
+        return _heartbeat_result(
+            f"reply-{calls}",
+            world_perception,
+            wake_context,
+        )
 
     monkeypatch.setattr(service, "_run_heartbeat_model", _fake_model)
 
@@ -1412,7 +1720,7 @@ async def test_automatic_and_manual_heartbeats_are_serialized(
         max_active_calls = max(max_active_calls, active_calls)
         try:
             await asyncio.sleep(0.02)
-            return _heartbeat_result("串行完成", world_perception)
+            return _heartbeat_result("串行完成", world_perception, wake_context)
         finally:
             active_calls -= 1
 
@@ -1489,7 +1797,7 @@ async def test_consumed_heartbeat_events_remain_consumed_after_restart(
         world_perception: Any = None,
         heartbeat_deadline: float | None = None,
     ) -> HeartbeatModelResult:
-        return _heartbeat_result("已确认", world_perception)
+        return _heartbeat_result("已确认", world_perception, wake_context)
 
     monkeypatch.setattr(service, "_run_heartbeat_model", _fake_model)
     await service._run_heartbeat_round(collect_background_agents=False)

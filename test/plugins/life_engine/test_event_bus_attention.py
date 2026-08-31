@@ -268,6 +268,21 @@ def test_raw_metadata_preserves_causality_and_summary_channel() -> None:
     assert raw.metadata["causation_id"] == "cause-9"
 
 
+def test_conscious_activity_uses_life_channel_not_external_chat() -> None:
+    raw = life_event_from_legacy(
+        _event(
+            10,
+            event_type=EventType.CONSCIOUS_ACTIVITY,
+            source="life_chatter",
+            content_type="conscious_activity_model_turn",
+            content="generated activity",
+        )
+    )
+
+    assert raw.channel == "life"
+    assert raw.event_type == "conscious_activity_model_turn"
+
+
 def test_heartbeat_classifier_excludes_chatter_and_legacy_summary() -> None:
     real_heartbeat = _event(
         1,

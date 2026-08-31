@@ -148,6 +148,7 @@ class MinecraftSession:
         get_recent_subconscious_context: Any | None = None,
         get_subject_context_projection_snapshot: Any | None = None,
         record_minecraft_consciousness_decision: Any | None = None,
+        record_conscious_model_turn: Any | None = None,
         report_world_observation: Any | None = None,
         consciousness_decision_source: MinecraftDecisionSource | None = None,
     ) -> None:
@@ -171,6 +172,7 @@ class MinecraftSession:
         self._record_minecraft_consciousness_decision = (
             record_minecraft_consciousness_decision
         )
+        self._record_conscious_model_turn = record_conscious_model_turn
         self._report_world_observation = report_world_observation
         self._injected_consciousness_decision_source = consciousness_decision_source
         self._state = SessionState()
@@ -581,7 +583,10 @@ class MinecraftSession:
             }
 
         planner = JsonIntentPlanner(
-            ElysiumModelDecisionSource(self._config.planner_task_name),
+            ElysiumModelDecisionSource(
+                self._config.planner_task_name,
+                activity_recorder=self._record_minecraft_planner_activity,
+            ),
             lambda: client.capabilities,
             profile.planner_guidance,
         )
@@ -660,6 +665,7 @@ class MinecraftSession:
                 "body_name": selected_name,
                 "trace_path": str(trace.path),
             }
+
         self._state.readiness = ReadinessState.ACTIVE
         self._state.readiness_detail = "Minecraft embodiment session is active"
         return {
@@ -679,6 +685,74 @@ class MinecraftSession:
                 else {"enabled": False, "running": False, "phase": "disabled"}
             ),
         }
+
+    async def _record_minecraft_planner_activity(
+        self,
+        response: Any,
+        input_document: dict[str, Any],
+    ) -> None:
+        """Append each embodied planning generation before an action may execute."""
+
+        recorder = self._record_conscious_model_turn
+        if not callable(recorder):
+            return
+        stream_id = str(self._state.stream_id or "").strip()
+        instance_id = str(
+            self._state.consciousness_instance_id or ""
+        ).strip()
+        if not stream_id or not instance_id:
+            raise RuntimeError(
+                "Minecraft planner activity has no active consciousness identity"
+            )
+        raw_intent = input_document.get("intent")
+        intent = dict(raw_intent) if isinstance(raw_intent, Mapping) else {}
+        intent_id = str(intent.get("intent_id") or "").strip()
+        revision = int(intent.get("revision") or 0)
+        observations = input_document.get("observations")
+        receipts = input_document.get("receipts")
+        observation_ids = [
+            str(item.get("observation_id") or "")
+            for item in observations
+            if isinstance(item, Mapping)
+        ] if isinstance(observations, list) else []
+        receipt_ids = [
+            str(item.get("receipt_id") or "")
+            for item in receipts
+            if isinstance(item, Mapping)
+        ] if isinstance(receipts, list) else []
+        turn_identity = json.dumps(
+            {
+                "intent_id": intent_id,
+                "revision": revision,
+                "observation_ids": observation_ids,
+                "receipt_ids": receipt_ids,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        turn_digest = hashlib.sha256(
+            turn_identity.encode("utf-8")
+        ).hexdigest()[:24]
+        turn_occurrence_id = (
+            f"minecraft:{self._state.session_id}:embodiment:"
+            f"{intent_id or 'unknown'}:{turn_digest}"
+        )
+        await recorder(
+            stream_id=stream_id,
+            source_instance_id=instance_id,
+            turn_occurrence_id=turn_occurrence_id,
+            transport_request_id=str(
+                getattr(response, "request_record_id", "")
+                or f"{turn_occurrence_id}:transport"
+            ),
+            provider_reasoning_content=str(
+                getattr(response, "reasoning_content", "") or ""
+            ),
+            assistant_message=str(getattr(response, "message", "") or ""),
+            calls=[],
+            surface="minecraft_embodiment_planner",
+        )
 
     async def stop(self) -> dict[str, Any]:
         """Interrupt work, release controls, close bridges, and end the scene."""

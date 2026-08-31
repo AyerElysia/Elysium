@@ -2916,6 +2916,32 @@ class MemoryWitnessCoordinator:
                 "MemoryWitnessAuthoringDeadlineExceeded:"
                 f"configured_timeout={timeout:.3f}:task_name={task_name}"
             ) from exc
+        activity_recorder = getattr(
+            self._service,
+            "record_conscious_model_turn",
+            None,
+        )
+        if callable(activity_recorder):
+            window_id = self._window_id(instance.instance_id, records[0])
+            turn_occurrence_id = f"memory-witness:{window_id}:authoring"
+            await activity_recorder(
+                stream_id=(
+                    self._window_stream_scope(records)
+                    or "life_engine.memory_witness"
+                ),
+                source_instance_id=instance.instance_id,
+                turn_occurrence_id=turn_occurrence_id,
+                transport_request_id=str(
+                    getattr(response, "request_record_id", "")
+                    or f"{turn_occurrence_id}:transport"
+                ),
+                provider_reasoning_content=str(
+                    getattr(response, "reasoning_content", "") or ""
+                ),
+                assistant_message=str(result or ""),
+                calls=[],
+                surface="memory_witness",
+            )
         receipt = _exact_perception_receipt(response, perception)
         if receipt is None:
             raise RuntimeError("MemoryWitnessPerceptionDeliveryUnverified")
@@ -2954,7 +2980,10 @@ class MemoryWitnessCoordinator:
         )
         content_budget = _RECENT_SUBCONSCIOUS_CONTEXT_MAX_BYTES - wrapper_bytes
         try:
-            projection = getter(max_bytes=content_budget)
+            projection = getter(
+                max_bytes=content_budget,
+                include_tool_payloads=False,
+            )
             if inspect.isawaitable(projection):
                 projection = await projection
         except asyncio.CancelledError:

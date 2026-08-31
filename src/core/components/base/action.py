@@ -118,6 +118,18 @@ class BaseAction(ABC, LLMUsable):
             "origin_stream_id": str(scope.get("stream_id") or ""),
             "tool_call_id": self._tool_call_id,
         }
+        source_instance_id = str(
+            scope.get("consciousness_instance_id") or ""
+        ).strip()
+        if source_instance_id:
+            origin["consciousness_instance_id"] = source_instance_id
+        activity_ids = scope.get("conscious_activity_ids")
+        if isinstance(activity_ids, dict):
+            activity_id = str(
+                activity_ids.get(self._tool_call_id) or ""
+            ).strip()
+            if activity_id:
+                origin["conscious_activity_id"] = activity_id
         if isinstance(occurrences, list) and occurrences:
             origin["autonomy_occurrences"] = occurrences
         outreach_occurrences = scope.get("initiative_outreach_occurrences")

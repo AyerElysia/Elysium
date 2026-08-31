@@ -29,6 +29,7 @@ from .embodiment_contracts import (
 
 DecisionSource = Callable[[dict[str, Any]], Awaitable[str]]
 CapabilitySource = Callable[[], Sequence[str]]
+ModelActivityRecorder = Callable[[Any, dict[str, Any]], Awaitable[None]]
 
 _SYSTEM_PROMPT = """\
 You are the operational planner for Elysia's currently selected Minecraft body.
@@ -219,12 +220,18 @@ class JsonIntentPlanner:
 class ElysiumModelDecisionSource:
     """Use Elysium's configured model stack for one planner decision."""
 
-    def __init__(self, model_task_name: str) -> None:
+    def __init__(
+        self,
+        model_task_name: str,
+        *,
+        activity_recorder: ModelActivityRecorder | None = None,
+    ) -> None:
         """Bind an explicit configured model task."""
 
         if not model_task_name.strip():
             raise ValueError("model_task_name must not be empty")
         self._model_task_name = model_task_name
+        self._activity_recorder = activity_recorder
         self._verified_context_deliveries: dict[
             str, VerifiedPerceptionDelivery
         ] = {}
@@ -317,6 +324,8 @@ class ElysiumModelDecisionSource:
         )
         response = await request.send(stream=False)
         await response
+        if self._activity_recorder is not None:
+            await self._activity_recorder(response, input_document)
         if perception_text is not None and perception_reference is not None:
             delivery_id = str(perception_reference["delivery_id"])
             receipt = response.effective_context_receipt(delivery_id)

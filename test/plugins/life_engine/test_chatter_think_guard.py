@@ -69,6 +69,117 @@ def test_ensure_unique_tool_call_ids_rewrites_duplicates() -> None:
     manager.validate_for_send(payloads)
 
 
+async def test_conscious_tool_activity_records_same_call_arguments_and_result() -> None:
+    chatter = LifeChatter.__new__(LifeChatter)
+    call = ToolCall(
+        id="send-activity-1",
+        name="action-life_send_text",
+        args={
+            "mood": "温柔",
+            "decision": "直接回应",
+            "expected_response": "对方感到被看见",
+            "thought": "我会认真接住这句话。",
+            "content": "我在听。",
+        },
+    )
+    service = SimpleNamespace(
+        record_conscious_model_turn=AsyncMock(
+            return_value={"send-activity-1": "activity-1"}
+        ),
+        record_conscious_tool_results=AsyncMock(),
+    )
+
+    activity_ids = await chatter._record_conscious_tool_calls(
+        service,
+        [call],
+        SimpleNamespace(
+            request_record_id="request-1",
+            reasoning_content="provider 内部推理",
+            message="同轮独白",
+        ),
+        stream_id="stream-1",
+        turn_occurrence_id="turn-1",
+        source_instance_id="chat-instance-1",
+        fallback_model_turn_id="fallback-1",
+    )
+    response = SimpleNamespace(
+        payloads=[
+            LLMPayload(
+                ROLE.TOOL_RESULT,
+                ToolResult(
+                    value={"status": "delivered"},
+                    call_id="send-activity-1",
+                    name="action-life_send_text",
+                ),
+            )
+        ]
+    )
+    await chatter._record_conscious_tool_results(
+        service,
+        [call],
+        response,
+        stream_id="stream-1",
+        turn_occurrence_id="turn-1",
+        source_instance_id="chat-instance-1",
+        activity_ids=activity_ids,
+        outcomes={
+            "send-activity-1": {
+                "success": True,
+                "technical_outcome": "delivered",
+                "delivery_receipt_sha256": "a" * 64,
+                "delivery_message_id": "provider-1",
+                "delivery_proof_status": "durable",
+            }
+        },
+    )
+
+    call_payload = service.record_conscious_model_turn.await_args.kwargs
+    assert call_payload["source_instance_id"] == "chat-instance-1"
+    assert call_payload["turn_occurrence_id"] == "turn-1"
+    assert call_payload["transport_request_id"] == "request-1"
+    assert call_payload["provider_reasoning_content"] == "provider 内部推理"
+    assert call_payload["assistant_message"] == "同轮独白"
+    assert call_payload["calls"][0]["arguments"] == call.args
+    result_payload = service.record_conscious_tool_results.await_args.kwargs
+    assert result_payload["activity_ids"] == {
+        "send-activity-1": "activity-1"
+    }
+    assert result_payload["results"][0]["result"] == {
+        "status": "delivered"
+    }
+    assert result_payload["results"][0]["success"] is True
+    assert result_payload["results"][0]["technical_outcome"] == "delivered"
+
+
+async def test_empty_model_turn_is_still_recorded_as_conscious_activity() -> None:
+    chatter = LifeChatter.__new__(LifeChatter)
+    service = SimpleNamespace(
+        record_conscious_model_turn=AsyncMock(return_value={}),
+    )
+    response = SimpleNamespace(
+        request_record_id="request-empty",
+        reasoning_content="",
+        message="",
+    )
+
+    activity_ids = await chatter._record_conscious_tool_calls(
+        service,
+        [],
+        response,
+        stream_id="stream-empty",
+        turn_occurrence_id="turn-empty",
+        source_instance_id="chat-instance-empty",
+        fallback_model_turn_id="fallback-empty",
+    )
+
+    assert activity_ids == {}
+    payload = service.record_conscious_model_turn.await_args.kwargs
+    assert payload["transport_request_id"] == "request-empty"
+    assert payload["provider_reasoning_content"] == ""
+    assert payload["assistant_message"] == ""
+    assert payload["calls"] == []
+
+
 def test_life_decision_panel_maps_reasoning_message_and_tools(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

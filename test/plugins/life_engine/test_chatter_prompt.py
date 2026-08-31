@@ -3568,6 +3568,15 @@ async def test_life_chatter_outer_cancellation_closes_tool_call_tail(
     chatter = LifeChatter.__new__(LifeChatter)
     chatter.plugin = SimpleNamespace(config=None)
     chatter.stream_id = "stream-a"
+    recorded_states: list[dict[str, object]] = []
+
+    class ActivityService:
+        async def record_conscious_activity_state(self, **kwargs) -> None:
+            recorded_states.append(dict(kwargs))
+
+        def resolve_consciousness_instance(self, stream_id: str) -> str:
+            assert stream_id == "stream-a"
+            return "chat-instance-a"
 
     async def fake_fetch_unreads():
         return [], []
@@ -3578,7 +3587,7 @@ async def test_life_chatter_outer_cancellation_closes_tool_call_tail(
     import src.core.managers.stream_manager as stream_manager_module
 
     monkeypatch.setattr(stream_manager_module, "get_stream_manager", lambda: DummyStreamManager())
-    monkeypatch.setattr(chatter, "_get_life_service", lambda: None)
+    monkeypatch.setattr(chatter, "_get_life_service", lambda: ActivityService())
     monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
     monkeypatch.setattr(chatter, "_drive_global_runtime_until_yield", cancel_drive)
 
@@ -3598,6 +3607,17 @@ async def test_life_chatter_outer_cancellation_closes_tool_call_tail(
     assert response.payloads[-1].role == ROLE.ASSISTANT
     assert response.payloads[-1].content[0].text == "__SUSPEND__"
     LLMContextManager().validate_for_send(response.payloads)
+    assert recorded_states == [
+        {
+            "stream_id": "stream-a",
+            "source_instance_id": "chat_global",
+            "occurrence_id": "turn-1:stream-step-cancelled",
+            "state_kind": "chatter_interrupted",
+            "payload": {"phase": "tool_exec"},
+            "surface": "life_chatter",
+            "causation_id": "turn-1",
+        }
+    ]
     assert rt.phase == _Phase.WAIT_USER
     assert rt.active_stream_id == ""
     assert rt.active_unread_turn_key == ""

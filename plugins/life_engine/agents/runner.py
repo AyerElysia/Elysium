@@ -9,12 +9,13 @@ from __future__ import annotations
 import asyncio
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from src.app.plugin_system.api.llm_api import create_llm_request, get_model_set_by_task
 from src.core.utils.llm_tool_call import exec_llm_usable
-from src.kernel.llm import LLMPayload, ROLE, Text, ToolRegistry, ToolResult
+from src.kernel.llm import ROLE, LLMPayload, Text, ToolRegistry, ToolResult
 
+from .activity import DelegatedActivityRecorder
 from .definitions import AgentResult, AgentTypeDefinition
 from .registry import get_agent_type_registry
 
@@ -43,6 +44,12 @@ class AgentRunner:
         self.extra_mcp_server_names = list(extra_mcp_server_names or [])
         self.stream_id = str(stream_id or "").strip()
         self.trigger_message = trigger_message
+        self._activity_recorder = DelegatedActivityRecorder(
+            plugin=plugin,
+            stream_id=self.stream_id,
+            trigger_message=trigger_message,
+            surface="life_engine_agent",
+        )
 
     async def run(self) -> AgentResult:
         """同步执行智能体，返回结构化结果。"""
@@ -74,10 +81,10 @@ class AgentRunner:
     async def _run_loop(self) -> tuple[str, int, int]:
         """核心多轮循环。返回 (最终文本, 轮数, 工具调用次数)。"""
         from ..core.config import LifeEngineConfig
-        from ..tools import ALL_TOOLS
-        from ..tools.todo_tools import TODO_TOOLS
         from ..memory.tools import MEMORY_TOOLS
+        from ..tools import ALL_TOOLS
         from ..tools.grep_tools import GREP_TOOLS
+        from ..tools.todo_tools import TODO_TOOLS
         from ..tools.web_tools import WEB_TOOLS
 
         config = getattr(self.plugin, "config", None)
@@ -156,18 +163,25 @@ class AgentRunner:
             reply_text = str(response_text or "").strip()
 
             call_list = list(getattr(response, "call_list", []) or [])
+            activity_ids = await self._activity_recorder.record_model_turn(
+                response,
+                call_list,
+                turn_index=round_num,
+            )
             if not call_list:
                 final_result = reply_text
                 break
 
             total_tool_calls += len(call_list)
 
-            for call in call_list:
+            activity_results: list[dict[str, Any]] = []
+            for call_index, call in enumerate(call_list):
                 tool_name = getattr(call, "name", "") or ""
                 raw_args = getattr(call, "args", {}) or {}
                 args = dict(raw_args) if isinstance(raw_args, dict) else {}
 
                 usable_cls = tool_registry.get(tool_name)
+                tool_succeeded = False
                 if usable_cls:
                     try:
                         success, result = await exec_llm_usable(
@@ -177,6 +191,7 @@ class AgentRunner:
                             message=self.trigger_message,
                             kwargs=args,
                         )
+                        tool_succeeded = bool(success)
                         result_text = str(result) if success else f"失败: {result}"
                     except Exception as exc:
                         result_text = f"异常: {exc}"
@@ -184,12 +199,32 @@ class AgentRunner:
                     result_text = f"未知工具: {tool_name}"
 
                 call_id = getattr(call, "id", None)
+                effective_call_id = str(call_id or f"delegated-call-{call_index}")
                 response.add_payload(
                     LLMPayload(
                         ROLE.TOOL_RESULT,
                         ToolResult(value=result_text, call_id=call_id, name=tool_name),
                     )
                 )
+                activity_results.append(
+                    {
+                        "call_id": effective_call_id,
+                        "tool_name": str(tool_name or "<unknown>"),
+                        "result": result_text,
+                        "success": tool_succeeded,
+                        "technical_outcome": (
+                            "delegated_tool_completed"
+                            if tool_succeeded
+                            else "delegated_tool_failed"
+                        ),
+                    }
+                )
+
+            await self._activity_recorder.record_tool_results(
+                turn_index=round_num,
+                activity_ids=activity_ids,
+                results=activity_results,
+            )
 
             response = await response.send(stream=False)
         else:

@@ -419,6 +419,8 @@ async def test_model_turn_delivers_identity_observation_and_native_pixels_exactl
             },
             ensure_ascii=False,
         )
+        reasoning_content = "我先观察环境，再决定是否行动"
+        request_record_id = "minecraft-request-1"
 
         def __init__(self, deliveries: dict[str, str]) -> None:
             self._deliveries = deliveries
@@ -500,6 +502,12 @@ async def test_model_turn_delivers_identity_observation_and_native_pixels_exactl
     decision = await source.decide(context)
 
     assert decision.kind == "wait"
+    record = decision.to_record()
+    assert record["transport_request_id"] == "minecraft-request-1"
+    assert record["provider_reasoning_content"] == (
+        "我先观察环境，再决定是否行动"
+    )
+    assert record["assistant_message"] == _Response.message
     assert len(request.deliveries) == 2
     user_payload = next(item for item in request.payloads if item.role == ROLE.USER)
     assert any(isinstance(part, Image) for part in user_payload.content)

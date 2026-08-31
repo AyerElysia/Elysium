@@ -98,6 +98,8 @@ def _legacy_channel(event: LifeEngineEvent) -> LifeEventChannel:
         return LifeEventChannel.LIFE
     if content_type.startswith("autonomy_intent_"):
         return LifeEventChannel.LIFE
+    if event.event_type == EventType.CONSCIOUS_ACTIVITY:
+        return LifeEventChannel.LIFE
     if event.event_type == EventType.HEARTBEAT:
         return LifeEventChannel.LIFE
     if str(event.source or "").strip().lower() == "system":

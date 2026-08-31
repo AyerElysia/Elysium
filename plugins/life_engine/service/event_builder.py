@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -25,6 +26,7 @@ class EventType(str, Enum):
     TOOL_CALL = "tool_call"      # 工具调用
     TOOL_RESULT = "tool_result"  # 工具返回结果
     AGENT_RESULT = "agent_result"  # 后台智能体执行结果
+    CONSCIOUS_ACTIVITY = "conscious_activity"  # 意识实例实际发生的认知/状态活动
 
 
 @dataclass(slots=True)
@@ -231,6 +233,18 @@ def _shorten_text(text: str, *, max_length: int = 240) -> str:
     return normalized[: max_length - 1] + "…"
 
 
+def _canonical_json_text(value: Any) -> str:
+    """Serialize one durable activity payload without losing Unicode text."""
+
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
 def _parse_hhmm(value: str) -> dtime | None:
     """解析 HH:MM（24 小时制）时间字符串。"""
     raw = (value or "").strip()
@@ -314,6 +328,18 @@ class EventBuilder:
 
         message_type = getattr(message.message_type, "value", str(message.message_type))
 
+        occurrence_digest = hashlib.sha256(
+            _canonical_json_text(
+                {
+                    "direction": str(direction or "received"),
+                    "message_id": str(message.message_id or f"sequence:{seq}"),
+                    "platform": platform,
+                    "stream_id": stream_id,
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        occurrence_id = f"life-message:{occurrence_digest}"
+
         return LifeEngineEvent(
             event_id=f"msg_{message.message_id or seq}",
             event_type=EventType.MESSAGE,
@@ -336,13 +362,17 @@ class EventBuilder:
             ),
             chat_type=chat_type,
             stream_id=stream_id,
+            occurrence_id=occurrence_id,
             source_instance_id=str(extra.get("consciousness_instance_id") or "") or None,
             correlation_id=str(
                 extra.get("correlation_id")
                 or extra.get("episode_id")
                 or ""
             ) or None,
-            content_ref=str(extra.get("content_ref") or "") or None,
+            content_ref=(
+                str(extra.get("content_ref") or "").strip()
+                or f"life-event-occurrence:{occurrence_id}"
+            ),
             raw_content=full_content,
         )
 
@@ -507,7 +537,7 @@ class EventBuilder:
 
         return LifeEngineEvent(
             event_id=f"chatter_inner_monologue_{seq}",
-            event_type=EventType.HEARTBEAT,
+            event_type=EventType.CONSCIOUS_ACTIVITY,
             timestamp=_now_iso(),
             sequence=seq,
             source="life_chatter",
@@ -572,7 +602,7 @@ class EventBuilder:
         seq = self._next_sequence()
         return LifeEngineEvent(
             event_id=decision_id,
-            event_type=EventType.HEARTBEAT,
+            event_type=EventType.CONSCIOUS_ACTIVITY,
             timestamp=authored_at,
             sequence=seq,
             source="minecraft_consciousness",
@@ -603,6 +633,19 @@ class EventBuilder:
         """构建工具调用事件。"""
         seq = self._next_sequence()
         event_id = f"tool_call_{seq}"
+        occurrence_id = f"life-tool-call:{event_id}"
+        raw_content = _canonical_json_text(
+            {
+                "schema": "life.conscious_activity.tool_call.v1",
+                "phase": "chosen",
+                "tool_name": str(tool_name or ""),
+                "arguments": dict(tool_args or {}),
+                "heartbeat_run_id": str(heartbeat_run_id or ""),
+                "call_id": str(call_id or ""),
+                "parent_event_id": str(parent_event_id or ""),
+                "causation_id": str(causation_id or ""),
+            }
+        )
         return LifeEngineEvent(
             event_id=event_id,
             event_type=EventType.TOOL_CALL,
@@ -618,12 +661,209 @@ class EventBuilder:
             causation_id=causation_id,
             tool_name=tool_name,
             tool_args=tool_args,
+            occurrence_id=occurrence_id,
+            content_ref=f"life-event-occurrence:{occurrence_id}",
+            raw_content=raw_content,
+        )
+
+    def build_conscious_tool_call_event(
+        self,
+        tool_name: str,
+        tool_args: dict[str, Any],
+        *,
+        activity_id: str,
+        model_turn_activity_id: str,
+        call_id: str,
+        stream_id: str,
+        source_instance_id: str,
+        turn_occurrence_id: str,
+        surface: str = "life_chatter",
+    ) -> LifeEngineEvent:
+        """Build one subject-authored tool choice for the shared life ledger."""
+
+        identity = str(activity_id or "").strip()
+        if not identity:
+            raise ValueError("conscious activity_id must not be empty")
+        event = self.build_tool_call_event(
+            tool_name,
+            tool_args,
+            call_id=call_id,
+            parent_event_id=f"{model_turn_activity_id}:generated",
+            causation_id=f"{model_turn_activity_id}:generated",
+        )
+        occurrence_id = f"{identity}:chosen"
+        event.event_id = occurrence_id
+        surface_name = str(surface or "life_chatter").strip() or "life_chatter"
+        event.source = surface_name
+        event.source_detail = (
+            "意识实例工具选择 | "
+            f"surface={surface_name} | "
+            f"instance={source_instance_id or 'unknown'} | "
+            f"stream={stream_id or 'unknown'} | {tool_name}"
+        )
+        event.content_type = "conscious_activity_tool_call"
+        event.stream_id = stream_id or None
+        event.occurrence_id = occurrence_id
+        event.source_instance_id = source_instance_id or None
+        event.correlation_id = turn_occurrence_id or None
+        event.content_ref = f"life-event-occurrence:{occurrence_id}"
+        event.raw_content = _canonical_json_text(
+            {
+                "schema": "life.conscious_activity.tool_call.v1",
+                "activity_id": identity,
+                "model_turn_activity_id": model_turn_activity_id,
+                "phase": "chosen",
+                "surface": surface_name,
+                "actor_consciousness_instance_id": source_instance_id,
+                "stream_id": stream_id,
+                "turn_occurrence_id": turn_occurrence_id,
+                "call_id": call_id,
+                "tool_name": tool_name,
+                "arguments": dict(tool_args or {}),
+            }
+        )
+        return event
+
+    def build_conscious_model_turn_event(
+        self,
+        *,
+        activity_id: str,
+        transport_request_id: str,
+        stream_id: str,
+        source_instance_id: str,
+        turn_occurrence_id: str,
+        provider_reasoning_content: str,
+        assistant_message: str,
+        tool_call_ids: list[str],
+        surface: str = "life_chatter",
+        heartbeat_run_id: str | None = None,
+    ) -> LifeEngineEvent:
+        """Build one complete successful model generation as conscious activity."""
+
+        identity = str(activity_id or "").strip()
+        if not identity:
+            raise ValueError("model turn activity_id must not be empty")
+        occurrence_id = f"{identity}:generated"
+        surface_name = str(surface or "life_chatter").strip() or "life_chatter"
+        raw_content = _canonical_json_text(
+            {
+                "schema": "life.conscious_activity.model_turn.v1",
+                "activity_id": identity,
+                "phase": "generated",
+                "surface": surface_name,
+                "actor_consciousness_instance_id": source_instance_id,
+                "stream_id": stream_id,
+                "turn_occurrence_id": turn_occurrence_id,
+                "transport_request_id": transport_request_id,
+                "provider_reasoning_content": str(
+                    provider_reasoning_content or ""
+                ),
+                "assistant_message": str(assistant_message or ""),
+                "tool_call_ids": [
+                    str(value or "").strip()
+                    for value in tool_call_ids
+                    if str(value or "").strip()
+                ],
+            }
+        )
+        seq = self._next_sequence()
+        visible = _canonical_json_text(
+            {
+                "phase": "generated",
+                "has_provider_reasoning": bool(provider_reasoning_content),
+                "has_assistant_message": bool(assistant_message),
+                "tool_call_count": len(tool_call_ids),
+            }
+        )
+        return LifeEngineEvent(
+            event_id=occurrence_id,
+            event_type=EventType.CONSCIOUS_ACTIVITY,
+            timestamp=_now_iso(),
+            sequence=seq,
+            source=surface_name,
+            source_detail=(
+                "意识实例模型轮 | "
+                f"surface={surface_name} | "
+                f"instance={source_instance_id or 'unknown'} | "
+                f"stream={stream_id or 'unknown'}"
+            ),
+            content=visible,
+            content_type="conscious_activity_model_turn",
+            heartbeat_run_id=heartbeat_run_id,
+            stream_id=stream_id or None,
+            occurrence_id=occurrence_id,
+            causation_id=turn_occurrence_id or None,
+            source_instance_id=source_instance_id or None,
+            correlation_id=turn_occurrence_id or None,
+            content_ref=f"life-event-occurrence:{occurrence_id}",
+            raw_content=raw_content,
+        )
+
+    def build_conscious_activity_state_event(
+        self,
+        *,
+        activity_id: str,
+        stream_id: str,
+        source_instance_id: str,
+        occurrence_id: str,
+        state_kind: str,
+        payload: dict[str, Any],
+        surface: str,
+        causation_id: str = "",
+        correlation_id: str = "",
+    ) -> LifeEngineEvent:
+        """Build a non-textual conscious state such as wait or interruption."""
+
+        identity = str(activity_id or "").strip()
+        state = str(state_kind or "").strip()
+        occurrence = str(occurrence_id or "").strip()
+        surface_name = str(surface or "").strip()
+        if not identity or not state or not occurrence or not surface_name:
+            raise ValueError("conscious activity state attribution is incomplete")
+        event_occurrence = f"{identity}:state"
+        return LifeEngineEvent(
+            event_id=event_occurrence,
+            event_type=EventType.CONSCIOUS_ACTIVITY,
+            timestamp=_now_iso(),
+            sequence=self._next_sequence(),
+            source=surface_name,
+            source_detail=(
+                "意识实例状态活动 | "
+                f"surface={surface_name} | "
+                f"instance={source_instance_id or 'unknown'} | "
+                f"state={state}"
+            ),
+            content=_canonical_json_text(
+                {
+                    "state_kind": state,
+                    "payload_keys": sorted(str(key) for key in payload),
+                }
+            ),
+            content_type="conscious_activity_state",
+            stream_id=stream_id or None,
+            occurrence_id=event_occurrence,
+            causation_id=str(causation_id or occurrence),
+            source_instance_id=source_instance_id or None,
+            correlation_id=str(correlation_id or occurrence),
+            content_ref=f"life-event-occurrence:{event_occurrence}",
+            raw_content=_canonical_json_text(
+                {
+                    "schema": "life.conscious_activity.state.v1",
+                    "activity_id": identity,
+                    "surface": surface_name,
+                    "actor_consciousness_instance_id": source_instance_id,
+                    "stream_id": stream_id,
+                    "occurrence_id": occurrence,
+                    "state_kind": state,
+                    "payload": dict(payload),
+                }
+            ),
         )
 
     def build_tool_result_event(
         self,
         tool_name: str,
-        result: str,
+        result: Any,
         success: bool,
         *,
         heartbeat_run_id: str | None = None,
@@ -638,14 +878,39 @@ class EventBuilder:
         linked_parent_id = parent_event_id or (
             call_event.event_id if call_event is not None else None
         )
+        result_text = (
+            result if isinstance(result, str) else _canonical_json_text(result)
+        )
+        event_id = f"tool_result_{seq}"
+        occurrence_id = f"life-tool-result:{event_id}"
+        raw_content = _canonical_json_text(
+            {
+                "schema": "life.conscious_activity.tool_result.v1",
+                "phase": "completed" if success else "failed",
+                "tool_name": str(tool_name or ""),
+                "result": result,
+                "success": bool(success),
+                "heartbeat_run_id": str(
+                    heartbeat_run_id
+                    or (
+                        call_event.heartbeat_run_id
+                        if call_event is not None
+                        else ""
+                    )
+                    or ""
+                ),
+                "call_id": str(linked_call_id or ""),
+                "parent_event_id": str(linked_parent_id or ""),
+            }
+        )
         return LifeEngineEvent(
-            event_id=f"tool_result_{seq}",
+            event_id=event_id,
             event_type=EventType.TOOL_RESULT,
             timestamp=_now_iso(),
             sequence=seq,
             source=INTERNAL_PLATFORM,
             source_detail=f"工具返回 | {tool_name} | {'成功' if success else '失败'}",
-            content=_shorten_text(result, max_length=500),
+            content=_shorten_text(result_text, max_length=500),
             content_type="tool_result",
             heartbeat_run_id=heartbeat_run_id or (
                 call_event.heartbeat_run_id if call_event is not None else None
@@ -657,7 +922,78 @@ class EventBuilder:
             ),
             tool_name=tool_name,
             tool_success=success,
+            occurrence_id=occurrence_id,
+            content_ref=f"life-event-occurrence:{occurrence_id}",
+            raw_content=raw_content,
         )
+
+    def build_conscious_tool_result_event(
+        self,
+        tool_name: str,
+        result: Any,
+        success: bool,
+        *,
+        activity_id: str,
+        call_id: str,
+        stream_id: str,
+        source_instance_id: str,
+        turn_occurrence_id: str,
+        technical_outcome: str = "",
+        delivery_receipt_sha256: str = "",
+        delivery_message_id: str = "",
+        delivery_proof_status: str = "",
+        surface: str = "life_chatter",
+    ) -> LifeEngineEvent:
+        """Build the immutable outcome paired with a conscious tool choice."""
+
+        identity = str(activity_id or "").strip()
+        if not identity:
+            raise ValueError("conscious activity_id must not be empty")
+        parent_event_id = f"{identity}:chosen"
+        event = self.build_tool_result_event(
+            tool_name,
+            result,
+            success,
+            call_id=call_id,
+            parent_event_id=parent_event_id,
+            causation_id=parent_event_id,
+        )
+        occurrence_id = f"{identity}:result"
+        event.event_id = occurrence_id
+        surface_name = str(surface or "life_chatter").strip() or "life_chatter"
+        event.source = surface_name
+        event.source_detail = (
+            "意识实例工具结果 | "
+            f"surface={surface_name} | "
+            f"instance={source_instance_id or 'unknown'} | "
+            f"stream={stream_id or 'unknown'} | {tool_name}"
+        )
+        event.content_type = "conscious_activity_tool_result"
+        event.stream_id = stream_id or None
+        event.occurrence_id = occurrence_id
+        event.source_instance_id = source_instance_id or None
+        event.correlation_id = turn_occurrence_id or None
+        event.content_ref = f"life-event-occurrence:{occurrence_id}"
+        event.raw_content = _canonical_json_text(
+            {
+                "schema": "life.conscious_activity.tool_result.v1",
+                "activity_id": identity,
+                "phase": "completed" if success else "failed",
+                "surface": surface_name,
+                "actor_consciousness_instance_id": source_instance_id,
+                "stream_id": stream_id,
+                "turn_occurrence_id": turn_occurrence_id,
+                "call_id": call_id,
+                "tool_name": tool_name,
+                "success": bool(success),
+                "technical_outcome": str(technical_outcome or ""),
+                "delivery_receipt_sha256": str(delivery_receipt_sha256 or ""),
+                "delivery_message_id": str(delivery_message_id or ""),
+                "delivery_proof_status": str(delivery_proof_status or ""),
+                "result": result,
+            }
+        )
+        return event
 
     def build_agent_result_event(
         self,
@@ -675,8 +1011,10 @@ class EventBuilder:
         """构建后台智能体执行结果事件。"""
         status = "成功" if success else "失败"
         seq = self._next_sequence()
+        event_id = f"agent_result_{seq}"
+        occurrence_id = f"life-agent-result:{event_id}"
         return LifeEngineEvent(
-            event_id=f"agent_result_{seq}",
+            event_id=event_id,
             event_type=EventType.AGENT_RESULT,
             timestamp=_now_iso(),
             sequence=seq,
@@ -690,6 +1028,9 @@ class EventBuilder:
             causation_id=causation_id,
             tool_name=f"agent:{agent_type}",
             tool_success=success,
+            occurrence_id=occurrence_id,
+            content_ref=f"life-event-occurrence:{occurrence_id}",
+            raw_content=str(result_text or ""),
         )
 
     def build_direct_message_event(

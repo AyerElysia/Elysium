@@ -149,6 +149,72 @@ async def test_router_rejects_string_boolean_and_uses_fallback() -> None:
 
 
 @pytest.mark.asyncio
+async def test_router_records_each_successful_generation_before_using_it() -> None:
+    response = _Response(
+        '{"reason":"交给表达层","should_respond":true}',
+        reasoning="先判断这批消息是否应进入表达层",
+    )
+    response.request_record_id = "router-request-1"
+    chatter = _Chatter({"router": response, "agent": response})
+    recorded: list[tuple[object, str]] = []
+
+    async def record_activity(raw_response: object, task: str) -> None:
+        recorded.append((raw_response, task))
+
+    result = await router.route_should_respond(
+        chatter=chatter,
+        logger=SimpleNamespace(
+            debug=lambda *_: None,
+            info=lambda *_: None,
+            warning=lambda *_: None,
+            error=lambda *_: None,
+        ),
+        unreads_text="new message",
+        chat_stream=_stream(),
+        activity_recorder=record_activity,
+    )
+
+    assert result["should_respond"] is True
+    assert recorded == [(response, "router")]
+
+
+@pytest.mark.asyncio
+async def test_router_never_uses_a_generation_that_failed_activity_recording() -> None:
+    chatter = _Chatter(
+        {
+            "router": _Response(
+                '{"reason":"unrecorded","should_respond":false}'
+            ),
+            "agent": _Response(
+                '{"reason":"recorded fallback","should_respond":true}'
+            ),
+        }
+    )
+    attempts: list[str] = []
+
+    async def record_activity(_response: object, task: str) -> None:
+        attempts.append(task)
+        if task == "router":
+            raise RuntimeError("ledger unavailable")
+
+    result = await router.route_should_respond(
+        chatter=chatter,
+        logger=SimpleNamespace(
+            debug=lambda *_: None,
+            info=lambda *_: None,
+            warning=lambda *_: None,
+            error=lambda *_: None,
+        ),
+        unreads_text="new message",
+        chat_stream=_stream(),
+        activity_recorder=record_activity,
+    )
+
+    assert result["should_respond"] is True
+    assert attempts == ["router", "agent"]
+
+
+@pytest.mark.asyncio
 async def test_router_exhaustion_preserves_message_for_subject() -> None:
     chatter = _Chatter(
         {

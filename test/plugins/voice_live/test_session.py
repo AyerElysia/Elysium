@@ -155,6 +155,7 @@ class BlockingStateConsciousness(FakeConsciousness):
 class FakeBridge:
     def __init__(self) -> None:
         self.transcripts: list[tuple[str, str, str]] = []
+        self.activity_states: list[dict[str, Any]] = []
 
     def build_system_prompt(self) -> str:
         return "independent voice context"
@@ -163,6 +164,37 @@ class FakeBridge:
         self, role: str, text: str, *, provider_event_id: str = ""
     ) -> None:
         self.transcripts.append((role, text, provider_event_id))
+
+    async def record_activity_state(self, **kwargs: Any) -> None:
+        self.activity_states.append(dict(kwargs))
+
+
+class ActivityBridge(FakeBridge):
+    def __init__(self, timeline: list[str]) -> None:
+        super().__init__()
+        self.timeline = timeline
+        self.results: list[Any] = []
+
+    async def record_tool_call_activity(self, **kwargs: Any):
+        self.timeline.append("record-call")
+        return "voice-turn-1", {str(kwargs["call_id"]): "activity-1"}
+
+    async def record_tool_result_activity(self, **kwargs: Any) -> None:
+        self.timeline.append("record-result")
+        self.results.append(kwargs["result"])
+
+    def project_tool_result(self, result: Any):
+        self.timeline.append("project-result")
+        return "bounded-provider-result", {"truncated": True}
+
+
+class OrderedBroker:
+    def __init__(self, timeline: list[str]) -> None:
+        self.timeline = timeline
+
+    async def execute(self, name: str, arguments_json: str) -> dict[str, Any]:
+        self.timeline.append("execute")
+        return {"success": True, "full": "结果" * 5000}
 
 
 class BundleBridge(FakeBridge):
@@ -358,6 +390,39 @@ async def test_slow_world_state_report_does_not_delay_session_ready(
 
 
 @pytest.mark.asyncio
+async def test_voice_tool_activity_is_recorded_before_projection_and_provider_submit(
+    tmp_path: Path,
+) -> None:
+    config = make_config(tmp_path)
+    timeline: list[str] = []
+    provider = FakeProvider()
+    bridge = ActivityBridge(timeline)
+    store = VoiceEpisodeStore(tmp_path, "voice_tool_order", "tool-order")
+    session = CallSession(
+        config,
+        "tool-order",
+        provider_factory=lambda _: provider,
+        store=store,
+        consciousness=FakeConsciousness(),
+        bridge=bridge,
+        tool_broker=OrderedBroker(timeline),
+    )
+    session._provider = provider
+
+    await session._on_tool_call(
+        ToolCallEvent("call-1", "action-life_send_text", '{"content":"你好"}')
+    )
+
+    assert timeline == ["record-call", "execute", "record-result", "project-result"]
+    assert bridge.results == [{"success": True, "full": "结果" * 5000}]
+    assert provider.tool_results == [("call-1", "bounded-provider-result")]
+    records = store.read_all()
+    assert next(record for record in records if record.event == "tool.call").payload[
+        "arguments_json"
+    ] == '{"content":"你好"}'
+
+
+@pytest.mark.asyncio
 async def test_provider_connect_and_subconscious_prepare_overlap_during_startup(
     tmp_path: Path,
 ) -> None:
@@ -515,6 +580,7 @@ async def test_failed_voice_model_turn_still_opens_a_new_context_frontier(
         "recent-subconscious-prefix",
         "recent-subconscious-prefix",
     ]
+    assert bridge.activity_states[-1]["state_kind"] == "response_cancelled"
     await session.stop()
 
 
@@ -617,6 +683,12 @@ async def test_session_runs_audio_interrupt_transcript_tool_and_cleanup(
         InterruptionEvent("client", "response-1", "item-1")
     )
     assert sum(event.get("type") == "playback.clear" for event in json_events) == 1
+    assert bridge.activity_states[-1]["state_kind"] == "response_interrupted"
+    assert bridge.activity_states[-1]["payload"] == {
+        "source": "client",
+        "response_id": "response-1",
+        "item_id": "item-1",
+    }
 
     await provider._emit_tool_call(ToolCallEvent("call", "action-think", '{"x":1}'))
     assert provider.tool_results == [

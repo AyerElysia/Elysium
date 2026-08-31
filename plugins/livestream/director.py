@@ -322,6 +322,31 @@ class LifeChatterDeliberator:
             timeout=self.timeout_seconds,
         )
         response_text = response.message
+        activity_recorder = getattr(service, "record_conscious_model_turn", None)
+        if not callable(activity_recorder):
+            raise DirectorUnavailableError(
+                "LifeEngine cannot record the livestream model activity"
+            )
+        source_window = ",".join(str(value) for value in source_sequences)
+        await activity_recorder(
+            stream_id=stream.stream_id,
+            source_instance_id=str(
+                getattr(self._consciousness, "instance_id", "") or ""
+            ),
+            turn_occurrence_id=(
+                f"livestream:{session_id}:director:{source_window}"
+            ),
+            transport_request_id=str(
+                getattr(response, "request_record_id", "")
+                or f"livestream:{session_id}:director:{source_window}"
+            ),
+            provider_reasoning_content=str(
+                getattr(response, "reasoning_content", "") or ""
+            ),
+            assistant_message=str(response_text or ""),
+            calls=[],
+            surface="livestream",
+        )
         plan = self.parse_plan(str(response_text or ""), events)
         lookup_receipt = getattr(response, "effective_context_receipt", None)
         effective = (

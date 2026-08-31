@@ -303,6 +303,9 @@ class MinecraftConsciousnessDecision:
     intention: str = ""
     reason: str = ""
     reconsider_after_seconds: float | None = None
+    transport_request_id: str = ""
+    provider_reasoning_content: str = ""
+    assistant_message: str = ""
 
     def to_record(self) -> dict[str, Any]:
         """Return the complete decision for immutable Life Event storage."""
@@ -316,6 +319,9 @@ class MinecraftConsciousnessDecision:
             "intention": self.intention,
             "reason": self.reason,
             "reconsider_after_seconds": self.reconsider_after_seconds,
+            "transport_request_id": self.transport_request_id,
+            "provider_reasoning_content": self.provider_reasoning_content,
+            "assistant_message": self.assistant_message,
         }
 
 
@@ -664,12 +670,25 @@ class ElysiumMinecraftDecisionSource:
         if subconscious_delivery_id:
             _verify_delivery(response, subconscious_delivery_id, subconscious_part)
         raw = str(getattr(response, "message", "") or "").strip()
-        return self._parse_decision(raw, context)
+        return self._parse_decision(
+            raw,
+            context,
+            transport_request_id=str(
+                getattr(response, "request_record_id", "")
+                or f"minecraft:{context.session_id}:turn:{context.turn_index}"
+            ),
+            provider_reasoning_content=str(
+                getattr(response, "reasoning_content", "") or ""
+            ),
+        )
 
     def _parse_decision(
         self,
         raw: str,
         context: MinecraftConsciousnessTurnContext,
+        *,
+        transport_request_id: str = "",
+        provider_reasoning_content: str = "",
     ) -> MinecraftConsciousnessDecision:
         """Parse a technical decision without rewriting authored text."""
 
@@ -770,6 +789,9 @@ class ElysiumMinecraftDecisionSource:
             intention=intention,
             reason=reason,
             reconsider_after_seconds=reconsider,
+            transport_request_id=str(transport_request_id or ""),
+            provider_reasoning_content=str(provider_reasoning_content or ""),
+            assistant_message=raw,
         )
 
 

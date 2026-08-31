@@ -21,6 +21,7 @@ from src.core.utils.llm_tool_call import exec_llm_usable
 from src.kernel.llm import ROLE, LLMPayload, Text, ToolRegistry, ToolResult
 from src.kernel.logger import get_logger
 
+from .activity import DelegatedActivityRecorder
 from .contracts import TaskContract, TaskKind, TaskResult, TaskStatus
 
 if TYPE_CHECKING:
@@ -133,6 +134,13 @@ class Worker:
         self.trace_hook = trace_hook
         # 上游任务的输出，注入到 context 中
         self.upstream_outputs = upstream_outputs or {}
+        self._activity_recorder = DelegatedActivityRecorder(
+            plugin=plugin,
+            stream_id=stream_id,
+            trigger_message=trigger_message,
+            surface="life_engine_orchestration",
+            run_occurrence_id=f"orchestration-task:{task.task_id}",
+        )
 
     async def run(self) -> TaskResult:
         """执行任务，返回结构化结果。"""
@@ -249,6 +257,11 @@ class Worker:
             total_tokens += len(reply_text) // 3
 
             call_list = list(getattr(response, "call_list", []) or [])
+            activity_ids = await self._activity_recorder.record_model_turn(
+                response,
+                call_list,
+                turn_index=round_num,
+            )
             if not call_list:
                 final_text = reply_text
                 self._emit("round_end", {"round": round_num + 1, "tool_calls": 0})
@@ -259,7 +272,8 @@ class Worker:
                 "tool_calls": len(call_list),
             })
 
-            for call in call_list:
+            activity_results: list[dict[str, Any]] = []
+            for call_index, call in enumerate(call_list):
                 tool_name = getattr(call, "name", "") or ""
                 raw_args = getattr(call, "args", {}) or {}
                 args = dict(raw_args) if isinstance(raw_args, dict) else {}
@@ -267,6 +281,7 @@ class Worker:
                 self._emit("tool_call", {"tool": tool_name, "args_keys": list(args.keys())})
 
                 usable_cls = tool_registry.get(tool_name)
+                tool_succeeded = False
                 if usable_cls:
                     try:
                         success, result = await exec_llm_usable(
@@ -276,6 +291,7 @@ class Worker:
                             message=self.trigger_message,
                             kwargs=args,
                         )
+                        tool_succeeded = bool(success)
                         result_text = str(result) if success else f"失败: {result}"
                     except Exception as exc:
                         result_text = f"异常: {exc}"
@@ -285,12 +301,32 @@ class Worker:
                 total_tokens += len(result_text) // 3
 
                 call_id = getattr(call, "id", None)
+                effective_call_id = str(call_id or f"delegated-call-{call_index}")
                 response.add_payload(
                     LLMPayload(
                         ROLE.TOOL_RESULT,
                         ToolResult(value=result_text, call_id=call_id, name=tool_name),
                     )
                 )
+                activity_results.append(
+                    {
+                        "call_id": effective_call_id,
+                        "tool_name": str(tool_name or "<unknown>"),
+                        "result": result_text,
+                        "success": tool_succeeded,
+                        "technical_outcome": (
+                            "orchestration_tool_completed"
+                            if tool_succeeded
+                            else "orchestration_tool_failed"
+                        ),
+                    }
+                )
+
+            await self._activity_recorder.record_tool_results(
+                turn_index=round_num,
+                activity_ids=activity_ids,
+                results=activity_results,
+            )
 
             # 预算检查：token
             if total_tokens >= budget.max_tokens_total:

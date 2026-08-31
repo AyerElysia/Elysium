@@ -90,6 +90,18 @@ def build_chat_message_event(
     receipt = _provider_receipt(extra)
     if receipt:
         metadata["provider_receipt"] = receipt
+    activity_lineage = {
+        key: str(extra.get(key) or "").strip()
+        for key in (
+            "conscious_activity_id",
+            "tool_call_id",
+            "origin_turn_key",
+            "origin_stream_id",
+        )
+        if str(extra.get(key) or "").strip()
+    }
+    if activity_lineage:
+        metadata["conscious_activity_lineage"] = activity_lineage
     source_connection = str(adapter_signature or extra.get("source_connection") or "")
     if source_connection:
         metadata["source_connection"] = source_connection
@@ -113,9 +125,16 @@ def build_chat_message_event(
         occurrence_id=f"chat:{digest}",
         source_instance_id=str(extra.get("consciousness_instance_id") or "chat_global"),
         correlation_id=str(
-            extra.get("correlation_id") or extra.get("episode_id") or ""
+            extra.get("correlation_id")
+            or extra.get("episode_id")
+            or extra.get("origin_turn_key")
+            or ""
         ),
-        causation_id=str(extra.get("causation_id") or ""),
+        causation_id=str(
+            extra.get("conscious_activity_id")
+            or extra.get("causation_id")
+            or ""
+        ),
         content_ref=str(extra.get("content_ref") or ""),
     )
 

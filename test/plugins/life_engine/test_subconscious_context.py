@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from src.core.models.message import Message
+import json
 
 from plugins.life_engine.service.event_builder import (
     EventBuilder,
@@ -14,6 +14,7 @@ from plugins.life_engine.service.subconscious_context import (
     SubconsciousSummary,
     SummaryEntry,
 )
+from src.core.models.message import Message
 
 
 def _event(
@@ -438,12 +439,122 @@ def test_recent_projection_shares_thoughts_and_tools_without_private_messages() 
     assert projected.through_sequence == 5
     assert "我刚刚想到要继续看看这件事" in projected.content
     assert "TOOL_CALL inspect" in projected.content
-    assert "notes.txt" not in projected.content
+    assert "notes.txt" in projected.content
     assert "TOOL_RESULT inspect success" in projected.content
     assert "现在更清楚了" in projected.content
     assert "source=life_chatter instance=chat_global" in projected.content
     assert "PRIVATE_TRANSCRIPT" not in projected.content
     assert projected.delivered_bytes == len(projected.content.encode("utf-8"))
+
+    witness_view = manager.project_recent(
+        [private_message, thought, call, result, later_thought],
+        include_tool_payloads=False,
+    )
+    assert "notes.txt" not in witness_view.content
+    assert "看完了" not in witness_view.content
+    assert '"argument_keys":["path"]' in witness_view.content
+    assert "payload=redacted_for_consumer" in witness_view.content
+    assert "redacted-tools-v1" in witness_view.algorithm_version
+
+
+def test_conscious_expression_activity_keeps_complete_arguments_and_outcome() -> None:
+    current = 0
+
+    def next_sequence() -> int:
+        nonlocal current
+        current += 1
+        return current
+
+    builder = EventBuilder(next_sequence)
+    arguments = {
+        "mood": "温柔而认真",
+        "decision": "完整接住她的分享",
+        "expected_response": "她知道这段经历被认真看见",
+        "thought": "先理解，再用自己的话回应，不把思考冒充成外发正文。",
+        "content": "我听见了，也会把这件事认真放在心上。",
+    }
+    call = builder.build_conscious_tool_call_event(
+        "action-life_send_text",
+        arguments,
+        activity_id="activity-1",
+        model_turn_activity_id="model-turn-1",
+        call_id="call-1",
+        stream_id="stream-1",
+        source_instance_id="chat-instance-1",
+        turn_occurrence_id="turn-1",
+    )
+    result = builder.build_conscious_tool_result_event(
+        "action-life_send_text",
+        {"status": "delivered"},
+        True,
+        activity_id="activity-1",
+        call_id="call-1",
+        stream_id="stream-1",
+        source_instance_id="chat-instance-1",
+        turn_occurrence_id="turn-1",
+        technical_outcome="delivered",
+        delivery_receipt_sha256="a" * 64,
+        delivery_message_id="provider-message-1",
+        delivery_proof_status="durable",
+    )
+
+    projected = SubconsciousContextManager().prepare([call, result], cursor=0)
+    raw_call = json.loads(call.raw_content or "{}")
+    raw_result = json.loads(result.raw_content or "{}")
+
+    assert raw_call["arguments"] == arguments
+    assert raw_call["actor_consciousness_instance_id"] == "chat-instance-1"
+    assert raw_result["result"] == {"status": "delivered"}
+    assert raw_result["technical_outcome"] == "delivered"
+    assert raw_result["delivery_message_id"] == "provider-message-1"
+    assert set(projected.acknowledged_event_ids) == {
+        "activity-1:chosen",
+        "activity-1:result",
+    }
+    for value in arguments.values():
+        assert value in projected.content
+    assert "life-event-occurrence:activity-1:chosen" in projected.content
+
+
+def test_oversized_activity_is_authoritative_but_prompt_uses_exact_ref() -> None:
+    current = 0
+
+    def next_sequence() -> int:
+        nonlocal current
+        current += 1
+        return current
+
+    builder = EventBuilder(next_sequence)
+    full_thought = "爱莉在认真整理这段经历🌸" * 1200
+    call = builder.build_conscious_tool_call_event(
+        "action-life_send_text",
+        {
+            "mood": "认真",
+            "decision": "回应",
+            "expected_response": "被看见",
+            "thought": full_thought,
+            "content": "我在。",
+        },
+        activity_id="activity-large",
+        model_turn_activity_id="model-turn-large",
+        call_id="call-large",
+        stream_id="stream-large",
+        source_instance_id="chat-instance-large",
+        turn_occurrence_id="turn-large",
+    )
+
+    projected = SubconsciousContextManager().project_recent(
+        [call],
+        max_bytes=4096,
+    )
+
+    assert full_thought in (call.raw_content or "")
+    assert full_thought not in projected.content
+    assert '"delivery":"excerpt_ref"' in projected.content
+    assert '"original_bytes":' in projected.content
+    assert '"sha256":' in projected.content
+    assert "life-event-occurrence:activity-large:chosen" in projected.content
+    assert projected.delivered_bytes <= 4096
 
 
 def test_recent_projection_uses_latest_group_count_and_hard_utf8_budget() -> None:
