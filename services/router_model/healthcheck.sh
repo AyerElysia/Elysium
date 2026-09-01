@@ -78,7 +78,7 @@ fi
 if printf '%s' "$MODELS" | grep -q "\"$SERVED_NAME\""; then
     ok "/v1/models 含 $SERVED_NAME"
 else
-    bad "/v1/models 里没有 $SERVED_NAME，config/model.toml 的 model id 会对不上"
+    bad "/v1/models 里没有 $SERVED_NAME，config/models.toml 的 model id 会对不上"
     printf '     实际返回: %s\n' "$MODELS"
     exit 1
 fi
