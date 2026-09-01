@@ -870,6 +870,11 @@ class LifeEngineService(BaseService):
         # 避免并发写 runtime checkpoint 触发无谓的 revision 冲突。
         self._message_persist_lock = asyncio.Lock()
 
+        # 世界投影追赶串行锁：后台任务与 record_send_requested /
+        # record_delivery_status 等同步调用点都会触发 catch_up，
+        # 并发会导致 world_projection_changes 主键冲突。
+        self._world_projection_lock = asyncio.Lock()
+
         # 状态持久化
         self._state_persistence: StatePersistence | None = None
         self._event_bus: LifeEventBus | None = None
@@ -4139,13 +4144,17 @@ class LifeEngineService(BaseService):
     async def catch_up_world_projection(self) -> int:
         """Advance the selected or legacy projection without blocking the loop."""
 
-        gateway = self._get_perception_gateway()
-        if isinstance(gateway, AsyncPerceptionGateway):
-            return await gateway.catch_up()
-        return await asyncio.to_thread(
-            self._get_world_projection().catch_up,
-            self._get_event_bus().store,
-        )
+        # 后台化的消息慢阶段与同步调用点（record_send_requested /
+        # record_delivery_status）都会走到这里，并发执行会让
+        # world_projection_changes 的 ingest_position 主键冲突，此处统一串行。
+        async with self._world_projection_lock:
+            gateway = self._get_perception_gateway()
+            if isinstance(gateway, AsyncPerceptionGateway):
+                return await gateway.catch_up()
+            return await asyncio.to_thread(
+                self._get_world_projection().catch_up,
+                self._get_event_bus().store,
+            )
 
     async def rebuild_world_projection(self) -> int:
         """Explicitly replay World projection while preserving delivery cursors."""
