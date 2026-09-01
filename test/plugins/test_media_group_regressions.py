@@ -182,3 +182,19 @@ async def test_napcat_fetch_does_not_bypass_proxy_after_http_status_error(
         await napcat_utils.download_image_base64(str(request.url))
 
     assert len(_FakeAsyncClient.calls) == 1
+
+
+async def test_napcat_fetch_exhausts_retries_then_raises_runtime_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = httpx.Request("GET", "https://example.invalid/image")
+    _configure_napcat_fetch(
+        monkeypatch,
+        [httpx.ReadTimeout("read timed out", request=request)] * 3,
+    )
+
+    with pytest.raises(RuntimeError, match="图片下载失败（已尝试 3 次）"):
+        await napcat_utils.download_image_base64(str(request.url))
+
+    assert len(_FakeAsyncClient.calls) == 3
+    assert all("trust_env" not in call for call in _FakeAsyncClient.calls)

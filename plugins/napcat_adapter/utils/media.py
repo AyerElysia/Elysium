@@ -24,6 +24,8 @@ async def download_image_base64(url: str, max_attempts: int = 3) -> str:
 
     WSL 出站网络存在间歇性丢包（TCP 握手偶发十余秒），单次下载容易踩中，
     这里做多次尝试 + 递增退避；单次内部仍保留代理失败降级直连的逻辑。
+    HTTP 状态错误（4xx/5xx）是服务器的明确响应，重试不会改变结果，
+    直接抛出，不重试、不降级直连。
     """
     if not url:
         raise ValueError("图片URL为空")
@@ -36,6 +38,9 @@ async def download_image_base64(url: str, max_attempts: int = 3) -> str:
             if not image_bytes:
                 raise ValueError("图片内容为空")
             return await get_task_manager().to_thread(base64_encode_bytes, image_bytes)
+        except httpx.HTTPStatusError:
+            # 服务器明确返回的状态错误是确定结果：不重试、不降级直连。
+            raise
         except Exception as e:  # noqa: BLE001 - 穷尽尝试后再抛出
             last_error = e
             if attempt < max_attempts:
