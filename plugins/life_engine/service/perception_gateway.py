@@ -8,6 +8,7 @@ chunks instead of being expanded into prompts.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -619,6 +620,11 @@ class AsyncPerceptionGateway(PerceptionGateway):
         self._registry = registry
         self._ledger = ledger
         self._projection = projection
+        # 追赶入口不止一处（core.py 的 2502 / 3061 会绕过
+        # catch_up_world_projection 直接调用本方法），并发执行会让
+        # world_projection_changes 的 ingest_position 主键冲突。
+        # 在共享资源层串行，覆盖所有调用方。
+        self._catch_up_lock = asyncio.Lock()
 
     @property
     def projection(self) -> Any:
@@ -647,18 +653,19 @@ class AsyncPerceptionGateway(PerceptionGateway):
 
         if batch_size <= 0 or max_batches <= 0:
             raise ValueError("world catch-up limits must be positive")
-        contract = await self._projection.projector_contract()
-        self._ensure_deliverable(contract)
-        position = int(contract.get("as_of_ingest_position") or 0)
-        for _ in range(max_batches):
-            batch = await self._ledger.read_since(position, limit=batch_size)
-            if not batch:
-                return position
-            position = await self._projection.apply_events(batch)
-        raise RuntimeError(
-            "WorldProjectionCatchUpLimit: ledger backlog exceeded the bounded "
-            f"replay window after position {position}"
-        )
+        async with self._catch_up_lock:
+            contract = await self._projection.projector_contract()
+            self._ensure_deliverable(contract)
+            position = int(contract.get("as_of_ingest_position") or 0)
+            for _ in range(max_batches):
+                batch = await self._ledger.read_since(position, limit=batch_size)
+                if not batch:
+                    return position
+                position = await self._projection.apply_events(batch)
+            raise RuntimeError(
+                "WorldProjectionCatchUpLimit: ledger backlog exceeded the bounded "
+                f"replay window after position {position}"
+            )
 
     async def rebuild(
         self,
