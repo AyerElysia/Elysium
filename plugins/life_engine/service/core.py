@@ -5730,6 +5730,10 @@ class LifeEngineService(BaseService):
         # 保存的只是本地技术 checkpoint（global revision 推进）。双实例共享
         # MySQL 下该 key 必然并发竞争，冲突属合法竞争，走 recoverable 语义，
         # 避免并发提交把消息收集路径打成 message_collect_failed。
+        # ⚠️ 2026-09-01 现状更正：当前 backend="local" 且 multi_writer_enabled=false，
+        # multi-writer bridge 未注册，双实例共享场景不存在。上文的 recoverable
+        # 语义是为多实例/多写者模式预留的防御；单实例下若仍出现该冲突，
+        # 说明存在未知的并发写入源，应当排查而不是当作合法竞争放过。
         if self._message_persist_async_enabled():
             # EventBus 处理器有 5 秒硬截止，而 facts 实测 2.0-4.6s、context
             # 0.2-2.8s，合计常顶到阈值被打成 message_collect_failed，并连带

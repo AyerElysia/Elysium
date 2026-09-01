@@ -356,6 +356,10 @@ async def run_chat_stream(
                         # 的 revision。重置 _GLOBAL_RUNTIME 后下轮会重读最新
                         # revision 重建，属可恢复路径，用 WARNING 而非 ERROR
                         # 避免双实例并发把驱动器刷成错误。
+                        # ⚠️ 2026-09-01 现状更正：当前 backend="local" 且 multi_writer_enabled=false，
+                        # 双实例场景不存在（9-01 实测 RuntimeStateRevisionConflict 0 次）。
+                        # 此处保留 WARNING 语义是为多实例模式预留；单实例下出现该冲突
+                        # 意味着存在未知并发源，应排查而非放过。
                         logger.warning(
                             f"[驱动器] stream={stream_id[:8]}, "
                             f"执行 Chatter 出现运行时状态竞争 "
