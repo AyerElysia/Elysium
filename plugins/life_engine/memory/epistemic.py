@@ -889,36 +889,6 @@ def reduce_claim_state(
     )
 
 
-def reduce_belief_state(
-    belief: MemoryBelief,
-    events: Sequence[MemoryStateEvent],
-) -> BeliefState:
-    """Purely rebuild one perspective's endorsement without changing a claim."""
-
-    active = _active_events(events)
-    status = BeliefStatus.UNREVIEWED.value
-    last_changed_at = ""
-    for event in active:
-        if event.entity_type != "belief" or event.entity_id != belief.belief_id:
-            continue
-        if event.event_type == "belief_endorsed":
-            status = BeliefStatus.ENDORSED.value
-        elif event.event_type == "belief_rejected":
-            status = BeliefStatus.REJECTED.value
-        elif event.event_type == "belief_suspended":
-            status = BeliefStatus.SUSPENDED.value
-        elif event.event_type == "belief_restored":
-            status = str(
-                event.payload.get("status", BeliefStatus.UNREVIEWED.value)
-                or BeliefStatus.UNREVIEWED.value
-            )
-        last_changed_at = event.recorded_at
-    return BeliefState(
-        belief=belief,
-        status=status,
-        active_event_ids=tuple(item.event_id for item in active),
-        last_changed_at=last_changed_at,
-    )
 
 
 def reduce_memory_disposition(
@@ -1501,7 +1471,6 @@ __all__ = [
     "new_claim",
     "now_iso",
     "project_current_facts",
-    "reduce_belief_state",
     "search_epistemic_claims",
     "reduce_claim_state",
     "reduce_memory_disposition",

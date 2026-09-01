@@ -2497,6 +2497,9 @@ class MySQLDocumentIndexProjection(_MySQLPort):
             # 不能用全量 validate：join_generation 的 shared token 是常量
             # "shared-generation"，与激活时写入的随机 fencing token hash
             # 永远不匹配，会导致双实例下每个批次都 failed。
+            # ⚠️ 2026-09-01 现状更正：当前 backend="local" 且 multi_writer_enabled=false，
+            # 双实例共享场景不存在。此处逻辑是为多实例/多写者模式预留的防御；
+            # 单实例下若出现该冲突，应排查并发写入源而非当作合法竞争放过。
             await self.runtime.validate_writer()
             upsert_kwargs = {
                 "ids": [item[1].chunk_id for item in payloads],

@@ -363,6 +363,9 @@ class SelectedLearningPersistence:
                 # 双实例共享 MySQL 时学习持久化投影的 CAS 冲突是合法竞争，
                 # 事件已放回缓冲保留待处理，属可恢复路径，用 WARNING 而非
                 # ERROR 避免后台持久化把日志刷成错误。
+                # ⚠️ 2026-09-01 现状更正：当前 backend="local" 且 multi_writer_enabled=false，
+                # 双实例共享场景不存在。此处逻辑是为多实例/多写者模式预留的防御；
+                # 单实例下若出现该冲突，应排查并发写入源而非当作合法竞争放过。
                 logger.warning(
                     "selected learning persistence CAS 竞争（可恢复），"
                     "事件保留待重试: %s",
@@ -792,6 +795,9 @@ class SelectedLearningMaintenanceJournal(LearningMaintenanceJournalPort):
                 # 双实例共享 MySQL 时学习维护投影的 CAS 冲突是合法竞争
                 # （两实例各自推进同一 projection revision），属可恢复路径，
                 # 用 WARNING 而非 ERROR 避免后台维护把日志刷成错误。
+                # ⚠️ 2026-09-01 现状更正：当前 backend="local" 且 multi_writer_enabled=false，
+                # 双实例共享场景不存在。此处逻辑是为多实例/多写者模式预留的防御；
+                # 单实例下若出现该冲突，应排查并发写入源而非当作合法竞争放过。
                 logger.warning(
                     "selected learning maintenance CAS 竞争（可恢复），"
                     "保留待处理工作: %s",

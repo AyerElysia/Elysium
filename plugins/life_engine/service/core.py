@@ -4328,6 +4328,9 @@ class LifeEngineService(BaseService):
         if changed:
             self._self_pause_skip_logged = False
             # 手动解除休息锁已在本实例生效，持久化冲突属双实例合法竞争，可恢复。
+            # ⚠️ 2026-09-01 现状更正：当前 backend="local" 且 multi_writer_enabled=false，
+            # 双实例共享场景不存在。此处逻辑是为多实例/多写者模式预留的防御；
+            # 单实例下若出现该冲突，应排查并发写入源而非当作合法竞争放过。
             await self._save_runtime_context(recoverable_on_shared_conflict=True)
             logger.info(f"life_engine 主动休息锁已解除: source={source}")
         return changed
@@ -5734,6 +5737,9 @@ class LifeEngineService(BaseService):
         # multi-writer bridge 未注册，双实例共享场景不存在。上文的 recoverable
         # 语义是为多实例/多写者模式预留的防御；单实例下若仍出现该冲突，
         # 说明存在未知的并发写入源，应当排查而不是当作合法竞争放过。
+        # ⚠️ 2026-09-01 现状更正：当前 backend="local" 且 multi_writer_enabled=false，
+        # 双实例共享场景不存在。此处逻辑是为多实例/多写者模式预留的防御；
+        # 单实例下若出现该冲突，应排查并发写入源而非当作合法竞争放过。
         if self._message_persist_async_enabled():
             # EventBus 处理器有 5 秒硬截止，而 facts 实测 2.0-4.6s、context
             # 0.2-2.8s，合计常顶到阈值被打成 message_collect_failed，并连带
@@ -7193,6 +7199,9 @@ class LifeEngineService(BaseService):
                 # 模型输出是主体真实产出，必须照常写入事件时间线，不能被
                 # 竞争误判为心跳失败而丢弃（否则 heartbeat operation 被标
                 # failed，下轮重放同一 sequence 导致重复模型调用）。
+                # ⚠️ 2026-09-01 现状更正：当前 backend="local" 且 multi_writer_enabled=false，
+                # 双实例共享场景不存在。此处逻辑是为多实例/多写者模式预留的防御；
+                # 单实例下若出现该冲突，应排查并发写入源而非当作合法竞争放过。
                 logger.info(
                     "life_engine 感知游标已被其他实例推进，跳过本轮感知提交: "
                     f"{conflict}"
@@ -7717,6 +7726,9 @@ class LifeEngineService(BaseService):
             # 提交若发现游标已被另一实例推进，属合法竞争。表达消息已通过
             # bridge/event 事实落库，感知游标只是可重建投影指针——跳过感知
             # 提交、保留主体产出即可，不能把竞争误判为表达失败刷 ERROR。
+            # ⚠️ 2026-09-01 现状更正：当前 backend="local" 且 multi_writer_enabled=false，
+            # 双实例共享场景不存在。此处逻辑是为多实例/多写者模式预留的防御；
+            # 单实例下若出现该冲突，应排查并发写入源而非当作合法竞争放过。
             logger.warning(
                 f"life_chatter 感知游标已被其他实例推进，跳过本轮感知提交: {conflict}"
             )
@@ -10659,6 +10671,9 @@ class LifeEngineService(BaseService):
                     # 关闭路径的最终 checkpoint：双实例同时关闭时冲突属合法
                     # 竞争，可恢复，避免关闭流程被 RuntimeStateConflict 打断
                     # 刷 ERROR。
+                    # ⚠️ 2026-09-01 现状更正：当前 backend="local" 且 multi_writer_enabled=false，
+                    # 双实例共享场景不存在。此处逻辑是为多实例/多写者模式预留的防御；
+                    # 单实例下若出现该冲突，应排查并发写入源而非当作合法竞争放过。
                     await self._save_runtime_context(
                         recoverable_on_shared_conflict=True
                     )

@@ -149,6 +149,9 @@ _UNMANAGED_SINGLETON_WRITER_PREFIX = (
 _TRANSIENT_ERROR_ESCALATION_COUNT = 3
 # 双实例共享同一 witness presence 行时，PresenceRevisionConflict 是常态合法竞争；
 # 前 8 次只记 debug/warning，第 9 次才升级 ERROR，避免常态竞争刷 ERROR。
+# ⚠️ 2026-09-01 现状更正：当前 backend="local" 且 multi_writer_enabled=false，
+# 双实例共享场景不存在。此处逻辑是为多实例/多写者模式预留的防御；
+# 单实例下若出现该冲突，应排查并发写入源而非当作合法竞争放过。
 _CONCURRENCY_ERROR_ESCALATION_COUNT = 9
 _MYSQL_LOST_CONNECTION_ERROR_CODE = 2013
 _MYSQL_LOCK_WAIT_TIMEOUT_ERROR_CODE = 1205
@@ -3077,6 +3080,9 @@ class MemoryWitnessCoordinator:
             # profile/digest 竞争，如 "projection manifest profile is
             # incompatible"）。这是可恢复的外部依赖失败：本轮跳过 authoring、
             # 不推进游标，由上层按可恢复路径静默重试。
+            # ⚠️ 2026-09-01 现状更正：当前 backend="local" 且 multi_writer_enabled=false，
+            # 双实例共享场景不存在。此处逻辑是为多实例/多写者模式预留的防御；
+            # 单实例下若出现该冲突，应排查并发写入源而非当作合法竞争放过。
             raise MemoryWitnessAuthoringProjectionUnavailable(
                 f"MemoryWitnessAuthoringProjectionUnavailable: "
                 f"{type(projection_error).__name__}: {projection_error}"

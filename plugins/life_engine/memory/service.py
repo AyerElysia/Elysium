@@ -59,13 +59,8 @@ from .epistemic import (
     ClaimEvidence,
     ClaimSearchResult,
     ClaimState,
-    CurrentFactProjection,
-    EpistemicConflict,
-    MemoryAuditEntry,
-    MemoryBelief,
     MemoryClaim,
     MemoryDisposition,
-    MemoryStateEvent,
     RetrievalEpisode,
     RetrievalExposure,
     RetrievalFeedback,
@@ -1837,62 +1832,13 @@ class LifeMemoryService:
             entity_id,
         )
 
-    async def record_epistemic_claim(
-        self,
-        *,
-        subject_key: str,
-        content: str,
-        claim_kind: str,
-        source: str,
-        authority: str = "",
-        valid_from: str = "",
-        valid_to: str = "",
-        stream_scope: str = "",
-        visibility: str = "private",
-        consciousness_instance_id: str = "",
-        metadata: Dict[str, Any] | None = None,
-        claim_id: str = "",
-        recorded_at: str = "",
-    ) -> MemoryClaim:
-        """兼容式构造并追加一个新主张；不会由文本相似度合并旧主张。"""
-        claim = new_claim(
-            subject_key=subject_key,
-            content=content,
-            claim_kind=claim_kind,
-            source=source,
-            authority=authority,
-            valid_from=valid_from,
-            valid_to=valid_to,
-            stream_scope=stream_scope,
-            visibility=visibility,
-            consciousness_instance_id=consciousness_instance_id,
-            metadata=metadata,
-            claim_id=claim_id,
-            recorded_at=recorded_at,
-        )
-        return await self.append_memory_claim(claim)
 
     async def append_claim_evidence(self, evidence: ClaimEvidence) -> ClaimEvidence:
         """追加一条支持、挑战或语境证据，不将其折算为真值分数。"""
         return await self._require_memory_storage().epistemic.append_evidence(evidence)
 
-    async def append_memory_belief(self, belief: MemoryBelief) -> MemoryBelief:
-        """登记一个意识视角与主张的关系；认可状态由事件另行记录。"""
-        return await self._require_memory_storage().epistemic.append_belief(belief)
 
-    async def append_epistemic_conflict(
-        self,
-        conflict: EpistemicConflict,
-    ) -> EpistemicConflict:
-        """登记冲突而不擅自裁决两个主张中的任何一个。"""
-        return await self._require_memory_storage().epistemic.append_conflict(conflict)
 
-    async def append_memory_state_event(
-        self,
-        event: MemoryStateEvent,
-    ) -> MemoryStateEvent:
-        """追加可审计状态变化；权限校验和撤销关系由本体层强制。"""
-        return await self._require_memory_storage().epistemic.append_state_event(event)
 
     async def get_memory_disposition(
         self,
@@ -1920,78 +1866,10 @@ class LifeMemoryService:
             recorded_as_of=recorded_as_of,
         )
 
-    async def list_memory_claim_states(
-        self,
-        subject_key: str,
-        *,
-        recorded_as_of: str = "",
-        valid_at: str = "",
-        stream_scope: str | None = None,
-        visibility: tuple[str, ...] = ("private",),
-    ) -> List[ClaimState]:
-        """双时间查询主张状态，默认不跨私有流。"""
-        return await self._require_memory_storage().epistemic.list_claim_states(
-            subject_key,
-            recorded_as_of=recorded_as_of,
-            valid_at=valid_at,
-            stream_scope=stream_scope,
-            visibility=visibility,
-        )
 
-    async def project_current_memory_facts(
-        self,
-        subject_key: str,
-        *,
-        valid_at: str,
-        recorded_as_of: str = "",
-        stream_scope: str | None = None,
-        visibility: tuple[str, ...] = ("private",),
-    ) -> CurrentFactProjection:
-        """重建一个双时间当前事实投影，冲突和不确定性始终保留。"""
-        return await self._require_memory_storage().epistemic.project_current_facts(
-            subject_key,
-            valid_at=valid_at,
-            recorded_as_of=recorded_as_of,
-            stream_scope=stream_scope,
-            visibility=visibility,
-        )
 
-    async def get_memory_audit_trail(
-        self,
-        entity_type: str,
-        entity_id: str,
-        *,
-        recorded_as_of: str = "",
-    ) -> List[MemoryAuditEntry]:
-        """返回事件、操作者、理由、因果来源与补偿关系的完整审计轨迹。"""
-        return await self._require_memory_storage().epistemic.get_audit_trail(
-            entity_type,
-            entity_id,
-            recorded_as_of=recorded_as_of,
-        )
 
-    async def list_memory_state_events(
-        self,
-        entity_type: str,
-        entity_id: str,
-        *,
-        recorded_as_of: str = "",
-    ) -> List[MemoryStateEvent]:
-        """读取完整事件轨迹，供审计、回放和解释使用。"""
-        return await self._require_memory_storage().epistemic.list_state_events(
-            entity_type,
-            entity_id,
-            recorded_as_of=recorded_as_of,
-        )
 
-    async def list_memory_claim_evidence(
-        self,
-        claim_id: str,
-    ) -> List[ClaimEvidence]:
-        """读取一个主张的完整证据链。"""
-        return await self._require_memory_storage().epistemic.list_claim_evidence(
-            claim_id
-        )
 
     # --------------------------------------------------------
     # 生命记忆本体：不可变经历与第一人称见证
