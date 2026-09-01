@@ -866,6 +866,10 @@ class LifeEngineService(BaseService):
         self._minecraft_decision_event_cache: dict[str, LifeEngineEvent] = {}
         self._minecraft_recorded_decision_ids: set[str] = set()
 
+        # 消息慢阶段后台化串行锁：facts/context 移到后台后仍需串行，
+        # 避免并发写 runtime checkpoint 触发无谓的 revision 冲突。
+        self._message_persist_lock = asyncio.Lock()
+
         # 状态持久化
         self._state_persistence: StatePersistence | None = None
         self._event_bus: LifeEventBus | None = None
@@ -5713,15 +5717,24 @@ class LifeEngineService(BaseService):
             adapter_signature=adapter_signature,
         )
         _facts_start = time.monotonic()
-        await self._publish_message_facts(event, chat_fact)
-        _phase_facts = time.monotonic() - _facts_start
-        _ctx_start = time.monotonic()
         # 消息事实已通过 multi-writer bridge 的 operation/fact 持久化，这里
         # 保存的只是本地技术 checkpoint（global revision 推进）。双实例共享
         # MySQL 下该 key 必然并发竞争，冲突属合法竞争，走 recoverable 语义，
         # 避免并发提交把消息收集路径打成 message_collect_failed。
-        await self._save_runtime_context(recoverable_on_shared_conflict=True)
-        _phase_context = time.monotonic() - _ctx_start
+        if self._message_persist_async_enabled():
+            # EventBus 处理器有 5 秒硬截止，而 facts 实测 2.0-4.6s、context
+            # 0.2-2.8s，合计常顶到阈值被打成 message_collect_failed，并连带
+            # 阻塞 event loop 导致 LLM 流式响应判空。enqueue 已在锁内完成
+            # （消息不会丢），慢阶段整体移交后台串行执行。
+            self._schedule_message_persist(event, chat_fact)
+            _phase_facts = 0.0
+            _phase_context = 0.0
+        else:
+            await self._publish_message_facts(event, chat_fact)
+            _phase_facts = time.monotonic() - _facts_start
+            _ctx_start = time.monotonic()
+            await self._save_runtime_context(recoverable_on_shared_conflict=True)
+            _phase_context = time.monotonic() - _ctx_start
         if direction == "received":
             self._schedule_curiosity_review(message, event)
         if unlocked_self_pause:
@@ -5791,6 +5804,67 @@ class LifeEngineService(BaseService):
                 runtime_store=self.runtime_state_store(),
             )
         return self._curiosity_engine
+
+    def _message_persist_async_enabled(self) -> bool:
+        """慢阶段是否后台化。
+
+        默认启用；出现顺序或持久化语义问题时可在 life_engine 配置的
+        ``storage`` 段设 ``message_persist_async = false`` 立即回退，
+        无需改动代码。
+        """
+
+        cfg = self._cfg()
+        storage_cfg = getattr(cfg, "storage", None)
+        if storage_cfg is None:
+            return True
+        return bool(getattr(storage_cfg, "message_persist_async", True))
+
+    def _schedule_message_persist(
+        self, event: LifeEngineEvent, chat_fact: LifeEvent
+    ) -> None:
+        """把消息事实持久化与 checkpoint 推进交给后台串行任务。"""
+
+        get_task_manager().create_task(
+            self._run_message_persist(event, chat_fact),
+            name=f"life_message_persist_{event.sequence}",
+            daemon=True,
+            timeout=120.0,
+        )
+
+    async def _run_message_persist(
+        self, event: LifeEngineEvent, chat_fact: LifeEvent
+    ) -> None:
+        """后台串行执行慢阶段，并记录耗时以便继续观察瓶颈。"""
+
+        started = time.monotonic()
+        try:
+            async with self._message_persist_lock:
+                facts_start = time.monotonic()
+                await self._publish_message_facts(event, chat_fact)
+                facts_elapsed = time.monotonic() - facts_start
+                ctx_start = time.monotonic()
+                await self._save_runtime_context(
+                    recoverable_on_shared_conflict=True
+                )
+                ctx_elapsed = time.monotonic() - ctx_start
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            # 后台化后异常不再能向上冒泡，必须显式记录，否则会静默丢数据。
+            logger.warning(
+                "life_engine 消息慢阶段后台持久化失败: "
+                f"error_type={type(exc).__name__} error={exc} "
+                f"message_id={event.event_id} sequence={event.sequence}"
+            )
+            return
+
+        total = time.monotonic() - started
+        if total >= 4.0:
+            logger.info(
+                "life_engine 消息慢阶段后台持久化仍偏慢: "
+                f"total={total:.2f}s facts={facts_elapsed:.2f}s "
+                f"context={ctx_elapsed:.2f}s message_id={event.event_id}"
+            )
 
     def _schedule_curiosity_review(
         self, message: Message, event: LifeEngineEvent
