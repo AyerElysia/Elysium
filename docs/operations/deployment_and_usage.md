@@ -94,7 +94,7 @@ main.py
 | `main.py` | 当前主入口 |
 | `config/core.toml` | Core、数据库、HTTP、日志、全局 LLM 行为 |
 | `config/models.toml` | 生产 Provider、模型注册和有序语义任务路由；不承载本地消息 TTS |
-| `config/model.toml` | 旧格式显式迁移兼容；生产启动不读取，也不参与任务回退 |
+| ~~`config/model.toml`~~ | **已于 2026-09-01 移除**：旧格式仅供显式迁移，生产启动从不读取、不参与任务回退。备份见 `/root/Elysia/backups/config/` |
 | `config/mcp.toml` | MCP 服务配置 |
 | `config/plugins/life_engine/config.toml` | Life Engine、心跳、Chatter、记忆及场景能力 |
 | `config/plugins/feishu_adapter/config.toml` | 飞书应用、连接和消息行为 |
