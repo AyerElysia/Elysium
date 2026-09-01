@@ -32,6 +32,8 @@ from plugins.life_engine.minecraft.trace_projection import (
 from plugins.life_engine.service.consciousness import ConsciousnessRegistry
 from plugins.life_engine.service.subconscious_context import RecentSubconsciousContext
 
+_DURABLE_SCENE_LOOP_TIMEOUT_SECONDS = 10.0
+
 
 def _body_only_config(**kwargs: Any) -> MCConfig:
     """Keep legacy body tests separate from the new scene-runtime contract."""
@@ -449,7 +451,13 @@ async def test_dedicated_consciousness_runs_observe_decide_act_without_chat(
     started = await session.start(goal="一起随便探索", body_name="agent")
     assert started["success"] is True, started
     try:
-        await asyncio.wait_for(acted.wait(), timeout=2.0)
+        # This path intentionally crosses several append+fsync boundaries before
+        # dispatch.  Keep the assertion event-driven while allowing parallel
+        # full-suite disk contention; the deadline still detects a stuck loop.
+        await asyncio.wait_for(
+            acted.wait(),
+            timeout=_DURABLE_SCENE_LOOP_TIMEOUT_SECONDS,
+        )
     except TimeoutError as exception:
         raise AssertionError(
             {"status": await session.get_status(), "order": order}
