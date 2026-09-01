@@ -257,5 +257,44 @@ async def test_audit_tamper_fails_closed(tmp_path: Path) -> None:
         await registry.register_generation(generation("local-v2", marker="1"))
 
 
+async def test_file_authority_reuses_verified_head_until_audit_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "authority.json"
+    writer = FileAuthorityRegistry(state_path)
+    await writer.register_generation(generation("local-v1"))
+    token = await writer.activate_generation(
+        "local-v1",
+        expected_epoch=0,
+        owner_id="writer",
+        lease_seconds=60,
+        confirm_previous_writers_stopped=True,
+    )
+
+    reader = FileAuthorityRegistry(state_path)
+    original_scan = reader._scan_audit_unlocked
+    scan_count = 0
+
+    def counted_scan() -> object:
+        nonlocal scan_count
+        scan_count += 1
+        return original_scan()
+
+    monkeypatch.setattr(reader, "_scan_audit_unlocked", counted_scan)
+
+    await reader.validate(token)
+    await reader.validate(token)
+    async with reader.fenced(token):
+        pass
+    assert (await reader.health())["status"] == "healthy"
+    assert scan_count == 1
+
+    renewed = await writer.renew(token, lease_seconds=60)
+    await reader.validate(renewed)
+    await reader.validate(renewed)
+    assert scan_count == 2
+
+
 def test_authority_token_expiry_hint_is_timezone_safe() -> None:
     assert datetime.now(UTC).tzinfo is not None

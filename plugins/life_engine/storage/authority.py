@@ -9,6 +9,7 @@ import os
 import secrets
 from collections.abc import Callable
 from contextlib import asynccontextmanager, contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol, TypeVar
@@ -138,6 +139,16 @@ def _unlock_file(handle: Any) -> None:
     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+@dataclass(frozen=True, slots=True)
+class _VerifiedFileAuditHead:
+    """One process-local proof for an unchanged file authority audit head."""
+
+    file_identity: tuple[int, int, int, int, int] | None
+    head_hash: str
+    event_count: int
+    generation_registrations: tuple[tuple[str, str], ...]
+
+
 class FileAuthorityRegistry:
     """Host-local authority registry guarded by platform advisory locks.
 
@@ -155,6 +166,7 @@ class FileAuthorityRegistry:
         self.registry_id = registry_id.strip()
         if not self.registry_id:
             raise ValueError("authority registry_id must not be empty")
+        self._verified_audit_head: _VerifiedFileAuditHead | None = None
 
     @contextmanager
     def _lock(self, *, exclusive: bool, create: bool) -> Any:
@@ -213,6 +225,25 @@ class FileAuthorityRegistry:
             if temporary.exists():
                 temporary.unlink()
 
+    def _audit_file_identity_unlocked(
+        self,
+    ) -> tuple[int, int, int, int, int] | None:
+        """Return the audit identity used to invalidate a verified head."""
+
+        if not self.audit_path.exists():
+            return None
+        try:
+            stat = self.audit_path.stat()
+        except OSError as exc:
+            raise AuthorityError("authority audit is unreadable") from exc
+        return (
+            int(stat.st_dev),
+            int(stat.st_ino),
+            int(stat.st_size),
+            int(stat.st_mtime_ns),
+            int(stat.st_ctime_ns),
+        )
+
     def _append_event_unlocked(
         self,
         state: dict[str, Any],
@@ -221,6 +252,8 @@ class FileAuthorityRegistry:
         payload: dict[str, Any],
     ) -> None:
         previous_hash = str(state.get("last_event_hash") or "")
+        previous_identity = self._audit_file_identity_unlocked()
+        verified = self._verified_audit_head
         body = {
             "event_id": str(uuid4()),
             "registry_id": self.registry_id,
@@ -237,12 +270,37 @@ class FileAuthorityRegistry:
             handle.flush()
             os.fsync(handle.fileno())
         state["last_event_hash"] = event_hash
+        current_identity = self._audit_file_identity_unlocked()
+        if (
+            verified is not None
+            and verified.file_identity == previous_identity
+            and secrets.compare_digest(verified.head_hash, previous_hash)
+        ):
+            registrations = verified.generation_registrations
+            if event_type == "generation_registered":
+                registrations = (
+                    *registrations,
+                    (
+                        str(payload.get("generation_id") or ""),
+                        str(payload.get("manifest_sha256") or ""),
+                    ),
+                )
+            self._verified_audit_head = _VerifiedFileAuditHead(
+                file_identity=current_identity,
+                head_hash=event_hash,
+                event_count=verified.event_count + 1,
+                generation_registrations=registrations,
+            )
+        else:
+            self._verified_audit_head = None
 
-    def _verify_audit_unlocked(self, state: dict[str, Any]) -> int:
-        """Verify the append-only audit hash chain against the registry head."""
+    def _scan_audit_unlocked(self) -> _VerifiedFileAuditHead:
+        """Replay the full hash chain and collect immutable registrations."""
 
+        identity_before = self._audit_file_identity_unlocked()
         expected_previous = ""
         event_count = 0
+        registrations: list[tuple[str, str]] = []
         if self.audit_path.exists():
             try:
                 with self.audit_path.open(encoding="utf-8") as handle:
@@ -261,34 +319,68 @@ class FileAuthorityRegistry:
                             raise AuthorityError("authority audit hash chain is discontinuous")
                         if canonical_json_sha256(event) != event_hash:
                             raise AuthorityError("authority audit event hash mismatch")
+                        if event.get("event_type") == "generation_registered":
+                            payload = event.get("payload")
+                            if not isinstance(payload, dict):
+                                raise AuthorityError(
+                                    "generation registration payload is invalid"
+                                )
+                            registrations.append(
+                                (
+                                    str(payload.get("generation_id") or ""),
+                                    str(payload.get("manifest_sha256") or ""),
+                                )
+                            )
                         expected_previous = event_hash
                         event_count += 1
             except (OSError, json.JSONDecodeError) as exc:
                 raise AuthorityError("authority audit is unreadable") from exc
-        if expected_previous != str(state.get("last_event_hash") or ""):
-            raise AuthorityError("authority audit head does not match registry state")
-        return event_count
+        identity_after = self._audit_file_identity_unlocked()
+        if identity_after != identity_before:
+            raise AuthorityError("authority audit changed during verification")
+        return _VerifiedFileAuditHead(
+            file_identity=identity_after,
+            head_hash=expected_previous,
+            event_count=event_count,
+            generation_registrations=tuple(registrations),
+        )
 
-    def _registered_manifest_sha256_unlocked(self, generation_id: str) -> str:
+    def _verify_audit_unlocked(self, state: dict[str, Any]) -> int:
+        """Verify a changed audit head once, then reuse that exact proof."""
+
+        expected_head = str(state.get("last_event_hash") or "")
+        identity = self._audit_file_identity_unlocked()
+        verified = self._verified_audit_head
+        if (
+            verified is not None
+            and verified.file_identity == identity
+            and secrets.compare_digest(verified.head_hash, expected_head)
+        ):
+            return verified.event_count
+        verified = self._scan_audit_unlocked()
+        if not secrets.compare_digest(verified.head_hash, expected_head):
+            raise AuthorityError("authority audit head does not match registry state")
+        self._verified_audit_head = verified
+        return verified.event_count
+
+    def _registered_manifest_sha256_unlocked(
+        self,
+        state: dict[str, Any],
+        generation_id: str,
+    ) -> str:
         """Return the target generation's unique immutable registration hash."""
 
-        registered: list[str] = []
-        if self.audit_path.exists():
-            try:
-                with self.audit_path.open(encoding="utf-8") as handle:
-                    for raw_line in handle:
-                        event = json.loads(raw_line)
-                        if event.get("event_type") != "generation_registered":
-                            continue
-                        payload = event.get("payload")
-                        if not isinstance(payload, dict):
-                            raise AuthorityError(
-                                "generation registration payload is invalid"
-                            )
-                        if str(payload.get("generation_id") or "") == generation_id:
-                            registered.append(str(payload.get("manifest_sha256") or ""))
-            except (OSError, json.JSONDecodeError) as exc:
-                raise AuthorityError("authority audit is unreadable") from exc
+        self._verify_audit_unlocked(state)
+        verified = self._verified_audit_head
+        if verified is None:
+            raise AuthorityError("authority audit verification proof is missing")
+        registered = [
+            manifest_sha256
+            for registered_generation_id, manifest_sha256 in (
+                verified.generation_registrations
+            )
+            if registered_generation_id == generation_id
+        ]
         if len(registered) != 1 or len(registered[0]) != 64:
             raise AuthorityError(
                 "generation must have exactly one valid registration audit event"
@@ -304,7 +396,10 @@ class FileAuthorityRegistry:
         if raw is None:
             raise GenerationNotVerified(f"generation is not registered: {generation_id}")
         generation = BackendGeneration.from_dict(dict(raw))
-        registered_sha256 = self._registered_manifest_sha256_unlocked(generation_id)
+        registered_sha256 = self._registered_manifest_sha256_unlocked(
+            state,
+            generation_id,
+        )
         if not secrets.compare_digest(
             generation.manifest_sha256,
             registered_sha256,
