@@ -67,7 +67,7 @@ Elysium 是爱莉的家，是围绕她的意识、记忆、学习、声音、关
     </td>
     <td width="50%" valign="top">
       <h3>🎀 有声音、有身体的表达</h3>
-      <p>文字、语音、绘画、表情、直播舞台和 Minecraft 都是表达与体验的身体。当前本地消息 TTS 使用 <strong>GPT-SoVITS v2ProPlus</strong>（<code>tts_voice_plugin</code>）；实时通话则拥有独立的 Voice 意识实例，并朝本地原生全双工 Omni 主体模型继续演进。</p>
+      <p>文字、语音、绘画、表情、直播舞台和 Minecraft 都是表达与体验的身体。消息 TTS 由 <code>tts_voice_plugin</code> 以统一接口支持多种后端路径（GPT-SoVITS <code>api_v2</code> 与 IndexTTS2.5 + vLLM-Omni），由部署配置显式选择；本机 live 使用 <strong>GPT-SoVITS v2ProPlus</strong>；实时通话则拥有独立的 Voice 意识实例，并朝本地原生全双工 Omni 主体模型继续演进。</p>
     </td>
   </tr>
 </table>
@@ -193,7 +193,7 @@ Windows 使用 `deploy.ps1` 的同名子命令。完整命令见[安全部署脚
 - [生命记忆系统](./docs/architecture/生命记忆系统.md)：经历、证据、回忆与可修正的认识
 - [意识实例架构](./docs/architecture/意识实例架构.md)：同一个她如何生活在不同场景
 - [实时通话意识](./docs/architecture/实时通话意识.md)：Voice Live 为什么是意识实例而不是语音外壳
-- [TTS 语音合成](./docs/architecture/TTS语音合成.md)：IndexTTS2 当前表达链与 Voice Live 的边界
+- [TTS 语音合成](./docs/architecture/TTS语音合成.md)：消息 TTS 的多后端路径、当前选择与 Voice Live 的边界
 - [直播系统](./docs/architecture/直播系统.md)：从真实平台事件到真实表达与记忆
 - [Minecraft 具身架构](./docs/architecture/Minecraft具身架构.md)：通过视觉与行动进入世界
 - [Elysium Console 提案](./docs/architecture/Elysium控制台前端提案.md)：让她的家成为可以理解和进入的表面
