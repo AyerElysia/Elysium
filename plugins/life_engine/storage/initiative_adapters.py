@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 from collections.abc import Awaitable, Callable
@@ -11,7 +10,6 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, AsyncContextManager, TypeVar
 
 from sqlalchemy import text
-from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.kernel.storage import canonical_json
@@ -48,6 +46,7 @@ from ..initiative.reducer import (
     seed_command_payload,
 )
 from .contracts import StorageBackendRuntime
+from ._write_base import run_write_attempts
 from .models import BackendKind
 from .proactive_decision_guard import (
     ProactiveDecisionGuardConflict,
@@ -70,7 +69,6 @@ _REENCOUNTER_DELIVERIES = "life_initiative.reencounter_deliveries"
 _DOMAIN_LOCK_NAMESPACE = "life_initiative.metadata"
 _DOMAIN_LOCK_KEY = "authority_projection_v1"
 _SCHEMA_VERSION = 1
-_MAX_WRITE_ATTEMPTS = 3
 _BACKLOG_DEGRADED_SECONDS = 900.0
 
 
@@ -211,17 +209,6 @@ class SQLInitiativeRecordStore:
             )
         return _parse_time(value)
 
-    @staticmethod
-    def _retryable(exc: DBAPIError) -> bool:
-        message = str(exc.orig).lower()
-        codes = {str(value) for value in getattr(exc.orig, "args", ())}
-        return bool(
-            {"1205", "1213"} & codes
-            or "deadlock" in message
-            or "database is locked" in message
-            or "lock wait timeout" in message
-        )
-
     async def _write(
         self,
         operation: Callable[[AsyncSession], Awaitable[_T]],
@@ -237,15 +224,14 @@ class SQLInitiativeRecordStore:
         self,
         operation: Callable[[AsyncSession], Awaitable[_T]],
     ) -> _T:
-        for attempt in range(_MAX_WRITE_ATTEMPTS):
-            try:
-                async with self.runtime.unit_of_work() as uow:
-                    return await operation(uow.session)
-            except DBAPIError as exc:
-                if attempt + 1 >= _MAX_WRITE_ATTEMPTS or not self._retryable(exc):
-                    raise
-                await asyncio.sleep(0.02 * (attempt + 1))
-        raise AssertionError("bounded initiative retry loop exhausted")
+        async def _attempt() -> _T:
+            async with self.runtime.unit_of_work() as uow:
+                return await operation(uow.session)
+
+        return await run_write_attempts(
+            _attempt,
+            exhaustion_message="bounded initiative retry loop exhausted",
+        )
 
     async def _lock_domain(self, session: AsyncSession) -> None:
         payload = {"kind": "initiative_projection_lock", "schema_version": 1}

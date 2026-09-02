@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 from collections.abc import Awaitable, Callable
@@ -11,7 +10,7 @@ from datetime import UTC, datetime
 from typing import Any, TypeVar
 
 from sqlalchemy import bindparam, text
-from sqlalchemy.exc import DBAPIError, IntegrityError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.kernel.storage import canonical_json
@@ -32,9 +31,9 @@ from .event_contracts import (
     LifeEventSnapshotRecord,
 )
 from .models import BackendKind
+from ._write_base import MAX_WRITE_ATTEMPTS, run_write_attempts
 
 _T = TypeVar("_T")
-_MAX_WRITE_ATTEMPTS = 3
 
 
 def _parse_datetime(value: Any) -> datetime | None:
@@ -113,30 +112,18 @@ class SQLLifeEventStore:
             raise RuntimeError("storage backend did not return a valid database time")
         return parsed
 
-    @staticmethod
-    def _retryable(exc: DBAPIError) -> bool:
-        message = str(exc.orig).lower()
-        codes = {str(value) for value in getattr(exc.orig, "args", ())}
-        return bool(
-            {"1205", "1213"} & codes
-            or "deadlock" in message
-            or "database is locked" in message
-            or "lock wait timeout" in message
-        )
-
     async def _write(
         self,
         operation: Callable[[AsyncSession], Awaitable[_T]],
     ) -> _T:
-        for attempt in range(_MAX_WRITE_ATTEMPTS):
-            try:
-                async with self.runtime.unit_of_work() as uow:
-                    return await operation(uow.session)
-            except DBAPIError as exc:
-                if attempt + 1 >= _MAX_WRITE_ATTEMPTS or not self._retryable(exc):
-                    raise
-                await asyncio.sleep(0.02 * (attempt + 1))
-        raise AssertionError("bounded Life Event retry loop exhausted unexpectedly")
+        async def _attempt() -> _T:
+            async with self.runtime.unit_of_work() as uow:
+                return await operation(uow.session)
+
+        return await run_write_attempts(
+            _attempt,
+            exhaustion_message="bounded Life Event retry loop exhausted unexpectedly",
+        )
 
     @staticmethod
     def _source_sequence(event: LifeEvent) -> int:
@@ -907,7 +894,7 @@ class SQLLifeEventStore:
         """Compatibility monotonic advance implemented through revision CAS."""
 
         requested = max(0, int(ingest_position))
-        for _ in range(_MAX_WRITE_ATTEMPTS):
+        for _ in range(MAX_WRITE_ATTEMPTS):
             cursor = await self.consumer_cursor(consumer_id)
             if requested <= cursor.position:
                 return cursor.position
@@ -923,7 +910,7 @@ class SQLLifeEventStore:
                 continue
             return committed.position
         raise LifeEventConsumerConflict(
-            f"consumer cursor remained contended after {_MAX_WRITE_ATTEMPTS} attempts"
+            f"consumer cursor remained contended after {MAX_WRITE_ATTEMPTS} attempts"
         )
 
     async def health_snapshot(self) -> dict[str, Any]:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 from collections.abc import Awaitable, Callable
@@ -16,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.kernel.storage import canonical_json
 
 from .contracts import StorageBackendRuntime
+from ._write_base import run_write_attempts
 from .learning_contracts import (
     LearningCommitResult,
     LearningEventDraft,
@@ -28,8 +28,13 @@ from .learning_contracts import (
 from .models import BackendKind
 from .writer_claims import SingletonWriterClaim, SingletonWriterClaimLost
 
+def _translate_learning_claim_lost(exc: DBAPIError) -> Exception | None:
+    if "LearningSingletonWriterClaimRequired" in str(exc.orig):
+        return SingletonWriterClaimLost("LearningSingletonWriterClaimRequired")
+    return None
+
+
 _T = TypeVar("_T")
-_MAX_WRITE_ATTEMPTS = 3
 _PROJECTION_STATES = frozenset({"ready", "rebuilding", "failed"})
 _MAX_OCCURRENCE_ID_CHARS = 255
 _MAX_EVENT_KIND_CHARS = 128
@@ -111,44 +116,29 @@ class SQLLearningStore:
             raise RuntimeError("storage backend returned invalid database time")
         return parsed
 
-    @staticmethod
-    def _retryable(exc: DBAPIError) -> bool:
-        message = str(exc.orig).lower()
-        codes = {str(value) for value in getattr(exc.orig, "args", ())}
-        return bool(
-            {"1205", "1213"} & codes
-            or "deadlock" in message
-            or "database is locked" in message
-            or "lock wait timeout" in message
-        )
-
     async def _write(
         self,
         operation: Callable[[AsyncSession], Awaitable[_T]],
     ) -> _T:
-        for attempt in range(_MAX_WRITE_ATTEMPTS):
-            try:
-                async with self.runtime.unit_of_work(
-                    writer_claim=self.writer_claim
-                ) as uow:
-                    if self.writer_claim is not None:
-                        await self.runtime.bind_singleton_writer_write(
-                            uow.session,
-                            self.writer_claim,
-                        )
-                    result = await operation(uow.session)
-                    if self.writer_claim is not None:
-                        await self.runtime.clear_singleton_writer_write(uow.session)
-                    return result
-            except DBAPIError as exc:
-                if "LearningSingletonWriterClaimRequired" in str(exc.orig):
-                    raise SingletonWriterClaimLost(
-                        "LearningSingletonWriterClaimRequired"
-                    ) from None
-                if attempt + 1 >= _MAX_WRITE_ATTEMPTS or not self._retryable(exc):
-                    raise
-                await asyncio.sleep(0.02 * (attempt + 1))
-        raise AssertionError("bounded learning retry loop exhausted unexpectedly")
+        async def _attempt() -> _T:
+            async with self.runtime.unit_of_work(
+                writer_claim=self.writer_claim
+            ) as uow:
+                if self.writer_claim is not None:
+                    await self.runtime.bind_singleton_writer_write(
+                        uow.session,
+                        self.writer_claim,
+                    )
+                result = await operation(uow.session)
+                if self.writer_claim is not None:
+                    await self.runtime.clear_singleton_writer_write(uow.session)
+                return result
+
+        return await run_write_attempts(
+            _attempt,
+            exhaustion_message="bounded learning retry loop exhausted unexpectedly",
+            translate=_translate_learning_claim_lost,
+        )
 
     @staticmethod
     def _validate_draft(draft: LearningEventDraft) -> None:

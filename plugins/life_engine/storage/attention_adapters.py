@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import hashlib
 import json
@@ -12,7 +11,6 @@ from datetime import UTC, datetime
 from typing import Any, AsyncContextManager, TypeVar
 
 from sqlalchemy import bindparam, text
-from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.kernel.storage import canonical_json
@@ -38,6 +36,7 @@ from ..attention_threads.projection import (
     build_attention_thread_projection,
 )
 from .contracts import StorageBackendRuntime
+from ._write_base import run_write_attempts
 from .models import BackendKind
 from .proactive_decision_guard import (
     ProactiveDecisionGuardConflict,
@@ -45,7 +44,6 @@ from .proactive_decision_guard import (
 )
 
 _T = TypeVar("_T")
-_MAX_WRITE_ATTEMPTS = 3
 _MAX_CHUNK_BYTES = 256 * 1024
 
 
@@ -132,17 +130,6 @@ class SQLAttentionThreadStore:
             raise RuntimeError("storage backend returned invalid database time")
         return parsed
 
-    @staticmethod
-    def _retryable(exc: DBAPIError) -> bool:
-        message = str(exc.orig).lower()
-        codes = {str(value) for value in getattr(exc.orig, "args", ())}
-        return bool(
-            {"1205", "1213"} & codes
-            or "deadlock" in message
-            or "database is locked" in message
-            or "lock wait timeout" in message
-        )
-
     async def _write(
         self,
         operation: Callable[[AsyncSession], Awaitable[_T]],
@@ -158,15 +145,14 @@ class SQLAttentionThreadStore:
         self,
         operation: Callable[[AsyncSession], Awaitable[_T]],
     ) -> _T:
-        for attempt in range(_MAX_WRITE_ATTEMPTS):
-            try:
-                async with self.runtime.unit_of_work() as uow:
-                    return await operation(uow.session)
-            except DBAPIError as exc:
-                if attempt + 1 >= _MAX_WRITE_ATTEMPTS or not self._retryable(exc):
-                    raise
-                await asyncio.sleep(0.02 * (attempt + 1))
-        raise AssertionError("bounded attention retry loop exhausted unexpectedly")
+        async def _attempt() -> _T:
+            async with self.runtime.unit_of_work() as uow:
+                return await operation(uow.session)
+
+        return await run_write_attempts(
+            _attempt,
+            exhaustion_message="bounded attention retry loop exhausted unexpectedly",
+        )
 
     async def _assert_active_actor(
         self,

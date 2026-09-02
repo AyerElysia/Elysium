@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import binascii
 import hashlib
@@ -13,12 +12,13 @@ from pathlib import PurePosixPath
 from typing import Any, TypeVar
 
 from sqlalchemy import text
-from sqlalchemy.exc import DBAPIError, IntegrityError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.kernel.storage import canonical_json
 
 from .contracts import StorageBackendRuntime
+from ._write_base import run_write_attempts
 from .models import BackendKind
 from .subject_contracts import (
     SUBJECT_AUTHORITY_PATHS,
@@ -40,7 +40,6 @@ from .subject_contracts import (
 )
 
 _T = TypeVar("_T")
-_MAX_WRITE_ATTEMPTS = 3
 _MAX_SUBJECT_CANDIDATE_BYTES = 4 * 1024 * 1024
 
 
@@ -192,27 +191,18 @@ class SQLSubjectDocumentStore:
             raise RuntimeError("storage backend returned invalid database time")
         return parsed
 
-    @staticmethod
-    def _retryable(exc: DBAPIError) -> bool:
-        message = str(exc.orig).lower()
-        codes = {str(value) for value in getattr(exc.orig, "args", ())}
-        return bool(
-            {"1205", "1213"} & codes
-            or "deadlock" in message
-            or "database is locked" in message
-            or "lock wait timeout" in message
-        )
+    async def _write(
+        self,
+        operation: Callable[[AsyncSession], Awaitable[_T]],
+    ) -> _T:
+        async def _attempt() -> _T:
+            async with self.runtime.unit_of_work() as uow:
+                return await operation(uow.session)
 
-    async def _write(self, operation: Callable[[AsyncSession], Awaitable[_T]]) -> _T:
-        for attempt in range(_MAX_WRITE_ATTEMPTS):
-            try:
-                async with self.runtime.unit_of_work() as uow:
-                    return await operation(uow.session)
-            except DBAPIError as exc:
-                if attempt + 1 >= _MAX_WRITE_ATTEMPTS or not self._retryable(exc):
-                    raise
-                await asyncio.sleep(0.02 * (attempt + 1))
-        raise AssertionError("bounded subject document retry loop exhausted")
+        return await run_write_attempts(
+            _attempt,
+            exhaustion_message="bounded subject document retry loop exhausted",
+        )
 
     @staticmethod
     def _document_id(logical_path: str) -> str:

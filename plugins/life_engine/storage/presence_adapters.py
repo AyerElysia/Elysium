@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
@@ -10,7 +9,7 @@ from typing import Any, TypeVar
 from uuid import uuid4
 
 from sqlalchemy import text
-from sqlalchemy.exc import DBAPIError, IntegrityError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.kernel.storage import canonical_json
@@ -20,6 +19,7 @@ from ..service.presence_store import (
     StreamOwnershipConflict,
 )
 from .contracts import StorageBackendRuntime
+from ._write_base import run_write_attempts
 from .domain_contracts import (
     PresenceCommitResult,
     PresenceLeaseConflict,
@@ -28,7 +28,6 @@ from .domain_contracts import (
 from .models import BackendKind
 
 _T = TypeVar("_T")
-_MAX_WRITE_ATTEMPTS = 3
 
 
 def _parse_datetime(value: Any) -> datetime | None:
@@ -96,30 +95,18 @@ class SQLPresenceStore:
             raise RuntimeError("storage backend did not return a valid database time")
         return parsed
 
-    @staticmethod
-    def _retryable(exc: DBAPIError) -> bool:
-        message = str(exc.orig).lower()
-        codes = {str(value) for value in getattr(exc.orig, "args", ())}
-        return bool(
-            {"1205", "1213"} & codes
-            or "deadlock" in message
-            or "database is locked" in message
-            or "lock wait timeout" in message
-        )
-
     async def _write(
         self,
         operation: Callable[[AsyncSession], Awaitable[_T]],
     ) -> _T:
-        for attempt in range(_MAX_WRITE_ATTEMPTS):
-            try:
-                async with self.runtime.unit_of_work() as uow:
-                    return await operation(uow.session)
-            except DBAPIError as exc:
-                if attempt + 1 >= _MAX_WRITE_ATTEMPTS or not self._retryable(exc):
-                    raise
-                await asyncio.sleep(0.02 * (attempt + 1))
-        raise AssertionError("bounded Presence retry loop exhausted unexpectedly")
+        async def _attempt() -> _T:
+            async with self.runtime.unit_of_work() as uow:
+                return await operation(uow.session)
+
+        return await run_write_attempts(
+            _attempt,
+            exhaustion_message="bounded Presence retry loop exhausted unexpectedly",
+        )
 
     @staticmethod
     def _normalize_instance(instance: dict[str, Any]) -> dict[str, Any]:
