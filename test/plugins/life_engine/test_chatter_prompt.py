@@ -20,6 +20,11 @@ from plugins.life_engine.core.chatter import (
 )
 from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.core.context_assembly import LifeChatterContextAssembler
+from plugins.life_engine.core.context_compaction import (
+    SUMMARY_CLOSE,
+    SUMMARY_INTRO,
+    SUMMARY_OPEN,
+)
 from plugins.life_engine.service.core import LifeEngineService
 from plugins.life_engine.service.event_builder import EventType, LifeEngineEvent
 from plugins.life_engine.service.perception_gateway import (
@@ -191,7 +196,7 @@ def test_life_chatter_persistent_user_prompt_excludes_dynamic_context() -> None:
     assert "<runtime_assistant_context>" not in prompt
 
 
-def test_life_chatter_context_compression_hook_preserves_dropped_history() -> None:
+def test_life_chatter_context_hook_projects_only_content_neutral_refs() -> None:
     manager = LLMContextManager()
     request = SimpleNamespace(context_manager=manager)
 
@@ -215,9 +220,10 @@ def test_life_chatter_context_compression_hook_preserves_dropped_history() -> No
     assert trimmed[0].role == ROLE.SYSTEM
     assert trimmed[1].role == ROLE.USER
     compressed = trimmed[1].content[0].text
-    assert "<compressed_life_chatter_context>" in compressed
-    assert "旧用户消息" in compressed
-    assert "旧回复" in compressed
+    assert "<mechanical_context_omission>" in compressed
+    assert "ctxg_" in compressed
+    assert "旧用户消息" not in compressed
+    assert "旧回复" not in compressed
     assert trimmed[2].content[0].text == "新用户消息"
 
 
@@ -241,13 +247,14 @@ def test_life_chatter_context_compression_hook_uses_configured_limits() -> None:
     )
 
     compressed = compressed_payloads[0].content[0].text
-    assert "更早的 1 组上下文已进一步省略" in compressed
+    assert '"unlisted_earlier_group_count":1' in compressed
+    assert '"listed_group_count":1' in compressed
     assert "第一组用户消息" not in compressed
-    assert "第二组用户消息" in compressed
-    assert "..." in compressed
+    assert "第二组用户消息" not in compressed
+    assert "ctxg_" in compressed
 
 
-def test_life_chatter_rolling_context_snapshot_is_compacted_with_summary() -> None:
+def test_life_chatter_rolling_context_snapshot_uses_mechanical_refs() -> None:
     payloads = [
         LLMPayload(ROLE.USER, Text(f"旧用户消息-{index}" + "x" * 20_000))
         if index % 2 == 0
@@ -268,8 +275,9 @@ def test_life_chatter_rolling_context_snapshot_is_compacted_with_summary() -> No
     assert after_chars < before_chars
     assert after_chars <= 320_000
     assert compacted[0].role == ROLE.USER
-    assert "<compressed_life_chatter_context>" in compacted[0].content[0].text
-    assert "旧用户消息" in compacted[0].content[0].text
+    assert "<mechanical_context_omission>" in compacted[0].content[0].text
+    assert "ctxg_" in compacted[0].content[0].text
+    assert "旧用户消息" not in compacted[0].content[0].text
     assert any(
         part.text == "最新用户消息"
         for payload in compacted
@@ -288,7 +296,8 @@ def test_life_chatter_single_huge_snapshot_payload_has_hard_cap() -> None:
     assert before_chars > 320_000
     assert after_chars <= 320_000
     assert LifeChatter._estimate_payload_chars(compacted) == after_chars
-    assert "<compressed_life_chatter_context>" in compacted[0].content[0].text
+    assert "<mechanical_context_omission>" in compacted[0].content[0].text
+    assert "超大消息" not in compacted[0].content[0].text
 
 
 def test_life_chatter_snapshot_compaction_drops_large_binary_and_tool_payloads() -> None:
@@ -322,8 +331,10 @@ def test_life_chatter_snapshot_compaction_drops_large_binary_and_tool_payloads()
     serialized = str(LifeChatter._snapshot_data_for_payloads(compacted))
     assert "a" * 1_000 not in serialized
     assert "z" * 1_000 not in serialized
-    assert "[图片]" in serialized
-    assert "[工具结果]" in serialized
+    assert "[图片]" not in serialized
+    assert "[工具结果]" not in serialized
+    assert "<mechanical_context_omission>" in serialized
+    assert "最新问题" in serialized
 
 
 def test_life_chatter_snapshot_persists_only_media_descriptor() -> None:
@@ -463,9 +474,7 @@ async def test_life_chatter_snapshot_save_failure_does_not_mutate_runtime(
 ) -> None:
     config = LifeEngineConfig()
     config.settings.workspace_path = str(tmp_path)
-    config.chatter.context_compaction_trigger_chars = 1_000
-    config.chatter.context_compaction_target_chars = 500
-    config.chatter.context_compaction_min_recent_groups = 1
+    config.chatter.rolling_context_snapshot_char_budget = 1_000
     chatter = LifeChatter.__new__(LifeChatter)
     chatter.plugin = SimpleNamespace(config=config)
     payloads = [
@@ -481,9 +490,9 @@ async def test_life_chatter_snapshot_save_failure_does_not_mutate_runtime(
 
     compactable_response = SimpleNamespace(payloads=list(payloads))
     result = chatter._maybe_compact_runtime_context(compactable_response)
-    assert result.triggered
+    assert result.triggered is False
     assert compactable_response.payloads is not payloads
-    assert len(compactable_response.payloads) < len(payloads)
+    assert compactable_response.payloads == payloads
 
     if failure_stage == "mkdir":
         monkeypatch.setattr(Path, "mkdir", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("mkdir")))
@@ -1355,6 +1364,30 @@ def test_rolling_context_projection_drops_retired_reaction_guidance() -> None:
     )
 
 
+def test_rolling_context_projection_drops_only_strict_retired_summary() -> None:
+    retired = LLMPayload(
+        ROLE.USER,
+        Text(f"{SUMMARY_INTRO}\n{SUMMARY_OPEN}\n旧复制正文\n{SUMMARY_CLOSE}"),
+    )
+    ordinary = LLMPayload(
+        ROLE.USER,
+        Text(f"我只是讨论 {SUMMARY_OPEN} 这个旧标签，不是系统摘要。"),
+    )
+    assistant = LLMPayload(ROLE.ASSISTANT, Text("保留这次真实回应"))
+
+    cleaned = LifeChatter._without_retired_context_summaries(
+        [retired, ordinary, assistant]
+    )
+
+    assert cleaned == [ordinary, assistant]
+    assert LifeChatter._without_retired_context_summaries(cleaned) == cleaned
+    assert "旧复制正文" not in str(cleaned)
+    LLMContextManager()._validate_payloads(
+        cleaned,
+        allow_incomplete_tail=False,
+    )
+
+
 @pytest.mark.asyncio
 async def test_rolling_context_legacy_think_load_is_read_only_then_save_normalizes(
     tmp_path,
@@ -1366,6 +1399,14 @@ async def test_rolling_context_legacy_think_load_is_read_only_then_save_normaliz
     chatter.instance_id = "chat_global"
 
     legacy_payloads = [
+        LLMPayload(
+            ROLE.USER,
+            Text(
+                f"{SUMMARY_INTRO}\n{SUMMARY_OPEN}\n"
+                "arbitrary copied tool result\n"
+                f"{SUMMARY_CLOSE}"
+            ),
+        ),
         LLMPayload(
             ROLE.USER,
             Text(
@@ -1447,6 +1488,7 @@ async def test_rolling_context_legacy_think_load_is_read_only_then_save_normaliz
         ROLE.ASSISTANT,
     ]
     assert [part.text for part in loaded[0].content] == ["new message"]
+    assert "arbitrary copied tool result" not in str(loaded)
     LLMContextManager()._validate_payloads(
         loaded,
         allow_incomplete_tail=False,
@@ -1467,6 +1509,7 @@ async def test_rolling_context_legacy_think_load_is_read_only_then_save_normaliz
         normalized,
         ensure_ascii=False,
     )
+    assert SUMMARY_OPEN not in json.dumps(normalized, ensure_ascii=False)
 
 
 def test_life_chatter_binds_identity_to_request_and_follow_up_upper() -> None:

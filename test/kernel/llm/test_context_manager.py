@@ -101,6 +101,51 @@ def test_context_manager_applies_hook() -> None:
     assert trimmed[2].content[0].text == "q2"
 
 
+def test_context_manager_rebuilds_hook_when_more_groups_are_dropped() -> None:
+    seen_dropped_counts: list[int] = []
+
+    def hook(dropped_groups, remaining_payloads):
+        del remaining_payloads
+        seen_dropped_counts.append(len(dropped_groups))
+        return [
+            LLMPayload(ROLE.ASSISTANT, Text(f"dropped={len(dropped_groups)}")),
+            LLMPayload(ROLE.USER, Text("reference-overhead")),
+        ]
+
+    manager = LLMContextManager(compression_hook=hook)
+    payloads = [LLMPayload(ROLE.SYSTEM, Text("sys"))]
+    for index in range(1, 5):
+        payloads.extend(
+            [
+                LLMPayload(ROLE.USER, Text(f"q{index}")),
+                LLMPayload(ROLE.ASSISTANT, Text(f"a{index}")),
+            ]
+        )
+
+    trimmed = manager.maybe_trim(
+        payloads,
+        max_token_budget=80,
+        token_counter=lambda items: len(items) * 10,
+    )
+
+    assert seen_dropped_counts == [1, 2]
+    assert any(
+        isinstance(part, Text) and part.text == "dropped=2"
+        for payload in trimmed
+        for part in payload.content
+    )
+    assert not any(
+        isinstance(part, Text) and part.text in {"q1", "a1", "q2", "a2"}
+        for payload in trimmed
+        for part in payload.content
+    )
+    assert any(
+        isinstance(part, Text) and part.text == "q3"
+        for payload in trimmed
+        for part in payload.content
+    )
+
+
 def test_llm_request_uses_custom_context_manager() -> None:
     class CustomManager(LLMContextManager):
         def __init__(self) -> None:

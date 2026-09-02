@@ -1153,16 +1153,62 @@ class LifeEngineConfig(BaseConfig):
             ),
         )
 
+        context_stewardship_enabled: bool = Field(
+            default=True,
+            description=(
+                "启用主体自述式上下文连续性：基础设施只报告容量压力，"
+                "连续性说明必须由 active consciousness 显式书写。"
+            ),
+        )
+
+        context_pressure_ratio: float = Field(
+            default=0.75,
+            ge=0.1,
+            le=0.99,
+            description=(
+                "当前任务 token 预算达到该比例时，向主体提供一次 content-free 容量清单；"
+                "它不判断重要性，也不自动触发释放。"
+            ),
+        )
+
+        context_pressure_max_groups: int = Field(
+            default=24,
+            ge=1,
+            le=64,
+            description="容量清单单次最多列出的精确上下文组引用数。",
+        )
+
+        self_continuity_checkpoint_max_bytes: int = Field(
+            default=32 * 1024,
+            ge=1024,
+            le=64 * 1024,
+            description=(
+                "主体亲自书写的连续性检查点 UTF-8 硬上限；基础设施不得代写或改写。"
+            ),
+        )
+
+        context_emergency_reference_max_bytes: int = Field(
+            default=8 * 1024,
+            ge=256,
+            le=32 * 1024,
+            description=(
+                "容量通知及模型/快照硬边界兜底投影的 UTF-8 上限；"
+                "只能包含 hash/ref/计数，不能复制正文。"
+            ),
+        )
+
         context_compression_max_groups: int = Field(
             default=12,
             ge=1,
-            description="上下文压缩摘要最多保留的旧对话组数。",
+            description=(
+                "兼容旧配置：机械兜底最多列出的旧组引用数；不再生成语义摘要。"
+            ),
         )
 
         context_compression_max_part_chars: int = Field(
             default=360,
             ge=16,
-            description="上下文压缩摘要中每个内容片段的最大字符数。",
+            description="退役兼容字段：主体自述连续性不会按字符裁剪并拼接旧内容。",
         )
 
         rolling_context_snapshot_char_budget: int = Field(
@@ -1173,31 +1219,31 @@ class LifeEngineConfig(BaseConfig):
 
         context_compaction_enabled: bool = Field(
             default=True,
-            description="是否启用 life_chatter 分层运行态/快照上下文压缩。",
+            description="退役兼容字段：不再允许基础设施自动生成语义压缩。",
         )
 
         context_compaction_trigger_chars: int = Field(
             default=120_000,
             ge=1_000,
-            description="运行态上下文超过该序列化字符估计值时触发分层压缩。",
+            description="退役兼容字段：容量压力改按任务 token 预算计算。",
         )
 
         context_compaction_target_chars: int = Field(
             default=80_000,
             ge=500,
-            description="分层压缩后的目标序列化字符估计值（应不大于 trigger）。",
+            description="退役兼容字段：基础设施不再决定语义压缩目标。",
         )
 
         context_compaction_min_recent_groups: int = Field(
             default=2,
             ge=1,
-            description="压缩后至少保留的最近完整对话组数（未闭合工具链额外保护）。",
+            description="退役兼容字段：主体通过精确 group_ref 决定释放与保留。",
         )
 
         context_compaction_summary_max_chars: int = Field(
             default=12_000,
             ge=200,
-            description="规范 summary 正文最大字符数；旧 summary 更新替换且不嵌套。",
+            description="退役兼容字段：系统不再生成 summary 正文。",
         )
 
         recent_history_tail_messages: int = Field(
@@ -2210,17 +2256,7 @@ class LifeEngineConfig(BaseConfig):
     @field_validator("chatter")
     @classmethod
     def validate_context_compaction_budgets(cls, v: LifeEngineConfig.ChatterSection):
-        """Ensure compaction target <= trigger and snapshot hard cap is usable."""
-        trigger = int(getattr(v, "context_compaction_trigger_chars", 0) or 0)
-        target = int(getattr(v, "context_compaction_target_chars", 0) or 0)
-        hard = int(getattr(v, "rolling_context_snapshot_char_budget", 0) or 0)
-        if trigger > 0 and target > trigger:
-            raise ValueError(
-                "context_compaction_target_chars 不能大于 context_compaction_trigger_chars"
-            )
-        if hard > 0 and trigger > hard:
-            # Allow but clamp is not done here; warn via ValueError only if clearly broken.
-            pass
+        """Retain legacy fields without letting them govern subject continuity."""
         return v
 
     @field_validator("settings")
