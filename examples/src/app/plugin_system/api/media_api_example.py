@@ -24,7 +24,7 @@ from src.kernel.scheduler import get_unified_scheduler
 
 async def main() -> None:
     """演示 media_api 的基础功能。"""
-    init_core_config(str(REPO_ROOT / "config" / "core.toml"))
+    init_core_config(str(REPO_ROOT / "config" / "elysium.toml"))
     init_model_config(str(REPO_ROOT / "config" / "models.toml"))
     core_cfg = get_core_config()
     db_cfg = core_cfg.database

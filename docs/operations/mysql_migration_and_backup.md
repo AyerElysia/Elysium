@@ -90,14 +90,14 @@ uv run python scripts/backup_life_data.py \
 
 脚本使用 SQLite Online Backup API 备份并生成逐表逻辑根、逐文件 SHA-256、frontier 与来源证据：
 
-- `core.toml` 指向的 Core SQLite（新部署默认 `Elysium.db`）；
+- `elysium.toml` 指向的 Core SQLite（新部署默认 `Elysium.db`）；
 - `.memory/memory.db`；
 - `life_events.sqlite3`；
 - `consciousness_presence.sqlite3`；
 - `world_projection.sqlite3`。
 - `.memory/archive_sync_state.sqlite3`。
 
-非默认数据库文件名必须从 `config/core.toml` 显式传给
+非默认数据库文件名必须从 `config/elysium.toml` 显式传给
 `--core-sqlite-relative`；不得根据文件存在性自动猜测权威库，也不得自动移动或改名既有数据库。规范部署入口
 `deploy.sh backup` / `deploy.ps1 backup` 会从已校验的 `database.sqlite_path`
 派生该参数。

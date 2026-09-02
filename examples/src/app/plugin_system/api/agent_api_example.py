@@ -26,7 +26,7 @@ from src.kernel.db import init_database_from_config
 async def main() -> None:
     """演示 agent_api 的基础功能。"""
     # 初始化配置
-    init_core_config(str(REPO_ROOT / "config" / "core.toml"))
+    init_core_config(str(REPO_ROOT / "config" / "elysium.toml"))
 
     # 初始化数据库
     core_cfg = get_core_config()

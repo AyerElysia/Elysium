@@ -22,7 +22,7 @@
 
 实现细节:
 - 使用同步 SQLAlchemy 进行数据库连接和元数据管理（不依赖框架的异步引擎）
-- 配置从 config/core.toml 的 [database] 节读取（与框架共享同一份配置）
+- 配置从 config/elysium.toml 的 [database] 节读取（与框架共享同一份配置）
 - 采用流式迁移，避免一次性加载过多数据
 - 支持 SQLite、PostgreSQL 之间的互相迁移
 - 批量插入失败时自动降级为逐行插入，最大程度保留数据
@@ -96,12 +96,12 @@ PROJECT_ROOT = str(_project_root)
 
 
 def load_core_config() -> dict:
-    """加载 config/core.toml 配置文件。
+    """加载 config/elysium.toml 配置文件。
 
     Returns:
         配置字典，若文件不存在或解析失败则返回空字典
     """
-    config_path = os.path.join(PROJECT_ROOT, "config", "core.toml")
+    config_path = os.path.join(PROJECT_ROOT, "config", "elysium.toml")
     if not os.path.exists(config_path):
         logger.warning("配置文件不存在: %s", config_path)
         return {}
@@ -120,7 +120,7 @@ def load_core_config() -> dict:
 
 
 def get_database_config_from_toml(db_type: str) -> dict | None:
-    """从 config/core.toml 的 [database] 节读取数据库配置。
+    """从 config/elysium.toml 的 [database] 节读取数据库配置。
 
     Args:
         db_type: 数据库类型，支持 "sqlite" 或 "postgresql"
@@ -148,7 +148,7 @@ def get_database_config_from_toml(db_type: str) -> dict | None:
             "database": db_config.get("postgresql_database") or "elysium",
             "user": db_config.get("postgresql_user") or "postgres",
             "password": db_config.get("postgresql_password") or "",
-            # core.toml 暂无 schema 配置项，默认 public
+            # elysium.toml 暂无 schema 配置项，默认 public
             "schema": db_config.get("postgresql_schema") or "public",
         }
 
@@ -660,7 +660,7 @@ class DatabaseMigrator:
             source_type: 源数据库类型 (sqlite/postgresql)
             target_type: 目标数据库类型 (sqlite/postgresql)
             batch_size: 批量处理大小
-            source_config: 源数据库配置，None 时从 config/core.toml 读取
+            source_config: 源数据库配置，None 时从 config/elysium.toml 读取
             target_config: 目标数据库配置，必须显式传入
             skip_tables: 要跳过的表名集合
             only_tables: 只迁移的表名集合（设置后忽略 skip_tables）
@@ -698,15 +698,15 @@ class DatabaseMigrator:
             raise ValueError(f"不支持的目标数据库类型: {self.target_type}")
 
     def _load_source_config(self) -> dict:
-        """加载源数据库配置，优先使用传入的配置，否则从 core.toml 读取。"""
+        """加载源数据库配置，优先使用传入的配置，否则从 elysium.toml 读取。"""
         if self.source_config:
             logger.info("使用传入的源数据库配置")
             return self.source_config
 
-        logger.info("未提供源数据库配置，尝试从 config/core.toml 读取")
+        logger.info("未提供源数据库配置，尝试从 config/elysium.toml 读取")
         config = get_database_config_from_toml(self.source_type)
         if not config:
-            raise ValueError("无法从 config/core.toml 中读取源数据库配置，请检查 [database] 节")
+            raise ValueError("无法从 config/elysium.toml 中读取源数据库配置，请检查 [database] 节")
 
         logger.info("成功从配置文件读取源数据库配置")
         return config
@@ -1048,8 +1048,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1000, help="批量处理大小（默认: 1000）")
     parser.add_argument("--interactive", action="store_true", help="启用交互式向导模式")
 
-    # 源数据库参数（可选，默认从 config/core.toml 读取）
-    src = parser.add_argument_group("源数据库配置（可选，默认从 config/core.toml 读取）")
+    # 源数据库参数（可选，默认从 config/elysium.toml 读取）
+    src = parser.add_argument_group("源数据库配置（可选，默认从 config/elysium.toml 读取）")
     src.add_argument("--source-path", type=str, help="SQLite 数据库路径")
     src.add_argument("--source-host", type=str, help="PostgreSQL 主机")
     src.add_argument("--source-port", type=int, help="PostgreSQL 端口")
@@ -1198,10 +1198,10 @@ def interactive_setup() -> dict:
     # 源数据库配置
     print()
     print("源数据库配置：")
-    print("  默认会从 config/core.toml 中读取对应配置。")
+    print("  默认会从 config/elysium.toml 中读取对应配置。")
     use_default_source = input("是否使用配置文件中的【源数据库】配置? [Y/n]: ").strip().lower()
     if use_default_source in ("", "y", "yes"):
-        source_config = None  # 由 DatabaseMigrator 自动从 core.toml 读取
+        source_config = None  # 由 DatabaseMigrator 自动从 elysium.toml 读取
     else:
         print("请手动输入源数据库连接信息：")
         if source_type == "sqlite":

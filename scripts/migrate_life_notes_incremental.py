@@ -103,7 +103,7 @@ def _local_notes_files(data_root: Path) -> list[tuple[Path, str]]:
 
 async def _run(args: argparse.Namespace) -> dict[str, object]:
     config_toml = tomllib.loads(
-        (_REPOSITORY_ROOT / "config/core.toml").read_text(encoding="utf-8")
+        (_REPOSITORY_ROOT / "config/elysium.toml").read_text(encoding="utf-8")
     )
     db = config_toml["database"]
     config = MySQLStorageConfig(

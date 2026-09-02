@@ -20,7 +20,7 @@
 4. 逐域导入并按各域合同校验（字节/hash/行数/根）；
 5. 在 data/life_storage/authority.json 注册 VERIFIED 本地 generation。
 
-不修改 config/core.toml、不启动 Elysium。切换配置并手动启动是独立的
+不修改 config/elysium.toml、不启动 Elysium。切换配置并手动启动是独立的
 人工步骤。复制运行的进度与冲突以 content-free JSONL 留存在 evidence 目录。
 """
 

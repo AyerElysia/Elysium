@@ -14,7 +14,7 @@ from src.app.runtime.single_instance import SingleInstanceLock
 _INSTANCE_LOCK_PATH = Path("data/runtime/elysium.lock")
 
 
-def load_ui_level_from_config(config_path: str = "config/core.toml") -> UILevel:
+def load_ui_level_from_config(config_path: str = "config/elysium.toml") -> UILevel:
     """从配置文件加载 UI 级别
 
     Args:
@@ -51,7 +51,7 @@ def load_ui_level_from_config(config_path: str = "config/core.toml") -> UILevel:
 
 
 def runtime_startup_guard(
-    config_path: str = "config/core.toml",
+    config_path: str = "config/elysium.toml",
     *,
     lock_path: str | Path = _INSTANCE_LOCK_PATH,
 ) -> SingleInstanceLock | nullcontext[None]:
@@ -73,11 +73,11 @@ async def main() -> None:
     from src.app.runtime import Bot
 
     # 从配置文件读取 UI 级别
-    ui_level = load_ui_level_from_config("config/core.toml")
+    ui_level = load_ui_level_from_config("config/elysium.toml")
 
     # 创建 Bot 实例
     bot = Bot(
-        config_path="config/core.toml",
+        config_path="config/elysium.toml",
         plugins_dir="plugins",
         log_dir="logs",
         ui_level=ui_level,
@@ -100,7 +100,7 @@ if __name__ == "__main__":
         print(f"[env] loaded local secrets: {', '.join(_loaded_local_env)}")
     try:
         # SQLite remains process-local; MySQL coordinates concurrent writers.
-        with runtime_startup_guard("config/core.toml"):
+        with runtime_startup_guard("config/elysium.toml"):
             asyncio.run(main())
     except KeyboardInterrupt:
         # 用户中断（Ctrl+C）

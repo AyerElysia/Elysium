@@ -792,7 +792,7 @@ def init_core_config(config_path: str) -> CoreConfig:
 
         从文件加载：
         ```python
-        config = init_core_config("config/core.toml")
+        config = init_core_config("config/elysium.toml")
         ```
     """
     global _global_config

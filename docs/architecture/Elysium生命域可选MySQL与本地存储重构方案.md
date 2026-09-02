@@ -1,6 +1,6 @@
 # Elysium 生命域可选 MySQL / 本地存储重构方案
 
-> 状态：阶段 0—8 的存储基座、各生命域 Port、local/MySQL 双适配、同一 service-owned runtime 现役接线、复制/校验/反向导出工具、汇总审计工具和数据库不可变门均已落地。全局后端由 `config/core.toml [storage].backend` 唯一选择；`backend=local` 默认保留 legacy-local 兼容运行，显式设置 `local_selectable_enabled=true` 后则使用本地 SQLite selectable runtime、文件权威和预先注册的 verified local generation。MySQL runtime 已支持同一 verified generation 内多个合法进程共享写入，本地 selectable runtime 仍由进程锁限制为单 writer。对 `runtime_context/global` 这类不能由多个进程共同拥有的单例状态，现已增加 generation-scoped writer claim；每次写事务同时复核 generation fencing 与 claim epoch/token，失租后失败关闭，不做自动 rebase 或最后写入覆盖。历史远程 shadow 来自 `writer_frozen=false` 在线快照，只证明无损复制/恢复，不能作为新的生产 generation 激活证据。任何新部署或重新切换仍需使用独立目标库、冻结快照、领域同源复制、verified generation 和用户手工启动后的全链路验收。
+> 状态：阶段 0—8 的存储基座、各生命域 Port、local/MySQL 双适配、同一 service-owned runtime 现役接线、复制/校验/反向导出工具、汇总审计工具和数据库不可变门均已落地。全局后端由 `config/elysium.toml [storage].backend` 唯一选择；`backend=local` 默认保留 legacy-local 兼容运行，显式设置 `local_selectable_enabled=true` 后则使用本地 SQLite selectable runtime、文件权威和预先注册的 verified local generation。MySQL runtime 已支持同一 verified generation 内多个合法进程共享写入，本地 selectable runtime 仍由进程锁限制为单 writer。对 `runtime_context/global` 这类不能由多个进程共同拥有的单例状态，现已增加 generation-scoped writer claim；每次写事务同时复核 generation fencing 与 claim epoch/token，失租后失败关闭，不做自动 rebase 或最后写入覆盖。历史远程 shadow 来自 `writer_frozen=false` 在线快照，只证明无损复制/恢复，不能作为新的生产 generation 激活证据。任何新部署或重新切换仍需使用独立目标库、冻结快照、领域同源复制、verified generation 和用户手工启动后的全链路验收。
 >
 > 目标：在不改变爱莉主体语义、不丢失不可变历史、不把 Chroma 误作权威存储的前提下，为 Elysium 建立行为等价的本地与 MySQL 两套耐久存储后端。迁移采用“复制、校验、可选切换”，绝不移动、删除或改写原 SQLite、Markdown、JSON、JSONL 与媒体数据文件。
 
@@ -487,7 +487,7 @@ MySQL 结构化过滤
 
 ## 13. 存储运行配置与使用方式
 
-现役配置以 `config/core.toml` 的全局 `[storage]` 和 `[database]` 为准。Core 与 Life Engine 不能独立选择后端；Life Engine 插件文件不再配置 MySQL 连接或 generation：
+现役配置以 `config/elysium.toml` 的全局 `[storage]` 和 `[database]` 为准。Core 与 Life Engine 不能独立选择后端；Life Engine 插件文件不再配置 MySQL 连接或 generation：
 
 ```toml
 [storage]

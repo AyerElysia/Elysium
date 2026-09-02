@@ -60,7 +60,7 @@ class Bot:
 
     def __init__(
         self,
-        config_path: str = "config/core.toml",
+        config_path: str = "config/elysium.toml",
         plugins_dir: str = "plugins",
         log_dir: str = "logs",
         ui_level: UILevel = UILevel.STANDARD,
@@ -313,7 +313,6 @@ class Bot:
 
         # Step 1: Config
         from src.core.config import init_core_config, init_mcp_config
-        from src.kernel.config.unified import init_config as init_unified_config
         from src.kernel.container import container
         from src.kernel.protocols import (
             EventBusProtocol,
@@ -323,8 +322,6 @@ class Bot:
 
         self.config = init_core_config(self.config_path)
         init_mcp_config("config/mcp.toml")
-        # 架构 v2：统一配置（兼容模式，从老文件构建）
-        init_unified_config("config/elysium.toml")
         # Step 2: Logger
         from src.kernel.logger import COLOR, get_logger, initialize_logger_system
         from src.kernel.protocols import LogStoreProtocol

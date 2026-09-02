@@ -23,7 +23,7 @@ from src.core.config import init_core_config
 
 async def main() -> None:
     """演示 chat_api 的基础功能。"""
-    init_core_config(str(REPO_ROOT / "config" / "core.toml"))
+    init_core_config(str(REPO_ROOT / "config" / "elysium.toml"))
     await load_all_plugins(str(REPO_ROOT / "plugins"))
     chatters = chat_api.get_all_chatters()
     print(f"已注册 Chatter 数量: {len(chatters)}")

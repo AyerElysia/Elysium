@@ -92,7 +92,7 @@ main.py
 | 文件 | 用途 |
 | --- | --- |
 | `main.py` | 当前主入口 |
-| `config/core.toml` | Core、数据库、HTTP、日志、全局 LLM 行为 |
+| `config/elysium.toml` | Core、数据库、HTTP、日志、全局 LLM 行为 |
 | `config/models.toml` | 生产 Provider、模型注册和有序语义任务路由；不承载本地消息 TTS |
 | ~~`config/model.toml`~~ | **已于 2026-09-01 移除**：旧格式仅供显式迁移，生产启动从不读取、不参与任务回退。备份见 `/root/Elysia/backups/config/` |
 | `config/mcp.toml` | MCP 服务配置 |
@@ -142,7 +142,7 @@ Git Bash：
 cd "<Elysium项目目录>"
 ```
 
-所有启动和测试命令都应从项目根目录执行，因为当前入口使用了 `config/core.toml`、`plugins`、`logs` 等相对路径。
+所有启动和测试命令都应从项目根目录执行，因为当前入口使用了 `config/elysium.toml`、`plugins`、`logs` 等相对路径。
 
 ---
 
@@ -166,7 +166,7 @@ Linux / WSL / Git Bash：
 
 ### 4.2 锁与恢复边界
 
-生产运行使用 `uv run --frozen --no-sync`，启动过程中不得解析新版本、安装插件包或修改 lock。`config/core.toml.example` 因此默认设置 `[plugin_deps].enabled = false`。可选插件缺包时，先把依赖加入 `pyproject.toml`，更新并审查 `uv.lock`，完成测试后再部署；禁止在启动日志报错后逐包 `pip install`。
+生产运行使用 `uv run --frozen --no-sync`，启动过程中不得解析新版本、安装插件包或修改 lock。`config/elysium.toml.example` 因此默认设置 `[plugin_deps].enabled = false`。可选插件缺包时，先把依赖加入 `pyproject.toml`，更新并审查 `uv.lock`，完成测试后再部署；禁止在启动日志报错后逐包 `pip install`。
 
 MySQL 异步引擎要求 SQLAlchemy ≥ 2.0.50；项目声明已经固定该下限，当前 lock 为 2.0.52。旧环境出现半卸载、元数据漂移或依赖不闭合时，不要原地强装单包。先保留可恢复的旧 `.venv`，再由操作者创建空的新环境并重新执行 `bootstrap`；新环境通过 doctor 与手工启动验收前不要删除旧环境。
 
@@ -176,7 +176,7 @@ MySQL 异步引擎要求 SQLAlchemy ≥ 2.0.50；项目声明已经固定该下�
 
 ## 5. 首次生成配置
 
-`bootstrap` 会从当前 schema 示例创建缺失的 `core.toml` 与 `models.toml`，同时写入默认关闭的可选插件工程配置。已存在普通文件绝不覆盖，异常目标类型直接失败。不要依赖一次失败启动来自动生成配置。
+`bootstrap` 会从当前 schema 示例创建缺失的 `elysium.toml` 与 `models.toml`，同时写入默认关闭的可选插件工程配置。已存在普通文件绝不覆盖，异常目标类型直接失败。不要依赖一次失败启动来自动生成配置。
 
 模型密钥保持为 `${ELYSIUM_NEXUS_API_KEY}` 等环境引用，真实值由当前终端或受控 secret manager 注入。正式模型加载会拒绝空值、未解析变量和示例占位符；部署 doctor 还会拒绝明文密钥。部署不创建 `.env`，也不把密钥放入命令参数或日志。本地 Router 等可选侧车在独立验收后再加入配置。
 
@@ -189,12 +189,12 @@ MySQL 异步引擎要求 SQLAlchemy ≥ 2.0.50；项目声明已经固定该下�
 编辑：
 
 ```text
-config/core.toml
+config/elysium.toml
 ```
 
-Elysium 只允许通过 `config/core.toml` 配置全局存储。选择 `mysql` 时，Core 和 Life Engine 必须一起使用同一组 MySQL 连接、generation 和 authority 参数；选择 `local` 时，二者都使用本地存储。Life Engine 插件文件不再包含 MySQL 连接、generation 或后端选择，避免任何第二配置来源。
+Elysium 只允许通过 `config/elysium.toml` 配置全局存储。选择 `mysql` 时，Core 和 Life Engine 必须一起使用同一组 MySQL 连接、generation 和 authority 参数；选择 `local` 时，二者都使用本地存储。Life Engine 插件文件不再包含 MySQL 连接、generation 或后端选择，避免任何第二配置来源。
 
-MySQL 模式的最小 Core 配置如下（真实地址和用户名只写入本机被 Git 忽略的 `config/core.toml`；密码只由环境变量注入，不要写入本文、TOML 或提交；epoch/token 不需要配置）：
+MySQL 模式的最小 Core 配置如下（真实地址和用户名只写入本机被 Git 忽略的 `config/elysium.toml`；密码只由环境变量注入，不要写入本文、TOML 或提交；epoch/token 不需要配置）：
 
 ```toml
 [bot]
@@ -298,7 +298,7 @@ workspace 的 `runtime/proactive/backend-binding.json` 绑定精确 backend iden
 
 回退同样不能只改 `[storage].backend`：目标尚未产生任何新写入时，可保留冻结源和全部 manifest 作为回退证据；一旦目标开始写入，旧源已经落后，必须先重新停写、完成全生命域反向导出/快照、逐项校验并登记新的 verified generation。项目不提供“自动回退并自动合并分叉”的捷径。
 
-现役 MySQL generation 合并新版本后，如果启动报某个新增生命域表不存在，不得让业务启动自动建表，也不要重新执行旧 SQLite 全量迁移。先停止 Elysium，在维护窗口使用同一份 `config/core.toml` 执行对应的幂等增量升级：
+现役 MySQL generation 合并新版本后，如果启动报某个新增生命域表不存在，不得让业务启动自动建表，也不要重新执行旧 SQLite 全量迁移。先停止 Elysium，在维护窗口使用同一份 `config/elysium.toml` 执行对应的幂等增量升级：
 
 ```powershell
 uv run --frozen --no-sync python .\scripts\adopt_life_mysql_baseline.py upgrade-runtime-state
@@ -321,7 +321,7 @@ uv run --frozen --no-sync python .\scripts\adopt_life_mysql_baseline.py upgrade-
 └── Life Engine：同一 MySQL generation；Chroma/FTS 与工作区文件仍是可重建投影
 ```
 
-Life Engine 插件配置不再包含 `[storage]` 或 `[storage_mysql]`；MySQL 的连接、generation、registry 和 owner 登记只在 `config/core.toml` 配置，后端选择只看 `[storage].backend`。`backend="local"` 时系统自动使用 file authority、忽略保留的 MySQL generation；`backend="mysql"` 时系统自动使用 MySQL authority并严格校验该 generation。旧 `[storage].authority_provider` 会被配置迁移移除，切换时不要清空/恢复 generation，也不要修改第二个开关。插件仅保留 local 模式所需的 `[storage_local]` 路径。任何插件级 `enabled`、`authoritative_backend`、generation 或 MySQL 连接字段都是旧配置，严格校验会拒绝加载。
+Life Engine 插件配置不再包含 `[storage]` 或 `[storage_mysql]`；MySQL 的连接、generation、registry 和 owner 登记只在 `config/elysium.toml` 配置，后端选择只看 `[storage].backend`。`backend="local"` 时系统自动使用 file authority、忽略保留的 MySQL generation；`backend="mysql"` 时系统自动使用 MySQL authority并严格校验该 generation。旧 `[storage].authority_provider` 会被配置迁移移除，切换时不要清空/恢复 generation，也不要修改第二个开关。插件仅保留 local 模式所需的 `[storage_local]` 路径。任何插件级 `enabled`、`authoritative_backend`、generation 或 MySQL 连接字段都是旧配置，严格校验会拒绝加载。
 
 MySQL 模式并不意味着把 Chroma 或媒体字节强行塞入关系表：Life Event、Life Memory、Presence、World、Learning、统一主动权威和主体文档版本由 MySQL 作为权威；Chroma、全文索引和工作区 Markdown 是可重建投影；图片、语音、视频和附件字节仍按受管媒体合同保存在文件或对象存储中，MySQL 保存其身份、哈希、权限和位置元数据。旧 `life_engine_workspace/thoughts/streams.json` 仅是迁移证据；可写 `ThoughtStreamManager` 已删除，任何模式都不得继续修改该文件。
 
@@ -365,7 +365,7 @@ local 模式启动报 `SubjectAuthoritySourceMissing: <name>` 时，含义是主
 
 ### 6.4 阶段三 `/api/v1` 认证基座
 
-阶段三应用接口默认不挂载。只有明确需要前端或独立应用后端联调时，才在本机 `config/core.toml` 中启用：
+阶段三应用接口默认不挂载。只有明确需要前端或独立应用后端联调时，才在本机 `config/elysium.toml` 中启用：
 
 ```toml
 [http_router]
@@ -1114,7 +1114,7 @@ Ctrl+C
 
 - [ ] `.venv` 中 Python 版本不低于 3.11。
 - [ ] `deploy.sh bootstrap` 或 `deploy.ps1 bootstrap` 成功，依赖与 `uv.lock` 一致。
-- [ ] `config/core.toml`、`config/models.toml` 已生成并保存；真实密钥未进入 Git。
+- [ ] `config/elysium.toml`、`config/models.toml` 已生成并保存；真实密钥未进入 Git。
 - [ ] SQLite 文件可创建或打开。
 - [ ] 启动过程无 Fatal error。
 - [ ] 仅有一个 Elysium 实例占用目标端口。

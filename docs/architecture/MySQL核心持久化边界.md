@@ -80,7 +80,7 @@ Life Event 与结构化记忆是权威数据；Chroma 和世界投影是可重�
 2. 创建最后一份 SQLite 在线快照；
 3. 比对当前逻辑指纹与远端；若变化，执行受审计的最终增量/重迁移；
 4. 校验远端和本地备份；
-5. 手工修改 `config/core.toml`；
+5. 手工修改 `config/elysium.toml`；
 6. 用户手工启动并执行读写冒烟；
 7. 保留原 SQLite 与所有 manifest，不删除。
 

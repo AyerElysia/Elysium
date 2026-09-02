@@ -1,67 +1,123 @@
-# Elysium unified-kernel compatibility configuration.
+# Elysium configuration template.
 #
-# This file does not replace config/core.toml or config/models.toml in the
-# current runtime. Core HTTP/storage/permissions still come from core.toml and
-# production model routing still comes from models.toml. Do not create this
-# file unless a subsystem-specific document explicitly requires it.
+# `config/elysium.toml` is the single active source for Core runtime, storage,
+# HTTP and permission settings. Model routing lives in `config/models.toml`.
+# `deploy.sh bootstrap` / `deploy.ps1 bootstrap` copies this file only when the
+# destination does not exist and restricts the local copy to the current user.
 
-[runtime]
-log_level = "INFO"
-db_path = "data/elysium.db"
-data_dir = "data"
+[bot]
+ui_level = "verbose"
 plugins_dir = "plugins"
+logs_dir = "logs"
+log_level = "INFO"
+data_dir = "data"
 shutdown_timeout = 15.0
 force_shutdown_after = 5.0
-process_workers = 4
-trust_env = true
+llm_preflight_check = true
+llm_preflight_timeout = 5.0
+enable_watchdog = true
+tick_interval = 5.0
+stream_warning_threshold = 150.0
+stream_restart_threshold = 360.0
+stream_step_timeout = 300.0
+message_buffer_window = 8.0
+message_buffer_max_skip = 3
 
-# ─── LLM 配置 ───────────────────────────────────
-# providers: API 提供商
-# models: 模型实例（引用 provider）
-# routing: 路由名 → 模型名 映射
+[chat]
+default_chat_mode = "normal"
+max_history_messages = 20
+max_unread_messages = 1000
+image_recognition_prompt = ""
 
-[llm.providers]
-# 示例（OpenAI 兼容接口）：
-# [llm.providers.my_provider]
-# base_url = "https://api.openai.com/v1"
-# api_key = "${OPENAI_API_KEY}"
-# client_type = "openai"
-# max_retry = 3
-# timeout = 60
+[llm]
+default_policy = "failover"
+enable_trajectory_logging = true
+trajectory_base_path = "data/training_data_lake"
+trajectory_flush_interval = 5.0
+trajectory_queue_limit = 10000
+trajectory_raw_retention_days = 3
+trajectory_archive_retention_days = 0
 
-[llm.models]
-# 示例：
-# [llm.models.main]
-# provider = "my_provider"
-# model = "gpt-4o"
-# max_tokens = 8192
-# temperature = 0.7
-#
-# [llm.models.fast]
-# provider = "my_provider"
-# model = "gpt-4o-mini"
-# max_tokens = 4096
+# The base deployment is local and needs no external database service.
+[storage]
+backend = "local"
+backend_generation = ""
+schema_version = 1
+multi_writer_enabled = false
+multi_writer_protocol_version = 1
+registry_id = "life-domain"
+authority_owner_id = "elysium-local-primary"
+require_verified_generation = true
+authority_lease_seconds = 120
+authority_renew_interval_seconds = 40
 
-[llm.routing]
-# 路由名 → 模型名。任务名参见 docs/architecture/LLM内核.md
-# core = "main"       # 心跳/核心推理
-# expression = "main" # 对话生成
-# agent = "main"      # 子代理
-# utility = "fast"    # 轻量杂务
-default = "main"
+[database]
+sqlite_path = "data/Elysium.db"
+connection_pool_size = 10
+connection_timeout = 10
+echo = false
 
-# ─── HTTP 服务 ──────────────────────────────────
+# MySQL is an explicit migration profile, not a bootstrap default. Before
+# switching storage.backend, create and verify a backup/generation and fill the
+# connection fields below. The password must remain an environment reference.
+mysql_host = "127.0.0.1"
+mysql_port = 3306
+mysql_database = "elysium"
+mysql_user = "elysium"
+mysql_password = "${ELYSIUM_MYSQL_PASSWORD}"
+mysql_charset = "utf8mb4"
+mysql_ssl_mode = "disabled"
+mysql_ssl_ca = ""
+mysql_ssl_cert = ""
+mysql_ssl_key = ""
+mysql_max_overflow = 20
+mysql_pool_recycle_seconds = 120
+mysql_idle_session_timeout_seconds = 180
+mysql_pool_timeout_seconds = 10
+mysql_query_timeout_seconds = 10
+mysql_lock_wait_timeout_seconds = 5
 
-[http]
-enabled = true
-host = "127.0.0.1"
-port = 18000
-api_keys = []  # 留空禁用认证（不推荐生产环境）
-
-# ─── 权限 ───────────────────────────────────────
-
-[permission]
-owner_list = []  # 格式：["qq:123456789", "feishu:ou_xxx"]
-default_level = "user"
+[permissions]
+# Add only explicit platform identities, for example "qq:123456".
+owner_list = []
+default_permission_level = "user"
 strict_mode = true
-cache_ttl = 300
+allow_operator_promotion = false
+allow_operator_demotion = false
+max_operator_promotion_level = "operator"
+allow_command_override = true
+override_requires_owner_approval = false
+enable_permission_cache = true
+permission_cache_ttl = 300
+log_permission_denied = true
+log_permission_granted = false
+
+[http_router]
+enable_http_router = true
+http_router_host = "127.0.0.1"
+http_router_port = 8000
+api_keys = []
+enable_app_api_v1 = false
+app_api_v1_database_path = "runtime/app_api_v1/auth.sqlite3"
+app_api_v1_allowed_origins = ["http://127.0.0.1:5173"]
+app_api_v1_max_concurrency = 32
+app_api_v1_max_websocket_connections = 64
+app_api_v1_rate_limit_requests_per_minute = 600
+app_api_v1_rate_limit_burst = 60
+app_api_v1_max_command_concurrency = 8
+app_api_v1_max_command_backlog = 1000
+# Enabling App API v1 additionally requires these environment variables:
+# ELYSIUM_APP_API_V1_SIGNING_SECRET (at least 32 bytes)
+# ELYSIUM_INSTALLATION_ID (stable installation identity)
+
+[advanced]
+force_sync_http = false
+trust_env = true
+process_workers = 4
+
+# Production starts must use the lock file. Runtime package installation is
+# disabled so startup can never mutate the environment or bypass uv.lock.
+[plugin_deps]
+enabled = false
+install_command = "uv pip install"
+skip_if_satisfied = true

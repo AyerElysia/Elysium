@@ -25,7 +25,7 @@ from src.kernel.db import init_database_from_config
 
 async def main() -> None:
     """演示 action_api 的基础功能。"""
-    init_core_config(str(REPO_ROOT / "config" / "core.toml"))
+    init_core_config(str(REPO_ROOT / "config" / "elysium.toml"))
     core_cfg = get_core_config()
     db_cfg = core_cfg.database
     await init_database_from_config(

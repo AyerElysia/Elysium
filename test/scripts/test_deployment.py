@@ -47,7 +47,7 @@ def _repository(path: Path) -> Path:
     (path / "config").mkdir(parents=True)
     for name in ("AGENTS.md", "main.py", "pyproject.toml", "uv.lock"):
         (path / name).write_text("# fixture\n", encoding="utf-8")
-    (path / "config/core.toml.example").write_text(_core_template(), encoding="utf-8")
+    (path / "config/elysium.toml.example").write_text(_core_template(), encoding="utf-8")
     (path / "config/models.toml.example").write_text(
         _model_template(), encoding="utf-8"
     )
@@ -87,7 +87,7 @@ def test_initialize_configuration_is_private_create_only_and_idempotent(
         config_only=True,
     )
 
-    assert "config/core.toml" in created
+    assert "config/elysium.toml" in created
     assert "config/models.toml" in created
     assert not preserved
     assert not (root / "data/life_engine_workspace/SOUL.md").exists()
@@ -96,7 +96,7 @@ def test_initialize_configuration_is_private_create_only_and_idempotent(
             mode = stat.S_IMODE((root / relative).stat().st_mode)
             assert mode == 0o600
 
-    core_path = root / "config/core.toml"
+    core_path = root / "config/elysium.toml"
     custom = b"operator-owned bytes\n"
     core_path.write_bytes(custom)
     second_created, second_preserved = deployment.bootstrap(
@@ -129,7 +129,7 @@ def test_shell_entrypoint_works_from_unrelated_cwd_and_unicode_path(
     )
 
     assert result.returncode == 0, result.stderr
-    assert (root / "config/core.toml").is_file()
+    assert (root / "config/elysium.toml").is_file()
     assert (root / "config/models.toml").is_file()
     assert not (root / "data/life_engine_workspace/SOUL.md").exists()
 
@@ -140,7 +140,7 @@ def test_initialize_configuration_rejects_symlink_without_touching_target(
     root = _repository(tmp_path / "repo")
     external = tmp_path / "external.toml"
     external.write_bytes(b"outside\n")
-    (root / "config/core.toml").symlink_to(external)
+    (root / "config/elysium.toml").symlink_to(external)
 
     with pytest.raises(deployment.DeploymentError, match="不是普通文件"):
         deployment.initialize_configuration(root)
@@ -400,7 +400,7 @@ def test_doctor_rejects_nested_config_directory_symlink(tmp_path: Path) -> None:
 def test_doctor_rejects_invalid_mysql_pool_lifetime(tmp_path: Path) -> None:
     root = _repository(tmp_path / "repo")
     deployment.initialize_configuration(root)
-    (root / "config/core.toml").write_text(
+    (root / "config/elysium.toml").write_text(
         "[storage]\n"
         'backend = "mysql"\n'
         'backend_generation = "verified-generation"\n\n'
@@ -659,7 +659,7 @@ def test_mysql_backup_uses_private_precreated_output_contract(
 ) -> None:
     root = _repository(tmp_path / "repo")
     deployment.initialize_configuration(root)
-    core_path = root / "config/core.toml"
+    core_path = root / "config/elysium.toml"
     core_path.write_text('[storage]\nbackend = "mysql"\n', encoding="utf-8")
     if os.name != "nt":
         core_path.chmod(0o600)
@@ -715,7 +715,7 @@ def test_committed_engineering_templates_match_current_schemas(
     from src.kernel.config.models_loader import ModelsConfig
 
     project_root = deployment.repository_root()
-    core = CoreConfig.load(project_root / "config/core.toml.example")
+    core = CoreConfig.load(project_root / "config/elysium.toml.example")
     models = ModelsConfig(project_root / "config/models.toml.example")
     assert core.storage.backend == "local"
     assert core.http_router.http_router_port == 8000

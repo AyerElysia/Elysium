@@ -398,7 +398,7 @@ def _atomic_create_private_file(root: Path, relative: str, content: str) -> bool
 
 def _configuration_sources(root: Path) -> dict[str, str]:
     sources = {
-        "config/core.toml": root / "config/core.toml.example",
+        "config/elysium.toml": root / "config/elysium.toml.example",
         "config/models.toml": root / "config/models.toml.example",
     }
     result: dict[str, str] = dict(PLUGIN_CONFIGS)
@@ -641,7 +641,7 @@ def _check_core(
     root: Path,
     environment: Mapping[str, str],
 ) -> dict[str, Any] | None:
-    relative = "config/core.toml"
+    relative = "config/elysium.toml"
     path = root / relative
     if not _private_file_check(report, root, relative):
         return None
@@ -1328,14 +1328,14 @@ def create_backup(
             raise DeploymentError(
                 "不能声明 writer 已冻结；仍检测到 Elysium: " + _format_owners(owners)
             )
-    core_path = root / "config/core.toml"
+    core_path = root / "config/elysium.toml"
     boundary_report = DoctorReport(checks=[])
-    if not _private_file_check(boundary_report, root, "config/core.toml"):
-        raise DeploymentError("缺少安全的 config/core.toml")
+    if not _private_file_check(boundary_report, root, "config/elysium.toml"):
+        raise DeploymentError("缺少安全的 config/elysium.toml")
     try:
         core = _load_toml(core_path)
     except (OSError, ValueError, tomllib.TOMLDecodeError) as error:
-        raise DeploymentError("config/core.toml 无法解析") from error
+        raise DeploymentError("config/elysium.toml 无法解析") from error
     storage = core.get("storage", {})
     backend = storage.get("backend", "local") if isinstance(storage, dict) else None
     python = _venv_python(root)

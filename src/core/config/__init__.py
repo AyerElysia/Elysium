@@ -7,7 +7,7 @@
     from src.core.config import init_core_config, get_core_config
 
     # 初始化配置（在使用前必须调用一次）
-    init_core_config("config/core.toml")
+    init_core_config("config/elysium.toml")
 
     # 获取配置实例
     config = get_core_config()

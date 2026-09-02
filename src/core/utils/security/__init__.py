@@ -61,7 +61,7 @@ async def get_api_key(api_key: str = Security(_api_key_header_auth)) -> str:
         logger.warning("API 密钥认证已启用，但 http_router.api_keys 为空，所有请求将被拒绝。")
         raise HTTPException(
             status_code=HTTP_401_UNAUTHORIZED,
-            detail="服务未配置 API 密钥，请在 config/core.toml 的 [http_router] 节中设置 api_keys",
+            detail="服务未配置 API 密钥，请在 config/elysium.toml 的 [http_router] 节中设置 api_keys",
         )
 
     if api_key not in valid_keys:

@@ -14,7 +14,7 @@
 
 ## 1. 当前安全状态
 
-- `config/core.toml [storage].backend` 是 Core 与 Life Engine 的唯一物理后端选择，只接受 `local` 或 `mysql`；
+- `config/elysium.toml [storage].backend` 是 Core 与 Life Engine 的唯一物理后端选择，只接受 `local` 或 `mysql`；
 - `backend=local` 默认是 legacy-local 兼容模式；只有显式设置 `local_selectable_enabled=true` 才打开 SQLite selectable runtime、要求 verified local generation 并取得文件权威；
 - Life Engine 插件配置不再拥有 `enabled` 或 `authoritative_backend` 开关；
 - 本机配置虽可选择 `mysql`，但正式 generation、authority 与 fencing 未通过时必须失败关闭，不得退回混合的 Core=MySQL、Life=local；
@@ -93,7 +93,7 @@ uv run python scripts/backup_life_data.py \
 MySQL 的后端选择、连接、generation 与 authority 只配置在 Core 全局文件：
 
 ```toml
-# config/core.toml
+# config/elysium.toml
 [storage]
 backend = "local"  # 物理后端；另一个合法值是 "mysql"
 local_selectable_enabled = false  # false=legacy-local；true=selectable local
@@ -162,7 +162,7 @@ Memory 的正常业务启动固定使用 `initialize_schema=false`：它只验�
 ```bash
 uv run python scripts/adopt_life_mysql_baseline.py \
   upgrade-memory \
-  --config config/core.toml \
+  --config config/elysium.toml \
   --registry-id life-domain \
   --confirm-memory-upgrade \
   --output /new/evidence/memory-upgrade-<UTC>
@@ -207,7 +207,7 @@ ELYSIUM_TEST_MYSQL_PRESENCE_WORLD_ISOLATED=1
 
 ```bash
 uv run python scripts/adopt_life_mysql_baseline.py \
-  upgrade-runtime-state --config config/core.toml
+  upgrade-runtime-state --config config/elysium.toml
 ```
 
 该模式只应用 checksum 受控的幂等 migration，创建/核验 `runtime_states`、`runtime_events`、singleton writer claim 当前态/只追加事件/事务连接绑定表、两条 claim-event 不可变 trigger，以及三条 runtime-state claim guard trigger；不登记或激活 generation，不修改 authority epoch，不导入本地运行数据，也不启动/停止 Elysium。命令重复执行必须返回相同 schema/当前内容证据；若 migration checksum 或 trigger 漂移则失败。普通业务启动固定使用 `initialize_schema=false`，不能代替迁移器建表。
@@ -231,7 +231,7 @@ Learning 的不可变经历事实允许同一 generation 的所有合法实例�
 
 ```bash
 uv run python scripts/adopt_life_mysql_baseline.py \
-  upgrade-learning --config config/core.toml
+  upgrade-learning --config config/elysium.toml
 ```
 
 该命令只幂等核验/安装 generic claim schema、`life_learning_schema_migrations` v1-v4、两条 Learning event 不可变 trigger，并先通过 v3 退役旧的全域 singleton guard，再由 v4 安装三条仅覆盖 projection INSERT/UPDATE/DELETE 的 projector guard；随后输出 Learning 表的 content-free 行数/root hash。它不取得 Learning claim、不写 `learning_events`/`learning_projections`、不修改 runtime state、generation/epoch 或 claim 业务行，也不启动/停止进程。配置中的 MySQL 密码仍须使用环境变量引用；命令不会接受或打印明文密码。

@@ -4,7 +4,7 @@
 
 ## 1. 配置文件修改
 
-编辑 `config/core.toml`，修改以下字段：
+编辑 `config/elysium.toml`，修改以下字段：
 
 ### 本地数据库（开发测试）
 

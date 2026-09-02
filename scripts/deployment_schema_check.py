@@ -40,7 +40,7 @@ def main(root: Path = ROOT) -> int:
             ModelsConfig,
         )
 
-        CoreConfig.load("config/core.toml", auto_update=False)
+        CoreConfig.load("config/elysium.toml", auto_update=False)
         MCPConfig.load("config/mcp.toml", auto_update=False)
         model_config = ModelsConfig("config/models.toml")
         model_config.require_tasks(PRODUCTION_MODEL_TASKS)

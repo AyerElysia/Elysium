@@ -169,7 +169,7 @@ def _arguments() -> argparse.Namespace:
             "upgrade-memory",
         ),
     )
-    parser.add_argument("--config", type=Path, default=_ROOT / "config" / "core.toml")
+    parser.add_argument("--config", type=Path, default=_ROOT / "config" / "elysium.toml")
     parser.add_argument("--generation-id")
     parser.add_argument("--owner-id")
     parser.add_argument("--registry-id", default="life-domain")
