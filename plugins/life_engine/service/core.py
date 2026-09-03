@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import os
 import time
@@ -20,6 +21,7 @@ from datetime import time as dtime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
+from types import SimpleNamespace
 
 from sqlalchemy.exc import (
     DBAPIError,
@@ -275,11 +277,26 @@ from .subconscious_context import (
     SubconsciousSummary,
 )
 from .heartbeat_rolling import (
+    estimate_payload_chars,
     format_new_events_text,
     iter_selected_events,
     load_heartbeat_rolling,
     rolling_payloads_only,
     save_heartbeat_rolling,
+)
+from ..core.context_stewardship import (
+    DEFAULT_CHECKPOINT_MAX_BYTES,
+    DEFAULT_EMERGENCY_REFERENCE_MAX_BYTES,
+    DEFAULT_PRESSURE_MAX_GROUPS,
+    HEARTBEAT_RUNTIME_KEY,
+    LiveContextWindow,
+    apply_pending_subject_checkpoint,
+    archive_target_for_runtime,
+    ensure_compression_required_appended,
+    has_compression_required_payload,
+    payloads_require_compression,
+    register_live_context,
+    unregister_live_context,
 )
 from .world_projection import (
     WORLD_LEGACY_IMPORT_EVENT,
@@ -9434,6 +9451,132 @@ class LifeEngineService(BaseService):
             return stamped
         return _now_iso()
 
+    def _instantiate_heartbeat_usable(
+        self,
+        usable_cls: Any,
+        *,
+        tool_call_id: str,
+        source_occurrence_id: str,
+    ) -> Any:
+        """Construct a heartbeat tool or action with a verifiable actor origin."""
+
+        from src.app.plugin_system.base import BaseAction
+
+        if inspect.isclass(usable_cls) and issubclass(usable_cls, BaseAction):
+            instance = usable_cls(
+                SimpleNamespace(stream_id="chat_global", platform="life_engine"),
+                self.plugin,
+            )
+            instance._trigger_message = SimpleNamespace(
+                extra={
+                    "life_turn_scope": {
+                        "consciousness_instance_id": "chat_global",
+                        "turn_key": str(source_occurrence_id or ""),
+                        "stream_id": "chat_global",
+                    }
+                }
+            )
+            return instance
+        return usable_cls(plugin=self.plugin)
+
+    def _heartbeat_workspace_path(self) -> str:
+        return str(self._cfg().settings.workspace_path or "").strip()
+
+    def _heartbeat_compaction_trigger_chars(self) -> int:
+        chatter = getattr(self._cfg(), "chatter", None)
+        return max(
+            1,
+            int(getattr(chatter, "context_compaction_trigger_chars", 120_000) or 120_000),
+        )
+
+    def _heartbeat_compaction_list_limits(self) -> tuple[int, int]:
+        chatter = getattr(self._cfg(), "chatter", None)
+        max_groups = int(
+            getattr(chatter, "context_pressure_max_groups", DEFAULT_PRESSURE_MAX_GROUPS)
+            or DEFAULT_PRESSURE_MAX_GROUPS
+        )
+        max_bytes = int(
+            getattr(
+                chatter,
+                "context_emergency_reference_max_bytes",
+                DEFAULT_EMERGENCY_REFERENCE_MAX_BYTES,
+            )
+            or DEFAULT_EMERGENCY_REFERENCE_MAX_BYTES
+        )
+        return max(1, max_groups), max(256, max_bytes)
+
+    def _register_heartbeat_live_context(self, payloads: list[Any]) -> None:
+        typed = [payload for payload in payloads if isinstance(payload, LLMPayload)]
+        namespace, subdir = archive_target_for_runtime(HEARTBEAT_RUNTIME_KEY)
+        register_live_context(
+            LiveContextWindow(
+                runtime_key=HEARTBEAT_RUNTIME_KEY,
+                payloads=typed,
+                archive_namespace=namespace,
+                local_archive_subdir=subdir,
+                workspace_path=self._heartbeat_workspace_path(),
+            )
+        )
+
+    def _apply_heartbeat_subject_checkpoint(self, response: Any) -> bool:
+        payloads = getattr(response, "payloads", None)
+        if not isinstance(payloads, list):
+            return False
+        chatter = getattr(self._cfg(), "chatter", None)
+        max_bytes = max(
+            1024,
+            int(
+                getattr(
+                    chatter,
+                    "self_continuity_checkpoint_max_bytes",
+                    DEFAULT_CHECKPOINT_MAX_BYTES,
+                )
+                or DEFAULT_CHECKPOINT_MAX_BYTES
+            ),
+        )
+        namespace, _subdir = archive_target_for_runtime(HEARTBEAT_RUNTIME_KEY)
+        try:
+            result = apply_pending_subject_checkpoint(
+                "chat_global",
+                [payload for payload in payloads if isinstance(payload, LLMPayload)],
+                max_checkpoint_bytes=max_bytes,
+                runtime_key=HEARTBEAT_RUNTIME_KEY,
+                archive_namespace=namespace,
+            )
+        except Exception as exc:  # noqa: BLE001 - derived projection fails closed
+            logger.warning(
+                "心跳主体连续性检查点未能在安全边界安装，原上下文保持不变: "
+                f"error_type={type(exc).__name__}"
+            )
+            return False
+        if result.triggered:
+            response.payloads = result.payloads
+            logger.info(
+                "心跳主体自述连续性检查点已安装: "
+                f"checkpoint_id={result.checkpoint_id} revision={result.revision} "
+                f"released_groups={result.released_groups} "
+                f"bytes={result.before_utf8_bytes}->{result.after_utf8_bytes}"
+            )
+        self._register_heartbeat_live_context(
+            list(getattr(response, "payloads", None) or [])
+        )
+        return bool(result.triggered)
+
+    def _ensure_heartbeat_compression_turn(self, response: Any) -> None:
+        payloads = getattr(response, "payloads", None)
+        if not isinstance(payloads, list):
+            return
+        max_groups, max_bytes = self._heartbeat_compaction_list_limits()
+        updated = ensure_compression_required_appended(
+            [payload for payload in payloads if isinstance(payload, LLMPayload)],
+            estimate=estimate_payload_chars,
+            trigger_chars=self._heartbeat_compaction_trigger_chars(),
+            max_groups=max_groups,
+            max_bytes=max_bytes,
+        )
+        response.payloads = updated
+        self._register_heartbeat_live_context(updated)
+
     async def _run_heartbeat_tool_call_execution(
         self,
         tool_name: str,
@@ -9456,10 +9599,11 @@ class LifeEngineService(BaseService):
             return f"未知工具: {tool_name}", False
 
         try:
-            tool_instance = usable_cls(plugin=self.plugin)
-            # Producer-side result budgets are task contracts.  Heartbeat has
-            # no trigger Message to infer this from, so bind its identity
-            # explicitly before executing any shared retrieval capability.
+            tool_instance = self._instantiate_heartbeat_usable(
+                usable_cls,
+                tool_call_id=tool_call_id,
+                source_occurrence_id=source_occurrence_id,
+            )
             tool_instance._runtime_task_name = "core"
             bind_runtime = getattr(tool_instance, "_bind_runtime_context", None)
             if callable(bind_runtime):
@@ -9470,6 +9614,7 @@ class LifeEngineService(BaseService):
             tool_instance._life_source_occurrence_id = source_occurrence_id
             tool_instance._life_source_occurred_at = source_occurred_at
             tool_instance._life_source_instance_id = "chat_global"
+            tool_instance._context_runtime_key = HEARTBEAT_RUNTIME_KEY
             call_args = dict(args)
             if should_strip_auto_reason_argument(tool_instance.execute, call_args):
                 call_args.pop("reason", None)
@@ -10095,10 +10240,14 @@ class LifeEngineService(BaseService):
         name = str(tool_name or "").strip()
         if name.startswith("tool-"):
             name = name[5:]
+        elif name.startswith("action-"):
+            name = name[7:]
         if not name or name == "nucleus_rest_heartbeat":
             return False
         if name == "nucleus_proactive_query":
             return False
+        if name == "author_self_continuity_checkpoint":
+            return True
         if name == "nucleus_todo":
             action = str(args.get("action") or "list").strip().lower()
             return action in {"write", "update_plan", "todo_write"}
@@ -10166,17 +10315,6 @@ class LifeEngineService(BaseService):
         if system_prompt is None:
             # SOUL 权威文本不可用——没有灵魂就不说话
             return HeartbeatModelResult("", None)
-        section_texts = await self._render_heartbeat_sections()
-        opportunity_page = None
-        bus = getattr(self, "_opportunity_bus", None)
-        if bus is not None:
-            get_page = getattr(bus, "get_pending_page", None)
-            if callable(get_page):
-                opportunity_page = get_page()
-        user_prompt = self._build_heartbeat_model_prompt(
-            wake_context,
-            section_texts=section_texts,
-        )
         (
             subconscious_delivery_id,
             subconscious_delivery_marker,
@@ -10189,24 +10327,38 @@ class LifeEngineService(BaseService):
             registry.register(tool)
         request.add_payload(LLMPayload(ROLE.TOOL, tools))
 
-        request.add_payload(LLMPayload(ROLE.USER, Text(user_prompt)))
+        workspace = self._heartbeat_workspace_path()
+        try:
+            baseline_rolling = await load_heartbeat_rolling(
+                service=self,
+                workspace_path=workspace,
+            )
+        except Exception as exc:  # noqa: BLE001 - derived snapshot fails closed to empty
+            logger.warning(
+                "读取心跳滚动上下文失败，本拍从空链开始: "
+                f"error_type={type(exc).__name__}"
+            )
+            baseline_rolling = []
+        rolling = list(baseline_rolling)
+        wake_text = str(wake_context or "")
+        if wake_text.strip():
+            rolling.append(LLMPayload(ROLE.USER, Text(wake_text)))
+        max_groups, max_bytes = self._heartbeat_compaction_list_limits()
+        rolling = ensure_compression_required_appended(
+            rolling,
+            estimate=estimate_payload_chars,
+            trigger_chars=self._heartbeat_compaction_trigger_chars(),
+            max_groups=max_groups,
+            max_bytes=max_bytes,
+        )
+        for payload in rolling:
+            request.add_payload(payload)
+        self._register_heartbeat_live_context(list(request.payloads))
         if subconscious_delivery_id:
             request.register_context_delivery(
                 subconscious_delivery_id,
-                user_prompt,
+                wake_text,
                 marker=subconscious_delivery_marker,
-            )
-        if world_perception is not None:
-            request.register_context_delivery(
-                world_perception.delivery_id,
-                user_prompt,
-                marker=world_perception.delivery_marker,
-            )
-        if opportunity_page is not None:
-            request.register_context_delivery(
-                str(opportunity_page.delivery_id),
-                user_prompt,
-                marker=str(opportunity_page.delivery_marker),
             )
 
         # 心跳请求超时与心跳间隔解耦：慢模型（长 prompt 的推理模型）单次可达上百秒，
@@ -10216,7 +10368,7 @@ class LifeEngineService(BaseService):
         logger.debug(
             f"life_engine heartbeat request: "
             f"system_prompt_len={len(system_prompt)} "
-            f"user_prompt_len={len(user_prompt)} "
+            f"rolling_payloads={len(rolling)} "
             f"tools_count={len(tools)}"
         )
 
@@ -10250,20 +10402,8 @@ class LifeEngineService(BaseService):
                     if subconscious_delivery_id:
                         fallback_request.register_context_delivery(
                             subconscious_delivery_id,
-                            user_prompt,
+                            wake_text,
                             marker=subconscious_delivery_marker,
-                        )
-                    if world_perception is not None:
-                        fallback_request.register_context_delivery(
-                            world_perception.delivery_id,
-                            user_prompt,
-                            marker=world_perception.delivery_marker,
-                        )
-                    if opportunity_page is not None:
-                        fallback_request.register_context_delivery(
-                            str(opportunity_page.delivery_id),
-                            user_prompt,
-                            marker=str(opportunity_page.delivery_marker),
                         )
                     response = await _await_with_heartbeat_deadline(
                         lambda: fallback_request.send(stream=False),
@@ -10297,11 +10437,7 @@ class LifeEngineService(BaseService):
         stop_reason = ""
         stop_stage = ""
         last_round_outcomes: list[str] = []
-        perception_receipt = (
-            self._heartbeat_perception_receipt(response, world_perception)
-            if world_perception is not None
-            else None
-        )
+        perception_receipt = None
         subconscious_receipt = (
             self._heartbeat_subconscious_receipt(
                 response,
@@ -10314,18 +10450,7 @@ class LifeEngineService(BaseService):
             raise PerceptionDeliveryUnverified(
                 "heartbeat model did not receive the exact subconscious activity projection"
             )
-        if world_perception is not None and perception_receipt is None:
-            raise PerceptionDeliveryUnverified(
-                "heartbeat model did not receive the exact World projection"
-            )
-        opportunity_receipt = (
-            self._heartbeat_subconscious_receipt(
-                response,
-                str(opportunity_page.delivery_id),
-            )
-            if opportunity_page is not None
-            else None
-        )
+        checkpoint_installed = False
 
         for turn_index in range(max_rounds):
             try:
