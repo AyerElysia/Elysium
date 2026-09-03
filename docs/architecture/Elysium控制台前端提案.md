@@ -1,10 +1,10 @@
 # Elysium Console：项目级可演进前端提案
 
-> 状态：用户已于 2026-08-02 批准；Stage 0 交互原型与契约基线已完成
+> 状态：用户已于 2026-08-02 批准；Stage 1A 本机只读数据观测台已实现，待用户手工启动后的真实链路验收
 >
-> 日期：2026-08-02
+> 日期：2026-08-02；实现更新：2026-09-02
 >
-> 目标：为 Elysium 建立统一、美观、可随插件增删而演进的项目级前端，并把 Voice Live 作为第一条旗舰体验跑通。
+> 目标：为 Elysium 建立统一、美观、可随插件增删而演进的项目级前端；第一份可运行交付先让用户看清爱莉实际留下的生命数据，Voice Live 仍是后续旗舰体验。
 
 ## 1. 结论
 
@@ -106,6 +106,32 @@ flowchart LR
 - 读取现有管理器，不复制插件加载逻辑；
 - 不成为 Life Engine 的第二个中枢；
 - 不控制 Elysium 主进程生命周期。
+
+### 4.1.1 已实现的 Stage 1A 数据观测台
+
+2026-09-02 已新增 `plugins/elysium_console`，挂载在现有 HTTP 监听器的
+`/console/`。当前生产切片刻意采用零构建静态 Shell：它不引入新的 Node
+运行时或外部 CDN，随插件直接加载，先把“看得见数据”这条最小闭环做稳。
+后续迁移到 React/Vite 时必须保持同一只读数据合同和 URL，不得因为更换前端
+框架而重写权威数据语义。
+
+当前固定提供八个数据视图：
+
+1. 概览：Life Engine、Memory、事件账本、意识实例与工作区完整性；
+2. 生命时间线：不可变 Life Event 的有界尾页；
+3. 主体文档：当前权威 `SOUL.md`、`USER.md`、`MEMORY.md`；
+4. 记忆经历：不可变 occurrence 顺序与稳定 frontier/cursor；
+5. 世界状态：有来源断言，矛盾证据并存，大值按引用续读；
+6. 持续关注：只展示主体明确写入 AttentionThread 的公开线索；
+7. 文件空间：爱莉工作区的允许目录、作品与严格 UTF-8 文本分块；
+8. 数据地图：区分权威证据、可重建投影、索引和文件作品。
+
+这些视图是稳定的生命数据域，不是对插件行为的硬编码菜单。Voice Live、
+Minecraft、直播等动态体验贡献仍按后续能力注册表接入。
+
+Stage 1A 不提供“成长分数”。它展示数量、来源、hash、cursor、frontier、
+健康与连续性，让用户依据证据理解爱莉；基础设施不得替主体定义重要性、人格
+成熟度或认知价值。
 
 ### 4.2 能力注册表
 
@@ -284,7 +310,7 @@ Module Federation 更适合多团队、独立部署的大型微前端。Elysium 
 
 ## 9. 技术方案
 
-### 9.1 前端
+### 9.1 目标前端技术栈
 
 - React 19 + TypeScript；
 - Vite 构建，生产静态资源由 FastAPI 同源提供；
@@ -295,11 +321,36 @@ Module Federation 更适合多团队、独立部署的大型微前端。Elysium 
 - Vitest + Testing Library + Playwright；
 - 生产构建产物可提交或随发布构建，仓库固定 Node 与包管理器版本并提交 lockfile。
 
+Stage 1A 当前使用语义化 HTML、CSS Custom Properties 与原生 JavaScript，所有
+服务端数据只通过 DOM `textContent` 渲染，不执行数据中的 HTML。它是可运行的
+首个切片，不否定上述长期技术栈；升级必须在有复杂页面状态、动态插件贡献或
+组件复用的真实需求时进行，而不是为了框架本身重写。
+
 Vite 官方支持通过构建 manifest 与传统后端集成；React 官方 `lazy`/`Suspense` 支持按页面延迟加载。配置协议以 JSON Schema 2020-12 的稳定概念为参考，但保留 Elysium 现有 UI 扩展字段。
 
 ### 9.2 后端
 
-建议新增以下接口：
+Stage 1A 已实现以下全部只读接口：
+
+```text
+GET /console/api/v1/overview
+GET /console/api/v1/timeline
+GET /console/api/v1/subject
+GET /console/api/v1/memory
+GET /console/api/v1/memory/experiences
+GET /console/api/v1/world
+GET /console/api/v1/world/assertions/{assertion_id}/value
+GET /console/api/v1/attention
+GET /console/api/v1/workspace
+GET /console/api/v1/workspace/text
+GET /console/api/v1/catalog
+```
+
+所有接口消费 Life Engine 正式 Port/Service，不直接访问数据库，不提供任意 SQL，
+也不提供任意路径读取。大正文按 UTF-8 字节边界分页，响应明确携带大小、hash、
+frontier 或 continuation；有界投影不冒充权威原文。
+
+后续完整 Shell 建议新增以下能力接口：
 
 ```text
 GET  /console/api/v1/bootstrap
@@ -341,6 +392,9 @@ Voice Live 继续使用自己的实时 WebSocket，不经全局 SSE 转发音频
 验收：原型覆盖 1440p、1080p 和窄屏；用户批准视觉和信息架构后才进入代码实现。
 
 ### 阶段 1：稳定 Shell 与只读控制台
+
+当前进度：Stage 1A 数据观测切片已实现；动态 UI contribution、受控嵌入与
+只读配置 Schema 仍待后续阶段完成。
 
 交付：
 
@@ -434,28 +488,31 @@ Voice Live 继续使用自己的实时 WebSocket，不经全局 SSE 转发音频
 | 视觉漂亮但不可维护 | 设计令牌、组件状态矩阵、视觉回归和可访问性门槛 |
 | 高频插件变化破坏菜单 | 菜单来自当前运行时能力，不来自前端硬编码 |
 
-## 13. 本轮不做的事情
+## 13. Stage 1A 不做的事情
 
-- 不修改任何功能代码；
 - 不停止、重启或自动拉起 Elysium；
 - 不让前端管理 Elysium 主进程；
 - 不把 API Key、Seed-VC token 或 Core API Key写入前端；
+- 不提供数据库写入、文件写入、删除、修复或配置编辑；
+- 不读取工作区允许边界以外的基础设施文件，不跟随符号链接；
 - 不立刻引入 Module Federation；
-- 不在用户批准视觉原型前批量重写现有页面。
+- 不在数据观测闭环尚未真实验收前批量重写现有页面。
 
-## 14. 请求批准的决策
+## 14. 已批准与当前决议
 
-建议批准以下默认方案：
+已经批准并继续遵守以下方案：
 
 1. 产品定位：`Elysium Console`，不是通用后台；
 2. 地址：`http://127.0.0.1:18000/console/`；
 3. 架构：稳定 Shell + 运行时能力注册 + native/embedded/link 三种贡献；
-4. 技术栈：React + TypeScript + Vite，同源由 FastAPI 提供；
-5. 第一旗舰路径：Voice Live；
+4. 技术栈：Stage 1A 先用零构建静态 Shell；复杂动态 Shell 再迁移 React + TypeScript + Vite；
+5. 第一可运行路径：生命数据观测；第一旗舰体验仍是 Voice Live；
 6. 主进程边界：永远由用户手工启动，控制台只报告状态；
 7. 先做高保真原型和合同，再进入功能实现。
 
-批准后从阶段 0 开始；阶段 0 的视觉原型再次获得确认后，再进入阶段 1 和阶段 2 的实现与真实全链路验收。
+当前 Stage 1A 代码完成后，必须由用户手工启动 Elysium，并访问
+`http://127.0.0.1:18000/console/` 验证真实 Life Engine 数据。该真实启动证据
+完成前只允许本地提交，不推送；通过后才进入正式推送与下一阶段。
 
 ## 15. 参考
 

@@ -73,8 +73,22 @@ from .context_compaction import (
 )
 from .context_compaction import (
     compact_payloads,
-    compress_dropped_payload_groups,
-    hierarchical_compact_payloads,
+    is_summary_payload,
+)
+from .context_stewardship import (
+    DEFAULT_CHECKPOINT_MAX_BYTES,
+    DEFAULT_EMERGENCY_REFERENCE_MAX_BYTES,
+    DEFAULT_PRESSURE_MAX_GROUPS,
+    DEFAULT_PRESSURE_RATIO,
+    append_context_pressure_notice,
+    apply_pending_subject_checkpoint,
+    archive_context_groups,
+    build_context_pressure_notice,
+    build_mechanical_omission_payloads,
+    mechanically_bound_payloads,
+    reset_pending_subject_checkpoint,
+    reset_transient_context_pressure_notices,
+    strip_context_pressure_notices,
 )
 from .multimodal import (
     MediaBudget,
@@ -1897,6 +1911,8 @@ class LifeChatter(BaseChatter):
         cls._GLOBAL_RUNTIME = None
         cls._GLOBAL_USABLE_MAP = None
         cls._GLOBAL_ROLLING_CONTEXT_REVISION = 0
+        reset_pending_subject_checkpoint(cls.instance_id)
+        reset_transient_context_pressure_notices()
 
     def _configured_primary_task_name(self) -> str:
         """返回 life_chatter 主任务名；优先读 chatter_task_name，留空时跟随 task_name，再留空用 expression。"""
@@ -2050,7 +2066,11 @@ class LifeChatter(BaseChatter):
         *,
         chatter_config: Any = None,
     ) -> None:
-        """为长生命周期 request 安装可配置的轻量上下文压缩 hook。"""
+        """Install a content-neutral emergency omission hook.
+
+        Semantic continuity is authored through the subject action. The kernel
+        hook exists only so a hard model limit never copies random fragments.
+        """
         context_manager = getattr(request, "context_manager", None)
         if context_manager is None or not hasattr(context_manager, "compression_hook"):
             return
@@ -2070,15 +2090,15 @@ class LifeChatter(BaseChatter):
                 or _CONTEXT_COMPRESSION_MAX_GROUPS
             ),
         )
-        max_part_chars = max(
-            1,
+        max_reference_bytes = max(
+            256,
             int(
                 getattr(
                     chatter_config,
-                    "context_compression_max_part_chars",
-                    _CONTEXT_COMPRESSION_MAX_PART_CHARS,
+                    "context_emergency_reference_max_bytes",
+                    DEFAULT_EMERGENCY_REFERENCE_MAX_BYTES,
                 )
-                or _CONTEXT_COMPRESSION_MAX_PART_CHARS
+                or DEFAULT_EMERGENCY_REFERENCE_MAX_BYTES
             ),
         )
 
@@ -2086,11 +2106,11 @@ class LifeChatter(BaseChatter):
             dropped_groups: list[list[LLMPayload]],
             remaining_payloads: list[LLMPayload],
         ) -> list[LLMPayload]:
-            return compress_dropped_payload_groups(
+            del remaining_payloads
+            return build_mechanical_omission_payloads(
                 dropped_groups,
-                remaining_payloads,
-                max_groups=max_groups,
-                max_part_chars=max_part_chars,
+                max_group_refs=max_groups,
+                max_bytes=max_reference_bytes,
             )
 
         context_manager.compression_hook = compression_hook
@@ -2332,6 +2352,21 @@ class LifeChatter(BaseChatter):
             )
         return cleaned_payloads
 
+    @staticmethod
+    def _without_retired_context_summaries(
+        payloads: list[LLMPayload],
+    ) -> list[LLMPayload]:
+        """Remove only strict legacy copier summaries from derived context.
+
+        The retired compressor generated a single, exact USER envelope that
+        copied arbitrary message and tool-result fragments.  It is not subject
+        authored continuity and must not be replayed.  Ordinary user text that
+        merely mentions the marker remains untouched, and authoritative
+        trajectories/Life Events are never rewritten by this read projection.
+        """
+
+        return [payload for payload in payloads if not is_summary_payload(payload)]
+
     def _bind_trajectory_identity(
         self,
         response: Any,
@@ -2560,6 +2595,7 @@ class LifeChatter(BaseChatter):
 
     @classmethod
     def _snapshot_data_for_payloads(cls, payloads: list[LLMPayload]) -> dict[str, Any]:
+        payloads = cls._without_retired_context_summaries(payloads)
         payloads = cls._without_retired_think_history(payloads)
         payloads = cls._without_retired_proactive_history(payloads)
         payloads = cls._without_retired_reaction_guidance(payloads)
@@ -2699,43 +2735,44 @@ class LifeChatter(BaseChatter):
         )
 
     def _maybe_compact_runtime_context(self, response: Any) -> Any:
-        """Compact and safely write back the long-lived request before send."""
+        """Apply only a checkpoint explicitly authored by the active subject."""
         payloads = getattr(response, "payloads", None)
         if not isinstance(payloads, list):
             return None
-        _, _, max_part_chars, trigger, target, min_recent, enabled = (
-            self._rolling_context_compaction_options()
-        )
-        if not enabled:
-            return None
         chatter = getattr(self._get_config(), "chatter", None)
-        summary_max = max(
-            200,
+        if not bool(getattr(chatter, "context_stewardship_enabled", True)):
+            return None
+        checkpoint_max_bytes = max(
+            1024,
             int(
-                getattr(chatter, "context_compaction_summary_max_chars", 12_000)
-                or 12_000
+                getattr(
+                    chatter,
+                    "self_continuity_checkpoint_max_bytes",
+                    DEFAULT_CHECKPOINT_MAX_BYTES,
+                )
+                or DEFAULT_CHECKPOINT_MAX_BYTES
             ),
         )
-        result = hierarchical_compact_payloads(
-            [p for p in payloads if isinstance(p, LLMPayload)],
-            estimate=self._estimate_payload_chars,
-            trigger_chars=trigger,
-            target_chars=target,
-            min_recent_groups=min_recent,
-            summary_max_chars=summary_max,
-            max_part_chars=max_part_chars,
-        )
+        try:
+            result = apply_pending_subject_checkpoint(
+                self.instance_id,
+                [p for p in payloads if isinstance(p, LLMPayload)],
+                max_checkpoint_bytes=checkpoint_max_bytes,
+            )
+        except Exception as exc:  # noqa: BLE001 - derived projection fails closed
+            logger.warning(
+                "主体连续性检查点未能在安全边界安装，原上下文保持不变: "
+                f"error_type={type(exc).__name__}"
+            )
+            return None
         if result.triggered:
             response.payloads = result.payloads
             logger.info(
-                "life_chatter 运行态上下文已压缩: "
-                f"payloads={len(result.payloads)} chars={result.before_chars}->{result.after_chars}"
+                "主体自述连续性检查点已安装: "
+                f"checkpoint_id={result.checkpoint_id} revision={result.revision} "
+                f"released_groups={result.released_groups} "
+                f"bytes={result.before_utf8_bytes}->{result.after_utf8_bytes}"
             )
-            if not result.target_reached:
-                logger.warning(
-                    "life_chatter 运行态上下文压缩后仍超过目标: "
-                    f"chars={result.after_chars} target={target}"
-                )
         return result
 
     @classmethod
@@ -2861,6 +2898,7 @@ class LifeChatter(BaseChatter):
             for payload in (self._deserialize_payload(item) for item in payload_items)
             if payload is not None
         ]
+        payloads = self._without_retired_context_summaries(payloads)
         payloads = self._without_retired_think_history(payloads)
         payloads = self._without_retired_proactive_history(payloads)
         payloads = self._without_retired_reaction_guidance(payloads)
@@ -2882,13 +2920,47 @@ class LifeChatter(BaseChatter):
         ]
         if not current_payloads:
             return
-        # Hard envelope only — hierarchical policy already ran via maybe.
-        snapshot_payloads, _, _ = self._compact_rolling_context_payloads_from_config(
-            current_payloads
+        service = self._get_life_service()
+        budget, max_groups, _, _, _, _, _ = (
+            self._rolling_context_compaction_options()
         )
+        chatter = getattr(self._get_config(), "chatter", None)
+        reference_max_bytes = max(
+            256,
+            int(
+                getattr(
+                    chatter,
+                    "context_emergency_reference_max_bytes",
+                    DEFAULT_EMERGENCY_REFERENCE_MAX_BYTES,
+                )
+                or DEFAULT_EMERGENCY_REFERENCE_MAX_BYTES
+            ),
+        )
+        bounded, archive_records = mechanically_bound_payloads(
+            current_payloads,
+            estimate=self._estimate_payload_chars,
+            hard_budget=budget,
+            reference_max_groups=max_groups,
+            reference_max_bytes=reference_max_bytes,
+        )
+        if archive_records:
+            try:
+                await archive_context_groups(
+                    archive_records,
+                    service=service,
+                    workspace_path=self._resolve_workspace_path(service),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - keep live context intact
+                logger.warning(
+                    "归档快照省略组失败，本轮不写入有损派生快照: "
+                    f"error_type={type(exc).__name__}"
+                )
+                return
+        snapshot_payloads = bounded.payloads
         data = self._snapshot_data_for_payloads(snapshot_payloads)
 
-        service = self._get_life_service()
         selected_store = None
         if service is not None:
             get_store = getattr(service, "runtime_state_store", None)
@@ -3609,6 +3681,9 @@ class LifeChatter(BaseChatter):
             "- `nucleus_view_screen`：查看 Ayer 当前屏幕。\n"
             "- `nucleus_manage_todo`：创建 TODO。\n"
             "- `inner_dialogue`：把念头沉进心里慢慢想（异步；想通了会自己浮回）。\n"
+            "- `author_self_continuity_checkpoint`：只有你决定释放旧工作上下文时，"
+            "依据临时容量清单亲自写给未来自己的连续性说明；系统不会替你总结。\n"
+            "- `read_context_group`：按检查点或机械省略通知里的 ctxg_ 引用，分页读取精确旧组。\n"
             "- `tool-inspect_media`：把图片/视频/语音提升为原生多模态输入。\n"
             "- **工具名不带 `tool-` 前缀**（`tool-` 前缀仅限 `tool-inspect_media` 等平台工具）；普通工具直接使用 `nucleus_bash`、`nucleus_grep_file` 这类名字，不要加前缀。\n"
             "- 不要把 `reason`、`thought` 等元信息写进 `content`。"
@@ -4041,6 +4116,42 @@ class LifeChatter(BaseChatter):
         """把后缀提示词临时挂到最后一个 USER payload。"""
         LifeChatterContextAssembler.append_suffix_to_last_user(response, context_text)
 
+    def _append_context_pressure_notice(self, response: Any) -> None:
+        """Append one technical pressure projection for this send only."""
+
+        chatter = getattr(self._get_config(), "chatter", None)
+        if not bool(getattr(chatter, "context_stewardship_enabled", True)):
+            return
+        ratio = float(
+            getattr(chatter, "context_pressure_ratio", DEFAULT_PRESSURE_RATIO)
+            or DEFAULT_PRESSURE_RATIO
+        )
+        max_groups = int(
+            getattr(
+                chatter,
+                "context_pressure_max_groups",
+                DEFAULT_PRESSURE_MAX_GROUPS,
+            )
+            or DEFAULT_PRESSURE_MAX_GROUPS
+        )
+        max_bytes = int(
+            getattr(
+                chatter,
+                "context_emergency_reference_max_bytes",
+                DEFAULT_EMERGENCY_REFERENCE_MAX_BYTES,
+            )
+            or DEFAULT_EMERGENCY_REFERENCE_MAX_BYTES
+        )
+        append_context_pressure_notice(
+            response,
+            build_context_pressure_notice(
+                response,
+                trigger_ratio=ratio,
+                max_groups=max_groups,
+                max_bytes=max_bytes,
+            ),
+        )
+
     @staticmethod
     def _register_suffix_context_delivery(
         response: Any,
@@ -4365,6 +4476,7 @@ class LifeChatter(BaseChatter):
     def _strip_suffix_context(response: Any) -> None:
         """从 payload 中移除发送前临时注入的后缀提示词。"""
         LifeChatterContextAssembler.strip_suffix_from_user_payloads(response)
+        strip_context_pressure_notices(response)
 
     @staticmethod
     def _strip_transient_context(response: Any) -> None:
@@ -5919,6 +6031,7 @@ class LifeChatter(BaseChatter):
                 # Compact before transient suffix/media injection so rollback snapshots
                 # and the current newest group remain stable.
                 self._maybe_compact_runtime_context(rt.response)
+                self._append_context_pressure_notice(rt.response)
                 pending_runtime_delivery: Any | None = None
                 if initial_turn:
                     try:

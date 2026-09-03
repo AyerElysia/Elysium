@@ -131,6 +131,10 @@ class LifeEnginePlugin(BasePlugin):
                 LifeSendTextAction,
                 LifeSendVoiceAction,
             )
+            from .context_stewardship import (
+                LifeAuthorSelfContinuityCheckpointAction,
+                LifeReadContextGroupTool,
+            )
 
             components.extend(
                 [
@@ -140,6 +144,8 @@ class LifeEnginePlugin(BasePlugin):
                     LifeSendImageAction,
                     LifeSendVoiceAction,
                     LifePassAndWaitAction,
+                    LifeAuthorSelfContinuityCheckpointAction,
+                    LifeReadContextGroupTool,
                     LifeRecognizeVoiceTool,
                     LifeSaveMediaTool,
                     LifeRecordInnerMonologueAction,

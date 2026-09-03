@@ -489,8 +489,12 @@ class LLMContextManager:
         if hook_payloads:
             combined = pinned + hook_payloads + remaining_payloads
             while len(kept_groups) > 1 and token_counter(combined) > token_budget:
-                kept_groups.pop(0)
+                dropped_groups.append(kept_groups.pop(0))
                 remaining_payloads = self._flatten_groups(kept_groups)
+                hook_payloads = self._apply_compression_hook(
+                    dropped_groups,
+                    remaining_payloads,
+                )
                 combined = pinned + hook_payloads + remaining_payloads
             return self._fit_oversized_text_payloads(
                 combined,

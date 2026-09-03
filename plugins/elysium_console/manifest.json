@@ -1,0 +1,23 @@
+{
+  "name": "elysium_console",
+  "version": "0.1.0",
+  "description": "Local read-only observatory for Elysium life data",
+  "author": "Elysium",
+  "license": "GPL-3.0",
+  "dependencies": {
+    "plugins": ["life_engine"],
+    "components": []
+  },
+  "include": [
+    {
+      "component_type": "router",
+      "component_name": "elysium_console",
+      "dependencies": [],
+      "enabled": true
+    }
+  ],
+  "entry_point": "plugin.py",
+  "min_core_version": "1.0.0",
+  "python_dependencies": ["fastapi"],
+  "dependencies_required": true
+}

@@ -26,6 +26,47 @@ def test_background_cognition_uses_quality_first_total_deadlines() -> None:
     assert config.curiosity.timeout_seconds == 300.0
 
 
+def test_chatter_uses_subject_authored_context_stewardship_defaults() -> None:
+    chatter = LifeEngineConfig.ChatterSection()
+
+    assert chatter.context_stewardship_enabled is True
+    assert chatter.context_pressure_ratio == 0.75
+    assert chatter.context_pressure_max_groups == 24
+    assert chatter.self_continuity_checkpoint_max_bytes == 32 * 1024
+    assert chatter.context_emergency_reference_max_bytes == 8 * 1024
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("context_pressure_ratio", 0.09),
+        ("context_pressure_ratio", 1.0),
+        ("context_pressure_max_groups", 0),
+        ("context_pressure_max_groups", 65),
+        ("self_continuity_checkpoint_max_bytes", 1023),
+        ("self_continuity_checkpoint_max_bytes", 65 * 1024),
+        ("context_emergency_reference_max_bytes", 255),
+        ("context_emergency_reference_max_bytes", 33 * 1024),
+    ],
+)
+def test_chatter_context_stewardship_rejects_invalid_bounds(
+    field: str,
+    value: float,
+) -> None:
+    with pytest.raises(ValueError):
+        LifeEngineConfig.ChatterSection(**{field: value})
+
+
+def test_retired_compaction_thresholds_no_longer_govern_subject_continuity() -> None:
+    chatter = LifeEngineConfig.ChatterSection(
+        context_compaction_trigger_chars=2_000,
+        context_compaction_target_chars=3_000,
+    )
+
+    assert chatter.context_compaction_target_chars == 3_000
+    assert chatter.context_stewardship_enabled is True
+
+
 @pytest.mark.parametrize(
     "section_type",
     [
