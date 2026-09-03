@@ -10,14 +10,13 @@
 
 TTS 只把爱莉已经决定表达的文字变成声音。它不替她决定说什么、何时说，不拥有独立人格、记忆或情绪权威。
 
-需要区分四种场景：
+需要区分三种场景：
 
 - **普通消息 TTS**：Life Chatter 的 `life_send_voice`，以及非 Life Chatter 的通用 TTS Action，消费本地消息 TTS Service；
-- **N.E.K.O Surface 自动语音**：文字回复由 Surface Adapter 自动交给本地 TTS Service，并按回复顺序播放；显式 TTS Action 必须被抑制，避免一条回复生成两份声音；
 - **直播 TTS**：直播运行时拥有独立的有界 HTTP 客户端、切句、内容寻址音频与舞台播放回执，可配置本地端点，但不复用聊天动作的发送语义；
 - **Voice Live**：持续听说、停顿与打断的实时意识实例，不是“聊天文本再接一次 TTS”。
 
-这些链可以使用本地模型，但场景责任不同。当前普通消息和 Surface 自动语音共享 `tts_voice_plugin:service:tts`；该 Service 以一个稳定接口封装 vLLM-Omni 与 GPT-SoVITS，具体后端属于本机部署选择。直播仍由自己的客户端与配置负责，不能把直播播放成功当成消息平台发送成功。
+这些链可以使用本地模型，但场景责任不同。当前普通消息共享 `tts_voice_plugin:service:tts`；该 Service 以一个稳定接口封装 vLLM-Omni 与 GPT-SoVITS，具体后端属于本机部署选择。直播仍由自己的客户端与配置负责，不能把直播播放成功当成消息平台发送成功。
 
 ## 2. 当前消息表达链
 
@@ -112,15 +111,11 @@ WAV 派生 `qq_voice_presence_v1`：24 kHz SOXR 单声道、2.8 kHz presence 与
 Silk 编码。它是可关闭、可复现的平台运输投影，不是新的 TTS 音色，也不修改 TTS
 原件或其他平台音频。URL、已有 Silk、非 WAV 与投影失败均保持原输入。
 
-### 4.2 N.E.K.O Surface
-
-Surface 的普通文字回复由 Adapter 自动合成并按回复顺序发布 `assistant.voice`。新用户轮次会取消上一轮尚未交付的语音。Life Chatter 在 Surface 上不暴露第二条语音动作；即使旧工具调用到达，执行层也必须拒绝重复合成。
-
-### 4.3 直播
+### 4.2 直播
 
 直播使用 `plugins/livestream` 的独立 `HttpTTSClient`、有界音频响应、切句队列和舞台回执。直播配置可以指向本地 TTS，但其 artifact、播放和重放合同不能由消息 TTS Service 代替。
 
-### 4.4 实时通话
+### 4.3 实时通话
 
 Voice Live 使用 Realtime Provider 持续处理输入输出。它不消费消息 TTS Service 拼接每轮回复。Seed-VC 若启用，只改变下行音色；当前禁用时不得占用显存。
 

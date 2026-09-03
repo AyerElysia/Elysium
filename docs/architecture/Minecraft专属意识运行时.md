@@ -13,17 +13,17 @@ Minecraft 是持续、高频、带身体后果的场景。核心 heartbeat 负�
   │ 统一主体投影 / 近期潜意识
   ▼
 MinecraftConsciousnessRuntime
-  │ 开放文本意图；也可主动等待或离场
+  │ speech + 一个 advertised 高层任务；也可等待或离场
   ▼
-EmbodimentRuntime + ModelPlanner
-  │ 动态能力中的类型化命令
+MinecraftTaskEngine（默认陪玩路径）
+  │ 单一 BodyGate、连续执行、进度/终态事件
   ▼
 Agent / Bot / Biomimetic Body
   │ 终态回执 + 动作后新观察
   └──────────────────────► 下一次场景轮次
 ```
 
-三层共享同一个主体和证据账本，但拥有不同职责。专属意识不输出任意 bridge 命令；planner 不创作高层目标；身体不解释成功，只返回事实。
+三层共享同一个主体和证据账本，但拥有不同职责。专属意识不输出任意低层 bridge 命令；任务引擎不创作高层目标；身体不解释成功，只返回事实。外部工具直接给出的开放文本意图仍由 `EmbodimentRuntime + ModelPlanner` 执行，但与专属意识共用 intent lock，不能并发争抢身体。
 
 ## 启动与身份绑定
 
@@ -44,15 +44,21 @@ Agent / Bot / Biomimetic Body
 
 模型响应成功并不自动证明材料送达。主体、观察和非空潜意识都必须有 `EffectiveContextReceipt`，且 `exact_present`、UTF-8 字节数与 SHA-256 同时一致，否则本轮不产生决定。
 
+这些材料不是 `life_chatter` 后缀。Minecraft 使用独立的 `life_minecraft_consciousness` 请求；主体、当前观察、近期潜意识分别是独立 `Text` part。默认硬预算是 8192/8192/4096 UTF-8 字节，近期潜意识最多 3 个完整因果组，近期结果最多 4 个 content-free 引用。World Perception 不参加默认跨意识同步，也不会把自身投影重新塞回下一轮。
+
+观察超限时不做替主体判断意义的摘要。投影使用固定的 `minecraft-core-facts-v1` 技术顺序，让 world readiness、世界标识、自身玩家、游戏聊天和 BodyGate 状态先于大型 players/inventory/entities 集合进入 UTF-8 前缀；完整规范观察、字节数和 SHA-256 仍保留在 trace/引用中。这样即使周围实体很多，也不会先把“我是谁、同伴说了什么、当前任务是否占锁”挤出可见窗口。
+
 ## 自主节奏
 
 模型每轮只使用一个技术控制 envelope：
 
-- `pursue`：给出自由文本意图，交给具身 planner；
-- `wait`：自己选择何时再次观察；
-- `end_session`：结束这个 Minecraft 场景。
+- `pursue`：可发送一段原样游戏聊天，并启动一个身体明确广告的高层任务；
+- `wait`：可说话，也可安静地自己选择何时再次观察；
+- `end_session`：可告别并结束这个 Minecraft 场景。
 
-这些名字只是调度协议，不是欲望、情绪、任务类型或回应优先级。运行时代码不分析关键词，也不规定她必须回复聊天。`wait` 在配置的技术上下限内；动作完成、外部中断、停止和其他未来事件源可以提前唤醒。所有轮次严格串行，模型慢只会延长当前轮，不会堆积并发请求。失败使用指数上限退避并暴露状态，不影响核心 heartbeat。
+这些名字只是调度协议，不是欲望、情绪、任务类型或回应优先级。运行时代码不分析关键词，也不规定她必须回复聊天。`wait` 在配置的技术上下限内；公共聊天、私聊、玩家进出、生命变化、死亡、spawn、断开、任务进度/终态、外部中断和停止可以提前唤醒。所有模型轮严格串行，长任务在身体侧异步继续，因此她不会因跟随或采集而失去说话和重新判断的机会。模型失败使用指数上限退避并暴露状态，不影响核心 heartbeat。
+
+身体任务采用稳定 task ID 与载荷摘要，同 ID 同载荷重放已有状态，异载荷拒绝；一个 BodyGate 同时只允许一个移动/采集/合成任务。默认技术期限为 180 秒，可接受的协议范围为 5–600 秒；超时先释放 pathfinder、挖掘和控制，再产生明确 `timed_out` 终态，不能伪装完成。
 
 ## 决策与动作一致性
 
@@ -60,7 +66,11 @@ Agent / Bot / Biomimetic Body
 
 如果落账结果不确定，运行时重试完全相同的决定；service 以 decision ID 幂等复用相同事件。进入物理执行后则绝不自动重放未知动作。具身 trace 的耐久 context 保存 `consciousness_decision_id`，用于把 `intent.issued` 与高层决定连接起来。
 
-专属意识已经读取过近期潜意识，因此它发出的 planner 意图不会再复制同一正文。外部工具直接发出的 MC 意图是另一个 frontier，仍可读取一次有界近期潜意识。两条入口通过同一 intent lock 串行，避免人体与专属意识争抢身体。
+成功解析的模型轮随决定事件保留 transport request、provider reasoning 与原始 assistant message。若响应已经生成、但 exact delivery 校验或 JSON 协议解析失败，它不会只留在日志里：session 先把该失败轮作为 `minecraft_scene_consciousness_failed_turn` 意识活动落入统一 Life Event，再进入有界退避；失败轮正文不写入 World receipt，近期潜意识即使读取它也仍受自身 UTF-8 总预算与 excerpt/ref 规则约束。
+
+专属意识已经读取过近期潜意识，因此它发出的高层任务不会再复制同一正文。外部工具直接发出的 MC 意图是另一个 frontier，仍可读取一次有界近期潜意识。两条入口通过同一 intent lock 和 BodyGate 串行，避免 planner 与专属意识争抢身体。
+
+游戏身体事件采用“先落账、后确认”：bot 把事件留在有界 journal，session 取 FIFO 头并写入当前 Minecraft instance 的 Life Event，成功后才发送 ACK 并唤醒 scene。控制器断开时监听器继续等待同一认证身体；未 ACK 事件原 ID/序列重放，ACK 丢失但已消费的事件只补 ACK。这样聊天不会因 WebSocket 抖动丢失，也不会因重连被回答两次。
 
 ## 停止、超时与恢复
 
@@ -80,6 +90,6 @@ v1 必须长期保留以下不变量：
 4. 当前观察和像素来自身体，动作完成由终态回执与后置观察证明；
 5. transient 正文不进入 World receipt，不形成 prompt 回灌；
 6. 不因模型空响应、裁剪或存储不确定而伪造决定或重复物理动作；
-7. Elysium 与 Minecraft/Java 的启动重启仍由用户手动执行。
+7. Elysium 的启动/重启仍由用户手动执行；session 只拥有自己创建的 bot 子进程，不能关闭用户的 Minecraft 客户端。
 
 允许未来替换的是调度策略、事件唤醒来源、场景长期计划表示、视觉采样策略、模型选择以及多人协作能力。替换时必须继续满足上述不变量，并重新完成真实端到端验收。

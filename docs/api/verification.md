@@ -8,13 +8,12 @@
 
 ### 1.1 旧插件路由弃用标记与迁移期
 
-- 四组旧插件路由保留未删除，均以 `BaseRouter` 类属性声明弃用元数据（`deprecation_notice`、`deprecation_sunset_date`、`deprecation_migration_link`），响应带 RFC 5987 编码的弃用 header：
+- 三组旧插件路由保留未删除，均以 `BaseRouter` 类属性声明弃用元数据（`deprecation_notice`、`deprecation_sunset_date`、`deprecation_migration_link`），响应带 RFC 5987 编码的弃用 header：
 
 | 旧路由 | 取代者 | 迁移期限 |
 | --- | --- | --- |
 | `plugins/livestream/router.py` `/livestream/*` | `/api/v1/livestream/*` | 2027-02-01 |
 | `plugins/voice_live/router.py` `/voice-live/*` | `/api/v1/voice-calls/*` | 2027-02-01 |
-| `plugins/neko_surface/router.py` `/api/neko-surface/*` | `/api/v1/surfaces/*` | 2027-02-01 |
 | `plugins/life_engine/memory/router.py` `/memory_vis/*` | `/api/v1/memory/visualization` | 2027-02-01 |
 
 - 迁移期旧客户端仍可用；弃用仅为标记，不自动删除、不自动跳转。

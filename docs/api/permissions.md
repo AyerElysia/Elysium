@@ -134,16 +134,12 @@
 | GET | `/tabletop/rooms/{room_id}/replay` | 全部 | `tabletop:read` | ✔ |
 | WS | `/tabletop/rooms/{room_id}/ws` | 全部 | `tabletop:play` + ticket | ✔ |
 
-## 9. 能力与 Surface
+## 9. 能力目录
 
 | 方法 | 路径 | 身份 | Scope | 状态 |
 | --- | --- | --- | --- | --- |
 | GET | `/abilities` | 全部 | `abilities:read` | ✔ |
 | GET | `/abilities/{ability_id}` | 全部 | `abilities:read` | ✔ |
-| GET | `/surfaces` | 全部 | `surface:read` | ✔ |
-| GET | `/surfaces/{surface_id}/status` | 全部 | `surface:read` | ✔ |
-| POST | `/surfaces/{surface_id}/tickets` | 全部 | `surface:connect` + resource | ✔ |
-| WS | `/surfaces/{surface_id}/ws` | 全部 | `surface:connect` + 单次 ticket | ○（无双向消费者） |
 
 ## 10. 管理（administrator / platform_service）
 
@@ -180,8 +176,6 @@
 | POST | `/admin/commitments/schedules/{id}:pause/resume` | `commitments:operate_schedule` | ✔ |
 | GET | `/admin/autonomy/intents` 等 | `autonomy:read` | ✔ |
 | POST | `/admin/autonomy/occurrences/{id}:cancel` | `autonomy:cancel_occurrence` | ✔ |
-| GET | `/admin/surfaces/{id}/connections` | `surface:admin` | ✔ |
-| POST | `/admin/surfaces/{id}/connections/{cid}:disconnect` | `surface:admin` | ✔ |
 | GET | `/admin/chat/streams/{sid}/announcements` | `chat:admin` | ✔ |
 | POST | `/admin/chat/streams/{sid}/announcements` | `chat:admin` | ✔ |
 | DELETE | `/admin/chat/streams/{sid}/announcements/{id}` | `chat:admin` | ✔ |
@@ -203,5 +197,5 @@
   资源授权校验；
 - **不可见与不存在统一处理**，不通过 404/403 差异泄露资源存在性；
 - 管理高敏读取（message 原文、隐藏状态、transcript 等）写入审计；
-- 所有 `/api/v1` 路由对旧插件 `/livestream`、`/voice-live`、`/api/neko-surface`、
-  `/memory_vis` 无继承关系，不共享弃用头。
+- 所有 `/api/v1` 路由对旧插件 `/livestream`、`/voice-live`、
+  `/memory_vis` 无继承关系，不共享弃用头。旧 `/api/neko-surface` 与 `/api/v1/surfaces` 已随 N.E.K.O 插件删除。

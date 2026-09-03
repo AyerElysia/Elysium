@@ -10,23 +10,23 @@
 爱莉的持续主体 / 统一记忆
         │ 固定主体投影 + 近期潜意识
         ▼
-Minecraft 专属意识 ── 自己观察、形成意图、等待或离场
-        │ 开放文本意图
+Minecraft 专属意识 ── 自己观察、说话、做事、等待或离场
+        │ 高层任务 + speech（默认陪玩路径）
         ▼
-具身模型规划器 ── 动态能力清单、当前世界事实
-        │ ActionIntent
+身体任务引擎 ── 单一 BodyGate、任务期限、进度/终态事件
+   ┌────┴────────────────────────────┐
+   │                 │               │
+Bot Body          Agent Body    Biomimetic Body
+Mineflayer        NeoForge      DXcam + SendInput
+独立同服玩家       Baritone      原生前台输入
+   │                 │               │
+   └──────────── Minecraft ──────────┘
+        │ 聊天/玩家/生命/任务事件
         ▼
-具身运行时 ── 租约、去重、超时、中断、证据链
-   ┌────┴─────────────────┐
-   │                      │
-Agent Body            Biomimetic Body
-NeoForge + Baritone    DXcam + SendInput
-结构化状态/高层动作       第一人称画面/原生输入
-   │                      │
-   └────── Minecraft ─────┘
-              │
-          OBS Game Capture
+耐久 Life Event ── ACK ── 提前唤醒专属意识
 ```
+
+外部 `nucleus_minecraft(intent=...)` 仍可走“开放文本意图 → 具身模型规划器 → 动态低层能力”的专家入口；它与专属意识入口共用同一个 intent lock、证据链和身体所有权，不与陪玩主循环并发抢控制。
 
 ## 统一契约
 
@@ -36,7 +36,15 @@ NeoForge + Baritone    DXcam + SendInput
 
 这些是操作协议，不是对爱莉思维的分类。系统不使用关键词替她决定目标，也不伪造“已完成”。
 
-## Agent Body：主力商业路线
+## Bot Body：默认陪玩路线
+
+Bot 作为独立玩家加入用户已经打开的 LAN 世界或离线模式服务器。它用 Mineflayer 采集结构化事实、pathfinder 导航，并通过 CollectBlock 执行连续采集。专属意识只挑选小而稳定的高层能力集合：跟随玩家、走向玩家/坐标、采集、合成、放置和进食；任务执行器持续跑任务，意识仍可说话、看状态、取消或替换任务。
+
+每个任务有稳定 task ID 与载荷摘要，同 ID 同载荷只重放状态，异载荷显式冲突；单一 BodyGate 禁止路径、挖掘和低层控制竞争；默认 180 秒技术期限避免永远卡住。accepted 只证明接单，progress 和 terminal 作为身体事件耐久投递，后置观察才证明世界变化。
+
+游戏公共聊天、私聊、系统消息、玩家进出、生命变化、死亡、spawn、断开及任务状态先进入身体侧有界 journal。控制器必须把 FIFO 头写入统一 Life Event，成功后才 ACK；重连只接受同一 instance/能力/元数据，未 ACK 事件原样重放。这样“用户在游戏里说话”是真正的事件唤醒，不依赖下一次轮询碰巧读到聊天环形缓冲。
+
+## Agent Body：可见客户端路线
 
 可见的 NeoForge 1.21.1 客户端内运行 Elysium Bridge：
 
@@ -60,9 +68,9 @@ Minecraft 不再借用核心 heartbeat 充当游戏回合。身体就绪、Prese
 
 它在启动身体前先固定一份 `projection_kind=minecraft` 的统一主体投影，并对 `SOUL.md`、`USER.md`、`MEMORY.md` 的派生摘要、版本、哈希和 UTF-8 字节数做 fail-closed 校验。没有可证明的主体投影就不启动身体，不回退到平行 persona。每个真实轮次都重新取得结构化游戏观察、可用时的第一人称 JPEG 像素、有界近期潜意识和最近结果引用；模型请求必须证明主体与观察正文被完整、精确送达，裁剪、重复或错配均不允许行动。
 
-场景模型只选择技术生命周期形状：形成一个开放文本意图、按自己选择的时长继续观察，或结束本次游戏。代码不按关键词替她规定情绪、目标或“应该回应谁”。`wait` 的时间只是她选择的下一次重新观察时间，并受技术上下限约束；新观察、动作结果、外部中断和停止信号可以提前唤醒。模型失败按有界退避重试，不把空响应写成主体决定，也不阻塞核心意识。
+场景模型只选择技术生命周期形状：说话并可启动一个 advertised 高层任务、按自己选择的时长继续观察，或结束本次游戏。代码不按关键词替她规定情绪、目标或“应该回应谁”。`wait` 的时间只是她选择的下一次重新观察时间，并受技术上下限约束；聊天、任务终态、玩家进出、生命变化、外部中断和停止信号可以提前唤醒。模型失败按有界退避重试，不把空响应写成主体决定，也不阻塞核心意识。
 
-每个决定先以 `minecraft_consciousness_decision` 归属到当前 `minecraft` instance/session/stream 的不可变 Life Event，并保留该轮 provider reasoning、原始 assistant message 和 transport request 身份，再允许具身规划器执行。高层意识决定“做什么”，原有 evidence-driven planner 只决定“如何做”；planner 自己的每次成功模型生成也在动作前以同一 instance 记录完整 reasoning/message，并绑定 intent revision、observation IDs 与 receipt IDs。终态回执和动作后新观察回到下一轮。状态接口公开 phase、turn count、当前 decision、最近错误、连续失败、主体引用和剩余会话时间，便于现场判断是主动等待、模型退避、身体执行还是故障。
+每个决定先以 `minecraft_consciousness_decision` 归属到当前 `minecraft` instance/session/stream 的不可变 Life Event，并保留该轮 provider reasoning、原始 assistant message 和 transport request 身份，再允许发送 speech 或启动高层任务。高层意识决定“做什么”，身体任务引擎只负责连续执行；外部开放文本意图使用的 evidence-driven planner 只决定“如何做”，其每次成功模型生成也在动作前以同一 instance 记录完整 reasoning/message，并绑定 intent revision、observation IDs 与 receipt IDs。终态事件和动作后新观察回到下一轮。状态接口公开 phase、turn count、当前 decision、最近错误、连续失败、主体引用和剩余会话时间，便于现场判断是主动等待、模型退避、身体执行还是故障。
 
 ### 重放与完成语义
 
@@ -90,11 +98,11 @@ Windows 原生身体绑定到精确 Minecraft 窗口：
 
 这条路线最接近人类身体，适合检验第一人称视觉能力、特殊 GUI 和没有结构化接口的模组。它依赖前台窗口，不应在同一 Windows 桌面上与人类同时争抢键鼠。
 
-## 一起玩与第三种轻量身体
+## 一起玩与社区经验
 
-真正独立的“你和爱莉各有一个角色”需要两个已授权 Minecraft 账号。推荐为爱莉运行第二个可见客户端；若走仿生路线，再给它独立 Windows 会话、虚拟机或实体设备，避免输入焦点互相抢夺。
+当前默认 bot 路线直接满足“你和爱莉各有一个角色”：用户客户端保留自己的账号，爱莉以不同的离线用户名加入开放到 LAN 的世界。若服务器开启正版认证，则仍需为爱莉提供独立授权账号，不能用昵称伪装认证。
 
-N.E.K.O 的公开 Minecraft 插件采用 Mineflayer/Mindcraft：机器人账号加入局域网或服务器，具有技能库、任务回执、截图和 Prismarine Viewer。这很适合做低资源、无前台依赖的第三种身体。可以复用其技能分解和 tick 后置条件确认思想，但接入时必须经过本项目的认证、序号、租约和证据契约。它的合成视角不能替代真实客户端作为主直播画面。
+N.E.K.O 的公开 `game_agent_minecraft` 插件同样采用独立 Minecraft 任务、稳定 task ID、WebSocket、截图/状态缓存、busy-skip、技术超时与重连。Neuro SDK 把游戏集成表达成动态动作注册、即时结果与小而有意义的上下文。Elysium 采用这些已验证的结构经验，同时保留自身更严格的 HMAC 认证、单一 BodyGate、不可变 Life Event、FIFO ACK、重放冲突和 exact-context 证明；不会复制根据模型文字猜测“是否卡住”的规则。
 
 ## OBS 与直播
 
@@ -114,9 +122,9 @@ OBS 使用 Game Capture。当前 Java 客户端在窗口枚举中不可选时，
 ## 验收门槛
 
 - 意识测试：统一主体投影 fail-closed；观察和像素精确送达；无聊天输入仍能形成决定；决定先落账再行动；模型空响应只触发有界退避；
-- 契约测试：认证、重放拒绝、序号、去重、租约、超时、中断和恢复；
+- 契约测试：认证、重放拒绝、序号、去重、BodyGate、任务期限、FIFO 事件 ACK、中断、同一身体重连和未 ACK 重放；
 - 执行测试：真实类型化动作或 Baritone 位移有世界证据，停止和释放有终态回执；
-- 连续陪玩测试：保持聊天静默时专属 scene 的 turn 仍按自身选择推进，核心 heartbeat 不加速；与用户同服 15–30 分钟并完成观察、决定、动作、回执、新观察闭环；
+- 连续陪玩测试：保持聊天静默时专属 scene 的 turn 仍按自身选择推进，核心 heartbeat 不加速；游戏聊天能提前唤醒并原样回到游戏；与用户同服 15–30 分钟并完成观察、决定、高层任务、终态事件、新观察闭环；
 - 仿生测试：真实鼠标视角变化，同时游戏结构化观测交叉确认，前后帧摘要不同；
 - 直播测试：OBS 预览无黑屏，并产生可播放的本地录制；
 - 故障测试：死亡、窗口丢失、连接重建和观测积压不会留下卡键或伪造成功。
