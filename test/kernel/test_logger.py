@@ -131,6 +131,113 @@ class TestLogger:
         logger.print_panel("panel content", title="Title")
         assert "panel content" in buf.getvalue()
 
+    def test_console_log_level_hides_infrastructure_not_life_health(
+        self, tmp_path: Path
+    ) -> None:
+        from src.kernel.logger import logger as logger_module
+
+        old_config = dict(logger_module._global_config)
+        try:
+            initialize_logger_system(
+                log_level="INFO",
+                console_log_level="ERROR",
+                db_path=tmp_path / "console.db",
+                enable_db=True,
+            )
+            infra_buf = StringIO()
+            infra = Logger(
+                name="stream_manager",
+                display="StreamMgr",
+                console=Console(file=infra_buf, force_terminal=False, width=200),
+                enable_db=True,
+            )
+            infra.info("StreamManager 初始化完成")
+            assert "StreamManager" not in infra_buf.getvalue()
+            time.sleep(0.05)
+            store = logger_module._global_log_store
+            assert store is not None
+            assert store.stats()["queued_count"] >= 1
+
+            life_buf = StringIO()
+            life = Logger(
+                name="life_engine",
+                display="life_engine",
+                console=Console(file=life_buf, force_terminal=False, width=200),
+            )
+            life.info("已准备唤醒上下文")
+            life.warning("心跳超时")
+            chatter_buf = StringIO()
+            chatter = Logger(
+                name="life_chatter.sub_agent",
+                console=Console(
+                    file=chatter_buf, force_terminal=False, width=200
+                ),
+            )
+            chatter.info("子代理开始")
+            chatter.warning("子代理失败")
+            output = life_buf.getvalue()
+            assert "已准备唤醒上下文" in output
+            assert "心跳超时" in output
+            assert "子代理开始" not in chatter_buf.getvalue()
+            assert "子代理失败" in chatter_buf.getvalue()
+
+            inbound_buf = StringIO()
+            inbound = Logger(
+                name="message_receiver",
+                display="消息接收器",
+                console=Console(
+                    file=inbound_buf, force_terminal=False, width=200
+                ),
+            )
+            inbound.info("<qq> 小星星: 你好")
+            inbound.debug("收到消息: id=skip")
+            assert "<qq> 小星星: 你好" in inbound_buf.getvalue()
+            assert "id=skip" not in inbound_buf.getvalue()
+
+            audit_buf = StringIO()
+            audit = Logger(
+                name="life_engine.audit",
+                console=Console(file=audit_buf, force_terminal=False, width=200),
+            )
+            audit.info('{"event":"heartbeat_tool_loop_stopped"}')
+            assert "heartbeat_tool_loop_stopped" not in audit_buf.getvalue()
+
+            service_buf = StringIO()
+            service = Logger(
+                name="service_manager",
+                console=Console(
+                    file=service_buf, force_terminal=False, width=200
+                ),
+            )
+            service.warning("Service 类未找到: emoji:service:emoji_sender")
+            assert "emoji_sender" not in service_buf.getvalue()
+        finally:
+            shutdown_logger_system()
+            logger_module._global_config.clear()
+            logger_module._global_config.update(old_config)
+
+    def test_console_log_level_defaults_to_log_level(self) -> None:
+        from src.kernel.logger import logger as logger_module
+
+        old_config = dict(logger_module._global_config)
+        try:
+            initialize_logger_system(
+                log_level="INFO",
+                enable_db=False,
+            )
+            buf = StringIO()
+            log = Logger(
+                name="stream_manager",
+                display="StreamMgr",
+                console=Console(file=buf, force_terminal=False, width=200),
+            )
+            log.info("StreamManager 初始化完成")
+            assert "StreamManager 初始化完成" in buf.getvalue()
+        finally:
+            shutdown_logger_system()
+            logger_module._global_config.clear()
+            logger_module._global_config.update(old_config)
+
 
 # ---------------------------------------------------------------------------
 # get_logger / registry

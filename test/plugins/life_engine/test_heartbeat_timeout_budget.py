@@ -20,6 +20,8 @@ from plugins.life_engine.service.core import (
     HeartbeatBudgetExhausted,
     LifeEngineService,
     _await_with_heartbeat_deadline,
+    _heartbeat_stall_kind,
+    _heartbeat_tool_round_outcomes,
     _heartbeat_tool_round_progress,
     _resolve_heartbeat_timeout,
     _resolve_heartbeat_total_budget,
@@ -152,6 +154,47 @@ def test_tool_progress_fingerprint_is_content_free_and_protocol_aware() -> None:
     assert "secret-cursor" not in progress.fingerprint
 
 
+def test_tool_round_outcomes_are_names_and_status_only() -> None:
+    call = SimpleNamespace(
+        id="call-1",
+        name="nucleus_read_file",
+        args={"path": "private.md"},
+    )
+    outcomes = _heartbeat_tool_round_outcomes(
+        [call],
+        [
+            ToolResult(
+                value="执行失败: invalid bounded-result continuation",
+                call_id="call-1",
+                name="nucleus_read_file",
+            )
+        ],
+    )
+
+    assert outcomes == ["nucleus_read_file:fail"]
+
+
+def test_stall_kind_names_the_gates_that_fired() -> None:
+    assert (
+        _heartbeat_stall_kind(
+            consecutive_no_progress=2,
+            consecutive_protocol_failures=0,
+            consecutive_same_failure=1,
+            stall_limit=2,
+        )
+        == "no_progress"
+    )
+    assert (
+        _heartbeat_stall_kind(
+            consecutive_no_progress=2,
+            consecutive_protocol_failures=2,
+            consecutive_same_failure=1,
+            stall_limit=2,
+        )
+        == "protocol_failure+no_progress"
+    )
+
+
 class _FakeHeartbeatResponse:
     def __init__(
         self,
@@ -268,9 +311,6 @@ async def test_followup_retry_then_repeated_protocol_failure_stops_third_turn(
     request = _FakeHeartbeatRequest(first)
     audit_rows: list[dict[str, object]] = []
 
-    async def _empty_text() -> str:
-        return ""
-
     async def _system_prompt() -> str:
         return "system"
 
@@ -296,7 +336,6 @@ async def test_followup_retry_then_repeated_protocol_failure_stops_third_turn(
         lambda **fields: audit_rows.append(fields),
     )
     monkeypatch.setattr(service, "_build_heartbeat_system_prompt", _system_prompt)
-    monkeypatch.setattr(service, "_build_memory_maintenance_prompt_if_due", _empty_text)
     monkeypatch.setattr(service, "_render_heartbeat_sections", _sections)
     monkeypatch.setattr(service, "_run_learning_heartbeat_maintenance", _no_maintenance)
     monkeypatch.setattr(service, "_get_nucleus_tools", lambda: [FailingReadTool])
@@ -323,3 +362,8 @@ async def test_followup_retry_then_repeated_protocol_failure_stops_third_turn(
     assert result.perception_receipt.transport_request_id == "response-2"
     assert result.text == ""
     assert any(row.get("stop_reason") == "consecutive_tool_stalls" for row in audit_rows)
+    stopped = next(
+        row for row in audit_rows if row.get("stop_reason") == "consecutive_tool_stalls"
+    )
+    assert stopped.get("last_round_tools") == ["nucleus_read_file:fail"]
+    assert "protocol_failure" in str(stopped.get("stall_kind"))

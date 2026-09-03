@@ -146,15 +146,3 @@ async def test_execute_reports_platform_send_failure(monkeypatch) -> None:
 
     assert success is False
     assert "平台发送失败" in message
-
-
-async def test_surface_execute_is_suppressed_when_adapter_owns_tts() -> None:
-    action = _build_action(always_available=True, platform="neko.surface")
-    action.tts_service = SimpleNamespace()
-
-    success, message = await action.execute(
-        tts_voice_text="这条不应再生成第二份语音。",
-    )
-
-    assert success is False
-    assert "自动 TTS" in message

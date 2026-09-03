@@ -705,7 +705,6 @@ def test_committed_engineering_templates_match_current_schemas(
     from plugins.life_engine.core.config import LifeEngineConfig
     from plugins.livestream.config import LivestreamConfig
     from plugins.napcat_adapter.config import NapcatAdapterConfig
-    from plugins.neko_surface.config import NekoSurfaceConfig
     from plugins.skill_manager.config import SkillManagerConfig
     from plugins.tts_voice_plugin.config import TTSVoiceConfig
     from plugins.voice_live.config import VoiceLiveConfig
@@ -735,7 +734,6 @@ def test_committed_engineering_templates_match_current_schemas(
         "config/plugins/life_engine/config.toml": LifeEngineConfig,
         "config/plugins/Livestream/config.toml": LivestreamConfig,
         "config/plugins/napcat_adapter/config.toml": NapcatAdapterConfig,
-        "config/plugins/neko_surface/config.toml": NekoSurfaceConfig,
         "config/plugins/skill_manager/config.toml": SkillManagerConfig,
         "config/plugins/tts_voice_plugin/config.toml": TTSVoiceConfig,
         "config/plugins/Voice-Live/config.toml": VoiceLiveConfig,
@@ -762,7 +760,7 @@ def test_schema_helper_loads_every_generated_plugin_config(
 
     assert deployment_schema_check.main(root) == 0
 
-    (root / "config/plugins/neko_surface/config.toml").write_text(
+    (root / "config/plugins/skill_manager/config.toml").write_text(
         '[plugin]\nenabled = "not-a-boolean"\n',
         encoding="utf-8",
     )

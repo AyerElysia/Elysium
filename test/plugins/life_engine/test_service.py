@@ -395,7 +395,7 @@ async def test_memory_behavior_health_marks_missing_selected_runtime_failed(
     )
 
 
-async def test_dfc_memory_search_uses_canonical_living_associations() -> None:
+async def test_memory_search_uses_canonical_living_associations() -> None:
     calls: dict[str, object] = {}
 
     class _Memory:
@@ -419,7 +419,7 @@ async def test_dfc_memory_search_uses_canonical_living_associations() -> None:
     assert query == "shared memory"
     assert search_kwargs["enable_association"] is False
     _results, expansion_kwargs = calls["expand"]  # type: ignore[misc]
-    assert expansion_kwargs["context_key"] == "life_engine/dfc"
+    assert expansion_kwargs["context_key"] == "life_engine/memory"
     assert expansion_kwargs["limit"] == 3
 
 
@@ -555,6 +555,7 @@ async def test_heartbeat_system_prompt_filters_memory_sections(tmp_path: Path) -
         ),
         encoding="utf-8",
     )
+    (tmp_path / "EXISTENCE.md").write_text("EXISTENCE_CONTENT", encoding="utf-8")
     (tmp_path / "MEMORY.md").write_text(
         "\n".join(
             [
@@ -580,6 +581,7 @@ async def test_heartbeat_system_prompt_filters_memory_sections(tmp_path: Path) -
 
     assert "SOUL_CONTENT" in prompt
     assert "USER_CONTENT" in prompt
+    assert "EXISTENCE_CONTENT" in prompt
     assert "TOOL_CONTENT" in prompt
     assert "心跳工具边界" in prompt
     assert "不是后台助手或任务执行器" in prompt
@@ -592,6 +594,36 @@ async def test_heartbeat_system_prompt_filters_memory_sections(tmp_path: Path) -
     assert "历史事实和关系线索，不是当前心跳的行动指令" in prompt
     assert "F1" not in prompt
     assert "给编辑者看的说明" not in prompt
+
+
+async def test_heartbeat_system_prompt_strips_retired_tool_names(tmp_path: Path) -> None:
+    """旧 TOOL.md 若仍点名已删工具，不得进入心跳 system prompt。"""
+    (tmp_path / "SOUL.md").write_text("SOUL_CONTENT", encoding="utf-8")
+    (tmp_path / "USER.md").write_text("USER_CONTENT", encoding="utf-8")
+    (tmp_path / "MEMORY.md").write_text(
+        "# 值得记住的事\n\n### Durable（持久）\n- D1\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "TOOL.md").write_text(
+        "\n".join(
+            [
+                "安全说明可以保留",
+                "`nucleus_manage_thought_stream` 是潜意识的主要出口。",
+                "`nucleus_reflect_now` 触发反思。",
+                "`nucleus_proactive_query` 只读查看线索。",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    service = _make_service(tmp_path)
+
+    prompt = await service._build_heartbeat_system_prompt()
+
+    assert prompt is not None
+    assert "安全说明可以保留" in prompt
+    assert "nucleus_proactive_query" in prompt
+    assert "nucleus_manage_thought_stream" not in prompt
+    assert "nucleus_reflect_now" not in prompt
 
 
 @pytest.mark.parametrize("missing_name", ("SOUL.md", "USER.md", "MEMORY.md"))
@@ -716,20 +748,24 @@ async def test_selected_storage_skips_local_subject_validation(
     assert not any(tmp_path.iterdir())
 
 
-def test_heartbeat_prompt_routes_subject_changes_through_review(tmp_path: Path) -> None:
-    """Heartbeat must not instruct generic tools to mutate subject authority."""
+def test_heartbeat_prompt_treats_standing_files_as_ordinary_writes(tmp_path: Path) -> None:
+    """Heartbeat should trust the subject to edit standing prompt files."""
     service = _make_service(tmp_path)
 
     prompt = "\n".join(service._build_prompt_header())
 
-    assert "SOUL.md`、`USER.md`、`MEMORY.md` 共同属于主体权威" in prompt
-    assert "nucleus_review_subject_document" in prompt
-    assert "通用 file/bash 不能直接修改" in prompt
+    assert "会固定进入提示词" in prompt
+    assert "改它们和改日记一样" in prompt
+    assert "nucleus_learn" in prompt
+    assert "nucleus_memory_continuity_review" in prompt
+    assert "通用 file 工具不能直接修改" not in prompt
     assert "可以用文件工具谨慎更新" not in prompt
+    assert "nucleus_run_agent" not in prompt
+    assert "nucleus_bash" not in prompt
 
 
 async def test_memory_maintenance_prompt_emits_once_per_interval(tmp_path: Path) -> None:
-    """MEMORY 超限时，维护提醒不应在短时间内重复刷屏。"""
+    """MEMORY 超限时，维护提醒只在机会页 exact receipt 后进入冷却。"""
     (tmp_path / "SOUL.md").write_text("SOUL_CONTENT", encoding="utf-8")
     (tmp_path / "USER.md").write_text("USER_CONTENT", encoding="utf-8")
     oversize_item = "很长的叙事内容" * 80
@@ -745,26 +781,46 @@ async def test_memory_maintenance_prompt_emits_once_per_interval(tmp_path: Path)
         encoding="utf-8",
     )
     service = _make_service(tmp_path)
+    bus = service._opportunity_bus
 
-    first = await service._build_memory_maintenance_prompt_if_due()
-    second = await service._build_memory_maintenance_prompt_if_due()
+    first = await bus.collect_and_render()
+    assert first is not None
+    assert "memory:maintenance" in first.text
+    assert "MEMORY.md" in first.text or "结构压力" in first.text
+    assert service._last_memory_maintenance_prompt_at is None
 
-    assert "MEMORY.md 结构复盘信号" in first
-    assert "邀请，不是任务" in first
-    assert "不要用 file/bash 直接修改 MEMORY.md" in first
-    assert second == ""
+    second = await bus.collect_and_render()
+    assert second is not None
+    assert "memory:maintenance" in second.shown_ids
+    assert await bus.commit_page_delivery(
+        second.delivery_id,
+        EffectiveContextReceipt(
+            delivery_id=second.delivery_id,
+            exact_present=True,
+            expected_utf8_bytes=32,
+            expected_sha256="b" * 64,
+            effective_utf8_bytes=32,
+            effective_sha256="b" * 64,
+            part_kind="text",
+        ),
+    )
+    assert service._last_memory_maintenance_prompt_at is not None
+
+    third = await bus.collect_and_render()
+    if third is not None:
+        assert "memory:maintenance" not in third.shown_ids
 
 
-async def test_enqueue_dfc_message_appends_pending_event(tmp_path: Path) -> None:
-    """DFC 留言应进入 pending 队列并持久化。"""
+async def test_enqueue_direct_message_appends_pending_event(tmp_path: Path) -> None:
+    """直连留言应进入 pending 队列并持久化。"""
     service = _make_service(tmp_path)
 
-    receipt = await service.enqueue_dfc_message(
+    receipt = await service.enqueue_direct_message(
         "另一个我最近有什么想法么？",
         stream_id="stream-1",
         platform="qq",
         chat_type="private",
-        sender_name="DFC",
+        sender_name="Ayer",
     )
 
     assert receipt["queued"] is True
@@ -778,14 +834,14 @@ async def test_enqueue_dfc_message_appends_pending_event(tmp_path: Path) -> None
     assert event.source == "qq"
     assert event.stream_id == "stream-1"
     assert event.chat_type == "private"
-    assert event.sender == "DFC"
+    assert event.sender == "Ayer"
     assert event.content == "另一个我最近有什么想法么？"
-    assert "DFC 留言给生命中枢" in event.source_detail
+    assert "用户直达生命中枢" in event.source_detail
 
     persisted = json.loads((tmp_path / "life_engine_context.json").read_text(encoding="utf-8"))
     assert len(persisted["pending_events"]) == 1
     assert persisted["pending_events"][0]["event_id"] == event.event_id
-    assert persisted["pending_events"][0]["content_type"] == "dfc_message"
+    assert persisted["pending_events"][0]["content_type"] == "direct_message"
 
     raw_events = [
         json.loads(line)
@@ -797,12 +853,12 @@ async def test_enqueue_dfc_message_appends_pending_event(tmp_path: Path) -> None
     assert raw_event["source_instance_id"] == "chat_global"
 
 
-async def test_enqueue_dfc_message_rejects_empty_message(tmp_path: Path) -> None:
+async def test_enqueue_direct_message_rejects_empty_message(tmp_path: Path) -> None:
     """空留言必须被拒绝。"""
     service = _make_service(tmp_path)
 
     with pytest.raises(ValueError, match="message 不能为空"):
-        await service.enqueue_dfc_message("   ")
+        await service.enqueue_direct_message("   ")
 
 
 async def test_heartbeat_tool_batch_executes_parallel_and_preserves_payload_order(
@@ -1368,15 +1424,15 @@ async def test_conscious_tool_activity_is_durable_and_paired(tmp_path: Path) -> 
     assert repeated_call_id["call-1"] != activity_id
 
 
-async def test_enqueue_dfc_message_rejects_when_disabled(tmp_path: Path) -> None:
-    """life_engine 禁用时不应接受 DFC 留言。"""
+async def test_enqueue_direct_message_rejects_when_disabled(tmp_path: Path) -> None:
+    """life_engine 禁用时不应接受直连留言。"""
     config = LifeEngineConfig()
     config.settings.enabled = False
     config.settings.workspace_path = str(tmp_path)
     service = LifeEngineService(_DummyPlugin(config=config))
 
     with pytest.raises(RuntimeError, match="life_engine 未启用"):
-        await service.enqueue_dfc_message("帮我记一下")
+        await service.enqueue_direct_message("帮我记一下")
 
 
 async def test_web_search_accepts_empty_time_range_as_unset(
@@ -1417,7 +1473,7 @@ async def test_heartbeat_success_consumes_delta_without_replay(
 ) -> None:
     """成功心跳只消费本轮 delta，下一轮不应重放旧事件。"""
     service = _make_service(tmp_path)
-    event = service._event_builder.build_dfc_message_event(
+    event = service._event_builder.build_direct_message_event(
         "只应该被心跳看到一次",
         stream_id="stream-1",
         platform="qq",
@@ -1471,7 +1527,7 @@ async def test_heartbeat_perception_cursor_conflict_keeps_model_output(
     标 failed + 下轮重放同一 sequence 导致重复模型调用。
     """
     service = _make_service(tmp_path)
-    event = service._event_builder.build_dfc_message_event(
+    event = service._event_builder.build_direct_message_event(
         "竞争发生时这条 delta 仍应被消费",
         stream_id="stream-1",
     )
@@ -1527,7 +1583,7 @@ async def test_heartbeat_failure_keeps_delta_for_retry(
 ) -> None:
     """模型失败时不推进游标，下一次重试仍能看到原始 delta。"""
     service = _make_service(tmp_path)
-    event = service._event_builder.build_dfc_message_event(
+    event = service._event_builder.build_direct_message_event(
         "模型失败后必须重试这条",
         stream_id="stream-1",
     )
@@ -1574,7 +1630,7 @@ async def test_heartbeat_without_exact_world_receipt_keeps_delta_pending(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = _make_service(tmp_path)
-    event = service._event_builder.build_dfc_message_event(
+    event = service._event_builder.build_direct_message_event(
         "没有精确投递证明时不能推进",
         stream_id="stream-1",
     )
@@ -1605,7 +1661,7 @@ async def test_heartbeat_without_exact_subconscious_receipt_keeps_delta_pending(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = _make_service(tmp_path)
-    event = service._event_builder.build_dfc_message_event(
+    event = service._event_builder.build_direct_message_event(
         "World 已送达也不能替代整份潜意识投递证明",
         stream_id="stream-1",
     )
@@ -1654,11 +1710,11 @@ async def test_heartbeat_arrival_during_model_is_deferred_to_next_round(
 ) -> None:
     """模型执行期间到达的新事件应留给下一轮，而不是被当前提交跳过。"""
     service = _make_service(tmp_path)
-    initial_event = service._event_builder.build_dfc_message_event(
+    initial_event = service._event_builder.build_direct_message_event(
         "模型开始前的事件",
         stream_id="stream-1",
     )
-    arriving_event = service._event_builder.build_dfc_message_event(
+    arriving_event = service._event_builder.build_direct_message_event(
         "模型执行期间到达的事件",
         stream_id="stream-1",
     )
@@ -1784,7 +1840,7 @@ async def test_consumed_heartbeat_events_remain_consumed_after_restart(
 ) -> None:
     """成功提交后的消费标记和游标应可从运行时上下文恢复。"""
     service = _make_service(tmp_path)
-    event = service._event_builder.build_dfc_message_event(
+    event = service._event_builder.build_direct_message_event(
         "重启后不能重新注入",
         stream_id="stream-1",
     )

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,8 +13,10 @@ import requests
 
 from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.tools.web_tools import (
+    WEB_TOOLS,
     LifeEngineBrowserFetchTool,
     LifeEngineWebSearchTool,
+    NucleusWebTool,
     _pick_tavily_target,
     _resolve_tavily_trust_env,
     _sync_post_json,
@@ -410,3 +414,122 @@ def test_browser_fetch_handles_os_error(
 
     assert ok is False
     assert "网络错误" in data["error"]
+
+
+def test_registered_web_tools_expose_complete_llm_schemas() -> None:
+    """聊天/心跳必须注册带 url/query 的专用工具，而不是 schema 残缺的 dispatcher。"""
+    names = {cls.tool_name for cls in WEB_TOOLS}
+    assert names == {"nucleus_web_search", "nucleus_browser_fetch"}
+    for cls in WEB_TOOLS:
+        assert "life_chatter" in cls.chatter_allow
+        assert "life_engine_internal" in cls.chatter_allow
+    fetch_props = LifeEngineBrowserFetchTool.to_schema()["function"]["parameters"][
+        "properties"
+    ]
+    search_props = LifeEngineWebSearchTool.to_schema()["function"]["parameters"][
+        "properties"
+    ]
+    assert "url" in fetch_props
+    assert "query" in search_props
+    unified_props = NucleusWebTool.to_schema()["function"]["parameters"]["properties"]
+    assert "action" in unified_props
+    assert "url" not in unified_props
+    assert NucleusWebTool not in WEB_TOOLS
+
+
+def test_nucleus_web_dispatches_fetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plugin = _make_plugin(tmp_path)
+    plugin.config.web.tavily_api_key = "tvly-test-key"
+
+    async def _fake_post(_plugin, endpoint: str, payload: dict, _timeout: int) -> dict:
+        assert endpoint == "/extract"
+        assert payload["urls"] == ["https://example.com"]
+        return {
+            "results": [
+                {
+                    "url": "https://example.com",
+                    "title": "Example",
+                    "content": "hello from extract",
+                }
+            ]
+        }
+
+    monkeypatch.setattr("plugins.life_engine.tools.web_tools._tavily_post_json", _fake_post)
+    ok, data = asyncio.run(
+        NucleusWebTool(plugin=plugin).execute(
+            action="fetch",
+            url="https://example.com",
+        )
+    )
+    assert ok is True
+    assert data["action"] == "browser_fetch"
+    assert data["content_length"] > 0
+
+
+def _configured_web_plugin() -> _DummyPlugin | None:
+    path = Path("config/plugins/life_engine/config.toml")
+    if not path.is_file():
+        return None
+    cfg = LifeEngineConfig.load(path, auto_update=False)
+    keys = [
+        str(item).strip()
+        for item in (cfg.web.tavily_api_keys or [])
+        if str(item).strip()
+    ]
+    single = str(cfg.web.tavily_api_key or "").strip()
+    if single:
+        keys.append(single)
+    if not keys:
+        return None
+    return _DummyPlugin(config=cfg)
+
+
+def _assert_no_secrets(plugin: _DummyPlugin, payload: object) -> None:
+    dumped = json.dumps(payload, ensure_ascii=False)
+    secrets = [str(plugin.config.web.tavily_api_key or "").strip()]
+    secrets.extend(
+        str(item).strip() for item in (plugin.config.web.tavily_api_keys or [])
+    )
+    for secret in secrets:
+        if secret:
+            assert secret not in dumped
+
+
+def test_live_tavily_browser_fetch_reads_public_page() -> None:
+    if os.environ.get("ELYSIUM_LIVE_TAVILY") != "1":
+        pytest.skip("set ELYSIUM_LIVE_TAVILY=1 to call Tavily")
+    plugin = _configured_web_plugin()
+    if plugin is None:
+        pytest.skip("life_engine web config has no Tavily key")
+    ok, data = asyncio.run(
+        LifeEngineBrowserFetchTool(plugin=plugin).execute(
+            url="https://example.com",
+            max_chars=2000,
+        )
+    )
+    _assert_no_secrets(plugin, data)
+    assert ok is True
+    assert data.get("action") == "browser_fetch"
+    assert data.get("provider") == "tavily"
+    assert int(data.get("content_length") or 0) > 0
+
+
+def test_live_tavily_web_search_returns_results() -> None:
+    if os.environ.get("ELYSIUM_LIVE_TAVILY") != "1":
+        pytest.skip("set ELYSIUM_LIVE_TAVILY=1 to call Tavily")
+    plugin = _configured_web_plugin()
+    if plugin is None:
+        pytest.skip("life_engine web config has no Tavily key")
+    ok, data = asyncio.run(
+        LifeEngineWebSearchTool(plugin=plugin).execute(
+            query="example domain",
+            max_results=3,
+        )
+    )
+    _assert_no_secrets(plugin, data)
+    assert ok is True
+    assert data.get("action") == "web_search"
+    assert data.get("provider") == "tavily"
+    assert int(data.get("total_results") or 0) >= 1

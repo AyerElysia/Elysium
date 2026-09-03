@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.service.core import LifeEngineService
 from plugins.life_engine.service.event_builder import EventType, LifeEngineEvent
 from plugins.life_engine.tools.event_grep_tools import (
@@ -22,11 +24,14 @@ def _event(
     stream_id: str = "s1",
     event_type: EventType = EventType.MESSAGE,
     tool_name: str | None = None,
+    source_instance_id: str | None = None,
+    causation_id: str | None = None,
+    timestamp: str | None = None,
 ) -> LifeEngineEvent:
     return LifeEngineEvent(
         event_id=f"evt-{sequence}",
         event_type=event_type,
-        timestamp=f"2026-04-25T00:0{sequence}:00+08:00",
+        timestamp=timestamp or f"2026-04-25T00:0{sequence}:00+08:00",
         sequence=sequence,
         source="qq" if stream_id else "life_engine",
         source_detail=f"stream={stream_id}",
@@ -35,7 +40,17 @@ def _event(
         chat_type="private",
         stream_id=stream_id,
         tool_name=tool_name,
+        occurrence_id=f"occ-{sequence}",
+        source_instance_id=source_instance_id,
+        causation_id=causation_id,
     )
+
+
+def _isolated_service(tmp_path: Path) -> LifeEngineService:
+    config = LifeEngineConfig()
+    config.settings.enabled = True
+    config.settings.workspace_path = str(tmp_path)
+    return LifeEngineService(SimpleNamespace(config=config))
 
 
 @pytest.fixture(autouse=True)
@@ -85,6 +100,28 @@ async def test_life_chatter_grep_defaults_to_current_stream() -> None:
     assert payload["stream_ids"] == ["s1"]
     assert payload["stats"]["matched_events"] == 1
     assert payload["matches"][0]["event"]["stream_id"] == "s1"
+
+
+async def test_heartbeat_grep_defaults_to_cross_stream() -> None:
+    service = LifeEngineService(SimpleNamespace(config=None))
+    service._event_history = [
+        _event(1, "跨流关键词", stream_id="s1"),
+        _event(2, "跨流关键词", stream_id="s2"),
+    ]
+
+    import plugins.life_engine.service.registry as registry
+
+    registry.register_life_engine_service(service)
+
+    tool = LifeEngineGrepEventsTool(plugin=SimpleNamespace())
+    ok, payload = await tool.execute(query="跨流关键词")
+
+    assert ok is True
+    assert isinstance(payload, dict)
+    assert payload["stream_ids"] == []
+    assert payload["include_life_internal"] is True
+    stream_ids = {match["event"]["stream_id"] for match in payload["matches"]}
+    assert stream_ids == {"s1", "s2"}
 
 
 async def test_life_chatter_grep_includes_life_internal_events_by_default() -> None:
@@ -160,8 +197,10 @@ async def test_life_engine_grep_can_search_tool_name() -> None:
     assert payload["matches"][0]["event"]["tool_name"] == "nucleus_web_search"
 
 
-async def test_proactive_opportunity_is_searchable_from_event_stream() -> None:
-    service = LifeEngineService(SimpleNamespace(config=None))
+async def test_proactive_opportunity_is_searchable_from_event_stream(
+    tmp_path: Path,
+) -> None:
+    service = _isolated_service(tmp_path)
     await service.enqueue_proactive_opportunity(
         "主动续话机会：对方已经沉默约 20 分钟",
         stream_id="s-proactive",
@@ -185,8 +224,10 @@ async def test_proactive_opportunity_is_searchable_from_event_stream() -> None:
     assert event["content_type"] == "proactive_opportunity"
 
 
-async def test_chatter_inner_monologue_is_searchable_from_event_stream() -> None:
-    service = LifeEngineService(SimpleNamespace(config=None))
+async def test_chatter_inner_monologue_is_searchable_from_event_stream(
+    tmp_path: Path,
+) -> None:
+    service = _isolated_service(tmp_path)
     await service.record_chatter_inner_monologue(
         "还是会忍不住想着他是不是在忙。",
         stream_id="s-monologue",
@@ -212,6 +253,146 @@ async def test_chatter_inner_monologue_is_searchable_from_event_stream() -> None
     assert event["stream_id"] == "s-monologue"
     assert event["source"] == "life_chatter"
     assert event["content_type"] == "chatter_inner_monologue"
+
+
+async def test_grep_finds_ledger_event_after_runtime_history_is_cleared(
+    tmp_path: Path,
+) -> None:
+    config = LifeEngineConfig()
+    config.settings.enabled = True
+    config.settings.workspace_path = str(tmp_path)
+    service = LifeEngineService(SimpleNamespace(config=config))
+    event = service._event_builder.build_dfc_message_event(
+        "账本里还有这条",
+        stream_id="s-ledger",
+    )
+    await service._queue_pending_event(event)
+    service._event_history = []
+    service._pending_events = []
+
+    import plugins.life_engine.service.registry as registry
+
+    registry.register_life_engine_service(service)
+    result = await grep_life_events(query="账本里还有这条")
+
+    assert result["stats"]["matched_events"] >= 1
+    match = result["matches"][0]["event"]
+    assert "账本里还有这条" in match["content"]
+    assert match["occurrence_id"]
+    assert match.get("read_with") in {"", "nucleus_read_event"}
+
+
+async def test_grep_empty_query_filters_by_tool_success_and_person() -> None:
+    service = LifeEngineService(SimpleNamespace(config=None))
+    service._event_history = [
+        _event(1, "成功调用", event_type=EventType.TOOL_RESULT, tool_name="nucleus_todo"),
+        _event(2, "失败调用", event_type=EventType.TOOL_RESULT, tool_name="nucleus_todo"),
+    ]
+    service._event_history[0].tool_success = True
+    service._event_history[1].tool_success = False
+    service._event_history[0].sender = "Ayer"
+    service._event_history[1].sender = "other"
+
+    import plugins.life_engine.service.registry as registry
+
+    registry.register_life_engine_service(service)
+    result = await grep_life_events(
+        query="",
+        tool_names=["nucleus_todo"],
+        tool_success=False,
+        person="other",
+    )
+    assert result["stats"]["matched_events"] == 1
+    assert result["matches"][0]["event"]["event_id"] == "evt-2"
+
+
+async def test_grep_empty_query_filters_by_time_instance_and_causation() -> None:
+    service = LifeEngineService(SimpleNamespace(config=None))
+    service._event_history = [
+        _event(
+            1,
+            "上午的活动",
+            timestamp="2026-09-03T02:00:00+08:00",
+            source_instance_id="chat_global",
+            causation_id="turn-a",
+        ),
+        _event(
+            2,
+            "下午的活动",
+            timestamp="2026-09-03T15:00:00+08:00",
+            source_instance_id="minecraft",
+            causation_id="turn-b",
+        ),
+        _event(
+            3,
+            "下午但别的实例",
+            timestamp="2026-09-03T16:00:00+08:00",
+            source_instance_id="chat_global",
+            causation_id="turn-c",
+        ),
+    ]
+
+    import plugins.life_engine.service.registry as registry
+
+    registry.register_life_engine_service(service)
+    result = await grep_life_events(
+        query="",
+        after="2026-09-03T12:00:00+08:00",
+        source_instance_ids=["minecraft"],
+        causation_ids=["turn-b"],
+    )
+    assert result["stats"]["matched_events"] == 1
+    assert result["matches"][0]["event"]["event_id"] == "evt-2"
+
+
+async def test_grep_thought_alias_matches_heartbeat() -> None:
+    service = LifeEngineService(SimpleNamespace(config=None))
+    service._event_history = [
+        _event(1, "心跳里想了一下", event_type=EventType.HEARTBEAT, stream_id=""),
+        _event(2, "普通聊天", stream_id="s1"),
+    ]
+
+    import plugins.life_engine.service.registry as registry
+
+    registry.register_life_engine_service(service)
+    result = await grep_life_events(query="", event_types=["thought"])
+    assert result["stats"]["matched_events"] == 1
+    assert result["matches"][0]["event"]["event_id"] == "evt-1"
+
+
+async def test_grep_thought_alias_and_scan_truncated_page(
+    tmp_path: Path,
+) -> None:
+    config = LifeEngineConfig()
+    config.settings.enabled = True
+    config.settings.workspace_path = str(tmp_path)
+    service = LifeEngineService(SimpleNamespace(config=config))
+    events = [
+        service._event_builder.build_dfc_message_event(f"事件{index}", stream_id="s1")
+        for index in range(6)
+    ]
+    await service._publish_raw_events(events)
+    service._event_history = []
+    service._pending_events = []
+
+    import plugins.life_engine.service.registry as registry
+
+    registry.register_life_engine_service(service)
+    first = await grep_life_events(query="", scan_limit=2, limit=80, order="desc")
+    assert first["stats"]["scan_truncated"] is True
+    next_before = first["scan"]["next_before_position"]
+    second = await grep_life_events(
+        query="",
+        scan_limit=20,
+        before_position=next_before,
+        order="desc",
+    )
+    first_ids = {item["event"]["event_id"] for item in first["matches"]}
+    second_ids = {item["event"]["event_id"] for item in second["matches"]}
+    assert first_ids.isdisjoint(second_ids)
+
+    thought = await grep_life_events(query="", event_types=["chat"])
+    assert thought["stats"]["matched_events"] >= 1
 
 
 async def test_read_event_pages_complete_authoritative_activity_by_occurrence() -> None:

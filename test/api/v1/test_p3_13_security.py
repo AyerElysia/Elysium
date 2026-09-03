@@ -25,8 +25,6 @@ def test_scope_resource_action_matrix_covers_every_exported_scope() -> None:
 
 
 def test_matrix_covers_post_merge_scopes_from_parallel_phases() -> None:
-    assert action_is_declared("surface:input", resource="surface:surface-1", action="input")
-    assert action_is_declared("surface:input", resource="surface:surface-1", action="send")
     assert action_is_declared("admin:jobs", resource="job:job-1", action="cancel")
     assert action_is_declared("admin:integrations", resource="integration:feishu", action="test")
 

@@ -633,29 +633,6 @@ async def test_life_send_voice_action_fails_closed_without_local_tts_service(
     assert result == "本地消息 TTS 服务未启用或尚未就绪"
 
 
-async def test_life_send_voice_action_does_not_duplicate_surface_auto_tts(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    action = LifeSendVoiceAction.__new__(LifeSendVoiceAction)
-    action.chat_stream = SimpleNamespace(
-        stream_id="surface-stream",
-        platform="neko.surface",
-    )
-
-    def fail_if_resolved(_signature: str) -> None:
-        raise AssertionError("Surface text mode must not resolve message TTS")
-
-    monkeypatch.setattr(
-        "plugins.tts_voice_plugin.api.get_local_tts_service",
-        lambda: fail_if_resolved("tts_voice_plugin:service:tts"),
-    )
-
-    ok, result = await action.execute(text="这句话只应由 Surface 自动朗读。")
-
-    assert ok is False
-    assert result == "N.E.K.O Surface 已由本地自动语音链接管"
-
-
 async def test_life_send_voice_action_rejects_empty_local_tts_audio(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

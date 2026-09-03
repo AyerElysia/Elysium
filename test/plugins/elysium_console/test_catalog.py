@@ -161,3 +161,57 @@ def test_experience_cursor_requires_composite_identity() -> None:
     assert cursor.ingest_position == 12
     with pytest.raises(ConsoleDataInvalid):
         ElysiumDataCatalog._experience_cursor(12, "")
+
+
+@pytest.mark.asyncio
+async def test_minecraft_controls_are_pinned_to_independent_bot_body() -> None:
+    class Session:
+        def __init__(self) -> None:
+            self.starts: list[dict[str, str]] = []
+            self.stops = 0
+
+        async def get_status(self) -> dict:
+            return {
+                "active": False,
+                "readiness": "idle",
+                "latest_observation": {
+                    "observation_id": "observation-1",
+                    "sequence": 7,
+                    "facts": {
+                        "world": {"mode": "multiplayer"},
+                        "inventory": ["must-not-be-copied"],
+                    },
+                },
+            }
+
+        async def preflight(self, *, body_name: str) -> dict:
+            assert body_name == "bot"
+            return {"success": True, "ready_to_start": True}
+
+        async def start(self, *, goal: str, body_name: str) -> dict:
+            self.starts.append({"goal": goal, "body_name": body_name})
+            return {"success": True, "body_name": body_name}
+
+        async def stop(self) -> dict:
+            self.stops += 1
+            return {"success": True}
+
+    session = Session()
+    service = SimpleNamespace(minecraft_session=session)
+    catalog = ElysiumDataCatalog(lambda: service)
+
+    status = await catalog.minecraft_status()
+    preflight = await catalog.minecraft_preflight()
+    started = await catalog.minecraft_start(goal="  一起   探索  ")
+    stopped = await catalog.minecraft_stop()
+
+    assert status["latest_observation"]["world"] == {"mode": "multiplayer"}
+    assert "inventory" not in status["latest_observation"]
+    assert preflight["result"]["ready_to_start"] is True
+    assert session.starts == [{"goal": "一起 探索", "body_name": "bot"}]
+    assert started["read_only"] is False
+    assert stopped["result"]["success"] is True
+    assert session.stops == 1
+
+    with pytest.raises(ConsoleDataInvalid, match="too long"):
+        await catalog.minecraft_start(goal="x" * 501)

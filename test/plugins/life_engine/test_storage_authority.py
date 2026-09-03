@@ -243,7 +243,72 @@ async def test_local_fence_blocks_cutover_until_transaction_scope_exits(
         await registry.validate(token)
 
 
-async def test_audit_tamper_fails_closed(tmp_path: Path) -> None:
+async def test_local_fence_does_not_block_incumbent_renew(tmp_path: Path) -> None:
+    registry = FileAuthorityRegistry(tmp_path / "authority.json")
+    await registry.register_generation(generation("local-v1"))
+    token = await registry.activate_generation(
+        "local-v1",
+        expected_epoch=0,
+        owner_id="writer-1",
+        lease_seconds=60,
+        confirm_previous_writers_stopped=True,
+    )
+
+    async with registry.fenced(token):
+        renewed = await asyncio.wait_for(
+            registry.renew(token, lease_seconds=60),
+            timeout=2,
+        )
+
+    assert renewed.authority_epoch == token.authority_epoch
+    await registry.validate(renewed)
+    await registry.revoke(renewed)
+
+
+async def test_incumbent_can_renew_after_wall_clock_lease_expiry(
+    tmp_path: Path,
+) -> None:
+    registry = FileAuthorityRegistry(tmp_path / "authority.json")
+    await registry.register_generation(generation("local-v1"))
+    token = await registry.activate_generation(
+        "local-v1",
+        expected_epoch=0,
+        owner_id="writer-1",
+        lease_seconds=1,
+        confirm_previous_writers_stopped=True,
+    )
+    await asyncio.sleep(1.2)
+    with pytest.raises(StaleAuthorityToken, match="lease has expired"):
+        await registry.validate(token)
+
+    renewed = await registry.renew(token, lease_seconds=60)
+    await registry.validate(renewed)
+    assert renewed.fencing_token == token.fencing_token
+    await registry.revoke(renewed)
+
+
+async def test_file_authority_keepalive_renews_while_writer_fence_is_held(
+    tmp_path: Path,
+) -> None:
+    registry = FileAuthorityRegistry(tmp_path / "authority.json")
+    await registry.register_generation(generation("local-v1"))
+    token = await registry.activate_generation(
+        "local-v1",
+        expected_epoch=0,
+        owner_id="writer-1",
+        lease_seconds=2,
+        confirm_previous_writers_stopped=True,
+    )
+    registry.start_keepalive(token, lease_seconds=2, interval_seconds=0.2)
+    try:
+        async with registry.fenced(token):
+            await asyncio.sleep(2.4)
+        await registry.validate(registry._keepalive_token or token)
+        health = await registry.health()
+        assert health["incumbent_keepalive"] == "running"
+        assert health["lease_expired"] is False
+    finally:
+        await registry.revoke(registry._keepalive_token or token)
     registry = FileAuthorityRegistry(tmp_path / "authority.json")
     await registry.register_generation(generation("local-v1"))
     lines = registry.audit_path.read_text(encoding="utf-8").splitlines()

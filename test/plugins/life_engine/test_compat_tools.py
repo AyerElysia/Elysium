@@ -6,10 +6,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from plugins.life_engine.core import compat_tools
 from plugins.life_engine.core.compat_tools import (
     LifeInnerQueryTool,
     LifeRecordInnerMonologueAction,
-    LifeThinkAction,
 )
 from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.core.plugin import LifeEnginePlugin
@@ -31,6 +31,8 @@ def test_life_engine_exposes_only_active_compat_tools_when_chatter_enabled() -> 
     assert "LifeSearchLifeMemoryTool" not in component_names
     assert "LifeRetrieveMemoryTool" not in component_names
     assert "LifeScheduleFollowupMessageAction" not in component_names
+    assert not hasattr(compat_tools, "LifeThinkAction")
+    assert not hasattr(compat_tools, "LifeScheduleFollowupMessageAction")
 
 
 async def test_record_inner_monologue_action_delegates_to_life_service(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -80,44 +82,6 @@ async def test_record_inner_monologue_action_delegates_to_life_service(monkeypat
     ]
 
 
-async def test_think_action_delegates_snapshot_to_life_service(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = []
-
-    class _FakeService:
-        async def record_chatter_think_snapshot(self, **kwargs):
-            calls.append(kwargs)
-            return {"channel": "chatter_think_snapshot"}
-
-    fake_plugin = SimpleNamespace(service=_FakeService())
-    monkeypatch.setattr(
-        "plugins.life_engine.core.compat_tools.get_plugin_manager",
-        lambda: SimpleNamespace(get_plugin=lambda name: fake_plugin if name == "life_engine" else None),
-    )
-
-    action = LifeThinkAction.__new__(LifeThinkAction)
-    action.plugin = fake_plugin
-    action.chat_stream = SimpleNamespace(stream_id="stream-2")
-
-    ok, message = await action.execute(
-        mood="在意",
-        decision="先把语气放软再回她",
-        expected_response="她会觉得我还在认真听",
-        thought="刚刚那句其实是在确认我是不是还在。",
-    )
-
-    assert ok is True
-    assert "思考动作已记录" in message
-    assert calls == [
-        {
-            "stream_id": "stream-2",
-            "thought": "刚刚那句其实是在确认我是不是还在。",
-            "mood": "在意",
-            "decision": "先把语气放软再回她",
-            "expected_response": "她会觉得我还在认真听",
-        }
-    ]
-
-
 async def test_inner_query_awaits_async_world_port(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -148,19 +112,3 @@ async def test_inner_query_awaits_async_world_port(
     assert ok is True
     assert result == "traceable world answer"
     assert calls == [("instance-query", "what changed")]
-
-
-async def test_schedule_followup_message_action_is_read_only_legacy() -> None:
-    from plugins.life_engine.core.compat_tools import LifeScheduleFollowupMessageAction
-
-    action = LifeScheduleFollowupMessageAction.__new__(LifeScheduleFollowupMessageAction)
-
-    ok, message = await action.execute(
-        delay_seconds=30.0,
-        thought="继续想一下",
-        topic="脑内思考",
-        followup_type="add_detail",
-    )
-
-    assert ok is False
-    assert "LegacyFollowupReadOnly" in message

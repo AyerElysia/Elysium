@@ -17,6 +17,9 @@ from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.prompts.sections import (
     HeartbeatSectionProvider,
     SectionContext,
+    build_handwritten_diary_inventory,
+    inspect_handwritten_diary_clutter,
+    build_file_care_invitation,
     render_heartbeat_sections,
 )
 from plugins.life_engine.service import LifeEngineService
@@ -113,3 +116,50 @@ def test_legacy_schedule_is_rejected_without_target_lookup(
                 target_key="p-legacy",
             )
         )
+
+
+def test_handwritten_diary_inventory_ignores_witness_and_lists_recent(
+    tmp_path: Path,
+) -> None:
+    diaries = tmp_path / "diaries"
+    diaries.mkdir()
+    (diaries / "2026-08-01.md").write_text("aug1", encoding="utf-8")
+    (diaries / "2026-08-31.md").write_text("aug31", encoding="utf-8")
+    (diaries / "2026-09-02.md").write_text("sep2", encoding="utf-8")
+    witness = diaries / "witness"
+    witness.mkdir()
+    (witness / "x.md").write_text("witness", encoding="utf-8")
+
+    text = build_handwritten_diary_inventory(diaries, today="2026-09-02")
+    assert text is not None
+    assert "共有 3 篇" in text
+    assert "2026-09-02" in text
+    assert "2026-08-31" in text
+    assert "（今天）" in text
+    assert "x.md" not in text
+    assert "不是任务" in text
+
+
+def test_handwritten_diary_inventory_empty_dir_returns_none(tmp_path: Path) -> None:
+    diaries = tmp_path / "diaries"
+    diaries.mkdir()
+    assert build_handwritten_diary_inventory(diaries, today="2026-09-02") is None
+
+
+def test_file_care_census_ignores_witness_and_quiet_folders(tmp_path: Path) -> None:
+    diaries = tmp_path / "diaries"
+    diaries.mkdir()
+    (diaries / "2026-08-01.md").write_text("a", encoding="utf-8")
+    (diaries / "2026-08-02.md").write_text("b", encoding="utf-8")
+    witness = diaries / "witness"
+    witness.mkdir()
+    (witness / "x.md").write_text("w", encoding="utf-8")
+    assert inspect_handwritten_diary_clutter(diaries) is None
+    crowded = inspect_handwritten_diary_clutter(diaries, min_top_level=2)
+    assert crowded is not None
+    assert crowded["total"] == 2
+    assert crowded["busiest_count"] == 1
+    text = build_file_care_invitation(crowded)
+    assert "不是任务" in text
+    assert "不能搬" in text
+    assert "witness" in text

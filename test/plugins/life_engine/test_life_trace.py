@@ -63,7 +63,7 @@ async def test_write_and_edit_file_records_trace(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("path", ["SOUL.md", "USER.md", "MEMORY.md"])
-async def test_generic_file_tools_block_subject_authority_paths(
+async def test_generic_file_tools_can_edit_standing_prompt_files(
     tmp_path: Path,
     path: str,
 ) -> None:
@@ -71,27 +71,29 @@ async def test_generic_file_tools_block_subject_authority_paths(
     target = tmp_path / path
     target.write_text("original\n", encoding="utf-8")
 
-    ok, write_error = await LifeEngineWriteFileTool(plugin=plugin).execute(
+    ok, write_payload = await LifeEngineWriteFileTool(plugin=plugin).execute(
         path,
         "replacement\n",
-        reason="must not bypass authority",
+        reason="subject owns standing prompts",
     )
-    assert ok is False
-    assert "SubjectAuthorityDirectMutationBlocked" in str(write_error)
+    assert ok is True
+    assert isinstance(write_payload, dict)
+    assert target.read_text(encoding="utf-8") == "replacement\n"
 
-    ok, edit_error = await LifeEngineEditFileTool(plugin=plugin).execute(
+    ok, edit_payload = await LifeEngineEditFileTool(plugin=plugin).execute(
         f"./{path}",
-        "original",
         "replacement",
-        reason="must not bypass authority",
+        "edited",
+        reason="subject owns standing prompts",
     )
-    assert ok is False
-    assert "SubjectAuthorityDirectMutationBlocked" in str(edit_error)
-    assert target.read_text(encoding="utf-8") == "original\n"
-    assert LifeTraceStore(tmp_path).history(path) == []
+    assert ok is True
+    assert isinstance(edit_payload, dict)
+    assert target.read_text(encoding="utf-8") == "edited\n"
+    history = LifeTraceStore(tmp_path).history(path)
+    assert [record.operation for record in history] == ["edit", "write"]
 
 
-async def test_generic_file_tool_blocks_symlink_to_subject_authority(
+async def test_generic_file_tool_follows_symlink_into_standing_prompt(
     tmp_path: Path,
 ) -> None:
     plugin = _plugin(tmp_path)
@@ -100,15 +102,15 @@ async def test_generic_file_tool_blocks_symlink_to_subject_authority(
     (tmp_path / "notes").mkdir()
     (tmp_path / "notes" / "alias.md").symlink_to(target)
 
-    ok, error = await LifeEngineWriteFileTool(plugin=plugin).execute(
+    ok, payload = await LifeEngineWriteFileTool(plugin=plugin).execute(
         "notes/alias.md",
         "replacement\n",
-        reason="symlink must not bypass authority",
+        reason="resolved standing prompt is still a normal file",
     )
 
-    assert ok is False
-    assert "SubjectAuthorityDirectMutationBlocked" in str(error)
-    assert target.read_text(encoding="utf-8") == "original\n"
+    assert ok is True
+    assert isinstance(payload, dict)
+    assert target.read_text(encoding="utf-8") == "replacement\n"
 
 
 @pytest.mark.parametrize(

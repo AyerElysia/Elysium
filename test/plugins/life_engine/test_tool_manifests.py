@@ -18,8 +18,15 @@ from plugins.life_engine.tools import ALL_TOOLS
 # 与 chatter.py `_build_primary_tool_guide` 核心工具文案对齐（注册名 = schema 名）
 _CHAT_GUIDE_TOOLS = {
     "tool-nucleus_bash",  # 查看或操作电脑终端
+    "tool-nucleus_read_file",
+    "tool-nucleus_grep_file",
+    "tool-nucleus_edit_file",
+    "tool-nucleus_apply_patch",
+    "tool-nucleus_glob_file",
+    "tool-nucleus_web_search",  # 联网搜索公开网页
+    "tool-nucleus_browser_fetch",  # 打开 URL 提取正文
     "tool-nucleus_view_screen",  # 查看 Ayer 当前屏幕
-    "tool-nucleus_manage_todo",  # 创建 TODO
+    "tool-nucleus_todo",  # TODO 板
     "tool-inner_dialogue",  # 把念头沉进心里慢慢想
     "tool-inspect_media",  # 把图片/视频/语音提升为原生多模态输入
     "action-life_send_text",  # 发送文字给用户
@@ -36,6 +43,15 @@ def test_chat_manifest_contains_guide_tools() -> None:
     assert not missing, f"chat manifest 缺少文案中列出的工具: {sorted(missing)}"
 
 
+def test_chat_manifest_keeps_registered_web_tools() -> None:
+    """WEB_TOOLS 里实际注册的联网工具必须能通过 chat 清单过滤。"""
+    from plugins.life_engine.tools.web_tools import WEB_TOOLS
+
+    chat = set(get_tool_manifest("chat"))
+    missing = {f"tool-{cls.tool_name}" for cls in WEB_TOOLS} - chat
+    assert not missing, f"chat manifest 丢掉了已注册的 Web 工具: {sorted(missing)}"
+
+
 def test_chat_manifest_contains_file_tools() -> None:
     """文件读写/搜索类基础能力必须在 chat 清单（读日记/搜索 workspace 依赖它们）。"""
     chat = set(get_tool_manifest("chat"))
@@ -44,11 +60,17 @@ def test_chat_manifest_contains_file_tools() -> None:
         "tool-nucleus_read_file",
         "tool-nucleus_list_files",
         "tool-nucleus_edit_file",
+        "tool-nucleus_apply_patch",
+        "tool-nucleus_glob_file",
         "tool-nucleus_write_file",
         "tool-nucleus_mkdir",
     }
     missing = required - chat
     assert not missing, f"chat manifest 缺少文件类工具: {sorted(missing)}"
+    names = {tool.tool_name for tool in ALL_TOOLS}
+    assert "nucleus_mkdir" in names
+    assert "nucleus_apply_patch" in names
+    assert "nucleus_glob_file" in names
 
 
 @pytest.mark.parametrize("kind", ["chat", "minecraft", "livestream", "voice_live", "memory_witness"])
@@ -86,3 +108,6 @@ def test_stream_bound_wake_and_followup_are_not_registered() -> None:
     assert "nucleus_tell_dfc" not in component_names
     assert "schedule_followup_message" not in component_names
     assert "nucleus_manage_autonomy_intent" not in component_names
+    assert "nucleus_browser_fetch" in component_names
+    assert "nucleus_web_search" in component_names
+    assert "nucleus_web" not in component_names

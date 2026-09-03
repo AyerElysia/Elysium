@@ -14,7 +14,7 @@ from plugins.life_engine.memory.continuity_tools import CONTINUITY_REVIEW_TOOLS
 from plugins.life_engine.memory.edges import EdgeType
 from plugins.life_engine.memory.service import LifeMemoryService
 from plugins.life_engine.memory.tools import MEMORY_TOOLS, LifeEngineMemoryStatsTool
-from plugins.life_engine.service.integrations import DFCIntegration, MemoryIntegration
+from plugins.life_engine.service.integrations import MemoryIntegration
 from plugins.life_engine.service.tool_manifests import get_tool_manifest
 from plugins.life_engine.tools.schedule_tools import (
     ScheduleRecord,
@@ -37,36 +37,6 @@ def test_canonical_relation_tool_is_reachable_from_chat_runtime() -> None:
 
     assert "life_engine_internal" in NucleusRelationsTool.chatter_allow
     assert "life_chatter" in NucleusRelationsTool.chatter_allow
-
-
-async def test_dfc_snapshot_does_not_create_a_parallel_diary_memory_path(
-    tmp_path: Path,
-) -> None:
-    class _Lock:
-        async def __aenter__(self) -> None:
-            return None
-
-        async def __aexit__(self, *_args: object) -> None:
-            return None
-
-    diary_dir = tmp_path / "diary"
-    diary_dir.mkdir()
-    (diary_dir / "2026-08-13.md").write_text(
-        "this must only be recalled through canonical memory",
-        encoding="utf-8",
-    )
-    service = SimpleNamespace(
-        _event_history=[],
-        _get_lock=lambda: _Lock(),
-        _workspace_dir=lambda: tmp_path,
-    )
-    integration = DFCIntegration(service)
-
-    snapshot = await integration.get_dfc_snapshot()
-    rendered = await integration.query_actor_context()
-
-    assert "recent_diary_lines" not in snapshot
-    assert "this must only be recalled" not in rendered
 
 
 async def test_direct_legacy_decay_entry_point_fails_closed() -> None:

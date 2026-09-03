@@ -24,7 +24,7 @@ class _Registry:
         self._active = active
 
     def get_for_stream(self, stream_id: str) -> object | None:
-        if stream_id != "stream:proactive":
+        if stream_id not in {"stream:proactive", "chat_global"}:
             return None
         return SimpleNamespace(instance_id="chat_global", is_active=self._active)
 
@@ -157,6 +157,7 @@ async def test_unified_command_requires_an_active_bound_actor(
     assert ok is False
     assert result == {
         "error": "PermissionError",
+        "error_message": "ProactiveActorIsNotActive",
         "operation": "attention.open",
         "authority_committed": False,
     }
@@ -208,3 +209,106 @@ def test_source_instance_never_defaults_to_actor_outside_core_heartbeat() -> Non
     )
     with pytest.raises(RuntimeError, match="ProactiveSourceInstanceRequired"):
         _source_instance(tool, "chat_global")  # type: ignore[arg-type]
+
+
+def test_heartbeat_source_time_prefers_timestamp_over_missing_occurred_at() -> None:
+    from plugins.life_engine.service.core import LifeEngineService
+
+    event = SimpleNamespace(timestamp="2026-09-03T01:00:00+08:00")
+    assert (
+        LifeEngineService._heartbeat_source_occurred_at(event)
+        == "2026-09-03T01:00:00+08:00"
+    )
+    assert LifeEngineService._heartbeat_source_occurred_at(
+        SimpleNamespace(occurred_at="2026-09-03T02:00:00+00:00")
+    ) == "2026-09-03T02:00:00+00:00"
+    fallback = LifeEngineService._heartbeat_source_occurred_at(SimpleNamespace())
+    assert fallback.endswith("+00:00") or fallback.endswith("+08:00") or "+" in fallback
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_attention_open_commits_using_event_timestamp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from plugins.life_engine.service.core import LifeEngineService
+    from src.kernel.llm import ToolRegistry
+
+    runtime = await open_local_proactive_runtime(
+        workspace_path=tmp_path,
+        config=_config(),
+        validate_active_actor=_active,
+    )
+    service = SimpleNamespace(
+        consciousness_registry=_Registry(),
+        proactive_authority=runtime.authority,
+        page_attention_threads=runtime.authority.page_attention,
+        decide_attention_thread=runtime.authority.decide_attention,
+        list_initiative_seeds=runtime.authority.list_initiatives,
+        get_initiative_seed=runtime.authority.get_initiative,
+        decide_initiative_seed=runtime.authority.decide_initiative,
+    )
+    monkeypatch.setattr(
+        "plugins.life_engine.service.registry.get_life_engine_service",
+        lambda: service,
+    )
+    heartbeat = LifeEngineService.__new__(LifeEngineService)
+    heartbeat.plugin = SimpleNamespace()
+    registry = ToolRegistry()
+    registry.register(LifeEngineProactiveCommandTool, name="nucleus_proactive_command")
+    source_occurred_at = LifeEngineService._heartbeat_source_occurred_at(
+        SimpleNamespace(timestamp="2026-09-03T01:00:00+08:00")
+    )
+    try:
+        result, success = await heartbeat._run_heartbeat_tool_call_execution(
+            "nucleus_proactive_command",
+            {
+                "action": "attention.open",
+                "expected_revision": 0,
+                "statement": "心跳用 timestamp 留下这条关注。",
+            },
+            registry,
+            tool_call_id="call:heartbeat-timestamp",
+            source_occurrence_id="heartbeat:run:1",
+            source_occurred_at=source_occurred_at,
+        )
+        assert success is True
+        assert isinstance(result, dict)
+        assert result["authority_committed"] is True
+        assert result["record_family"] == "attention"
+        view = await runtime.authority.get_attention(str(result["record_id"]))
+        assert view is not None
+        assert view.current_statement == "心跳用 timestamp 留下这条关注。"
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_command_missing_source_time_returns_error_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = SimpleNamespace(consciousness_registry=_Registry())
+    monkeypatch.setattr(
+        "plugins.life_engine.service.registry.get_life_engine_service",
+        lambda: service,
+    )
+    command = LifeEngineProactiveCommandTool(SimpleNamespace())
+    command._bind_runtime_context(
+        stream_id="stream:proactive",
+        tool_call_id="call:missing-time",
+    )
+    command._life_source_occurrence_id = "life:event:missing-time"
+    command._life_source_instance_id = "chat_global"
+    command._runtime_task_name = "core"
+
+    ok, result = await command.execute(
+        action="attention.open",
+        statement="没有来源时间就不能提交。",
+    )
+
+    assert ok is False
+    assert isinstance(result, dict)
+    assert result["error"] == "RuntimeError"
+    assert result["error_message"] == "ProactiveSourceTimeRequired"
+    assert result["authority_committed"] is False
+    assert result["operation"] == "attention.open"

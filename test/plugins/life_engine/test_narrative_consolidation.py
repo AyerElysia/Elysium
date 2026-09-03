@@ -4,7 +4,7 @@
 覆盖：
 1. NarrativeStore 游标推进 / pending 过滤（narrative 自身不算素材）
 2. quiet 回望同样推进游标，但不写自传正文
-3. RiverReflectionSection 的到期判断（数量门槛 / 间隔 / 邀请冷却 / 配置开关）
+3. 长河邀请的到期判断（数量门槛 / 间隔 / 邀请冷却 / 配置开关）
 4. nucleus_write_narrative 工具：空输入报错、写下叙事、安静回望，均入长河
 """
 
@@ -22,7 +22,11 @@ import pytest
 from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.narrative.store import AsyncLocalNarrativeStore, NarrativeStore
 from plugins.life_engine.narrative.tools import LifeEngineWriteNarrativeTool
-from plugins.life_engine.prompts.sections import RiverReflectionSection, SectionContext
+from plugins.life_engine.opportunity.producers import (
+    collect_narrative_invitation,
+    narrative_invitation_enabled,
+)
+from plugins.life_engine.prompts.sections import SectionContext
 from plugins.life_engine.trace.store import AsyncLocalLifeTraceStore, LifeTraceStore
 
 
@@ -100,7 +104,7 @@ def test_quiet_consolidation_advances_cursor_without_autobiography(tmp_path: Pat
     assert store.last_entry() is not None
 
 
-# ── 2. RiverReflectionSection ───────────────────────────────
+# ── 2. 长河邀请（机会总线生产者） ───────────────────────────
 
 
 def _make_ctx(tmp_path: Path) -> SectionContext:
@@ -123,7 +127,7 @@ def test_section_silent_below_min_moments(tmp_path: Path) -> None:
     ctx = _make_ctx(tmp_path)
     ctx.config.narrative.min_moments = 3
 
-    assert asyncio.run(RiverReflectionSection().render(ctx)) is None
+    assert asyncio.run(collect_narrative_invitation(ctx.service, config=ctx.config)) is None
 
 
 def test_section_renders_invitation_when_due(tmp_path: Path) -> None:
@@ -131,13 +135,14 @@ def test_section_renders_invitation_when_due(tmp_path: Path) -> None:
     ctx = _make_ctx(tmp_path)
     ctx.config.narrative.min_moments = 3
 
-    text = asyncio.run(RiverReflectionSection().render(ctx))
+    first = asyncio.run(collect_narrative_invitation(ctx.service, config=ctx.config))
+    second = asyncio.run(collect_narrative_invitation(ctx.service, config=ctx.config))
 
-    assert text is not None
-    assert "回望长河" in text
-    assert "nucleus_write_narrative" in text
-    assert "nothing_to_say" in text
-    assert "跳过也很好" in text
+    assert first is not None
+    assert second is not None
+    assert first.offer.disclosure_ref == ("nucleus_write_narrative",)
+    assert first.offer.facts["pending_count"] == 3
+    assert first.offer.domain == "narrative"
 
 
 def test_section_invite_cooldown_suppresses_repeat(tmp_path: Path) -> None:
@@ -145,11 +150,14 @@ def test_section_invite_cooldown_suppresses_repeat(tmp_path: Path) -> None:
     ctx = _make_ctx(tmp_path)
     ctx.config.narrative.min_moments = 3
 
-    first = asyncio.run(RiverReflectionSection().render(ctx))
-    second = asyncio.run(RiverReflectionSection().render(ctx))
+    first = asyncio.run(collect_narrative_invitation(ctx.service, config=ctx.config))
+    second = asyncio.run(collect_narrative_invitation(ctx.service, config=ctx.config))
 
     assert first is not None
-    assert second is None  # 邀请呈现过一次后进入冷却，不反复催促
+    assert second is not None
+    assert asyncio.run(first.commit(None)) is True
+    third = asyncio.run(collect_narrative_invitation(ctx.service, config=ctx.config))
+    assert third is None
 
 
 def test_section_respects_min_interval_since_consolidation(tmp_path: Path) -> None:
@@ -160,24 +168,24 @@ def test_section_respects_min_interval_since_consolidation(tmp_path: Path) -> No
 
     ctx = _make_ctx(tmp_path)
     ctx.config.narrative.min_moments = 3
-    assert asyncio.run(RiverReflectionSection().render(ctx)) is None
+    assert asyncio.run(collect_narrative_invitation(ctx.service, config=ctx.config)) is None
 
     # 把上次沉淀时间拨回 25 小时前，应当再次到期
     state = store.load_state()
     past = (_now() - timedelta(hours=25)).isoformat()
     state["last_consolidated_at"] = past
     store._save_state(state)
-    assert asyncio.run(RiverReflectionSection().render(ctx)) is not None
+    assert asyncio.run(collect_narrative_invitation(ctx.service, config=ctx.config)) is not None
 
 
 def test_section_disabled_by_config(tmp_path: Path) -> None:
     ctx = _make_ctx(tmp_path)
     ctx.config.narrative.enabled = False
-    assert RiverReflectionSection().enabled(ctx) is False
+    assert narrative_invitation_enabled(ctx.config, ctx.service) is False
 
     ctx.config.narrative.enabled = True
     ctx.config.narrative.inject_to_heartbeat = False
-    assert RiverReflectionSection().enabled(ctx) is False
+    assert narrative_invitation_enabled(ctx.config, ctx.service) is False
 
 
 def test_section_shows_last_entry_snippet(tmp_path: Path) -> None:
@@ -195,11 +203,10 @@ def test_section_shows_last_entry_snippet(tmp_path: Path) -> None:
 
     ctx = _make_ctx(tmp_path)
     ctx.config.narrative.min_moments = 3
-    text = asyncio.run(RiverReflectionSection().render(ctx))
+    collected = asyncio.run(collect_narrative_invitation(ctx.service, config=ctx.config))
 
-    assert text is not None
-    assert "上次你写道" in text
-    assert entry.text in text
+    assert collected is not None
+    assert entry.text in str(collected.offer.facts["last_entry_excerpt"])
 
 
 # ── 3. nucleus_write_narrative 工具 ─────────────────────────
