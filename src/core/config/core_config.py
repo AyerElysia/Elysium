@@ -44,7 +44,16 @@ class CoreConfig(ConfigBase):
         )
         log_level: str = Field(
             default="INFO",
-            description="日志级别：DEBUG/INFO/WARNING/ERROR/CRITICAL",
+            description="日志级别：DEBUG/INFO/WARNING/ERROR/CRITICAL（SQLite / 文本镜像）",
+        )
+        console_log_level: str = Field(
+            default="ERROR",
+            description=(
+                "终端日志级别。与 log_level 分开：默认 ERROR，避免把启动与基础设施 "
+                "INFO 刷进 tmux。life_engine / life_chatter 仍会打 WARNING；"
+                "消息接收器的入站渠道行仍会打 INFO。"
+                "决策面板不受此限制。设为 INFO 可恢复旧终端。"
+            ),
         )
         data_dir: str = Field(
             default="data",

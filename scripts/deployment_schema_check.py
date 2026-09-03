@@ -28,7 +28,6 @@ def main(root: Path = ROOT) -> int:
         from plugins.life_engine.core.config import LifeEngineConfig
         from plugins.livestream.config import LivestreamConfig
         from plugins.napcat_adapter.config import NapcatAdapterConfig
-        from plugins.neko_surface.config import NekoSurfaceConfig
         from plugins.skill_manager.config import SkillManagerConfig
         from plugins.tts_voice_plugin.config import TTSVoiceConfig
         from plugins.voice_live.config import VoiceLiveConfig
@@ -55,7 +54,6 @@ def main(root: Path = ROOT) -> int:
             (LifeEngineConfig, "config/plugins/life_engine/config.toml"),
             (LivestreamConfig, "config/plugins/Livestream/config.toml"),
             (NapcatAdapterConfig, "config/plugins/napcat_adapter/config.toml"),
-            (NekoSurfaceConfig, "config/plugins/neko_surface/config.toml"),
             (SkillManagerConfig, "config/plugins/skill_manager/config.toml"),
             (TTSVoiceConfig, "config/plugins/tts_voice_plugin/config.toml"),
             (VoiceLiveConfig, "config/plugins/Voice-Live/config.toml"),

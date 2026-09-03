@@ -332,6 +332,7 @@ class Bot:
         # run also leaves a durable, greppable text mirror on disk.
         initialize_logger_system(
             log_level=self.config.bot.log_level,
+            console_log_level=self.config.bot.console_log_level,
             log_dir=self.log_dir,
         )
         self.logger = get_logger(name="console", display="控制台", color=COLOR.BLUE)

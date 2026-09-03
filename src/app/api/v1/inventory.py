@@ -528,32 +528,6 @@ POST /api/v1/admin/autonomy/occurrences/{occurrence_id}:cancel
     ),
     *_contracts(
         """
-GET /api/v1/surfaces
-GET /api/v1/surfaces/{surface_id}/status
-POST /api/v1/surfaces/{surface_id}/tickets
-WS /api/v1/surfaces/{surface_id}/ws
-""",
-        domain="surfaces",
-        pages=("Neko 展示与交互",),
-        callers=_ALL_CALLERS,
-        scopes=("surface:read", "surface:connect"),
-        resource_authorization="按 surface owner、observer/input scope 与单次 ticket 校验",
-        anchor="plugins/neko_surface/router.py 与 elysia.surface.v1 协议",
-    ),
-    *_contracts(
-        """
-GET /api/v1/admin/surfaces/{surface_id}/connections
-POST /api/v1/admin/surfaces/{surface_id}/connections/{connection_id}:disconnect
-""",
-        domain="admin_surfaces",
-        pages=("Surface 连接管理",),
-        callers=_ADMIN_CALLERS,
-        scopes=("surface:admin",),
-        resource_authorization="要求全能管理员并校验目标 Surface 与连接身份",
-        anchor="plugins/neko_surface/router.py；需新增管理连接 facade",
-    ),
-    *_contracts(
-        """
 GET /api/v1/admin/tabletop/rooms
 GET /api/v1/admin/tabletop/rooms/{room_id}/moderator-view
 GET /api/v1/admin/tabletop/rooms/{room_id}/integrity

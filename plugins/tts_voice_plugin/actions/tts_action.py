@@ -129,13 +129,6 @@ class TTSVoiceAction(BaseAction):
             (是否成功, 结果描述)
         """
         try:
-            # N.E.K.O Surface voices ordinary Neo text through the Surface
-            # adapter.  Do not let a stale/global tool map create a second
-            # voice message for the same turn.
-            if str(getattr(self.chat_stream, "platform", "") or "").strip().lower() == "neko.surface":
-                logger.info("N.E.K.O Surface 使用本地自动语音链，跳过显式 tts_voice_action")
-                return False, "N.E.K.O Surface 已由自动 TTS 接管"
-
             if not self.tts_service:
                 logger.error("TTSService 未注册或初始化失败，静默处理。")
                 return False, "TTSService 未注册或初始化失败"
