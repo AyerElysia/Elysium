@@ -30,7 +30,6 @@ logger = get_logger("life_engine", display="life_engine")
 
 _PATH_WRITE_LOCKS: dict[str, asyncio.Lock] = {}
 
-# DFC 注入目标标识
 _TARGET_REMINDER_BUCKET = "actor"
 _TARGET_REMINDER_NAME = "生命中枢唤醒上下文"
 _SUMMARY_CONTENT_TYPES = {
@@ -706,8 +705,6 @@ class StatePersistence:
                         "last_wake_context_at": state.last_wake_context_at,
                         "last_wake_context_size": state.last_wake_context_size,
                         "last_external_message_at": state.last_external_message_at,
-                        "last_tell_dfc_at": state.last_tell_dfc_at,
-                        "tell_dfc_count": state.tell_dfc_count,
                         "self_pause_until": state.self_pause_until,
                         "self_pause_started_at": state.self_pause_started_at,
                         "self_pause_reason": state.self_pause_reason,
@@ -719,6 +716,9 @@ class StatePersistence:
                         "chatter_thought_cursors": state.chatter_thought_cursors or {},
                         "last_chatter_think_by_stream": (
                             state.last_chatter_think_by_stream or {}
+                        ),
+                        "inner_dialogue_ledger": (
+                            getattr(state, "inner_dialogue_ledger", None) or {}
                         ),
                     },
                     "pending_events": [event_to_dict(e) for e in pending_events],
@@ -1000,8 +1000,6 @@ class StatePersistence:
             state.last_wake_context_at = state_raw.get("last_wake_context_at")
             state.last_wake_context_size = _safe_int(state_raw.get("last_wake_context_size"))
             state.last_external_message_at = state_raw.get("last_external_message_at")
-            state.last_tell_dfc_at = state_raw.get("last_tell_dfc_at")
-            state.tell_dfc_count = _safe_int(state_raw.get("tell_dfc_count"))
             state.self_pause_until = state_raw.get("self_pause_until")
             state.self_pause_started_at = state_raw.get("self_pause_started_at")
             state.self_pause_reason = state_raw.get("self_pause_reason")
@@ -1063,6 +1061,10 @@ class StatePersistence:
                     if snapshot:
                         snapshots[sid] = snapshot
                 state.last_chatter_think_by_stream = snapshots
+
+            raw_inner_ledger = state_raw.get("inner_dialogue_ledger")
+            if isinstance(raw_inner_ledger, dict):
+                state.inner_dialogue_ledger = raw_inner_ledger
 
         # 持久化状态
         persisted_state = {

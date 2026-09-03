@@ -15,6 +15,7 @@ from src.app.plugin_system.api.llm_api import create_llm_request, get_model_set_
 from src.core.utils.llm_tool_call import exec_llm_usable
 from src.kernel.llm import ROLE, LLMPayload, Text, ToolRegistry, ToolResult
 
+from ..tools._utils import resolve_registry_tool
 from .activity import DelegatedActivityRecorder
 from .definitions import AgentResult, AgentTypeDefinition
 from .registry import get_agent_type_registry
@@ -180,7 +181,7 @@ class AgentRunner:
                 raw_args = getattr(call, "args", {}) or {}
                 args = dict(raw_args) if isinstance(raw_args, dict) else {}
 
-                usable_cls = tool_registry.get(tool_name)
+                usable_cls = resolve_registry_tool(tool_registry, tool_name)
                 tool_succeeded = False
                 if usable_cls:
                     try:

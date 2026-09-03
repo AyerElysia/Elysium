@@ -273,6 +273,66 @@ class WorldObservation:
 
 
 @dataclass(frozen=True, slots=True)
+class MinecraftBodyEvent:
+    """One ordered factual event emitted by an authenticated game body."""
+
+    event_id: str
+    instance_id: str
+    sequence: int
+    occurred_at: str
+    source: str
+    kind: str
+    payload: Mapping[str, Any] = field(default_factory=dict)
+    received_at: str = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        """Reject identity-free or non-namespaced events without interpretation."""
+
+        for value, name in (
+            (self.event_id, "event_id"),
+            (self.instance_id, "instance_id"),
+            (self.occurred_at, "occurred_at"),
+            (self.source, "source"),
+            (self.kind, "kind"),
+        ):
+            _require_text(value, name)
+        if self.sequence < 1:
+            raise ValueError("Minecraft body event sequence must be positive")
+        if not self.kind.startswith("minecraft."):
+            raise ValueError("Minecraft body event kind must use its namespace")
+        object.__setattr__(self, "payload", dict(self.payload))
+
+    def to_wire(self) -> JsonObject:
+        """Serialize the complete bounded body event."""
+
+        return {
+            "event_id": self.event_id,
+            "instance_id": self.instance_id,
+            "sequence": self.sequence,
+            "occurred_at": self.occurred_at,
+            "received_at": self.received_at,
+            "source": self.source,
+            "kind": self.kind,
+            "payload": dict(self.payload),
+        }
+
+    @classmethod
+    def from_wire(cls, payload: Mapping[str, Any]) -> MinecraftBodyEvent:
+        """Parse one event without inventing a replay identity."""
+
+        return cls(
+            event_id=str(payload["event_id"]),
+            instance_id=str(payload["instance_id"]),
+            sequence=int(payload["sequence"]),
+            occurred_at=str(payload["occurred_at"]),
+            received_at=utc_now(),
+            source=str(payload["source"]),
+            kind=str(payload["kind"]),
+            payload=dict(payload.get("payload") or {}),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ActionCommand:
     """One open-vocabulary operation proposed for a specific intention."""
 

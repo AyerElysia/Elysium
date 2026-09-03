@@ -110,8 +110,6 @@ class LifeEngineState:
     # 导致主动聊天时找不到目标流，见 send_targets 心跳段落）
     last_external_stream_id: str = ""
     last_external_source: str = ""
-    last_tell_dfc_at: str | None = None
-    tell_dfc_count: int = 0  # 本次运行期间传话总次数
     # 空闲心跳追踪：连续没有工具调用的心跳数
     idle_heartbeat_count: int = 0
     # 主动休息锁：由 life_engine 自己决定暂停 LLM 心跳一段时间
@@ -132,6 +130,8 @@ class LifeEngineState:
     last_chatter_think_by_stream: dict[str, dict[str, str]] = field(default_factory=dict)
     # 可恢复的规范化潜意识摘要（持久化为 JSON 字典）
     subconscious_summary: dict[str, Any] = field(default_factory=dict)
+    # Inner-dialogue open/return projection; rebuildable from Life Events.
+    inner_dialogue_ledger: dict[str, Any] = field(default_factory=dict)
 
 
 # 中枢内部消息的固定标识
@@ -144,7 +144,7 @@ def is_life_heartbeat_event(event: LifeEngineEvent) -> bool:
     """判断事件是否为生命中枢自身产生的真实心跳回复。
 
     ``HEARTBEAT`` 仍兼容承载 life_chatter 的 inner-monologue 事件；
-    后者属于对话器运行态，不应参与中枢心跳、SNN 奖赏或 DFC 最近思考统计。
+    后者属于对话器运行态，不应参与中枢心跳或 SNN 奖赏统计。
     """
     event_type = getattr(event, "event_type", None)
     event_type_value = getattr(event_type, "value", event_type)
@@ -387,18 +387,28 @@ class EventBuilder:
         platform: str = "",
         chat_type: str = "",
         sender_name: str = "",
+        source_instance_id: str = "",
     ) -> LifeEngineEvent:
         """构建主意识 → 潜意识 的异步内心对话事件。
 
         这不是外部用户留言，也不是第二人格咨询，而是同一主体把念头沉进中枢慢循环。
         """
+        from ..inner_dialogue.protocol import (
+            INNER_DIALOGUE_KIND,
+            dump_inner_dialogue_payload,
+        )
+
         seq = self._next_sequence()
         platform_name = str(platform or "life_chatter").strip() or "life_chatter"
         chat_type_name = str(chat_type or "unknown").strip().lower() or "unknown"
         sender_display = str(sender_name or "主意识").strip() or "主意识"
         target_stream_id = str(stream_id or "").strip()
+        instance_id = str(source_instance_id or "").strip()
         mode_name = str(mode or "reflect").strip().lower() or "reflect"
         rid = str(receipt_id or "").strip() or f"idlg_{seq}"
+        body = str(thought or "").strip()
+        thought_bytes = len(body.encode("utf-8"))
+        thought_sha256 = hashlib.sha256(body.encode("utf-8")).hexdigest()
         detail_parts = [
             platform_name,
             "内部",
@@ -409,13 +419,27 @@ class EventBuilder:
         ]
         if target_stream_id:
             detail_parts.append(f"stream_id={target_stream_id}")
+        if instance_id:
+            detail_parts.append(f"source_instance_id={instance_id}")
 
         header = (
             f"[内心对话 | mode={mode_name} | receipt={rid} | "
             f"expect_surface={'yes' if expect_surface else 'no'}]"
         )
-        body = str(thought or "").strip()
         content = f"{header}\n{body}" if body else header
+        payload = dump_inner_dialogue_payload(
+            {
+                "kind": INNER_DIALOGUE_KIND,
+                "receipt_id": rid,
+                "expect_surface": bool(expect_surface),
+                "stream_id": target_stream_id,
+                "source_instance_id": instance_id,
+                "mode": mode_name,
+                "thought": body,
+                "thought_sha256": thought_sha256,
+                "thought_bytes": thought_bytes,
+            }
+        )
 
         return LifeEngineEvent(
             event_id=f"idlg_{seq}",
@@ -425,48 +449,131 @@ class EventBuilder:
             source=platform_name,
             source_detail=" | ".join(detail_parts),
             content=content,
-            content_type="inner_dialogue",
+            content_type=INNER_DIALOGUE_KIND,
             sender=sender_display,
             chat_type=chat_type_name,
             stream_id=target_stream_id or None,
+            occurrence_id=rid,
+            correlation_id=rid,
+            source_instance_id=instance_id or None,
+            raw_content=payload,
         )
 
-    def build_dfc_message_event(
+    def build_inner_dialogue_return_event(
         self,
-        message: str,
         *,
-        stream_id: str = "",
-        platform: str = "",
-        chat_type: str = "",
-        sender_name: str = "",
+        receipt_id: str,
+        statement: str,
+        stream_id: str,
+        occurrence_id: str,
+        actor_consciousness_instance_id: str,
+        causation_id: str = "",
+        source_instance_id: str = "",
     ) -> LifeEngineEvent:
-        """构建一条来自 DFC 的异步留言事件。"""
-        seq = self._next_sequence()
-        platform_name = str(platform or "default_chatter").strip() or "default_chatter"
-        chat_type_name = str(chat_type or "unknown").strip().lower() or "unknown"
-        sender_display = str(sender_name or "另一个我（DFC）").strip() or "另一个我（DFC）"
-        target_stream_id = str(stream_id or "").strip()
-        detail_parts = [
-            platform_name,
-            "入站",
-            "内部对话",
-            "DFC 留言给生命中枢",
-        ]
-        if target_stream_id:
-            detail_parts.append(f"stream_id={target_stream_id}")
+        """构建潜意识 → 表达层 的显式回声事件。"""
+        from ..inner_dialogue.protocol import (
+            INNER_DIALOGUE_RETURN_KIND,
+            dump_inner_dialogue_payload,
+        )
 
+        seq = self._next_sequence()
+        rid = str(receipt_id or "").strip()
+        target_stream_id = str(stream_id or "").strip()
+        occurrence = str(occurrence_id or "").strip() or f"inner-return:{seq}"
+        actor = str(actor_consciousness_instance_id or "").strip()
+        source_instance = str(source_instance_id or actor).strip()
+        body = str(statement or "").strip()
+        statement_bytes = len(body.encode("utf-8"))
+        statement_sha256 = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        header = (
+            f"[内心对话回声 | receipt={rid} | occurrence={occurrence} | "
+            f"stream_id={target_stream_id or 'missing'}]"
+        )
+        content = f"{header}\n{body}" if body else header
+        payload = dump_inner_dialogue_payload(
+            {
+                "kind": INNER_DIALOGUE_RETURN_KIND,
+                "receipt_id": rid,
+                "return_occurrence_id": occurrence,
+                "stream_id": target_stream_id,
+                "actor_consciousness_instance_id": actor,
+                "statement": body,
+                "statement_sha256": statement_sha256,
+                "statement_bytes": statement_bytes,
+            }
+        )
         return LifeEngineEvent(
-            event_id=f"dfc_msg_{seq}",
+            event_id=f"idlg_ret_{seq}",
             event_type=EventType.MESSAGE,
             timestamp=_now_iso(),
             sequence=seq,
-            source=platform_name,
-            source_detail=" | ".join(detail_parts),
-            content=_shorten_text(str(message or "").strip(), max_length=500),
-            content_type="dfc_message",
-            sender=sender_display,
-            chat_type=chat_type_name,
+            source=INTERNAL_PLATFORM,
+            source_detail=(
+                "内部 | 内心对话回声 | "
+                f"receipt={rid} | actor={actor or 'unknown'}"
+            ),
+            content=content,
+            content_type=INNER_DIALOGUE_RETURN_KIND,
+            sender="潜意识回声",
             stream_id=target_stream_id or None,
+            occurrence_id=occurrence,
+            causation_id=str(causation_id or rid) or None,
+            correlation_id=rid,
+            source_instance_id=source_instance or None,
+            raw_content=payload,
+        )
+
+    def build_inner_dialogue_return_delivery_event(
+        self,
+        *,
+        receipt_id: str,
+        return_occurrence_id: str,
+        stream_id: str,
+        trigger_message_id: str,
+        causation_id: str = "",
+    ) -> LifeEngineEvent:
+        """记录回声已进入 originating 窗口的 content-free 投递回执。"""
+        from ..inner_dialogue.protocol import (
+            INNER_DIALOGUE_RETURN_DELIVERY_KIND,
+            dump_inner_dialogue_payload,
+        )
+
+        seq = self._next_sequence()
+        rid = str(receipt_id or "").strip()
+        occurrence = str(return_occurrence_id or "").strip()
+        target_stream_id = str(stream_id or "").strip()
+        trigger_id = str(trigger_message_id or "").strip()
+        payload = dump_inner_dialogue_payload(
+            {
+                "kind": INNER_DIALOGUE_RETURN_DELIVERY_KIND,
+                "receipt_id": rid,
+                "return_occurrence_id": occurrence,
+                "stream_id": target_stream_id,
+                "trigger_message_id": trigger_id,
+                "delivered": True,
+            }
+        )
+        return LifeEngineEvent(
+            event_id=f"idlg_del_{seq}",
+            event_type=EventType.MESSAGE,
+            timestamp=_now_iso(),
+            sequence=seq,
+            source=INTERNAL_PLATFORM,
+            source_detail=(
+                "内部 | 内心对话回声投递 | "
+                f"receipt={rid} | trigger={trigger_id or 'none'}"
+            ),
+            content=(
+                f"[内心对话回声投递 | receipt={rid} | "
+                f"occurrence={occurrence} | delivered=yes]"
+            ),
+            content_type=INNER_DIALOGUE_RETURN_DELIVERY_KIND,
+            sender="潜意识回声投递",
+            stream_id=target_stream_id or None,
+            occurrence_id=f"{occurrence}:delivery" if occurrence else f"idlg_del_{seq}",
+            causation_id=str(causation_id or occurrence or rid) or None,
+            correlation_id=rid,
+            raw_content=payload,
         )
 
     def build_heartbeat_event(
@@ -559,7 +666,10 @@ class EventBuilder:
         decision_id = str(decision.get("decision_id") or "").strip()
         if not decision_id:
             raise ValueError("Minecraft consciousness decision_id must not be empty")
-        if decision.get("schema") != "minecraft.consciousness_decision.v1":
+        if decision.get("schema") not in {
+            "minecraft.consciousness_decision.v1",
+            "minecraft.consciousness_decision.v2",
+        }:
             raise ValueError("unknown Minecraft consciousness decision schema")
         if (
             context_reference.get("schema")
@@ -593,6 +703,8 @@ class EventBuilder:
                 "decision_id": decision_id,
                 "kind": kind,
                 "intention": intention,
+                "speech": str(decision.get("speech") or ""),
+                "task": decision.get("task"),
                 "reason": reason,
             },
             ensure_ascii=False,
@@ -617,6 +729,91 @@ class EventBuilder:
             source_instance_id=instance_id,
             correlation_id=session_id,
             content_ref=f"minecraft-consciousness-decision:{decision_id}",
+            raw_content=raw,
+        )
+
+    def build_minecraft_body_event(
+        self,
+        body_event: dict[str, Any],
+        context_reference: dict[str, Any],
+    ) -> LifeEngineEvent:
+        """Build one exact game occurrence from the authenticated body stream."""
+
+        if body_event.get("schema") != "minecraft.body_event.v1":
+            raise ValueError("unknown Minecraft body event schema")
+        if context_reference.get("schema") != "minecraft.body_event_context.v1":
+            raise ValueError("unknown Minecraft body event context schema")
+        event_id = str(body_event.get("event_id") or "").strip()
+        kind = str(body_event.get("kind") or "").strip()
+        occurred_at = str(body_event.get("occurred_at") or "").strip()
+        game_instance_id = str(body_event.get("instance_id") or "").strip()
+        stream_id = str(context_reference.get("stream_id") or "").strip()
+        instance_id = str(context_reference.get("instance_id") or "").strip()
+        session_id = str(context_reference.get("session_id") or "").strip()
+        if not event_id or not kind.startswith("minecraft.") or not occurred_at:
+            raise ValueError("Minecraft body event identity is incomplete")
+        if not game_instance_id or not stream_id or not instance_id or not session_id:
+            raise ValueError("Minecraft body event attribution is incomplete")
+        payload = body_event.get("payload")
+        if not isinstance(payload, dict):
+            raise TypeError("Minecraft body event payload must be an object")
+        raw = json.dumps(
+            {
+                "body_event": dict(body_event),
+                "context_reference": dict(context_reference),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if len(raw.encode("utf-8")) > 24 * 1024:
+            raise ValueError("Minecraft body event record exceeds its durable bound")
+
+        is_inbound_chat = kind in {
+            "minecraft.chat.received",
+            "minecraft.whisper.received",
+        }
+        sender = str(payload.get("username") or "").strip()
+        message = str(payload.get("message") or "").strip()
+        if is_inbound_chat and not message:
+            raise ValueError("Minecraft inbound chat event has no message")
+        visible = (
+            message
+            if is_inbound_chat
+            else json.dumps(
+                {
+                    "event_id": event_id,
+                    "kind": kind,
+                    "payload": payload,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        seq = self._next_sequence()
+        return LifeEngineEvent(
+            event_id=event_id,
+            event_type=(
+                EventType.MESSAGE if is_inbound_chat else EventType.CONSCIOUS_ACTIVITY
+            ),
+            timestamp=occurred_at,
+            sequence=seq,
+            source="minecraft",
+            source_detail=(
+                "Minecraft 身体事件 | "
+                f"session={session_id} | body_instance={game_instance_id} | kind={kind}"
+            ),
+            content=_shorten_text(visible, max_length=1200),
+            content_type=kind,
+            sender=sender or None,
+            sender_id=sender or None,
+            chat_type="minecraft" if is_inbound_chat else None,
+            stream_id=stream_id,
+            occurrence_id=event_id,
+            source_instance_id=instance_id,
+            correlation_id=session_id,
+            content_ref=f"minecraft-body-event:{event_id}",
             raw_content=raw,
         )
 

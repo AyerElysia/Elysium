@@ -51,6 +51,7 @@ def _verification_system_prompt() -> str:
 _READ_ONLY_TOOLS: list[str] = [
     "nucleus_read_file",
     "nucleus_list_files",
+    "nucleus_glob_file",
     "nucleus_grep_file",
     "nucleus_grep_events",
     "nucleus_search_memory",
@@ -63,7 +64,6 @@ _READ_ONLY_TOOLS: list[str] = [
     "nucleus_view_screen",
     "nucleus_minecraft",
     "nucleus_proactive_query",
-    "nucleus_todo",
     "nucleus_schedule",
 ]
 

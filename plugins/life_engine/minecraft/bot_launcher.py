@@ -125,7 +125,13 @@ class MinecraftBotLauncher:
         """Verify the pinned integration layout and installed dependencies."""
 
         entrypoint = self._directory / "src" / "index.js"
-        required_modules = ("mineflayer", "mineflayer-pathfinder", "ws")
+        required_modules = (
+            "mineflayer",
+            "mineflayer-collectblock",
+            "mineflayer-pathfinder",
+            "vec3",
+            "ws",
+        )
         missing_modules = tuple(
             name
             for name in required_modules
@@ -139,6 +145,37 @@ class MinecraftBotLauncher:
             "missing_modules": missing_modules,
         }
         return result
+
+    @classmethod
+    async def check_server(
+        cls,
+        configured_host: str,
+        port: int,
+        *,
+        timeout_seconds: float = 1.5,
+    ) -> dict[str, object]:
+        """Prove the configured Minecraft endpoint accepts a TCP connection."""
+
+        host = cls.resolve_server_host(configured_host)
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port),
+                timeout=timeout_seconds,
+            )
+        except (OSError, TimeoutError) as exception:
+            return {
+                "available": False,
+                "host": host,
+                "port": port,
+                "error": f"{type(exception).__name__}: {exception}",
+            }
+        del reader
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except OSError:
+            pass
+        return {"available": True, "host": host, "port": port, "error": None}
 
     @staticmethod
     def ensure_token(token_file: Path) -> str:

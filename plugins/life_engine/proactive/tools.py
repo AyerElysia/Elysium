@@ -27,9 +27,24 @@ from ..initiative.projection import (
     project_initiative_seed_content,
 )
 from ..initiative.reachability import load_reachable_surfaces
-from ..tools.bounded_projection import project_bounded_items, sha256_json
+from ..inner_dialogue.protocol import (
+    InnerDialogueConflict,
+    InnerDialogueReturnBlocked,
+    InnerDialogueReturnRequiresHeartbeat,
+    inner_dialogue_summary,
+)
+from ..tools.bounded_projection import (
+    project_bounded_items,
+    project_bounded_text,
+    sha256_json,
+)
 
-ProactiveQueryResource = Literal["attention", "initiative", "reachability"]
+ProactiveQueryResource = Literal[
+    "attention",
+    "initiative",
+    "reachability",
+    "inner_dialogue",
+]
 ProactiveCommandAction = Literal[
     "attention.open",
     "attention.note",
@@ -41,6 +56,7 @@ ProactiveCommandAction = Literal[
     "initiative.reencounter",
     "initiative.release",
     "outreach.begin",
+    "inner.return",
 ]
 
 
@@ -136,7 +152,8 @@ class LifeEngineProactiveQueryTool(BaseTool):
     tool_description = (
         "只读查看统一主动系统。resource=attention 查看主体明确保留的持续关注；"
         "initiative 查看未来可能行动的公开意向；reachability 查看已登记对象和"
-        "物理表面。读取、未读取、忽略都不会改变任何状态，也不代表重要性。"
+        "物理表面；inner_dialogue 查看表达层沉下来、尚未交还的内心对话。"
+        "读取、未读取、忽略都不会改变任何状态，也不代表重要性。"
         "record_id 留空时列出有界索引；填写后读取该记录。"
     )
     chatter_allow: ClassVar[list[str]] = ["life_engine_internal", "life_chatter"]
@@ -145,11 +162,11 @@ class LifeEngineProactiveQueryTool(BaseTool):
         self,
         resource: Annotated[
             ProactiveQueryResource,
-            "attention / initiative / reachability",
+            "attention / initiative / reachability / inner_dialogue",
         ],
         record_id: Annotated[
             str,
-            "可选完整 thread_id/seed_id；留空返回列表",
+            "可选完整 thread_id/seed_id/inner_dialogue receipt_id；留空返回列表",
         ] = "",
         include_inactive: Annotated[
             bool,
@@ -168,7 +185,12 @@ class LifeEngineProactiveQueryTool(BaseTool):
     ) -> tuple[bool, str | dict[str, object]]:
         try:
             service, actor = _service_actor(self)
-            if resource not in {"attention", "initiative", "reachability"}:
+            if resource not in {
+                "attention",
+                "initiative",
+                "reachability",
+                "inner_dialogue",
+            }:
                 raise ValueError("unsupported proactive query resource")
             identity = str(record_id or "").strip()
             budget = int(max_bytes or 16 * 1024)
@@ -254,6 +276,44 @@ class LifeEngineProactiveQueryTool(BaseTool):
                     continuation=continuation,
                 )
 
+            if resource == "inner_dialogue":
+                if identity:
+                    record = await service.get_inner_dialogue_record(identity)
+                    if record is None:
+                        raise ValueError("inner dialogue receipt does not exist")
+                    return True, project_bounded_text(
+                        projection_name="proactive-inner-dialogue-content",
+                        task_name=getattr(self, "_runtime_task_name", ""),
+                        requested_max_bytes=max_bytes,
+                        binding={"receipt_id": identity},
+                        frontier={
+                            "receipt_id": record.receipt_id,
+                            "thought_sha256": record.thought_sha256,
+                            "status": record.status,
+                        },
+                        base_payload={
+                            "resource": "inner_dialogue",
+                            **inner_dialogue_summary(record),
+                        },
+                        content=record.thought,
+                        content_ref=f"inner-dialogue:{record.receipt_id}",
+                        continuation=continuation,
+                    )
+                records = await service.list_inner_dialogue_records()
+                items = [inner_dialogue_summary(record) for record in records]
+                return True, project_bounded_items(
+                    projection_name="proactive-inner-dialogue-list",
+                    task_name=getattr(self, "_runtime_task_name", ""),
+                    requested_max_bytes=max_bytes,
+                    binding={"status": "open"},
+                    frontier={"count": len(items), "sha256": sha256_json(items)},
+                    base_payload={"resource": "inner_dialogue"},
+                    items_key="receipts",
+                    items=items,
+                    item_refs=[item["receipt_id"] for item in items],
+                    continuation=continuation,
+                )
+
             surfaces = await load_reachable_surfaces()
             audience = str(audience_ref or "").strip()
             if audience:
@@ -287,6 +347,7 @@ class LifeEngineProactiveQueryTool(BaseTool):
         ) as exc:
             return False, {
                 "error": type(exc).__name__,
+                "error_message": str(exc),
                 "operation": "proactive_query",
                 "mutated": False,
             }
@@ -298,7 +359,8 @@ class LifeEngineProactiveCommandTool(BaseTool):
     tool_name = "nucleus_proactive_command"
     tool_description = (
         "统一主动系统的唯一写入口。attention.* 管理持续关注；initiative.* 管理"
-        "未来可能行动的公开意向；outreach.begin 明确选择对象和物理表面。"
+        "未来可能行动的公开意向；outreach.begin 明确选择对象和物理表面；"
+        "inner.return 把一条内心对话回声交还给沉下去的那个表达窗口。"
         "所有写入都要求活跃意识、稳定来源、expected_revision 和不可变事件回执。"
         "基础设施不会按分数、时间、容量或最近聊天替你创建、推进或发送。"
     )
@@ -309,7 +371,7 @@ class LifeEngineProactiveCommandTool(BaseTool):
         action: Annotated[ProactiveCommandAction, "要提交的显式主动决定"],
         record_id: Annotated[
             str,
-            "AttentionThread 或 InitiativeSeed 完整 ID；新建可留空",
+            "AttentionThread、InitiativeSeed 或 inner_dialogue receipt 完整 ID；新建可留空",
         ] = "",
         expected_revision: Annotated[
             int,
@@ -317,7 +379,8 @@ class LifeEngineProactiveCommandTool(BaseTool):
         ] = 0,
         statement: Annotated[
             str,
-            "愿意让未来意识实例看到的公开表述；pause/resume/reencounter 留空",
+            "愿意让未来意识实例看到的公开表述；inner.return 写给表达层的第一人称回声；"
+            "pause/resume/reencounter 留空",
         ] = "",
         related_entity_refs: Annotated[
             list[str] | None,
@@ -351,6 +414,7 @@ class LifeEngineProactiveCommandTool(BaseTool):
                 "initiative.reencounter",
                 "initiative.release",
                 "outreach.begin",
+                "inner.return",
             }:
                 raise ValueError("unsupported proactive command action")
             source = _source_occurrence(self)
@@ -418,6 +482,18 @@ class LifeEngineProactiveCommandTool(BaseTool):
                     "idempotent_replay": commit.idempotent_replay,
                 }
 
+            if action == "inner.return":
+                if str(getattr(self, "_runtime_task_name", "") or "").strip() != "core":
+                    raise InnerDialogueReturnRequiresHeartbeat()
+                return True, await service.return_inner_dialogue(
+                    receipt_id=str(record_id or "").strip(),
+                    statement=statement,
+                    occurrence_id=occurrence,
+                    actor_consciousness_instance_id=actor,
+                    source_instance_id=source_instance,
+                    causation_id=source,
+                )
+
             command = InitiativeOutreachCommand(
                 occurrence_id=occurrence,
                 actor_consciousness_instance_id=actor,
@@ -432,6 +508,28 @@ class LifeEngineProactiveCommandTool(BaseTool):
                 seed_revision=int(seed_revision),
             )
             return True, await service.begin_initiative_outreach(command)
+        except InnerDialogueConflict as exc:
+            return False, {
+                "error": "InnerDialogueConflict",
+                "record_id": exc.receipt_id,
+                "occurrence_id": exc.occurrence_id,
+                "authority_committed": False,
+                "recoverable": True,
+            }
+        except InnerDialogueReturnBlocked as exc:
+            return False, {
+                "error": "InnerDialogueReturnBlocked",
+                "error_message": exc.reason,
+                "record_id": exc.receipt_id,
+                "authority_committed": False,
+            }
+        except InnerDialogueReturnRequiresHeartbeat as exc:
+            return False, {
+                "error": type(exc).__name__,
+                "error_message": str(exc),
+                "operation": action,
+                "authority_committed": False,
+            }
         except AttentionThreadConflict as exc:
             return False, {
                 "error": "AttentionThreadConflict",
@@ -459,6 +557,7 @@ class LifeEngineProactiveCommandTool(BaseTool):
         ) as exc:
             return False, {
                 "error": type(exc).__name__,
+                "error_message": str(exc),
                 "operation": action,
                 "authority_committed": False,
             }

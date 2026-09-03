@@ -206,7 +206,7 @@ class LifeEngineCommandHandler(BaseEventHandler):
 
             return EventDecision.STOP, params
 
-        # 2) 直连命令：绕过 DFC，直接把内容投递到 life_engine
+        # 2) 直连命令：把内容投递到 life_engine
         direct_message = self._extract_direct_message(content)
         if direct_message is None:
             return EventDecision.PASS, params
@@ -272,5 +272,5 @@ class LifeEngineCommandHandler(BaseEventHandler):
             except Exception:
                 pass
 
-        # 拦截这条消息，不让它进入正常的对话流程（实现“绕过 DFC”）
+        # 拦截这条消息，不让它进入正常的对话流程
         return EventDecision.STOP, params

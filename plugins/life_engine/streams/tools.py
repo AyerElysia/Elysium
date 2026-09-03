@@ -1,8 +1,8 @@
-"""Read-only compatibility projection for the retired ThoughtStream archive.
+"""Bounded diagnostic projection for the retired ThoughtStream archive.
 
-The class remains importable so old snapshots and deterministic replay tools can
-explain historical data.  It is never registered in a live consciousness and
-cannot map a legacy mutation into the canonical proactive authority.
+This module is not a model-facing tool surface. Live consciousness uses
+``nucleus_proactive_query`` / ``nucleus_proactive_command``. The snapshot
+file is never written here.
 """
 
 from __future__ import annotations
@@ -13,17 +13,8 @@ import hashlib
 import hmac
 import json
 from pathlib import Path
-from typing import Annotated, ClassVar, Literal
-
-from src.app.plugin_system.api import log_api
-from src.app.plugin_system.base import BaseTool
 
 from .archive import LegacyThoughtStreamArchive
-from .legacy_snapshot import LegacySnapshotNotFoundError
-
-logger = log_api.get_logger("life_engine.stream_tools")
-
-StreamAction = Literal["create", "list", "advance", "retire", "reactivate"]
 
 THOUGHT_STREAM_LIST_DEFAULT_PAGE_SIZE = 20
 THOUGHT_STREAM_LIST_MAX_PAGE_SIZE = 20
@@ -246,121 +237,26 @@ def _render_bounded_list(
     return result
 
 
-def _get_service():
-    from ..service.registry import get_life_engine_service
+def read_legacy_thought_stream_page(
+    workspace: str | Path,
+    *,
+    include_dormant: bool = False,
+    cursor: str = "",
+    page_size: int = THOUGHT_STREAM_LIST_DEFAULT_PAGE_SIZE,
+    max_bytes: int = THOUGHT_STREAM_LIST_DEFAULT_MAX_BYTES,
+) -> str:
+    """Return one bounded diagnostic page of the retired ThoughtStream snapshot.
 
-    return get_life_engine_service()
-
-
-def _get_archive() -> LegacyThoughtStreamArchive | None:
-    """Open the exact old snapshot without constructing its mutable manager."""
-
-    service = _get_service()
-    if service is None:
-        return None
-    config = service._cfg()
-    workspace = Path(config.settings.workspace_path).resolve()
-    try:
-        return LegacyThoughtStreamArchive.open(
-            workspace / "thoughts" / "streams.json"
-        )
-    except LegacySnapshotNotFoundError:
-        return None
-
-
-class LifeEngineManageThoughtStreamTool(BaseTool):
-    """Deprecated schema restricted to bounded historical reads."""
-
-    tool_name: str = "nucleus_manage_thought_stream"
-    tool_description: str = (
-        "旧 ThoughtStream 只读归档兼容类，生产环境不注册。新调用只能使用"
-        " nucleus_proactive_query / nucleus_proactive_command。"
-        "create/advance/retire/reactivate 全部明确失败，也不会被机械迁移成"
-        " AttentionThread。list 仅在离线诊断显式注入旧快照 reader 时提供"
-        "有界历史页，永不混入 completed。分页使用 cursor、"
-        "page_size（最多 20）和 max_bytes（最多 16384）。"
+    Missing snapshots raise ``LegacySnapshotNotFoundError``. Invalid page
+    bounds raise ``ThoughtStreamProjectionError``. The snapshot is not written.
+    """
+    archive = LegacyThoughtStreamArchive.open(
+        Path(workspace).resolve() / "thoughts" / "streams.json"
     )
-    chatter_allow: ClassVar[list[str]] = ["life_engine_internal"]
-
-    def __init__(self, plugin) -> None:
-        super().__init__(plugin)
-
-    async def execute(
-        self,
-        action: Annotated[
-            StreamAction,
-            "旧操作：create / list / advance / retire / reactivate",
-        ],
-        # create 参数
-        title: Annotated[str, "思考流标题（action=create 时必填）"] = "",
-        reason: Annotated[str, "为什么这件事引起了你的兴趣（action=create 时可选）"] = "",
-        absorb_curiosity: Annotated[bool, "此思考流是否承接当前好奇牵引的刺点（承接后牵引会放下）"] = False,
-        # list 参数
-        include_dormant: Annotated[bool, "是否包含休眠中的思考流（action=list 时有效）"] = False,
-        cursor: Annotated[str, "上一页返回的 next_cursor（action=list 时有效）"] = "",
-        page_size: Annotated[
-            int, "单页最多返回条数，范围 1-20（action=list 时有效）"
-        ] = THOUGHT_STREAM_LIST_DEFAULT_PAGE_SIZE,
-        max_bytes: Annotated[
-            int, "单页 UTF-8 硬字节预算，范围 2048-16384（action=list 时有效）"
-        ] = THOUGHT_STREAM_LIST_DEFAULT_MAX_BYTES,
-        # advance 参数
-        stream_id: Annotated[str, "思考流ID（action=advance/retire 时必填）"] = "",
-        expected_revision: Annotated[
-            int,
-            "canonical 线索的当前 revision；advance/retire/reactivate 必填",
-        ] = 0,
-        thought: Annotated[str, "对该话题的最新想法（action=advance 时必填）"] = "",
-        curiosity_delta: Annotated[float, "好奇心变化量，正值=更感兴趣，负值=兴趣减退"] = 0.0,
-        # retire 参数
-        new_status: Annotated[str, "新状态: completed(已得出结论) 或 dormant(暂时搁置)"] = "completed",
-        conclusion: Annotated[str, "最终结论或搁置原因（action=retire 时可选）"] = "",
-    ) -> tuple[bool, str | dict[str, object]]:
-        del (
-            title,
-            reason,
-            absorb_curiosity,
-            stream_id,
-            expected_revision,
-            thought,
-            curiosity_delta,
-            new_status,
-            conclusion,
-        )
-        try:
-            if action == "list":
-                try:
-                    manager = _get_archive()
-                    if manager is None:
-                        return False, "旧思考流只读快照未初始化"
-                    return True, _render_bounded_list(
-                        manager,
-                        include_dormant=include_dormant,
-                        cursor=cursor,
-                        page_size=page_size,
-                        max_bytes=max_bytes,
-                    )
-                except ThoughtStreamProjectionError as exc:
-                    return False, f"思考流有界查询失败: {exc}"
-            return False, {
-                "error": "ThoughtStreamArchiveReadOnly",
-                "action": action,
-                "authority_committed": False,
-                "replacement": "nucleus_proactive_command",
-            }
-
-        except Exception as exc:  # noqa: BLE001 - operations-only boundary
-            logger.error(
-                f"旧思考流只读归档不可用: error_type={type(exc).__name__}"
-            )
-            return False, {
-                "error": type(exc).__name__,
-                "operation": "legacy_thought_stream_archive_read",
-                "mutated": False,
-            }
-
-
-# Historical class remains importable for deterministic replay diagnostics.
-# No live consciousness receives this schema; canonical proactive writes go
-# exclusively through ``nucleus_proactive_command``.
-STREAM_TOOLS: list[type[BaseTool]] = []
+    return _render_bounded_list(
+        archive,
+        include_dormant=include_dormant,
+        cursor=cursor,
+        page_size=page_size,
+        max_bytes=max_bytes,
+    )

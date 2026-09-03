@@ -14,7 +14,7 @@ from src.kernel.storage.migration_runner import (
 from .contracts import StorageBackendRuntime, StorageWriterRole
 from .models import BackendKind
 
-EVENT_SCHEMA_VERSION = 2
+EVENT_SCHEMA_VERSION = 3
 
 LOCAL_EVENT_SCHEMA_STATEMENTS = (
     """CREATE TABLE IF NOT EXISTS raw_life_events (
@@ -29,6 +29,8 @@ LOCAL_EVENT_SCHEMA_STATEMENTS = (
     )""",
     """CREATE INDEX IF NOT EXISTS idx_raw_life_events_source
         ON raw_life_events(source_event_id, occurred_at, ingest_position)""",
+    """CREATE INDEX IF NOT EXISTS idx_raw_life_events_occurred
+        ON raw_life_events(occurred_at, ingest_position)""",
     """CREATE TABLE IF NOT EXISTS raw_event_consumer_offsets (
         consumer_id TEXT PRIMARY KEY,
         ingest_position INTEGER NOT NULL,
@@ -138,6 +140,15 @@ _MYSQL_PAYLOAD_TEXT_MIGRATION = SchemaMigration(
     ),
 )
 
+_MYSQL_OCCURRED_INDEX_MIGRATION = SchemaMigration(
+    version=3,
+    name="life_event_occurred_at_index_v3",
+    statements=(
+        """CREATE INDEX idx_raw_life_events_occurred
+            ON raw_life_events(occurred_at, ingest_position)""",
+    ),
+)
+
 _MYSQL_IMMUTABILITY_MIGRATION = SchemaMigration(
     version=1,
     name="life_event_ledger_immutability_v1",
@@ -222,7 +233,13 @@ async def ensure_life_event_schema(
             table_name="life_event_schema_migrations",
             lock_name="elysium:life-event-schema",
         )
-        await runner.apply((_MYSQL_MIGRATION, _MYSQL_PAYLOAD_TEXT_MIGRATION))
+        await runner.apply(
+            (
+                _MYSQL_MIGRATION,
+                _MYSQL_PAYLOAD_TEXT_MIGRATION,
+                _MYSQL_OCCURRED_INDEX_MIGRATION,
+            )
+        )
         if require_database_immutability:
             immutability_runner = MySQLMigrationRunner(
                 runtime.engine,

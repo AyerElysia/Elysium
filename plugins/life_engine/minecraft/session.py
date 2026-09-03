@@ -21,6 +21,7 @@ from .bot_launcher import MinecraftBotLauncher
 from .bridge_body import BridgeBody
 from .bridge_client import (
     BridgeConfig,
+    BridgeDisconnectedError,
     BridgeProtocolError,
     MinecraftBridgeClient,
 )
@@ -35,6 +36,7 @@ from .consciousness import (
     MinecraftSubjectContextBinding,
 )
 from .embodiment_contracts import (
+    ActionCommand,
     EmbodiedIntent,
     ExecutionResult,
     WorldObservation,
@@ -50,6 +52,21 @@ from .model_planner import (
     JsonIntentPlanner,
 )
 from .trace_projection import build_world_trace_receipt
+
+_BODY_EVENT_WAKE_KINDS = frozenset(
+    {
+        "minecraft.body.disconnected",
+        "minecraft.chat.received",
+        "minecraft.player.died",
+        "minecraft.player.health_changed",
+        "minecraft.player.joined",
+        "minecraft.player.left",
+        "minecraft.task.cancelled",
+        "minecraft.task.completed",
+        "minecraft.task.failed",
+        "minecraft.whisper.received",
+    }
+)
 
 
 async def _invoke_callback(
@@ -121,6 +138,8 @@ class SessionState:
     window: dict[str, Any] | None = None
     game_instance_id: str | None = None
     bridge_version: str | None = None
+    body_event_count: int = 0
+    last_body_event: dict[str, Any] | None = None
 
     @property
     def duration_seconds(self) -> float:
@@ -148,6 +167,7 @@ class MinecraftSession:
         get_recent_subconscious_context: Any | None = None,
         get_subject_context_projection_snapshot: Any | None = None,
         record_minecraft_consciousness_decision: Any | None = None,
+        record_minecraft_body_event: Any | None = None,
         record_conscious_model_turn: Any | None = None,
         report_world_observation: Any | None = None,
         consciousness_decision_source: MinecraftDecisionSource | None = None,
@@ -172,6 +192,7 @@ class MinecraftSession:
         self._record_minecraft_consciousness_decision = (
             record_minecraft_consciousness_decision
         )
+        self._record_minecraft_body_event = record_minecraft_body_event
         self._record_conscious_model_turn = record_conscious_model_turn
         self._report_world_observation = report_world_observation
         self._injected_consciousness_decision_source = consciousness_decision_source
@@ -182,6 +203,9 @@ class MinecraftSession:
         self._trace: EmbodimentTrace | None = None
         self._execution_task: asyncio.Task[ExecutionResult] | None = None
         self._consciousness_runtime: MinecraftConsciousnessRuntime | None = None
+        self._body_event_task: asyncio.Task[Any] | None = None
+        self._body_event_task_id: str | None = None
+        self._traced_body_event_ids: set[str] = set()
         self._subject_context_binding: MinecraftSubjectContextBinding | None = None
         self._intent_lock = asyncio.Lock()
         self._lifecycle_lock = asyncio.Lock()
@@ -304,6 +328,16 @@ class MinecraftSession:
                 "integrations/minecraft_bot; missing: "
                 + ", ".join(dependency_check.get("missing_modules", ()))
             )
+        server_check = await self._bot_launcher.check_server(
+            self._config.bot_server_host,
+            self._config.bot_server_port,
+        )
+        if not server_check["available"]:
+            blockers.append(
+                "shared Minecraft world is not reachable at "
+                f"{server_check['host']}:{server_check['port']}; enter the world "
+                f"and open it to LAN on port {self._config.bot_server_port}"
+            )
         return {
             "success": not blockers,
             "body_name": profile.name,
@@ -313,8 +347,9 @@ class MinecraftSession:
             "existing_window": None,
             "bot_directory": str(self._bot_launcher.directory),
             "server_address": (
-                f"{self._config.bot_server_host}:{self._config.bot_server_port}"
+                f"{server_check['host']}:{server_check['port']}"
             ),
+            "server": server_check,
             "required_operations": sorted(profile.required_operations),
             "expected_bridge_version": self._config.expected_bridge_version,
             "token_bootstraps_on_launch": True,
@@ -431,6 +466,16 @@ class MinecraftSession:
                     "integrations/minecraft_bot; missing: "
                     + ", ".join(dependency_check.get("missing_modules", ()))
                 )
+            server_check = await self._bot_launcher.check_server(
+                self._config.bot_server_host,
+                self._config.bot_server_port,
+            )
+            if not server_check["available"]:
+                blockers.append(
+                    "shared Minecraft world is not reachable at "
+                    f"{server_check['host']}:{server_check['port']}; enter the world "
+                    f"and open it to LAN on port {self._config.bot_server_port}"
+                )
         if not installation.get("exists"):
             blockers.append("Minecraft home is missing")
         if not installation.get("has_version"):
@@ -528,6 +573,7 @@ class MinecraftSession:
         )
         await trace.open()
         self._projected_trace_receipts.clear()
+        self._traced_body_event_ids.clear()
         runtime = EmbodimentRuntime(trace, self._on_trace)
 
         try:
@@ -623,8 +669,15 @@ class MinecraftSession:
             if self._config.consciousness_enabled:
                 self._consciousness_runtime = self._create_consciousness_runtime()
                 self._consciousness_runtime.start()
+            self._start_body_event_pump()
         except Exception as exception:  # noqa: BLE001 - lifecycle must not look ready
             cleanup_errors: list[str] = []
+            try:
+                await self._close_body_event_pump()
+            except Exception as cleanup_exception:  # noqa: BLE001
+                cleanup_errors.append(
+                    f"body event pump cleanup failed: {cleanup_exception}"
+                )
             if self._consciousness_runtime is not None:
                 try:
                     await self._consciousness_runtime.close()
@@ -754,6 +807,46 @@ class MinecraftSession:
             surface="minecraft_embodiment_planner",
         )
 
+    async def _record_failed_minecraft_scene_turn(
+        self,
+        response: Any,
+        context: MinecraftConsciousnessTurnContext,
+    ) -> None:
+        """Persist a generated scene round that could not become a decision."""
+
+        recorder = self._record_conscious_model_turn
+        if not callable(recorder):
+            raise TypeError(
+                "Minecraft failed model turn has no durable activity recorder"
+            )
+        if (
+            context.session_id != self._state.session_id
+            or context.stream_id != self._state.stream_id
+            or context.instance_id != self._state.consciousness_instance_id
+        ):
+            raise RuntimeError(
+                "Minecraft failed model turn identity does not match the session"
+            )
+        turn_occurrence_id = (
+            f"minecraft:{context.session_id}:scene:{context.turn_index}"
+        )
+        await _invoke_callback(
+            recorder,
+            stream_id=context.stream_id,
+            source_instance_id=context.instance_id,
+            turn_occurrence_id=turn_occurrence_id,
+            transport_request_id=str(
+                getattr(response, "request_record_id", "")
+                or f"{turn_occurrence_id}:transport"
+            ),
+            provider_reasoning_content=str(
+                getattr(response, "reasoning_content", "") or ""
+            ),
+            assistant_message=str(getattr(response, "message", "") or ""),
+            calls=[],
+            surface="minecraft_scene_consciousness_failed_turn",
+        )
+
     async def stop(self) -> dict[str, Any]:
         """Interrupt work, release controls, close bridges, and end the scene."""
 
@@ -774,6 +867,10 @@ class MinecraftSession:
         errors: list[str] = []
         if consciousness_runtime is not None:
             consciousness_runtime.request_stop()
+        try:
+            await self._close_body_event_pump()
+        except Exception as exception:  # noqa: BLE001
+            errors.append(f"body event pump cleanup failed: {exception}")
         if runtime is not None:
             try:
                 await runtime.interrupt("Minecraft session stopped")
@@ -877,6 +974,230 @@ class MinecraftSession:
                 consciousness_decision_id=decision_id,
             )
 
+    async def _execute_consciousness_decision(
+        self,
+        decision: MinecraftConsciousnessDecision,
+    ) -> dict[str, Any]:
+        """Dispatch authored speech and one body-owned task without waiting for it."""
+
+        async with self._intent_lock:
+            client = self._bridge_client
+            trace = self._trace
+            if not self._state.active or client is None or trace is None:
+                return {"success": False, "error": "no Minecraft session is active"}
+            await self._refresh_consciousness(
+                "minecraft_consciousness_action_requested"
+            )
+            receipts: list[dict[str, Any]] = []
+            observation_id = (
+                self._state.latest_observation.observation_id
+                if self._state.latest_observation is not None
+                else None
+            )
+
+            async def dispatch(
+                *,
+                suffix: str,
+                operation: str,
+                parameters: Mapping[str, Any],
+            ) -> Any:
+                command = ActionCommand(
+                    command_id=f"{decision.decision_id}:{suffix}",
+                    intent_id=decision.decision_id,
+                    intent_revision=max(1, decision.turn_index),
+                    issued_at=decision.authored_at,
+                    operation=operation,
+                    parameters=dict(parameters),
+                    based_on_observation=observation_id,
+                    timeout_seconds=15.0,
+                )
+                issued = await trace.append("command.issued", command.to_wire())
+                await self._on_trace(issued)
+                receipt = await client.act(command)
+                if receipt.command_id != command.command_id:
+                    raise RuntimeError(
+                        "Minecraft scene receipt command identity changed"
+                    )
+                if receipt.intent_id != decision.decision_id:
+                    raise RuntimeError(
+                        "Minecraft scene receipt decision identity changed"
+                    )
+                recorded = await trace.append("command.receipt", receipt.to_wire())
+                await self._on_trace(recorded)
+                receipts.append(receipt.to_wire())
+                if (
+                    not receipt.accepted
+                    or not receipt.completed
+                    or receipt.interrupted
+                    or receipt.error is not None
+                ):
+                    raise RuntimeError(
+                        receipt.error
+                        or f"Minecraft body rejected {operation} without an error"
+                    )
+                return receipt
+
+            try:
+                if decision.speech:
+                    await dispatch(
+                        suffix="speech",
+                        operation="chat.send",
+                        parameters={"message": decision.speech},
+                    )
+                task_id = ""
+                if decision.task is not None:
+                    task_id = f"{decision.decision_id}:task"
+                    receipt = await dispatch(
+                        suffix="task-start",
+                        operation="task.start",
+                        parameters={
+                            "task_id": task_id,
+                            "kind": decision.task.kind,
+                            "arguments": dict(decision.task.arguments),
+                            "replace_current": decision.task.replace_current,
+                        },
+                    )
+                    if receipt.facts.get("task_accepted") is not True:
+                        raise RuntimeError(
+                            "Minecraft body did not prove high-level task acceptance"
+                        )
+            except Exception as exception:  # noqa: BLE001 - evidence boundary
+                self._state.last_error = str(exception)
+                return {
+                    "success": False,
+                    "decision_id": decision.decision_id,
+                    "error": str(exception),
+                    "receipts": receipts,
+                }
+            return {
+                "success": True,
+                "decision_id": decision.decision_id,
+                "task_id": task_id,
+                "task_dispatched": decision.task is not None,
+                "speech_dispatched": bool(decision.speech),
+                "receipts": receipts,
+            }
+
+    def _start_body_event_pump(self) -> None:
+        """Start one owned durable consumer for pushed game occurrences."""
+
+        if self._body_event_task is not None and not self._body_event_task.done():
+            return
+        client = self._bridge_client
+        if client is None:
+            raise RuntimeError("Minecraft body event pump has no bridge client")
+        task_kinds = tuple(client.hello_metadata.get("task_kinds") or ())
+        if self._record_minecraft_body_event is None:
+            if task_kinds:
+                raise RuntimeError(
+                    "high-level Minecraft tasks require a durable body event recorder"
+                )
+            return
+        task_info = get_task_manager().create_task(
+            self._run_body_event_pump(client),
+            name=f"minecraft_body_events:{self._state.session_id}",
+            daemon=True,
+            metadata={
+                "component": "minecraft_body_events",
+                "session_id": self._state.session_id,
+                "instance_id": self._state.consciousness_instance_id,
+            },
+        )
+        if task_info.task is None:
+            raise RuntimeError("Minecraft body event task was not created")
+        self._body_event_task_id = task_info.task_id
+        self._body_event_task = task_info.task
+
+    async def _run_body_event_pump(self, client: MinecraftBridgeClient) -> None:
+        """Persist each FIFO event before acknowledgement and wake the scene."""
+
+        while self._state.active and self._bridge_client is client:
+            try:
+                event = await client.next_event()
+                if event.event_id not in self._traced_body_event_ids:
+                    trace = self._trace
+                    if trace is None:
+                        raise RuntimeError("Minecraft body event trace is absent")
+                    await trace.append("body.event", event.to_wire())
+                    self._traced_body_event_ids.add(event.event_id)
+                await _invoke_callback(
+                    self._record_minecraft_body_event,
+                    {"schema": "minecraft.body_event.v1", **event.to_wire()},
+                    {
+                        "schema": "minecraft.body_event_context.v1",
+                        "session_id": self._state.session_id,
+                        "stream_id": self._state.stream_id,
+                        "instance_id": self._state.consciousness_instance_id,
+                        "body_name": self._state.body_name,
+                    },
+                )
+                self._state.body_event_count += 1
+                self._state.last_body_event = event.to_wire()
+                consciousness = self._consciousness_runtime
+                if (
+                    consciousness is not None
+                    and consciousness.running
+                    and event.kind in _BODY_EVENT_WAKE_KINDS
+                ):
+                    consciousness.wake(f"{event.kind}:{event.event_id}")
+                await client.acknowledge_event(event.event_id)
+            except asyncio.CancelledError:
+                raise
+            except BridgeProtocolError as exception:
+                self._state.last_error = str(exception)
+                self._state.readiness = ReadinessState.DEGRADED
+                self._state.readiness_detail = (
+                    f"Minecraft body event protocol failed: {exception}"
+                )
+                consciousness = self._consciousness_runtime
+                if consciousness is not None and consciousness.running:
+                    consciousness.wake("body_event_protocol_failed")
+                return
+            except (ConnectionError, OSError) as exception:
+                self._state.last_error = str(exception)
+                self._state.readiness = ReadinessState.DEGRADED
+                self._state.readiness_detail = (
+                    f"Minecraft body event bridge disconnected: {exception}"
+                )
+                consciousness = self._consciousness_runtime
+                if consciousness is not None and consciousness.running:
+                    consciousness.wake("body_event_bridge_disconnected")
+                try:
+                    await client.wait_until_connected()
+                except BridgeDisconnectedError:
+                    return
+                if not self._state.active or self._bridge_client is not client:
+                    return
+                self._state.last_error = ""
+                self._state.readiness = ReadinessState.ACTIVE
+                self._state.readiness_detail = (
+                    "Minecraft body bridge reconnected; durable event delivery resumed"
+                )
+                if consciousness is not None and consciousness.running:
+                    consciousness.wake("body_event_bridge_reconnected")
+            except Exception as exception:  # noqa: BLE001 - retain FIFO head
+                self._state.last_error = str(exception)
+                await asyncio.sleep(1.0)
+
+    async def _close_body_event_pump(self) -> None:
+        """Cancel and await the owned body-event consumer idempotently."""
+
+        task = self._body_event_task
+        self._body_event_task = None
+        self._body_event_task_id = None
+        if task is None or task is asyncio.current_task():
+            return
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        if task.done() and not task.cancelled():
+            exception = task.exception()
+            if exception is not None:
+                raise exception
+
     async def _do_intent_locked(
         self,
         intent: str,
@@ -911,6 +1232,9 @@ class MinecraftSession:
             ):
                 recent_subconscious = await _invoke_callback(
                     self._get_recent_subconscious_context,
+                    group_limit=self._config.consciousness_subconscious_group_limit,
+                    max_bytes=self._config.consciousness_subconscious_max_bytes,
+                    include_tool_payloads=False,
                 )
                 if not isinstance(recent_subconscious, RecentSubconsciousContext):
                     raise TypeError(
@@ -1128,7 +1452,16 @@ class MinecraftSession:
                 ),
                 min_wait_seconds=self._config.consciousness_min_wait_seconds,
                 max_wait_seconds=self._config.consciousness_max_wait_seconds,
+                failed_turn_recorder=self._record_failed_minecraft_scene_turn,
             )
+        client = self._bridge_client
+        if client is None:
+            raise RuntimeError("Minecraft consciousness bridge is absent")
+        task_kinds = tuple(
+            str(item).strip()
+            for item in (client.hello_metadata.get("task_kinds") or ())
+            if str(item).strip()
+        )
         return MinecraftConsciousnessRuntime(
             session_id=self._state.session_id,
             stream_id=self._state.stream_id,
@@ -1139,6 +1472,7 @@ class MinecraftSession:
             decision_source=decision_source,
             perception_source=self._perceive_for_consciousness,
             execute_intent=self._execute_consciousness_intent,
+            execute_scene_decision=self._execute_consciousness_decision,
             record_decision=self._record_consciousness_decision,
             request_end_session=self._request_consciousness_session_end,
             refresh_presence=self._refresh_consciousness,
@@ -1147,6 +1481,7 @@ class MinecraftSession:
             retry_max_seconds=self._config.consciousness_retry_max_seconds,
             stop_timeout_seconds=self._config.consciousness_stop_timeout_seconds,
             max_session_seconds=float(self._config.max_session_minutes) * 60.0,
+            task_kinds=task_kinds,
         )
 
     async def _perceive_for_consciousness(
@@ -1175,6 +1510,7 @@ class MinecraftSession:
                 self._get_recent_subconscious_context,
                 group_limit=self._config.consciousness_subconscious_group_limit,
                 max_bytes=self._config.consciousness_subconscious_max_bytes,
+                include_tool_payloads=False,
             )
         if not isinstance(recent_subconscious, RecentSubconsciousContext):
             raise TypeError(
@@ -1251,6 +1587,8 @@ class MinecraftSession:
                 client.instance_id if client else self._state.game_instance_id
             ),
             "bridge_version": self._state.bridge_version,
+            "body_event_count": self._state.body_event_count,
+            "last_body_event": self._state.last_body_event,
             "launch_pid": self._state.launch_pid,
             "window": self._state.window,
             "advertised_operations": list(client.capabilities) if client else [],
@@ -1459,6 +1797,9 @@ class MinecraftSession:
                         "navigation.goto",
                         "navigation.stop",
                         "player.respawn",
+                        "task.cancel",
+                        "task.start",
+                        "task.status",
                         "world.mine",
                     }
                 ),
@@ -1654,6 +1995,7 @@ class MinecraftSession:
         return (
             self._runtime is not None
             or self._consciousness_runtime is not None
+            or self._body_event_task is not None
             or self._presence_registered
             or self._scene_open
             or (

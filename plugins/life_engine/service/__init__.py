@@ -40,7 +40,6 @@ from .event_bus import (
     life_event_from_legacy,
 )
 from .integrations import (
-    DFCIntegration,
     MemoryIntegration,
     to_jsonable,
 )
@@ -80,7 +79,6 @@ __all__ = [
     "clear_wake_context_reminder",
     "get_file_metadata",
     # 集成管理器
-    "DFCIntegration",
     "MemoryIntegration",
     "to_jsonable",
 ]

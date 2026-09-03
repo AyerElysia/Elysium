@@ -155,9 +155,9 @@ class LifeEngineMinecraftTool(BaseTool):
                 "type": "string",
                 "enum": ["agent", "bot", "biomimetic"],
                 "description": (
-                    "action=start 时使用的身体：agent=独自托管客户端（默认）；"
-                    "bot=以独立玩家 Elysia 身份自己进入 Ayer 已开放的共享世界，"
-                    "不需要她带你，调用后自动加入；biomimetic=实验性前台视觉身体"
+                    "action=start 时使用的身体：bot=默认的陪玩身体，以独立玩家 "
+                    "ElysiaBot 身份进入 Ayer 已开放的共享世界并自动加入；"
+                    "agent=独自托管客户端；biomimetic=实验性前台视觉身体"
                 ),
             },
             "reason": {

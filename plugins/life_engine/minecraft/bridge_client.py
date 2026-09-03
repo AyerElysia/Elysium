@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -18,6 +19,7 @@ from websockets.exceptions import ConnectionClosed
 from .embodiment_contracts import (
     ActionCommand,
     ActionReceipt,
+    MinecraftBodyEvent,
     WorldObservation,
 )
 
@@ -44,6 +46,7 @@ class BridgeConfig:
     acknowledgement_timeout_seconds: float = 2.0
     observation_timeout_seconds: float = 10.0
     max_in_flight: int = 8
+    max_buffered_events: int = 256
 
     def __post_init__(self) -> None:
         """Validate transport configuration without exposing the token."""
@@ -58,6 +61,8 @@ class BridgeConfig:
             raise ValueError("bridge token must not be empty")
         if self.max_in_flight < 1:
             raise ValueError("max_in_flight must be positive")
+        if self.max_buffered_events < 1:
+            raise ValueError("max_buffered_events must be positive")
         for value in (
             self.open_timeout_seconds,
             self.acknowledgement_timeout_seconds,
@@ -84,22 +89,24 @@ class MinecraftBridgeClient:
         self._config = config
         self._socket: ClientConnection | ServerConnection | None = None
         self._server: Server | None = None
-        self._accept_ready: (
-            asyncio.Future[
-                tuple[ServerConnection, str, tuple[str, ...], dict[str, Any]]
-            ]
-            | None
-        ) = None
+        self._accept_ready: asyncio.Future[None] | None = None
         self._receiver: asyncio.Task[None] | None = None
         self._send_lock = asyncio.Lock()
+        self._connection_lock = asyncio.Lock()
+        self._connection_changed = asyncio.Condition()
         self._observation_changed = asyncio.Condition()
+        self._event_changed = asyncio.Condition()
         self._in_flight = asyncio.Semaphore(config.max_in_flight)
         self._pending: dict[str, _PendingCommand] = {}
         self._latest_observation: WorldObservation | None = None
+        self._events: deque[MinecraftBodyEvent] = deque()
+        self._seen_event_payloads: dict[str, str] = {}
+        self._latest_event_sequence: int | None = None
         self._instance_id: str | None = None
         self._capabilities: tuple[str, ...] = ()
         self._hello_metadata: dict[str, Any] = {}
         self._failure: BaseException | None = None
+        self._closed = True
 
     @property
     def connected(self) -> bool:
@@ -134,6 +141,7 @@ class MinecraftBridgeClient:
 
         if self.connected:
             return
+        self._closed = False
         self._failure = None
         if self._config.listen_uri is not None:
             await self._open_listener()
@@ -151,13 +159,12 @@ class MinecraftBridgeClient:
                 await socket.close()
                 raise
 
-        self._socket = socket
-        self._instance_id = instance_id
-        self._capabilities = capabilities
-        self._hello_metadata = metadata
-        self._receiver = asyncio.create_task(
-            self._receive_loop(socket),
-            name=f"minecraft_bridge_receive:{instance_id}",
+        await self._activate_socket(
+            socket,
+            instance_id,
+            capabilities,
+            metadata,
+            task_prefix="minecraft_bridge_receive",
         )
 
     async def _open_listener(self) -> None:
@@ -169,9 +176,7 @@ class MinecraftBridgeClient:
         parsed = urlsplit(listen_uri)
         expected_path = parsed.path or "/"
         loop = asyncio.get_running_loop()
-        ready: asyncio.Future[
-            tuple[ServerConnection, str, tuple[str, ...], dict[str, Any]]
-        ] = loop.create_future()
+        ready: asyncio.Future[None] = loop.create_future()
         self._accept_ready = ready
 
         async def handler(socket: ServerConnection) -> None:
@@ -181,20 +186,24 @@ class MinecraftBridgeClient:
             if request_path != expected_path:
                 await socket.close(code=1008, reason="bridge path mismatch")
                 return
-            if ready.done() or self._socket is not None:
-                await socket.close(code=1013, reason="controller lease is occupied")
-                return
             try:
                 instance_id, capabilities, metadata = await self._authenticate(socket)
+                await self._activate_socket(
+                    socket,
+                    instance_id,
+                    capabilities,
+                    metadata,
+                    task_prefix="minecraft_reverse_bridge_receive",
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as exception:  # noqa: BLE001 - auth boundary rejects all failures
                 if not ready.done():
                     ready.set_exception(exception)
-                await socket.close(code=1008, reason="bridge authentication failed")
+                await socket.close(code=1008, reason="bridge connection rejected")
                 return
             if not ready.done():
-                ready.set_result((socket, instance_id, capabilities, metadata))
+                ready.set_result(None)
             await socket.wait_closed()
 
         self._server = await serve(
@@ -207,21 +216,62 @@ class MinecraftBridgeClient:
         )
         try:
             async with asyncio.timeout(self._config.open_timeout_seconds):
-                socket, instance_id, capabilities, metadata = await ready
+                await ready
         except BaseException:
             self._server.close()
             await self._server.wait_closed()
             self._server = None
             self._accept_ready = None
             raise
-        self._socket = socket
-        self._instance_id = instance_id
-        self._capabilities = capabilities
-        self._hello_metadata = metadata
-        self._receiver = asyncio.create_task(
-            self._receive_loop(socket),
-            name=f"minecraft_reverse_bridge_receive:{instance_id}",
-        )
+
+    async def _activate_socket(
+        self,
+        socket: ClientConnection | ServerConnection,
+        instance_id: str,
+        capabilities: tuple[str, ...],
+        metadata: dict[str, Any],
+        *,
+        task_prefix: str,
+    ) -> None:
+        """Adopt one authenticated peer, including an exact-contract reconnect."""
+
+        async with self._connection_lock:
+            if self._closed:
+                raise BridgeDisconnectedError("bridge client is closing")
+            if self.connected:
+                raise BridgeProtocolError("controller lease is occupied")
+            if self._instance_id is not None:
+                if instance_id != self._instance_id:
+                    raise BridgeProtocolError(
+                        "reconnected body changed its game instance identity"
+                    )
+                if capabilities != self._capabilities or metadata != self._hello_metadata:
+                    raise BridgeProtocolError(
+                        "reconnected body changed its authenticated contract"
+                    )
+            self._socket = socket
+            self._instance_id = instance_id
+            self._capabilities = capabilities
+            self._hello_metadata = dict(metadata)
+            self._failure = None
+            self._receiver = asyncio.create_task(
+                self._receive_loop(socket),
+                name=f"{task_prefix}:{instance_id}",
+            )
+        async with self._connection_changed:
+            self._connection_changed.notify_all()
+
+    async def wait_until_connected(self) -> None:
+        """Wait for the same authenticated reverse body to reconnect."""
+
+        if self.connected:
+            return
+        async with self._connection_changed:
+            await self._connection_changed.wait_for(
+                lambda: self.connected or self._closed
+            )
+        if not self.connected:
+            raise BridgeDisconnectedError("bridge closed while awaiting reconnection")
 
     async def _authenticate(
         self,
@@ -258,6 +308,7 @@ class MinecraftBridgeClient:
                 "bridge_version",
                 "minecraft_version",
                 "neoforge_version",
+                "task_kinds",
             )
             if key in hello
         }
@@ -266,6 +317,7 @@ class MinecraftBridgeClient:
     async def close(self) -> None:
         """Request control release, close the socket, and fail pending work."""
 
+        self._closed = True
         socket = self._socket
         receiver = self._receiver
         server = self._server
@@ -302,6 +354,10 @@ class MinecraftBridgeClient:
             server.close()
             await server.wait_closed()
         self._fail_pending(BridgeDisconnectedError("bridge closed"))
+        async with self._event_changed:
+            self._event_changed.notify_all()
+        async with self._connection_changed:
+            self._connection_changed.notify_all()
         if close_errors:
             raise ExceptionGroup("Minecraft bridge cleanup failed", close_errors)
 
@@ -364,6 +420,35 @@ class MinecraftBridgeClient:
             finally:
                 self._pending.pop(command.command_id, None)
 
+    async def next_event(self) -> MinecraftBodyEvent:
+        """Peek the oldest unacknowledged body event for durable processing."""
+
+        if not self._events:
+            self._require_connected()
+        async with self._event_changed:
+            await self._event_changed.wait_for(
+                lambda: bool(self._events) or self._failure is not None
+            )
+        if self._events:
+            return self._events[0]
+        raise BridgeDisconnectedError(
+            f"bridge receiver failed before another body event: {self._failure}"
+        ) from self._failure
+
+    async def acknowledge_event(self, event_id: str) -> None:
+        """Acknowledge only the FIFO head after its durable consumer succeeds."""
+
+        if not str(event_id or "").strip():
+            raise ValueError("Minecraft body event_id must not be empty")
+        async with self._event_changed:
+            if not self._events:
+                raise BridgeProtocolError("body event acknowledgement has no pending event")
+            event = self._events[0]
+            if event.event_id != event_id:
+                raise BridgeProtocolError("body event acknowledgement is not FIFO")
+            await self._send({"type": "event_ack", "event_id": event_id})
+            self._events.popleft()
+
     async def interrupt(self, intent_id: str, reason: str) -> None:
         """Ask the body to stop one intention and release every held control."""
 
@@ -382,6 +467,7 @@ class MinecraftBridgeClient:
         socket: ClientConnection | ServerConnection,
     ) -> None:
         """Route all server messages to observations or command futures."""
+        failure: BaseException
         try:
             async for raw in socket:
                 message = self._decode(raw)
@@ -390,6 +476,8 @@ class MinecraftBridgeClient:
                     await self._accept_observation(message)
                 elif message_type == "receipt":
                     self._accept_receipt(message)
+                elif message_type == "event":
+                    await self._accept_event(message)
                 elif message_type == "heartbeat":
                     continue
                 else:
@@ -399,15 +487,31 @@ class MinecraftBridgeClient:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - transport failure must wake all waiters
-            self._failure = exc
-            self._fail_pending(exc)
-            async with self._observation_changed:
-                self._observation_changed.notify_all()
+            failure = exc
         else:
-            self._failure = BridgeDisconnectedError("bridge peer disconnected")
-            self._fail_pending(self._failure)
-            async with self._observation_changed:
-                self._observation_changed.notify_all()
+            failure = BridgeDisconnectedError("bridge peer disconnected")
+        await self._mark_disconnected(socket, failure)
+
+    async def _mark_disconnected(
+        self,
+        socket: ClientConnection | ServerConnection,
+        failure: BaseException,
+    ) -> None:
+        """Release only the failed socket while keeping a reverse listener alive."""
+
+        async with self._connection_lock:
+            if self._socket is not socket:
+                return
+            self._socket = None
+            self._receiver = None
+            self._failure = failure
+            self._fail_pending(failure)
+        async with self._observation_changed:
+            self._observation_changed.notify_all()
+        async with self._event_changed:
+            self._event_changed.notify_all()
+        async with self._connection_changed:
+            self._connection_changed.notify_all()
 
     async def _accept_observation(self, message: Mapping[str, Any]) -> None:
         """Validate instance identity and monotonically increasing sequence."""
@@ -438,6 +542,50 @@ class MinecraftBridgeClient:
             pending.acknowledged.set_result(receipt)
         if receipt.terminal and not pending.terminal.done():
             pending.terminal.set_result(receipt)
+
+    async def _accept_event(self, message: Mapping[str, Any]) -> None:
+        """Validate ordered, bounded events and retain them until explicit ack."""
+
+        raw = message.get("event")
+        if not isinstance(raw, Mapping):
+            raise BridgeProtocolError("body event envelope has no event object")
+        encoded = json.dumps(
+            dict(raw),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded) > 16 * 1024:
+            raise BridgeProtocolError("Minecraft body event exceeds 16384 bytes")
+        event = MinecraftBodyEvent.from_wire(raw)
+        if event.instance_id != self._instance_id:
+            raise BridgeProtocolError("body event came from a different game instance")
+        digest = hashlib.sha256(encoded).hexdigest()
+        seen = self._seen_event_payloads.get(event.event_id)
+        if seen is not None:
+            if seen != digest:
+                raise BridgeProtocolError("body event_id was replayed with another payload")
+            if not any(item.event_id == event.event_id for item in self._events):
+                # The durable consumer completed and the original ack write did
+                # not reach the body before disconnect.  Re-ack the exact replay;
+                # never append or re-execute it as a new occurrence.
+                await self._send({"type": "event_ack", "event_id": event.event_id})
+            return
+        previous = self._latest_event_sequence
+        if previous is not None and event.sequence != previous + 1:
+            raise BridgeProtocolError(
+                "body event sequence is not contiguous: "
+                f"{previous} -> {event.sequence}"
+            )
+        if len(self._events) >= self._config.max_buffered_events:
+            raise BridgeProtocolError("Minecraft body event buffer is full")
+        self._latest_event_sequence = event.sequence
+        self._seen_event_payloads[event.event_id] = digest
+        while len(self._seen_event_payloads) > self._config.max_buffered_events * 4:
+            self._seen_event_payloads.pop(next(iter(self._seen_event_payloads)))
+        async with self._event_changed:
+            self._events.append(event)
+            self._event_changed.notify_all()
 
     def _validate_hello(self, hello: Mapping[str, Any]) -> None:
         """Validate protocol and configured instance binding."""

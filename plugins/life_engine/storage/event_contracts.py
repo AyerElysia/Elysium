@@ -82,6 +82,18 @@ class LifeEventStorePort(Protocol):
     async def read_tail(self, limit: int = 100) -> list[LifeEvent]:
         """Read the latest events in ascending ledger order."""
 
+    async def scan_window(
+        self,
+        *,
+        after_position: int = 0,
+        before_position: int | None = None,
+        occurred_after: str | None = None,
+        occurred_before: str | None = None,
+        limit: int,
+        descending: bool = False,
+    ) -> list[LifeEvent]:
+        """Read a bounded ledger window by position and occurred_at."""
+
     async def occurrence_digest(self, occurrence_id: str) -> LifeEventDigest | None:
         """Return one immutable identity/hash pair without exposing mutable SQL."""
 
