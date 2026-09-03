@@ -1,8 +1,9 @@
 """TTS Voice 插件配置。
 
 定义本地语音合成插件的配置项，包括基础设置、风格列表、高级参数和空间音效。
-后端由 ``[tts].backend`` 显式选择 ``legacy_compat``（GPT-SoVITS api_v2）或
-``vllm_omni``（IndexTTS2.5）；本机当前 live 配置以 ignored ``config.toml`` 为准。
+后端由 ``[tts].backend`` 显式选择 ``legacy_compat``（GPT-SoVITS api_v2）、
+``vllm_omni``（IndexTTS2.5）或 ``breeze_tts2``；本机当前 live 配置以 ignored
+``config.toml`` 为准。
 """
 
 from typing import ClassVar, Literal
@@ -64,11 +65,12 @@ class PromptSection(SectionBase):
 class TTSSection(SectionBase):
     """TTS 语音合成基础配置。"""
 
-    backend: Literal["legacy_compat", "vllm_omni"] = Field(
+    backend: Literal["legacy_compat", "vllm_omni", "breeze_tts2"] = Field(
         default="legacy_compat",
         description=(
             "TTS HTTP 后端协议；legacy_compat 使用历史 /tts，"
-            "vllm_omni 使用 OpenAI-compatible /v1/audio/speech"
+            "vllm_omni 使用 OpenAI-compatible JSON /v1/audio/speech，"
+            "breeze_tts2 使用 Breeze multipart /v1/audio/speech"
         ),
     )
     server: str = Field(default="http://127.0.0.1:9880", description="本地 TTS 服务地址")
@@ -238,6 +240,33 @@ class TTSStyle(SectionBase):
         ),
     )
     text_language: str = Field(default="auto", description="文本语言模式 (zh/ja/en/auto 等)")
+    breeze_instruction: str = Field(
+        default=(
+            "始终保持参考说话人的音色、年龄感和身份。"
+            "像面对熟悉的人自然交谈，咬字清楚，停顿随语义变化；"
+            "不要念稿，不要变成另一个人。"
+        ),
+        description=(
+            "Breeze TTS 2 的可信演绎指令；来自部署配置，不得由用户正文覆盖"
+        ),
+    )
+    breeze_cfg_scale: float = Field(
+        default=3.8,
+        gt=0.0,
+        le=5.0,
+        description=(
+            "Breeze TTS 2 指令引导强度；当前研究基线为 3.8，"
+            "切换生产前仍须按参考音色试听"
+        ),
+    )
+    breeze_seed: int = Field(
+        default=-1,
+        ge=-1,
+        le=2_147_483_647,
+        description=(
+            "Breeze TTS 2 采样种子；-1 时由风格键与发音投影稳定派生，便于复现"
+        ),
+    )
 
 
 @config_section("tts_advanced")
