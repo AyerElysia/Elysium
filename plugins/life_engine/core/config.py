@@ -248,7 +248,20 @@ class LifeEngineConfig(BaseConfig):
 
         log_heartbeat: bool = Field(
             default=True,
-            description="是否在每次心跳时输出日志。",
+            description="是否输出心跳决策面板。",
+        )
+
+        heartbeat_panel_sink: str = Field(
+            default="file",
+            description=(
+                "心跳面板去向：file 写独立文件（主终端留给 chatter），"
+                "stdout 打到主终端，both 两边都打。"
+            ),
+        )
+
+        heartbeat_panel_path: str = Field(
+            default="logs/heartbeat.console",
+            description="heartbeat_panel_sink 为 file 或 both 时的面板文件路径。",
         )
 
         context_history_max_events: int = Field(
@@ -305,6 +318,16 @@ class LifeEngineConfig(BaseConfig):
             ge=0,
             description="潜意识上下文保留的最近完整因果组数量。",
         )
+
+        @field_validator("heartbeat_panel_sink")
+        @classmethod
+        def normalize_heartbeat_panel_sink(cls, value: object) -> str:
+            sink = str(value or "file").strip().lower()
+            if sink not in {"stdout", "file", "both"}:
+                raise ValueError(
+                    'heartbeat_panel_sink 必须是 "stdout"、"file" 或 "both"'
+                )
+            return sink
 
     @config_section("model")
     class ModelSection(SectionBase):
@@ -1758,7 +1781,7 @@ class LifeEngineConfig(BaseConfig):
 
         salient_tail_include_direct_messages: bool = Field(
             default=True,
-            description="是否包含 dfc_message / direct_message / inner_dialogue / proactive_opportunity 类消息。",
+            description="是否包含 direct_message / inner_dialogue / proactive_opportunity 类消息。历史 dfc_message 仍按同类消息读取。",
         )
 
         salient_tail_include_inner_monologue: bool = Field(

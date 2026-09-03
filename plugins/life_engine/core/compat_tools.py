@@ -15,69 +15,6 @@ from src.core.managers import get_plugin_manager
 logger = get_logger("life_engine.compat_tools")
 
 
-class LifeThinkAction(BaseAction):
-    """生命对话器的思考动作。"""
-
-    action_name = "think"
-    action_description = (
-        "在发送文本回复前，先记录一段内心思考动作。"
-        "此 action 必须与 action-life_send_text 同时使用，且必须排在 action-life_send_text 之前；"
-        "不要单独调用，也不要把它和查询型 tool 混在同一轮。"
-        "thought 只写内心活动，不要把真正要发给用户的正文只写在 thought 里；"
-        "最终回复必须单独写进 life_send_text.content。"
-    )
-
-    chatter_allow: list[str] = ["life_chatter"]
-    primary_action: bool = False
-
-    async def execute(
-        self,
-        mood: Annotated[str, "此刻的心情/情绪状态（必填）。"],
-        decision: Annotated[str, "你决定的下一步行动（必填）。"],
-        expected_response: Annotated[str, "你预期用户看到回复后的反应（必填）。"],
-        thought: Annotated[str, "你的心理活动（必填）。"] = "",
-        **extra_kwargs: object,
-    ) -> tuple[bool, str]:
-        legacy_content = extra_kwargs.pop("content", None)
-        normalized_thought = (thought or "").strip()
-        if not normalized_thought and isinstance(legacy_content, str):
-            normalized_thought = legacy_content.strip()
-            if normalized_thought:
-                logger.warning("action-think 收到兼容字段 content，已映射到 thought")
-
-        if not normalized_thought:
-            logger.warning(
-                "action-think 缺少 thought/content，已按 mood/decision/expected_response 降级记录"
-            )
-
-        if extra_kwargs:
-            logger.warning(
-                "action-think 收到未知参数，已忽略: %s",
-                sorted(extra_kwargs.keys()),
-            )
-
-        chat_stream = getattr(self, "chat_stream", None)
-        stream_id = str(getattr(chat_stream, "stream_id", "") or "").strip()
-        service = getattr(getattr(self, "plugin", None), "service", None)
-        if service is None:
-            life_plugin = get_plugin_manager().get_plugin("life_engine")
-            service = getattr(life_plugin, "service", None) if life_plugin is not None else None
-
-        if service is not None and stream_id and hasattr(service, "record_chatter_think_snapshot"):
-            try:
-                await service.record_chatter_think_snapshot(
-                    stream_id=stream_id,
-                    thought=normalized_thought,
-                    mood=str(mood or "").strip(),
-                    decision=str(decision or "").strip(),
-                    expected_response=str(expected_response or "").strip(),
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"记录 action-think 快照失败: {exc}")
-
-        return True, "思考动作已记录。请在同一轮内继续调用 life_send_text 发送最终回复。"
-
-
 class LifeRecordInnerMonologueAction(BaseAction):
     """把当前对话器生成的内心独白写回 life 运行态。"""
 
@@ -133,38 +70,6 @@ class LifeRecordInnerMonologueAction(BaseAction):
         return True, "内心独白已记录。请继续决定是回复用户，还是 pass_and_wait。"
 
 
-class LifeScheduleFollowupMessageAction(BaseAction):
-    """Retired stream-bound follow-up adapter kept for old direct callers."""
-
-    action_name = "schedule_followup_message"
-    action_description = (
-        "已退役：延迟续话会把一次想法绑定到当前聊天流并交给定时器续写。"
-        "未来连续性请使用 InitiativeSeed；真正行动时再明确选择对象和表面。"
-    )
-
-    chatter_allow: list[str] = ["life_chatter"]
-
-    async def execute(
-        self,
-        delay_seconds: Annotated[float, "过多久后再检查一次，单位秒。"],
-        thought: Annotated[str, "你此刻为什么还想继续说。"],
-        topic: Annotated[str, "这次续话围绕的话题。"],
-        followup_type: Annotated[
-            str,
-            "续话类型，例如 add_detail / clarify / soft_emotion / share_new_thought。",
-        ] = "share_new_thought",
-    ) -> tuple[bool, str]:
-        del delay_seconds, thought, topic, followup_type
-        return (
-            False,
-            (
-                "LegacyFollowupReadOnly: 使用统一主动系统保留未来连续性；"
-                "行动时通过 nucleus_proactive_query 与 nucleus_proactive_command "
-                "明确选择对象和表面。"
-            ),
-        )
-
-
 class LifeInnerDialogueTool(BaseTool):
     """主意识把念头沉进潜意识：异步内心对话，不即时返回答案。"""
 
@@ -172,7 +77,9 @@ class LifeInnerDialogueTool(BaseTool):
     tool_description = (
         "把一句话沉进自己心里慢慢想——这是主意识对潜意识的内心对话，不是咨询另一个人。"
         "工具只负责投递，不会同步返回“想完了的答案”。"
-        "适合：犹豫、惦记、补信息差、理清倾向；想通了会自己浮回表达层（若需要）。"
+        "适合：犹豫、惦记、补信息差、理清倾向。"
+        "expect_surface=true 只表示允许浮回；真正交还要由心跳 "
+        "`nucleus_proactive_command(action=inner.return)` 显式完成。"
         "调用后继续场面，不要假装已经想清楚。"
     )
     chatter_allow: list[str] = ["life_chatter"]
@@ -186,7 +93,7 @@ class LifeInnerDialogueTool(BaseTool):
         ] = "reflect",
         expect_surface: Annotated[
             bool,
-            "想完后是否允许浮回表达层。默认 true；false 则只在中枢内部沉淀。",
+            "是否允许心跳稍后把回声交还给这个窗口。默认 true；false 则只在中枢内部沉淀。不会自动叫醒。",
         ] = True,
         stream_id: Annotated[str, "当前对话流 ID。通常留空，由系统自动填充。"] = "",
         platform: Annotated[str, "当前平台名。通常留空，由系统自动填充。"] = "",
@@ -231,9 +138,16 @@ class LifeInnerDialogueTool(BaseTool):
 
         receipt_id = str(receipt.get("receipt_id") or receipt.get("event_id") or "unknown")
         mode_name = str(receipt.get("mode") or mode or "reflect")
+        blocked = str(receipt.get("return_blocked") or "").strip()
+        if blocked == "missing_stream":
+            return True, (
+                f"这句话已经沉进心里了（receipt={receipt_id}, mode={mode_name}）。"
+                "当前窗口没有 stream_id，心跳无法把回声交还给这里。"
+                "先继续场面；不要假装已经想清楚。"
+            )
         return True, (
             f"这句话已经沉进心里了（receipt={receipt_id}, mode={mode_name}）。"
-            "先继续场面；想通了会自己浮上来。不要假装已经想清楚。"
+            "先继续场面；若要浮回，需心跳 inner.return 显式交还。不要假装已经想清楚。"
         )
 
 
@@ -246,7 +160,7 @@ class LifeReportStateAction(BaseAction):
         "向潜意识的世界模型报告当前场景或关系状态变化。"
         "成功后写入不可变生命事件和 World assertion；它不会修改主体文档 MEMORY.md。"
         "当你完成一轮重要互动、观察到关系变化、或场景状态发生转变时使用。"
-        "若要改变 SOUL.md、USER.md 或 MEMORY.md，必须改走主体候选复盘与明确接受流程。"
+        "SOUL.md、USER.md、MEMORY.md 是固定提示词文件，改它们用普通文件工具即可。"
         "这不是给用户发消息，是向自己的内在世界更新一条有来源的观察。"
     )
 

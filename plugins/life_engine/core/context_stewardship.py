@@ -53,6 +53,8 @@ LEGACY_SUMMARY_INTRO = (
 
 PRESSURE_OPEN = "<context_pressure_notice>"
 PRESSURE_CLOSE = "</context_pressure_notice>"
+COMPRESSION_REQUIRED_OPEN = "<context_compression_required>"
+COMPRESSION_REQUIRED_CLOSE = "</context_compression_required>"
 CHECKPOINT_OPEN = "<subject_self_continuity_checkpoint>"
 CHECKPOINT_CLOSE = "</subject_self_continuity_checkpoint>"
 OMISSION_OPEN = "<mechanical_context_omission>"
@@ -61,10 +63,16 @@ OMISSION_CLOSE = "</mechanical_context_omission>"
 GROUP_SCHEMA = "elysium.context_group.v1"
 MANIFEST_SCHEMA = "elysium.context_group_manifest.v1"
 PRESSURE_SCHEMA = "elysium.context_pressure_notice.v1"
+COMPRESSION_REQUIRED_SCHEMA = "elysium.context_compression_required.v1"
 CHECKPOINT_SCHEMA = "elysium.subject_self_continuity_checkpoint.v1"
 OMISSION_SCHEMA = "elysium.mechanical_context_omission.v1"
 ARCHIVE_SCHEMA = "elysium.context_group_archive.v1"
 ARCHIVE_NAMESPACE = "life_chatter.context_archive"
+HEARTBEAT_ARCHIVE_NAMESPACE = "life_heartbeat.context_archive"
+CHATTER_RUNTIME_KEY = "life_chatter"
+HEARTBEAT_RUNTIME_KEY = "life_heartbeat"
+CHATTER_ARCHIVE_SUBDIR = "context_archive"
+HEARTBEAT_ARCHIVE_SUBDIR = "heartbeat_context_archive"
 ARCHIVE_MAX_BYTES = 12 * 1024 * 1024
 DEFAULT_PRESSURE_RATIO = 0.75
 DEFAULT_PRESSURE_MAX_GROUPS = 24
@@ -173,6 +181,49 @@ class ContextStewardshipResult:
 _PENDING_LOCK = threading.Lock()
 _PENDING_CHECKPOINTS: dict[str, SubjectCheckpointCommand] = {}
 _TRANSIENT_PRESSURE_PARTS: dict[int, Text] = {}
+_LIVE_WINDOWS: dict[str, "LiveContextWindow"] = {}
+
+
+@dataclass(frozen=True, slots=True)
+class LiveContextWindow:
+    """One surface's current private rolling payloads and archive identity."""
+
+    runtime_key: str
+    payloads: list[LLMPayload]
+    archive_namespace: str
+    local_archive_subdir: str
+    workspace_path: str = ""
+
+
+def _pending_key(actor_consciousness_instance_id: str, runtime_key: str) -> str:
+    actor = str(actor_consciousness_instance_id or "").strip()
+    runtime = str(runtime_key or CHATTER_RUNTIME_KEY).strip() or CHATTER_RUNTIME_KEY
+    return f"{runtime}:{actor}"
+
+
+def register_live_context(window: LiveContextWindow) -> None:
+    runtime = str(window.runtime_key or "").strip()
+    if not runtime:
+        raise ContextStewardshipError("live context runtime_key is missing")
+    with _PENDING_LOCK:
+        _LIVE_WINDOWS[runtime] = window
+
+
+def unregister_live_context(runtime_key: str) -> None:
+    with _PENDING_LOCK:
+        _LIVE_WINDOWS.pop(str(runtime_key or "").strip(), None)
+
+
+def get_live_context(runtime_key: str) -> LiveContextWindow | None:
+    with _PENDING_LOCK:
+        return _LIVE_WINDOWS.get(str(runtime_key or "").strip())
+
+
+def archive_target_for_runtime(runtime_key: str) -> tuple[str, str]:
+    runtime = str(runtime_key or CHATTER_RUNTIME_KEY).strip() or CHATTER_RUNTIME_KEY
+    if runtime == HEARTBEAT_RUNTIME_KEY:
+        return HEARTBEAT_ARCHIVE_NAMESPACE, HEARTBEAT_ARCHIVE_SUBDIR
+    return ARCHIVE_NAMESPACE, CHATTER_ARCHIVE_SUBDIR
 
 
 def _json_safe(value: Any) -> Any:
@@ -590,6 +641,146 @@ def reset_transient_context_pressure_notices() -> None:
         _TRANSIENT_PRESSURE_PARTS.clear()
 
 
+def is_compression_required_payload(payload: LLMPayload) -> bool:
+    """Recognize the durable compression-turn list; bodies are never included."""
+
+    return (
+        _strict_envelope_payload(
+            payload,
+            role=ROLE.USER,
+            opening=COMPRESSION_REQUIRED_OPEN,
+            closing=COMPRESSION_REQUIRED_CLOSE,
+            schema=COMPRESSION_REQUIRED_SCHEMA,
+        )
+        is not None
+    )
+
+
+def has_compression_required_payload(payloads: Sequence[LLMPayload]) -> bool:
+    return any(
+        is_compression_required_payload(payload)
+        for payload in payloads
+        if isinstance(payload, LLMPayload)
+    )
+
+
+def strip_compression_required_payloads(
+    payloads: Sequence[LLMPayload],
+) -> list[LLMPayload]:
+    return [
+        payload
+        for payload in payloads
+        if isinstance(payload, LLMPayload) and not is_compression_required_payload(payload)
+    ]
+
+
+def rolling_char_estimate(
+    payloads: Sequence[LLMPayload],
+    estimate: Callable[[Sequence[LLMPayload]], int] | None = None,
+) -> int:
+    typed = [payload for payload in payloads if isinstance(payload, LLMPayload)]
+    if estimate is not None:
+        return int(estimate(typed))
+    return _payloads_utf8_bytes(typed)
+
+
+def payloads_require_compression(
+    payloads: Sequence[LLMPayload],
+    *,
+    estimate: Callable[[Sequence[LLMPayload]], int] | None = None,
+    trigger_chars: int,
+) -> bool:
+    typed = [payload for payload in payloads if isinstance(payload, LLMPayload)]
+    if has_compression_required_payload(typed):
+        return True
+    return rolling_char_estimate(typed, estimate) > max(1, int(trigger_chars))
+
+
+def build_compression_required_payload(
+    payloads: Sequence[LLMPayload],
+    *,
+    max_groups: int = DEFAULT_PRESSURE_MAX_GROUPS,
+    max_bytes: int = DEFAULT_EMERGENCY_REFERENCE_MAX_BYTES,
+    estimated_chars: int | None = None,
+    trigger_chars: int | None = None,
+) -> LLMPayload | None:
+    """Build one durable USER list of releasable groups; no message or tool bodies."""
+
+    typed = [payload for payload in payloads if isinstance(payload, LLMPayload)]
+    manifest = build_group_manifest(typed)
+    if not manifest.groups:
+        return None
+    visible = list(manifest.groups[: max(1, int(max_groups))])
+    budget = max(256, int(max_bytes))
+
+    def render(items: Sequence[ContextGroupRecord]) -> str:
+        data = {
+            "schema": COMPRESSION_REQUIRED_SCHEMA,
+            "technical_only": True,
+            "estimated_chars": int(estimated_chars or 0),
+            "trigger_chars": int(trigger_chars or 0),
+            "source_manifest_sha256": manifest.source_manifest_sha256,
+            "current_checkpoint_revision": manifest.current_checkpoint_revision,
+            "releaseable_group_count": len(manifest.groups),
+            "listed_group_count": len(items),
+            "unlisted_later_group_count": max(0, len(manifest.groups) - len(items)),
+            "releaseable_groups_in_chronological_order": [
+                record.public_descriptor() for record in items
+            ],
+            "subject_contract": (
+                "滚动上下文已超过容量触发阈值。这只是组身份清单，不含正文，"
+                "也不判断哪些经历有意义。在恢复普通工作之前，必须由你调用 "
+                "author_self_continuity_checkpoint，自己选择释放到哪个 group_ref、"
+                "保留哪些 exact refs，并亲自写下 continuity_text。"
+                "需要先看原文时用 read_context_group。"
+                "系统不会代写摘要，也不会丢掉旧组来硬塞进窗口。"
+            ),
+        }
+        return (
+            COMPRESSION_REQUIRED_OPEN
+            + "\n"
+            + json.dumps(data, ensure_ascii=False, sort_keys=True, indent=2)
+            + "\n"
+            + COMPRESSION_REQUIRED_CLOSE
+        )
+
+    while True:
+        text = render(visible)
+        if len(text.encode("utf-8")) <= budget:
+            return LLMPayload(ROLE.USER, [Text(text)])
+        if not visible:
+            return None
+        visible.pop()
+
+
+def ensure_compression_required_appended(
+    payloads: Sequence[LLMPayload],
+    *,
+    estimate: Callable[[Sequence[LLMPayload]], int] | None = None,
+    trigger_chars: int,
+    max_groups: int = DEFAULT_PRESSURE_MAX_GROUPS,
+    max_bytes: int = DEFAULT_EMERGENCY_REFERENCE_MAX_BYTES,
+) -> list[LLMPayload]:
+    """Append the compression list once. Existing list bytes are not rewritten."""
+
+    typed = [payload for payload in payloads if isinstance(payload, LLMPayload)]
+    if has_compression_required_payload(typed):
+        return typed
+    estimated = rolling_char_estimate(typed, estimate)
+    if estimated <= max(1, int(trigger_chars)):
+        return typed
+    notice = build_compression_required_payload(
+        typed,
+        max_groups=max_groups,
+        max_bytes=max_bytes,
+        estimated_chars=estimated,
+        trigger_chars=trigger_chars,
+    )
+    if notice is None:
+        return typed
+    return [*typed, notice]
+
+
 def _checkpoint_payload(
     command: SubjectCheckpointCommand,
     *,
@@ -597,6 +788,7 @@ def _checkpoint_payload(
     released: Sequence[ContextGroupRecord],
     retained: Sequence[ContextGroupRecord],
     max_bytes: int,
+    archive_namespace: str = ARCHIVE_NAMESPACE,
 ) -> tuple[str, LLMPayload]:
     checkpoint_id = "selfctx_" + command.command_sha256
     data = {
@@ -610,7 +802,7 @@ def _checkpoint_payload(
         "released_group_refs": [record.group_ref for record in released],
         "retained_exact_group_refs": [record.group_ref for record in retained],
         "exact_archive": {
-            "namespace": ARCHIVE_NAMESPACE,
+            "namespace": str(archive_namespace or ARCHIVE_NAMESPACE),
             "state_keys": [record.group_ref for record in released],
         },
         "continuity_text": command.continuity_text,
@@ -683,6 +875,7 @@ def prepare_subject_checkpoint(
     command: SubjectCheckpointCommand,
     *,
     max_checkpoint_bytes: int = DEFAULT_CHECKPOINT_MAX_BYTES,
+    archive_namespace: str = ARCHIVE_NAMESPACE,
 ) -> PreparedSubjectCheckpoint:
     """Validate and prepare one subject-authored prefix release atomically."""
 
@@ -737,6 +930,7 @@ def prepare_subject_checkpoint(
         released=released,
         retained=retained,
         max_bytes=max_checkpoint_bytes,
+        archive_namespace=archive_namespace,
     )
     pinned, tail = split_pinned_and_tail(typed)
     groups = build_conversation_groups(tail)
@@ -755,7 +949,9 @@ def prepare_subject_checkpoint(
         surviving_groups,
         checkpoint_payload,
     )
-    rebuilt = list(pinned) + _flatten_groups(surviving_groups)
+    rebuilt = strip_compression_required_payloads(
+        list(pinned) + _flatten_groups(surviving_groups)
+    )
     return PreparedSubjectCheckpoint(
         command=command,
         checkpoint_id=checkpoint_id,
@@ -769,25 +965,34 @@ def prepare_subject_checkpoint(
     )
 
 
-def queue_subject_checkpoint(command: SubjectCheckpointCommand) -> bool:
+def queue_subject_checkpoint(
+    command: SubjectCheckpointCommand,
+    *,
+    runtime_key: str = CHATTER_RUNTIME_KEY,
+) -> bool:
     """Queue one validated command; return True for an idempotent replay."""
 
-    actor = command.actor_consciousness_instance_id
+    key = _pending_key(command.actor_consciousness_instance_id, runtime_key)
     with _PENDING_LOCK:
-        existing = _PENDING_CHECKPOINTS.get(actor)
+        existing = _PENDING_CHECKPOINTS.get(key)
         if existing is not None:
             if existing.command_sha256 == command.command_sha256:
                 return True
             raise ContextStewardshipError(
                 "another subject continuity checkpoint is already pending"
             )
-        _PENDING_CHECKPOINTS[actor] = command
+        _PENDING_CHECKPOINTS[key] = command
     return False
 
 
-def reset_pending_subject_checkpoint(actor_consciousness_instance_id: str) -> None:
+def reset_pending_subject_checkpoint(
+    actor_consciousness_instance_id: str,
+    *,
+    runtime_key: str = CHATTER_RUNTIME_KEY,
+) -> None:
+    key = _pending_key(actor_consciousness_instance_id, runtime_key)
     with _PENDING_LOCK:
-        _PENDING_CHECKPOINTS.pop(actor_consciousness_instance_id, None)
+        _PENDING_CHECKPOINTS.pop(key, None)
 
 
 def apply_pending_subject_checkpoint(
@@ -795,14 +1000,17 @@ def apply_pending_subject_checkpoint(
     payloads: Sequence[LLMPayload],
     *,
     max_checkpoint_bytes: int = DEFAULT_CHECKPOINT_MAX_BYTES,
+    runtime_key: str = CHATTER_RUNTIME_KEY,
+    archive_namespace: str = ARCHIVE_NAMESPACE,
 ) -> ContextStewardshipResult:
-    """Install a queued command at a closed Chatter tool boundary."""
+    """Install a queued command at a closed tool boundary of one surface."""
 
     actor = str(actor_consciousness_instance_id or "").strip()
     typed = [payload for payload in payloads if isinstance(payload, LLMPayload)]
     before = _payloads_utf8_bytes(typed)
+    key = _pending_key(actor, runtime_key)
     with _PENDING_LOCK:
-        command = _PENDING_CHECKPOINTS.get(actor)
+        command = _PENDING_CHECKPOINTS.get(key)
     if command is None:
         return ContextStewardshipResult(
             triggered=False,
@@ -815,12 +1023,13 @@ def apply_pending_subject_checkpoint(
             typed,
             command,
             max_checkpoint_bytes=max_checkpoint_bytes,
+            archive_namespace=archive_namespace,
         )
     finally:
         with _PENDING_LOCK:
-            current = _PENDING_CHECKPOINTS.get(actor)
+            current = _PENDING_CHECKPOINTS.get(key)
             if current is not None and current.command_sha256 == command.command_sha256:
-                _PENDING_CHECKPOINTS.pop(actor, None)
+                _PENDING_CHECKPOINTS.pop(key, None)
     return ContextStewardshipResult(
         triggered=True,
         payloads=prepared.payloads,
@@ -848,11 +1057,15 @@ async def archive_context_groups(
     *,
     service: Any | None,
     workspace_path: str,
+    namespace: str = ARCHIVE_NAMESPACE,
+    local_subdir: str = CHATTER_ARCHIVE_SUBDIR,
 ) -> None:
     """Persist exact released groups before their prompt projection is changed."""
 
     if not records:
         return
+    archive_namespace = str(namespace or ARCHIVE_NAMESPACE).strip() or ARCHIVE_NAMESPACE
+    archive_subdir = str(local_subdir or CHATTER_ARCHIVE_SUBDIR).strip() or CHATTER_ARCHIVE_SUBDIR
     store = None
     if service is not None:
         getter = getattr(service, "runtime_state_store", None)
@@ -868,7 +1081,7 @@ async def archive_context_groups(
                 raise ContextStewardshipError(
                     "context group exceeds the immutable archive byte limit"
                 )
-            existing = await store.get_state(ARCHIVE_NAMESPACE, record.group_ref)
+            existing = await store.get_state(archive_namespace, record.group_ref)
             if existing is not None:
                 if existing.payload != payload:
                     raise ContextStewardshipError(
@@ -877,14 +1090,14 @@ async def archive_context_groups(
                 continue
             try:
                 await store.put_state(
-                    namespace=ARCHIVE_NAMESPACE,
+                    namespace=archive_namespace,
                     state_key=record.group_ref,
                     expected_revision=0,
                     schema_version=1,
                     payload=payload,
                 )
             except RuntimeStateConflict:
-                existing = await store.get_state(ARCHIVE_NAMESPACE, record.group_ref)
+                existing = await store.get_state(archive_namespace, record.group_ref)
                 if existing is None or existing.payload != payload:
                     raise
         return
@@ -894,7 +1107,7 @@ async def archive_context_groups(
         raise ContextStewardshipError(
             "local context archive workspace_path is missing"
         )
-    root = Path(workspace).expanduser() / "runtime" / "context_archive"
+    root = Path(workspace).expanduser() / "runtime" / archive_subdir
     await asyncio.to_thread(root.mkdir, parents=True, exist_ok=True)
     for record in records:
         payload = _archive_payload(record)
@@ -930,10 +1143,14 @@ async def read_context_group_archive(
     *,
     service: Any | None,
     workspace_path: str,
+    namespace: str = ARCHIVE_NAMESPACE,
+    local_subdir: str = CHATTER_ARCHIVE_SUBDIR,
 ) -> dict[str, Any]:
     ref = str(group_ref or "").strip()
     if re.fullmatch(r"ctxg_[0-9a-f]{64}", ref) is None:
         raise ContextStewardshipError("group_ref is invalid")
+    archive_namespace = str(namespace or ARCHIVE_NAMESPACE).strip() or ARCHIVE_NAMESPACE
+    archive_subdir = str(local_subdir or CHATTER_ARCHIVE_SUBDIR).strip() or CHATTER_ARCHIVE_SUBDIR
     store = None
     if service is not None:
         getter = getattr(service, "runtime_state_store", None)
@@ -941,7 +1158,7 @@ async def read_context_group_archive(
             store = getter()
     payload: dict[str, Any] | None = None
     if store is not None:
-        stored = await store.get_state(ARCHIVE_NAMESPACE, ref)
+        stored = await store.get_state(archive_namespace, ref)
         if stored is None:
             raise ContextGroupArchiveNotFound(
                 "context group archive was not found"
@@ -956,7 +1173,7 @@ async def read_context_group_archive(
             raise ContextStewardshipError(
                 "local context archive workspace_path is missing"
             )
-        root = Path(workspace).expanduser() / "runtime" / "context_archive"
+        root = Path(workspace).expanduser() / "runtime" / archive_subdir
         path = root / f"{ref}.json"
         if not path.exists() or not path.is_file():
             raise ContextGroupArchiveNotFound(
@@ -1025,24 +1242,55 @@ def _plugin_workspace(plugin: Any) -> str:
     return str(getattr(service, "_workspace_path", "") or "").strip()
 
 
-def _live_context_group(group_ref: str) -> ContextGroupRecord | None:
+def _runtime_key_of(component: Any) -> str:
+    explicit = str(getattr(component, "_context_runtime_key", "") or "").strip()
+    if explicit:
+        return explicit
+    return CHATTER_RUNTIME_KEY
+
+
+def _live_window_payloads(runtime_key: str) -> list[LLMPayload] | None:
+    window = get_live_context(runtime_key)
+    if window is not None and isinstance(window.payloads, list):
+        return [payload for payload in window.payloads if isinstance(payload, LLMPayload)]
+    if runtime_key == CHATTER_RUNTIME_KEY:
+        from .chatter import LifeChatter
+
+        runtime = getattr(LifeChatter, "_GLOBAL_RUNTIME", None)
+        response = getattr(runtime, "response", None)
+        payloads = getattr(response, "payloads", None)
+        if isinstance(payloads, list):
+            return [payload for payload in payloads if isinstance(payload, LLMPayload)]
+    return None
+
+
+def _live_context_group(
+    group_ref: str,
+    *,
+    runtime_key: str = CHATTER_RUNTIME_KEY,
+) -> tuple[ContextGroupRecord, LiveContextWindow | None] | tuple[None, None]:
     """Resolve a ref from the current private runtime without broad history reads."""
 
-    from .chatter import LifeChatter
-
-    runtime = getattr(LifeChatter, "_GLOBAL_RUNTIME", None)
-    response = getattr(runtime, "response", None)
-    payloads = getattr(response, "payloads", None)
-    if not isinstance(payloads, list):
-        return None
-    manifest = build_group_manifest(
-        [payload for payload in payloads if isinstance(payload, LLMPayload)],
-        exclude_latest_group=False,
-    )
-    return next(
-        (record for record in manifest.groups if record.group_ref == group_ref),
+    payloads = _live_window_payloads(runtime_key)
+    if not payloads:
+        return None, None
+    manifest = build_group_manifest(payloads, exclude_latest_group=False)
+    record = next(
+        (item for item in manifest.groups if item.group_ref == group_ref),
         None,
     )
+    if record is None:
+        return None, None
+    window = get_live_context(runtime_key)
+    if window is None:
+        namespace, subdir = archive_target_for_runtime(runtime_key)
+        window = LiveContextWindow(
+            runtime_key=runtime_key,
+            payloads=payloads,
+            archive_namespace=namespace,
+            local_archive_subdir=subdir,
+        )
+    return record, window
 
 
 class LifeAuthorSelfContinuityCheckpointAction(BaseAction):
@@ -1050,11 +1298,11 @@ class LifeAuthorSelfContinuityCheckpointAction(BaseAction):
 
     action_name = "author_self_continuity_checkpoint"
     action_description = (
-        "当临时上下文容量通知出现时，由你亲自决定是否释放一段旧工作上下文，并把你希望未来的自己继续"
-        "知道的内容写成连续性说明。系统不会替你概括、挑选重要内容或改写 continuity_text。"
-        "必须原样使用通知里的 manifest/revision/group_ref；动作先归档精确旧组，随后才在安全边界安装。"
+        "滚动上下文进入压缩回合时，由你亲自决定释放哪些旧工作组，并把你希望未来的自己继续"
+        "知道的内容写成 continuity_text。系统不会替你概括、挑选重要内容或改写正文。"
+        "必须原样使用压缩清单里的 manifest/revision/group_ref；动作先归档精确旧组，随后才在安全边界安装。"
     )
-    chatter_allow: ClassVar[list[str]] = ["life_chatter"]
+    chatter_allow: ClassVar[list[str]] = ["life_chatter", "life_engine_internal"]
 
     async def execute(
         self,
@@ -1068,15 +1316,15 @@ class LifeAuthorSelfContinuityCheckpointAction(BaseAction):
         ],
         source_manifest_sha256: Annotated[
             str,
-            "当前 context_pressure_notice 给出的 source_manifest_sha256，必须精确复制。",
+            "当前 context_compression_required 清单给出的 source_manifest_sha256，必须精确复制。",
         ],
         expected_revision: Annotated[
             int,
-            "当前 context_pressure_notice 给出的 current_checkpoint_revision。",
+            "当前压缩清单给出的 current_checkpoint_revision。",
         ],
         release_through_group_ref: Annotated[
             str,
-            "按时间顺序释放到哪个 group_ref（含该组）；必须来自当前通知。",
+            "按时间顺序释放到哪个 group_ref（含该组）；必须来自当前清单。",
         ],
         retain_exact_group_refs: Annotated[
             list[str],
@@ -1087,6 +1335,8 @@ class LifeAuthorSelfContinuityCheckpointAction(BaseAction):
         actor = str(origin.get("consciousness_instance_id") or "").strip()
         if not actor:
             return False, "当前调用没有可验证的 active consciousness instance"
+        runtime_key = _runtime_key_of(self)
+        archive_namespace, archive_subdir = archive_target_for_runtime(runtime_key)
         command = SubjectCheckpointCommand(
             actor_consciousness_instance_id=actor,
             thought=str(thought or ""),
@@ -1101,17 +1351,10 @@ class LifeAuthorSelfContinuityCheckpointAction(BaseAction):
             ),
         )
         try:
-            # The action is only exposed by Life Chatter.  Reading its active
-            # response here validates exactly the manifest the subject saw;
-            # the latest in-flight tool group is intentionally excluded.
-            from .chatter import LifeChatter
-
-            runtime = getattr(LifeChatter, "_GLOBAL_RUNTIME", None)
-            response = getattr(runtime, "response", None)
-            payloads = getattr(response, "payloads", None)
+            payloads = _live_window_payloads(runtime_key)
             if not isinstance(payloads, list):
                 raise ContextStewardshipError(
-                    "active chatter context is unavailable"
+                    "active rolling context is unavailable"
                 )
             config = getattr(self.plugin, "config", None)
             chatter = getattr(config, "chatter", None)
@@ -1127,13 +1370,19 @@ class LifeAuthorSelfContinuityCheckpointAction(BaseAction):
                 payloads,
                 command,
                 max_checkpoint_bytes=max_bytes,
+                archive_namespace=archive_namespace,
             )
             await archive_context_groups(
                 prepared.released_groups,
                 service=_plugin_service(self.plugin),
                 workspace_path=_plugin_workspace(self.plugin),
+                namespace=archive_namespace,
+                local_subdir=archive_subdir,
             )
-            idempotent = queue_subject_checkpoint(command)
+            idempotent = queue_subject_checkpoint(
+                command,
+                runtime_key=runtime_key,
+            )
         except ContextStewardshipError as exc:
             return False, str(exc)
         except asyncio.CancelledError:
@@ -1155,15 +1404,15 @@ class LifeReadContextGroupTool(BaseTool):
 
     tool_name = "read_context_group"
     tool_description = (
-        "按 subject_self_continuity_checkpoint 或 mechanical_context_omission 中的 ctxg_ 引用，"
+        "按 subject_self_continuity_checkpoint 或压缩清单中的 ctxg_ 引用，"
         "分页读取精确旧上下文组。尚在当前私有运行态的组会先按内容地址归档再读取；"
         "这不是摘要，每页有 UTF-8 字节硬上限。"
     )
-    chatter_allow: ClassVar[list[str]] = ["life_chatter"]
+    chatter_allow: ClassVar[list[str]] = ["life_chatter", "life_engine_internal"]
 
     async def execute(
         self,
-        group_ref: Annotated[str, "检查点中列出的 ctxg_ 内容引用。"],
+        group_ref: Annotated[str, "检查点或压缩清单中列出的 ctxg_ 内容引用。"],
         offset_bytes: Annotated[
             int,
             "从哪个 UTF-8 字节位置继续读取；首次为 0，后续使用 next_offset_bytes。",
@@ -1181,25 +1430,36 @@ class LifeReadContextGroupTool(BaseTool):
             budget = max(256, min(requested, MAX_ARCHIVE_READ_BYTES))
             service = _plugin_service(self.plugin)
             workspace = _plugin_workspace(self.plugin)
+            runtime_key = _runtime_key_of(self)
+            archive_namespace, archive_subdir = archive_target_for_runtime(runtime_key)
             try:
                 archive = await read_context_group_archive(
                     group_ref,
                     service=service,
                     workspace_path=workspace,
+                    namespace=archive_namespace,
+                    local_subdir=archive_subdir,
                 )
             except ContextGroupArchiveNotFound:
-                live_record = _live_context_group(str(group_ref or "").strip())
-                if live_record is None:
+                live_record, window = _live_context_group(
+                    str(group_ref or "").strip(),
+                    runtime_key=runtime_key,
+                )
+                if live_record is None or window is None:
                     raise
                 await archive_context_groups(
                     [live_record],
                     service=service,
                     workspace_path=workspace,
+                    namespace=window.archive_namespace,
+                    local_subdir=window.local_archive_subdir,
                 )
                 archive = await read_context_group_archive(
                     group_ref,
                     service=service,
                     workspace_path=workspace,
+                    namespace=window.archive_namespace,
+                    local_subdir=window.local_archive_subdir,
                 )
             exact_text = canonical_json(archive["record"])
             chunk, next_offset, complete = _utf8_page(
@@ -1325,7 +1585,12 @@ def mechanically_bound_payloads(
     reference_max_groups: int = DEFAULT_PRESSURE_MAX_GROUPS,
     reference_max_bytes: int = DEFAULT_EMERGENCY_REFERENCE_MAX_BYTES,
 ) -> tuple[ContextStewardshipResult, tuple[ContextGroupRecord, ...]]:
-    """Apply a content-neutral emergency bound and return exact dropped records."""
+    """Apply a content-neutral emergency bound and return exact dropped records.
+
+    Production send and snapshot paths must not use this as a successful
+    compression.  Subject-authored checkpoints are the only way to release
+    old groups from a live rolling chain.
+    """
 
     typed = [payload for payload in payloads if isinstance(payload, LLMPayload)]
     before_bytes = _payloads_utf8_bytes(typed)
@@ -1384,12 +1649,19 @@ def mechanically_bound_payloads(
 
 __all__ = [
     "ARCHIVE_NAMESPACE",
+    "CHATTER_ARCHIVE_SUBDIR",
+    "CHATTER_RUNTIME_KEY",
     "CHECKPOINT_CLOSE",
     "CHECKPOINT_OPEN",
+    "COMPRESSION_REQUIRED_CLOSE",
+    "COMPRESSION_REQUIRED_OPEN",
     "DEFAULT_CHECKPOINT_MAX_BYTES",
     "DEFAULT_EMERGENCY_REFERENCE_MAX_BYTES",
     "DEFAULT_PRESSURE_MAX_GROUPS",
     "DEFAULT_PRESSURE_RATIO",
+    "HEARTBEAT_ARCHIVE_NAMESPACE",
+    "HEARTBEAT_ARCHIVE_SUBDIR",
+    "HEARTBEAT_RUNTIME_KEY",
     "OMISSION_CLOSE",
     "OMISSION_OPEN",
     "PRESSURE_CLOSE",
@@ -1400,23 +1672,35 @@ __all__ = [
     "ContextStewardshipResult",
     "LifeAuthorSelfContinuityCheckpointAction",
     "LifeReadContextGroupTool",
+    "LiveContextWindow",
     "SubjectCheckpointCommand",
     "append_context_pressure_notice",
     "apply_pending_subject_checkpoint",
     "archive_context_groups",
+    "archive_target_for_runtime",
+    "build_compression_required_payload",
     "build_context_pressure_notice",
     "build_conversation_groups",
     "build_group_manifest",
     "build_mechanical_omission_payloads",
     "checkpoint_data",
     "current_checkpoint_data",
+    "ensure_compression_required_appended",
+    "get_live_context",
+    "has_compression_required_payload",
+    "is_compression_required_payload",
     "is_legacy_summary_payload",
     "mechanically_bound_payloads",
+    "payloads_require_compression",
     "prepare_subject_checkpoint",
     "queue_subject_checkpoint",
     "read_context_group_archive",
+    "register_live_context",
     "reset_pending_subject_checkpoint",
     "reset_transient_context_pressure_notices",
+    "rolling_char_estimate",
     "split_pinned_and_tail",
+    "strip_compression_required_payloads",
     "strip_context_pressure_notices",
+    "unregister_live_context",
 ]

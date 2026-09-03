@@ -55,7 +55,13 @@ from src.kernel.logger import COLOR, get_logger
 from src.kernel.storage import canonical_json_sha256
 
 from ..constants import LIFE_CHATTER_GLOBAL_CURSOR_KEY
+from ..inner_dialogue.protocol import INNER_RETURN_SENDER_ID
 from ..memory.prompting import analyze_memory_text, render_memory_prompt
+from ..service.activity_panel import (
+    format_decision_panel,
+    format_decision_tool_args,
+    print_activity_panel,
+)
 from .chat_history import (
     build_chat_history_text,
     build_global_chat_history_text_from_db,
@@ -76,19 +82,21 @@ from .context_compaction import (
     is_summary_payload,
 )
 from .context_stewardship import (
+    ARCHIVE_NAMESPACE,
+    CHATTER_RUNTIME_KEY,
     DEFAULT_CHECKPOINT_MAX_BYTES,
     DEFAULT_EMERGENCY_REFERENCE_MAX_BYTES,
     DEFAULT_PRESSURE_MAX_GROUPS,
-    DEFAULT_PRESSURE_RATIO,
-    append_context_pressure_notice,
     apply_pending_subject_checkpoint,
-    archive_context_groups,
-    build_context_pressure_notice,
+    archive_target_for_runtime,
     build_mechanical_omission_payloads,
-    mechanically_bound_payloads,
+    ensure_compression_required_appended,
+    LiveContextWindow,
+    register_live_context,
     reset_pending_subject_checkpoint,
     reset_transient_context_pressure_notices,
     strip_context_pressure_notices,
+    unregister_live_context,
 )
 from .multimodal import (
     MediaBudget,
@@ -106,6 +114,28 @@ if TYPE_CHECKING:
 logger = get_logger("life_chatter", display="生命对话器", color=COLOR.MAGENTA)
 _T = TypeVar("_T")
 
+
+def _expand_llm_tool_names(names: frozenset[str]) -> frozenset[str]:
+    """Include unprefixed, tool-, and action- aliases for LLM-visible names."""
+
+    expanded: set[str] = set()
+    for name in names:
+        raw = str(name or "").strip()
+        if not raw:
+            continue
+        expanded.add(raw)
+        stripped = raw
+        for prefix in ("tool-", "action-"):
+            if stripped.startswith(prefix):
+                stripped = stripped[len(prefix) :]
+                break
+        if stripped:
+            expanded.add(stripped)
+            expanded.add(f"tool-{stripped}")
+            expanded.add(f"action-{stripped}")
+    return frozenset(expanded)
+
+
 # ── 控制流常量 ────────────────────────────────────────────────
 _PASS_AND_WAIT = "action-life_pass_and_wait"
 _SEND_TEXT = "action-life_send_text"
@@ -117,16 +147,38 @@ _MINECRAFT_CAUSAL_TOOL_NAMES = frozenset(
     {"nucleus_minecraft", "tool-nucleus_minecraft"}
 )
 _RETIRED_THINK_ACTION = "action-think"
-_RETIRED_PROACTIVE_ACTIONS = frozenset(
-    {
-        "nucleus_manage_attention_thread",
-        "nucleus_manage_initiative_seed",
-        "nucleus_reachability",
-        "nucleus_begin_outreach",
-        "nucleus_manage_thought_stream",
-        "nucleus_manage_autonomy_intent",
-        "nucleus_schedule_autonomy_intent",
-    }
+_RETIRED_THINK_ACTIONS = _expand_llm_tool_names(
+    frozenset({_RETIRED_THINK_ACTION, "think"})
+)
+_RETIRED_PROACTIVE_ACTIONS = _expand_llm_tool_names(
+    frozenset(
+        {
+            "nucleus_manage_attention_thread",
+            "nucleus_manage_initiative_seed",
+            "nucleus_reachability",
+            "nucleus_begin_outreach",
+            "nucleus_manage_thought_stream",
+            "nucleus_manage_autonomy_intent",
+            "nucleus_schedule_autonomy_intent",
+            "schedule_followup_message",
+            "action-schedule_followup_message",
+        }
+    )
+)
+_INITIATIVE_OUTREACH_SENDER_ID = "life_engine_initiative"
+_INTERNAL_WAKE_SENDER_IDS = frozenset(
+    {INNER_RETURN_SENDER_ID, _INITIATIVE_OUTREACH_SENDER_ID}
+)
+_INTERNAL_WAKE_ENVELOPE_OMITTED = "[internal_wake_envelope_omitted]"
+_INTERNAL_WAKE_SENDER_RE = re.compile(
+    r"^【[^】]+】(?:<[^>]*>\s*)?\[(?:"
+    + "|".join(re.escape(item) for item in sorted(_INTERNAL_WAKE_SENDER_IDS))
+    + r")\]\s"
+)
+_ROLLING_MESSAGE_START_RE = re.compile(r"^【[^】]+】")
+_NEW_MESSAGES_BLOCK_RE = re.compile(
+    r"<new_messages>\n?(.*?)\n?</new_messages>\n?",
+    re.DOTALL,
 )
 _SUSPEND_TEXT = "__SUSPEND__"
 _GLOBAL_RUNTIME_BUSY_RETRY_SECONDS = 1.0
@@ -157,21 +209,6 @@ _LIVE_BRIDGE_BLOCKED_USABLE_SIGNATURES = frozenset(
         "tts_voice_plugin:action:tts_voice_action",
     }
 )
-_SURFACE_BLOCKED_USABLE_SIGNATURES = frozenset(
-    {
-        "tts_voice_plugin:action:tts_voice_action",
-    }
-)
-_SURFACE_REALTIME_HIDDEN_USABLE_SIGNATURES = frozenset(
-    {
-        "life_engine:action:think",
-        "life_engine:action:record_inner_monologue",
-        "tts_voice_plugin:action:tts_voice_action",
-    }
-)
-_SURFACE_LOW_LATENCY_ENV = "NEKO_SURFACE_LOW_LATENCY"
-_SURFACE_FAST_MAX_TOKENS_ENV = "NEKO_SURFACE_FAST_MAX_TOKENS"
-_SURFACE_FAST_MAX_TOKENS_DEFAULT = 900
 
 # 运行时 assistant 注入队列：
 # 用于接收主动续话/内心独白等外部插件产生的上下文。
@@ -862,7 +899,6 @@ class LifeSendVoiceAction(_LifeSendMediaAction):
         "需要把文字合成为语音时填写 text。"
         "path 与 text 二选一。文字合成使用已启用的本地消息 TTS 服务，主体自行决定是否使用。"
         "QQ platform_action 的 send_group_ai_record 是 QQ 内置角色语音，不是本地爱莉音色。"
-        "N.E.K.O Surface 的文字回复由该场景自己的自动语音链处理，不要重复调用本动作。"
     )
     chatter_allow: list[str] = ["life_chatter"]
     media_type = MessageType.VOICE
@@ -897,10 +933,6 @@ class LifeSendVoiceAction(_LifeSendMediaAction):
             return False, "path 与 text 必须且只能填写一个"
         if normalized_path:
             return await self._send_path(normalized_path)
-
-        platform = str(getattr(self.chat_stream, "platform", "") or "").strip().lower()
-        if platform == "neko.surface":
-            return False, "N.E.K.O Surface 已由本地自动语音链接管"
 
         try:
             from plugins.tts_voice_plugin.api import get_local_tts_service
@@ -1911,8 +1943,12 @@ class LifeChatter(BaseChatter):
         cls._GLOBAL_RUNTIME = None
         cls._GLOBAL_USABLE_MAP = None
         cls._GLOBAL_ROLLING_CONTEXT_REVISION = 0
-        reset_pending_subject_checkpoint(cls.instance_id)
+        reset_pending_subject_checkpoint(
+            cls.instance_id,
+            runtime_key=CHATTER_RUNTIME_KEY,
+        )
         reset_transient_context_pressure_notices()
+        unregister_live_context(CHATTER_RUNTIME_KEY)
 
     def _configured_primary_task_name(self) -> str:
         """返回 life_chatter 主任务名；优先读 chatter_task_name，留空时跟随 task_name，再留空用 expression。"""
@@ -2233,7 +2269,7 @@ class LifeChatter(BaseChatter):
 
         return cls._without_retired_tool_history(
             payloads,
-            retired_names=frozenset({_RETIRED_THINK_ACTION}),
+            retired_names=_RETIRED_THINK_ACTIONS,
         )
 
     @classmethod
@@ -2366,6 +2402,196 @@ class LifeChatter(BaseChatter):
         """
 
         return [payload for payload in payloads if not is_summary_payload(payload)]
+
+    @classmethod
+    def _derived_rolling_payloads(
+        cls,
+        payloads: list[LLMPayload],
+        *,
+        strip_wake_envelopes: bool = False,
+    ) -> list[LLMPayload]:
+        """Normalize the derived rolling projection without rewriting authority."""
+
+        derived = cls._without_retired_context_summaries(payloads)
+        derived = cls._without_retired_think_history(derived)
+        derived = cls._without_retired_proactive_history(derived)
+        derived = cls._without_retired_reaction_guidance(derived)
+        if strip_wake_envelopes:
+            derived = cls._without_internal_wake_envelopes(derived)
+        return derived
+
+    @classmethod
+    def _install_derived_rolling_projection(
+        cls,
+        response: Any,
+        *,
+        strip_wake_envelopes: bool,
+    ) -> None:
+        """Replace live model payloads with the derived rolling projection."""
+
+        payloads = getattr(response, "payloads", None)
+        if not isinstance(payloads, list):
+            return
+        current = [item for item in payloads if isinstance(item, LLMPayload)]
+        response.payloads = cls._derived_rolling_payloads(
+            current,
+            strip_wake_envelopes=strip_wake_envelopes,
+        )
+
+    @classmethod
+    def _without_internal_wake_envelopes(
+        cls,
+        payloads: list[LLMPayload],
+    ) -> list[LLMPayload]:
+        """Drop synthetic wake envelopes from derived rolling USER text.
+
+        Inner-return and outreach envelopes must remain during MODEL_TURN /
+        FOLLOW_UP.  After the turn closes they are transport, not chat, and
+        must not teach later turns that the system was a conversation partner.
+        """
+
+        rewritten: list[LLMPayload] = []
+        for payload in payloads:
+            if payload.role != ROLE.USER:
+                rewritten.append(payload)
+                continue
+            original_content = list(getattr(payload, "content", None) or [])
+            content: list[Any] = []
+            changed = False
+            for part in original_content:
+                if not isinstance(part, Text):
+                    content.append(part)
+                    continue
+                stripped = cls._strip_wake_envelopes_from_text(part.text)
+                if stripped == part.text:
+                    content.append(part)
+                    continue
+                changed = True
+                if stripped.strip():
+                    content.append(Text(stripped))
+            if not content:
+                continue
+            rewritten.append(
+                payload
+                if not changed
+                else LLMPayload(payload.role, content)  # type: ignore[arg-type]
+            )
+        return cls._collapse_omitted_wake_user_payloads(rewritten)
+
+    @classmethod
+    def _strip_wake_envelopes_from_text(cls, text: str) -> str:
+        """Remove internal wake records from a rolling ``<new_messages>`` block."""
+
+        def _replace(match: re.Match[str]) -> str:
+            kept = [
+                record
+                for record in cls._split_new_message_records(match.group(1))
+                if record.strip() and not cls._is_internal_wake_record(record)
+            ]
+            if not kept:
+                return ""
+            return "<new_messages>\n" + "\n".join(kept) + "\n</new_messages>\n"
+
+        rewritten, count = _NEW_MESSAGES_BLOCK_RE.subn(_replace, text)
+        if count == 0:
+            return text
+        return re.sub(r"\n{3,}", "\n\n", rewritten)
+
+    @staticmethod
+    def _split_new_message_records(body: str) -> list[str]:
+        records: list[str] = []
+        current: list[str] = []
+        for line in str(body or "").splitlines():
+            if _ROLLING_MESSAGE_START_RE.match(line):
+                if current:
+                    records.append("\n".join(current))
+                current = [line]
+                continue
+            if current:
+                current.append(line)
+                continue
+            if line.strip():
+                records.append(line)
+        if current:
+            records.append("\n".join(current))
+        return records
+
+    @staticmethod
+    def _is_internal_wake_record(record: str) -> bool:
+        first = str(record or "").splitlines()[0] if record else ""
+        return bool(_INTERNAL_WAKE_SENDER_RE.match(first))
+
+    @staticmethod
+    def _is_rolling_prompt_shell(text: str) -> bool:
+        stripped = str(text or "").strip()
+        if not stripped:
+            return True
+        if "<new_messages>" in stripped or "<chat_history>" in stripped:
+            return False
+        return (
+            "你当前正在名为" in stripped
+            and "请基于上述信息决定接下来的动作" in stripped
+        )
+
+    @staticmethod
+    def _is_suspend_only_payload(payload: LLMPayload) -> bool:
+        if payload.role != ROLE.ASSISTANT:
+            return False
+        texts: list[str] = []
+        for part in list(getattr(payload, "content", None) or []):
+            if isinstance(part, ToolCall):
+                return False
+            if isinstance(part, Text):
+                texts.append(part.text)
+                continue
+            if isinstance(part, ReasoningText):
+                continue
+            return False
+        return not "".join(texts).replace(_SUSPEND_TEXT, "").strip()
+
+    @classmethod
+    def _is_omitted_wake_user(cls, payload: LLMPayload) -> bool:
+        if payload.role != ROLE.USER:
+            return False
+        texts: list[str] = []
+        for part in list(getattr(payload, "content", None) or []):
+            if not isinstance(part, Text):
+                return False
+            if part.text.strip() == _INTERNAL_WAKE_ENVELOPE_OMITTED:
+                return False
+            texts.append(part.text)
+        return cls._is_rolling_prompt_shell("\n".join(texts))
+
+    @classmethod
+    def _collapse_omitted_wake_user_payloads(
+        cls,
+        payloads: list[LLMPayload],
+    ) -> list[LLMPayload]:
+        """Drop empty wake USER frames without breaking assistant/tool chaining."""
+
+        collapsed: list[LLMPayload] = []
+        index = 0
+        while index < len(payloads):
+            payload = payloads[index]
+            if not cls._is_omitted_wake_user(payload):
+                collapsed.append(payload)
+                index += 1
+                continue
+
+            following = payloads[index + 1] if index + 1 < len(payloads) else None
+            previous = collapsed[-1] if collapsed else None
+            if previous is not None and cls._is_suspend_only_payload(previous):
+                collapsed.pop()
+                previous = collapsed[-1] if collapsed else None
+
+            previous_role = getattr(previous, "role", None)
+            can_drop = previous_role in {ROLE.USER, ROLE.TOOL_RESULT}
+            if following is not None and following.role == ROLE.ASSISTANT and not can_drop:
+                collapsed.append(
+                    LLMPayload(ROLE.USER, Text(_INTERNAL_WAKE_ENVELOPE_OMITTED))
+                )
+            index += 1
+        return collapsed
 
     def _bind_trajectory_identity(
         self,
@@ -2595,10 +2821,10 @@ class LifeChatter(BaseChatter):
 
     @classmethod
     def _snapshot_data_for_payloads(cls, payloads: list[LLMPayload]) -> dict[str, Any]:
-        payloads = cls._without_retired_context_summaries(payloads)
-        payloads = cls._without_retired_think_history(payloads)
-        payloads = cls._without_retired_proactive_history(payloads)
-        payloads = cls._without_retired_reaction_guidance(payloads)
+        payloads = cls._derived_rolling_payloads(
+            payloads,
+            strip_wake_envelopes=True,
+        )
         serialized_payloads = [
             item
             for item in (
@@ -2758,6 +2984,8 @@ class LifeChatter(BaseChatter):
                 self.instance_id,
                 [p for p in payloads if isinstance(p, LLMPayload)],
                 max_checkpoint_bytes=checkpoint_max_bytes,
+                runtime_key=CHATTER_RUNTIME_KEY,
+                archive_namespace=ARCHIVE_NAMESPACE,
             )
         except Exception as exc:  # noqa: BLE001 - derived projection fails closed
             logger.warning(
@@ -2773,6 +3001,7 @@ class LifeChatter(BaseChatter):
                 f"released_groups={result.released_groups} "
                 f"bytes={result.before_utf8_bytes}->{result.after_utf8_bytes}"
             )
+        self._register_chatter_live_context(response)
         return result
 
     @classmethod
@@ -2898,10 +3127,10 @@ class LifeChatter(BaseChatter):
             for payload in (self._deserialize_payload(item) for item in payload_items)
             if payload is not None
         ]
-        payloads = self._without_retired_context_summaries(payloads)
-        payloads = self._without_retired_think_history(payloads)
-        payloads = self._without_retired_proactive_history(payloads)
-        payloads = self._without_retired_reaction_guidance(payloads)
+        payloads = self._derived_rolling_payloads(
+            payloads,
+            strip_wake_envelopes=True,
+        )
         # Legacy snapshots migrate to v3 canonical digests on the next
         # successful save. Do not rewrite storage from a read path.
         return payloads
@@ -2921,44 +3150,7 @@ class LifeChatter(BaseChatter):
         if not current_payloads:
             return
         service = self._get_life_service()
-        budget, max_groups, _, _, _, _, _ = (
-            self._rolling_context_compaction_options()
-        )
-        chatter = getattr(self._get_config(), "chatter", None)
-        reference_max_bytes = max(
-            256,
-            int(
-                getattr(
-                    chatter,
-                    "context_emergency_reference_max_bytes",
-                    DEFAULT_EMERGENCY_REFERENCE_MAX_BYTES,
-                )
-                or DEFAULT_EMERGENCY_REFERENCE_MAX_BYTES
-            ),
-        )
-        bounded, archive_records = mechanically_bound_payloads(
-            current_payloads,
-            estimate=self._estimate_payload_chars,
-            hard_budget=budget,
-            reference_max_groups=max_groups,
-            reference_max_bytes=reference_max_bytes,
-        )
-        if archive_records:
-            try:
-                await archive_context_groups(
-                    archive_records,
-                    service=service,
-                    workspace_path=self._resolve_workspace_path(service),
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - keep live context intact
-                logger.warning(
-                    "归档快照省略组失败，本轮不写入有损派生快照: "
-                    f"error_type={type(exc).__name__}"
-                )
-                return
-        snapshot_payloads = bounded.payloads
+        snapshot_payloads = current_payloads
         data = self._snapshot_data_for_payloads(snapshot_payloads)
 
         selected_store = None
@@ -3243,103 +3435,6 @@ class LifeChatter(BaseChatter):
                 raise
             raise _LifeChatterModelTurnTimeout(timeout) from exc
 
-    @staticmethod
-    def _surface_fast_max_tokens() -> int:
-        raw = os.environ.get(_SURFACE_FAST_MAX_TOKENS_ENV)
-        try:
-            parsed = (
-                int(str(raw).strip())
-                if raw is not None
-                else _SURFACE_FAST_MAX_TOKENS_DEFAULT
-            )
-        except (TypeError, ValueError):
-            parsed = _SURFACE_FAST_MAX_TOKENS_DEFAULT
-        return max(128, min(parsed, 3200))
-
-    @classmethod
-    def _surface_realtime_model_set(cls, model_set: Any) -> Any:
-        """克隆当前模型集，并关闭 Surface 单轮中的额外思考延迟。"""
-        if not isinstance(model_set, (list, tuple)):
-            return model_set
-
-        token_limit = cls._surface_fast_max_tokens()
-        tuned_models: list[Any] = []
-        for model in model_set:
-            if not isinstance(model, dict):
-                tuned_models.append(model)
-                continue
-            tuned = dict(model)
-            configured_max = tuned.get("max_tokens")
-            if isinstance(configured_max, int) and configured_max > 0:
-                tuned["max_tokens"] = min(configured_max, token_limit)
-            else:
-                tuned["max_tokens"] = token_limit
-
-            extra_params = dict(tuned.get("extra_params") or {})
-            extra_params.pop("thinking", None)
-            extra_params["enable_thinking"] = False
-            extra_params["tool_choice"] = "required"
-            tuned["extra_params"] = extra_params
-            tuned_models.append(tuned)
-        return tuned_models
-
-    @staticmethod
-    def _usable_signature(usable: Any) -> str:
-        getter = getattr(usable, "get_signature", None)
-        if not callable(getter):
-            return ""
-        try:
-            return str(getter() or "")
-        except Exception:
-            return ""
-
-    @classmethod
-    def _apply_surface_realtime_request_overrides(
-        cls,
-        response: Any,
-        chat_stream: ChatStream,
-        *,
-        must_reply: bool,
-    ) -> tuple[bool, Any, list[tuple[Any, list[Any]]]]:
-        """临时精简本次 Surface 请求；全局 runtime 和其他平台不受污染。"""
-        if not must_reply or not cls._is_surface_low_latency_stream(chat_stream):
-            return False, None, []
-
-        original_model_set = getattr(response, "model_set", None)
-        if original_model_set is not None:
-            response.model_set = cls._surface_realtime_model_set(original_model_set)
-
-        saved_tool_payloads: list[tuple[Any, list[Any]]] = []
-        for payload in getattr(response, "payloads", None) or []:
-            if getattr(payload, "role", None) != ROLE.TOOL:
-                continue
-            original_content = list(getattr(payload, "content", None) or [])
-            filtered_content = [
-                usable
-                for usable in original_content
-                if cls._usable_signature(usable)
-                not in _SURFACE_REALTIME_HIDDEN_USABLE_SIGNATURES
-            ]
-            if len(filtered_content) == len(original_content):
-                continue
-            saved_tool_payloads.append((payload, original_content))
-            payload.content = filtered_content
-
-        return True, original_model_set, saved_tool_payloads
-
-    @staticmethod
-    def _restore_surface_realtime_request_overrides(
-        response: Any,
-        state: tuple[bool, Any, list[tuple[Any, list[Any]]]],
-    ) -> None:
-        applied, original_model_set, saved_tool_payloads = state
-        if not applied:
-            return
-        if original_model_set is not None:
-            response.model_set = original_model_set
-        for payload, original_content in saved_tool_payloads:
-            payload.content = original_content
-
     async def modify_llm_usables(self, llm_usables: list[Any]) -> list[type[Any]]:
         """直播桥接场景下裁掉当前无法走通的组件；并按配置过滤 MCP 工具。"""
         available = await super().modify_llm_usables(llm_usables)
@@ -3485,9 +3580,9 @@ class LifeChatter(BaseChatter):
     ) -> str:
         """构建 100% 静态可缓存前缀提示词。"""
 
-        # SOUL/USER/MEMORY 属于主体权威内容，只能来自唯一绑定的权威源。
-        # TOOL.md 是 life_engine/heartbeat 的工具边界；life_chatter 使用独立
-        # TOOLS.md，它是工程 Prompt 脚手架而非主体语义，仍留在工作空间。
+        # SOUL/USER/MEMORY 来自唯一绑定的权威源；EXISTENCE.md / TOOLS.md
+        # 是工作区里的固定提示词，和日记一样由主体自己改。
+        # TOOL.md 是心跳窗口的工具习惯，聊天不读它。
         texts = await self._load_subject_authority_texts(service)
         soul_text = texts.get("SOUL.md", "").strip()
         if not soul_text:
@@ -3500,12 +3595,14 @@ class LifeChatter(BaseChatter):
             memory_data = analyze_memory_text(memory_raw)
             if memory_data.raw_text:
                 memory_text = render_memory_prompt(memory_data, mode="chat")
+        existence_text = self._load_workspace_markdown(service, "EXISTENCE.md")
         tools_text = self._load_workspace_markdown(service, "TOOLS.md")
 
         return LifeChatterContextAssembler.build_prefix_prompt(
             soul_text=soul_text,
             user_text=texts.get("USER.md", "").strip(),
             memory_text=memory_text,
+            existence_text=existence_text,
             tools_text=tools_text,
             live_guidance=self._build_live_scene_guidance(chat_stream),
             primary_tool_guide=self._build_primary_tool_guide()
@@ -3598,43 +3695,6 @@ class LifeChatter(BaseChatter):
         """判断当前聊天流是否为直播桥接场景。"""
         return str(getattr(chat_stream, "platform", "") or "").strip().lower() == "live"
 
-    @staticmethod
-    def _is_surface_stream(chat_stream: ChatStream | None) -> bool:
-        """判断当前聊天流是否来自 N.E.K.O 实时表现窗口。"""
-        return (
-            str(getattr(chat_stream, "platform", "") or "").strip().lower()
-            == "neko.surface"
-        )
-
-    @staticmethod
-    def _surface_low_latency_enabled() -> bool:
-        """返回 Surface 是否启用默认开启的低延迟对话路径。"""
-        raw = os.environ.get(_SURFACE_LOW_LATENCY_ENV)
-        if raw is None:
-            return True
-        return raw.strip().lower() in {"1", "true", "yes", "on", "enabled"}
-
-    @classmethod
-    def _is_surface_low_latency_stream(cls, chat_stream: ChatStream | None) -> bool:
-        return (
-            cls._is_surface_stream(chat_stream) and cls._surface_low_latency_enabled()
-        )
-
-    @classmethod
-    def _build_surface_realtime_guidance(cls, chat_stream: ChatStream | None) -> str:
-        """构建只在本轮可见的 Surface 低延迟回复约束。"""
-        if not cls._is_surface_low_latency_stream(chat_stream):
-            return ""
-        return (
-            "### N.E.K.O 实时私聊\n"
-            "- 对方正在表现窗口前等待你的即时回应；优先自然接话和低延迟。\n"
-            "- 普通对话应在第一次模型决策里直接调用 `life_send_text`，不要先单独调用 "
-            "`think`、`record_inner_monologue` 或 TTS 工具。\n"
-            "- 只有确实需要查询或操作时才先调用其他工具；拿到结果后立即回复。\n"
-            "- 回复保持口语化、适合直接朗读，尽量一次发成一个完整短段。\n"
-            "- 语音由 Surface 本地自动语音链合成，不要主动调用任何 TTS/语音发送工具。"
-        )
-
     @classmethod
     def _build_live_scene_guidance(cls, chat_stream: ChatStream | None) -> str:
         """为直播桥接场景补充专用行为约束。"""
@@ -3673,17 +3733,24 @@ class LifeChatter(BaseChatter):
             "- 只有后一个动作必须依赖前一个工具的未知结果时才分轮；例如先 `nucleus_view_screen`，看到结果后再 `life_send_text`。\n"
             "### 核心工具\n"
             "- `life_send_text`：**在当前意识实例表面发送文字**。`content` 只写纯文本正文，长内容用 `\\n` 分段；它不负责选择其他聊天。\n"
-            "- `nucleus_proactive_query`：只读查看持续关注、未来意向或可达对象/表面；读取不改变状态。\n"
-            "- `nucleus_proactive_command`：统一主动写入口；显式管理关注/意向，或选择对象与表面发起一次表达判断。\n"
+            "- `nucleus_proactive_query`：只读查看持续关注、未来意向、可达对象/表面，或尚未交还的内心对话；读取不改变状态。\n"
+            "- `nucleus_proactive_command`：统一主动写入口；显式管理关注/意向，选择对象与表面发起一次表达判断，或由心跳 inner.return 交还回声。\n"
             "- `life_send_file`：发送本地文件给用户。\n"
             "- `action-life_pass_and_wait`：结束本轮，等待用户新消息。\n"
             "- `nucleus_bash`：查看或操作电脑终端。\n"
+            "- `nucleus_read_file`：读取 workspace 文件；结果带行号，编辑时不要把行号拷进文本。\n"
+            "- `nucleus_grep_file`：在 workspace 里搜文件内容或文件名。\n"
+            "- `nucleus_edit_file`：精确替换一段唯一原文。\n"
+            "- `nucleus_apply_patch`：多处/多文件精确改写（Codex patch 格式）。\n"
+            "- `nucleus_glob_file`：按 glob 找路径。\n"
+            "- `nucleus_web_search`：联网搜索公开网页。\n"
+            "- `nucleus_browser_fetch`：打开已有 URL 并提取可读正文。\n"
             "- `nucleus_view_screen`：查看 Ayer 当前屏幕。\n"
-            "- `nucleus_manage_todo`：创建 TODO。\n"
-            "- `inner_dialogue`：把念头沉进心里慢慢想（异步；想通了会自己浮回）。\n"
-            "- `author_self_continuity_checkpoint`：只有你决定释放旧工作上下文时，"
-            "依据临时容量清单亲自写给未来自己的连续性说明；系统不会替你总结。\n"
-            "- `read_context_group`：按检查点或机械省略通知里的 ctxg_ 引用，分页读取精确旧组。\n"
+            "- `nucleus_todo`：写入或查看 TODO 板（整组 `{id, content, status}`，可 merge）。\n"
+            "- `inner_dialogue`：把念头沉进心里慢慢想（异步；允许浮回后需心跳 inner.return 显式交还）。\n"
+            "- `author_self_continuity_checkpoint`：滚动超过容量阈值后必须由你亲自写给未来自己的连续性说明；"
+            "系统不会替你总结，也不会丢掉旧组来硬塞进窗口。\n"
+            "- `read_context_group`：按检查点或压缩清单里的 ctxg_ 引用，分页读取精确旧组。\n"
             "- `tool-inspect_media`：把图片/视频/语音提升为原生多模态输入。\n"
             "- **工具名不带 `tool-` 前缀**（`tool-` 前缀仅限 `tool-inspect_media` 等平台工具）；普通工具直接使用 `nucleus_bash`、`nucleus_grep_file` 这类名字，不要加前缀。\n"
             "- 不要把 `reason`、`thought` 等元信息写进 `content`。"
@@ -3755,12 +3822,6 @@ class LifeChatter(BaseChatter):
                 include_recent_chat_history=include_recent_chat_history,
                 commit_cursors=commit_cursors,
                 event_cursor_override=event_cursor_override,
-            )
-
-        surface_guidance = self._build_surface_realtime_guidance(chat_stream)
-        if surface_guidance:
-            context_text = "\n\n".join(
-                part for part in (context_text.strip(), surface_guidance) if part
             )
 
         if not context_text:
@@ -3876,6 +3937,19 @@ class LifeChatter(BaseChatter):
                 "force_reply": False,
             }
 
+        # 潜意识显式交还的内心对话回声 → 交给当前窗口重新判断，不等于必须说话。
+        if unread_msgs and any(
+            self._message_flag(msg, "is_inner_return_trigger")
+            for msg in unread_msgs
+        ):
+            return {
+                "reason": "潜意识显式交还了内心对话回声，交给当前窗口重新判断",
+                "should_respond": True,
+                "force_reply": self._should_force_reply_for_unread_batch(
+                    unread_msgs
+                ),
+            }
+
         # 外部机会或主体显式外联决定 → 交给主模型重新判断。
         # 这不是强制回复，只是让表达层看到新的真实上下文。
         if unread_msgs and any(
@@ -3909,15 +3983,6 @@ class LifeChatter(BaseChatter):
                 "force_reply": self._should_force_reply_for_unread_batch(
                     unread_msgs
                 ),
-            }
-
-        # N.E.K.O 是已认证的一对一表现窗口。用户在这里发出的文字天然就是
-        # 对爱莉的直接对话，不需要再花一次模型请求判断“要不要回复”。
-        if self._is_surface_low_latency_stream(chat_stream):
-            return {
-                "reason": "N.E.K.O 实时私聊直接进入表达层",
-                "should_respond": True,
-                "force_reply": True,
             }
 
         service = self._get_life_service()
@@ -4117,14 +4182,17 @@ class LifeChatter(BaseChatter):
         LifeChatterContextAssembler.append_suffix_to_last_user(response, context_text)
 
     def _append_context_pressure_notice(self, response: Any) -> None:
-        """Append one technical pressure projection for this send only."""
+        """Append one durable compression-required list when over the trigger."""
 
         chatter = getattr(self._get_config(), "chatter", None)
         if not bool(getattr(chatter, "context_stewardship_enabled", True)):
             return
-        ratio = float(
-            getattr(chatter, "context_pressure_ratio", DEFAULT_PRESSURE_RATIO)
-            or DEFAULT_PRESSURE_RATIO
+        payloads = getattr(response, "payloads", None)
+        if not isinstance(payloads, list):
+            return
+        trigger = max(
+            1,
+            int(getattr(chatter, "context_compaction_trigger_chars", 120_000) or 120_000),
         )
         max_groups = int(
             getattr(
@@ -4142,14 +4210,29 @@ class LifeChatter(BaseChatter):
             )
             or DEFAULT_EMERGENCY_REFERENCE_MAX_BYTES
         )
-        append_context_pressure_notice(
-            response,
-            build_context_pressure_notice(
-                response,
-                trigger_ratio=ratio,
-                max_groups=max_groups,
-                max_bytes=max_bytes,
-            ),
+        updated = ensure_compression_required_appended(
+            [payload for payload in payloads if isinstance(payload, LLMPayload)],
+            estimate=self._estimate_payload_chars,
+            trigger_chars=trigger,
+            max_groups=max_groups,
+            max_bytes=max_bytes,
+        )
+        response.payloads = updated
+        self._register_chatter_live_context(response)
+
+    def _register_chatter_live_context(self, response: Any) -> None:
+        payloads = getattr(response, "payloads", None)
+        if not isinstance(payloads, list):
+            return
+        namespace, subdir = archive_target_for_runtime(CHATTER_RUNTIME_KEY)
+        register_live_context(
+            LiveContextWindow(
+                runtime_key=CHATTER_RUNTIME_KEY,
+                payloads=payloads,
+                archive_namespace=namespace,
+                local_archive_subdir=subdir,
+                workspace_path=self._resolve_workspace_path(self._get_life_service()),
+            )
         )
 
     @staticmethod
@@ -4488,6 +4571,10 @@ class LifeChatter(BaseChatter):
     @classmethod
     def _transition(cls, rt: _WorkflowRuntime, to_phase: _Phase, reason: str) -> None:
         if to_phase == _Phase.WAIT_USER:
+            cls._install_derived_rolling_projection(
+                rt.response,
+                strip_wake_envelopes=True,
+            )
             released = cls._release_native_media(rt.response)
             if released:
                 logger.debug(f"[FSM] 已释放 {released} 个原生媒体内容块")
@@ -5139,6 +5226,7 @@ class LifeChatter(BaseChatter):
         return bool(
             cls._message_flag(message, "is_proactive_opportunity_trigger")
             or cls._message_flag(message, "is_initiative_outreach_trigger")
+            or cls._message_flag(message, "is_inner_return_trigger")
         )
 
     @classmethod
@@ -5514,15 +5602,7 @@ class LifeChatter(BaseChatter):
     @staticmethod
     def _format_decision_tool_args(args: Any) -> str:
         """格式化决策面板中的单个工具参数。"""
-        if not isinstance(args, dict):
-            return ""
-
-        display_items: list[str] = []
-        for key, value in args.items():
-            if key == "reason":
-                continue
-            display_items.append(f"{key}: {value}")
-        return ", ".join(display_items)
+        return format_decision_tool_args(args)
 
     @classmethod
     def _build_life_decision_panel(cls, chat_stream: ChatStream, response: Any) -> str:
@@ -5532,36 +5612,18 @@ class LifeChatter(BaseChatter):
             or getattr(chat_stream, "stream_id", "")
             or "未知聊天流"
         )
-        thought = (
-            str(getattr(response, "reasoning_content", "") or "").strip() or "（无）"
-        )
-        monologue = str(getattr(response, "message", "") or "").strip() or "（无）"
-
-        tool_lines: list[str] = []
-        for call in getattr(response, "call_list", None) or []:
-            call_name = str(getattr(call, "name", "") or "<unknown>")
-            formatted_args = cls._format_decision_tool_args(getattr(call, "args", None))
-            if formatted_args:
-                tool_lines.append(f"    {call_name} ({formatted_args})")
-            else:
-                tool_lines.append(f"    {call_name}")
-
-        tools_text = "\n".join(tool_lines) if tool_lines else "    （无）"
-        return (
-            f"聊天流名称：{stream_name}\n\n"
-            f"思考：{thought}\n\n"
-            f"独白：{monologue}\n\n"
-            f"调用工具：\n{tools_text}"
+        return format_decision_panel(
+            thought=str(getattr(response, "reasoning_content", "") or ""),
+            monologue=str(getattr(response, "message", "") or ""),
+            call_list=getattr(response, "call_list", None) or [],
+            header_lines=(f"聊天流名称：{stream_name}",),
         )
 
     @classmethod
     def _print_life_decision_panel(cls, chat_stream: ChatStream, response: Any) -> None:
         """打印 life_chatter 的模型决策窗口。"""
-        print_panel = getattr(logger, "print_panel", None)
-        if not callable(print_panel):
-            return
-
-        print_panel(
+        print_activity_panel(
+            logger,
             cls._build_life_decision_panel(chat_stream, response),
             title="Life Chatter 决策",
             border_style="magenta",
@@ -5637,7 +5699,7 @@ class LifeChatter(BaseChatter):
         后续切换到直播等特殊 stream 时沿用第一条流的工具可用性。
         """
         platform = str(getattr(trigger_msg, "platform", "") or "").strip().lower()
-        if platform not in {"live", "neko.surface"}:
+        if platform != "live":
             return False
 
         try:
@@ -5648,12 +5710,7 @@ class LifeChatter(BaseChatter):
             return False
 
         signature = getattr(usable_cls, "get_signature", lambda: None)()
-        blocked_signatures = (
-            _SURFACE_BLOCKED_USABLE_SIGNATURES
-            if platform == "neko.surface"
-            else _LIVE_BRIDGE_BLOCKED_USABLE_SIGNATURES
-        )
-        return str(signature or "") in blocked_signatures
+        return str(signature or "") in _LIVE_BRIDGE_BLOCKED_USABLE_SIGNATURES
 
     @staticmethod
     def _tool_results_for_calls(
@@ -5815,14 +5872,7 @@ class LifeChatter(BaseChatter):
                     usable_map,
                     trigger_msg,
                 ):
-                    platform = (
-                        str(getattr(trigger_msg, "platform", "") or "").strip().lower()
-                    )
-                    blocked_detail = (
-                        "当前 N.E.K.O 表现窗口由 Surface 自动处理语音，请改用文字回复。"
-                        if platform == "neko.surface"
-                        else "当前直播桥接场景已屏蔽该工具，请改用文字回复。"
-                    )
+                    blocked_detail = "当前直播桥接场景已屏蔽该工具，请改用文字回复。"
                     response.add_payload(
                         LLMPayload(
                             ROLE.TOOL_RESULT,
@@ -6029,7 +6079,12 @@ class LifeChatter(BaseChatter):
                 await self._inject_delta_unreads_if_any(rt, chat_stream)
 
                 # Compact before transient suffix/media injection so rollback snapshots
-                # and the current newest group remain stable.
+                # and the current newest group remain stable. Retired-tool stripping
+                # applies to the live derived chain; wake envelopes stay until WAIT_USER.
+                self._install_derived_rolling_projection(
+                    rt.response,
+                    strip_wake_envelopes=False,
+                )
                 self._maybe_compact_runtime_context(rt.response)
                 self._append_context_pressure_notice(rt.response)
                 pending_runtime_delivery: Any | None = None
@@ -6111,26 +6166,9 @@ class LifeChatter(BaseChatter):
                             chat_stream,
                             rt,
                         )
-                        override_state = self._apply_surface_realtime_request_overrides(
-                            source_response,
-                            chat_stream,
-                            must_reply=rt.must_reply,
-                        )
-                        try:
-                            response = await source_response.send(stream=False)
-                            self._strip_suffix_context(response)
-                            await response
-                        finally:
-                            self._restore_surface_realtime_request_overrides(
-                                source_response,
-                                override_state,
-                            )
-
-                        # LLMResponse 继承了本次临时模型集；恢复默认模型集，确保
-                        # 后续 QQ/飞书等流仍按统一 life 配置运行。
-                        applied, original_model_set, _saved_tools = override_state
-                        if applied and original_model_set is not None:
-                            response.model_set = original_model_set
+                        response = await source_response.send(stream=False)
+                        self._strip_suffix_context(response)
+                        await response
                         return response
 
                     rt.response = await self._await_model_turn(
@@ -6439,11 +6477,6 @@ class LifeChatter(BaseChatter):
                     self._transition(rt, _Phase.FOLLOW_UP, "empty turn, continue loop")
                     self._maybe_compact_runtime_context(llm_response)
                     await self._save_rolling_context_snapshot(llm_response)
-                    if (
-                        self._is_surface_low_latency_stream(chat_stream)
-                        and rt.must_reply
-                    ):
-                        continue
                     return Success("follow-up scheduled")
 
                 logger.debug(f"本轮调用: {[c.name for c in call_list]}")
@@ -7137,8 +7170,6 @@ class LifeChatter(BaseChatter):
                 self._transition(rt, _Phase.FOLLOW_UP, "default loop continue")
                 self._maybe_compact_runtime_context(llm_response)
                 await self._save_rolling_context_snapshot(llm_response)
-                if self._is_surface_low_latency_stream(chat_stream) and rt.must_reply:
-                    continue
                 return Success("follow-up scheduled")
 
     async def execute(self) -> AsyncGenerator[Wait | Success | Failure | Stop, None]:
