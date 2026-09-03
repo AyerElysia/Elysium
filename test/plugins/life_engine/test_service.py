@@ -161,15 +161,18 @@ def _heartbeat_result(
         if delivery_id
         else None
     )
-    return HeartbeatModelResult(
-        text=text,
-        perception_receipt=PerceptionDeliveryReceipt(
+    perception_receipt = None
+    if world_perception is not None:
+        perception_receipt = PerceptionDeliveryReceipt(
             delivery_id=world_perception.delivery_id,
             projection_sha256=world_perception.projection_sha256,
             delivered_bytes=world_perception.delivered_bytes,
             exact=True,
             transport_request_id="test-heartbeat",
-        ),
+        )
+    return HeartbeatModelResult(
+        text=text,
+        perception_receipt=perception_receipt,
         subconscious_receipt=subconscious_receipt,
     )
 
@@ -539,8 +542,8 @@ def test_cfg_auto_migrates_legacy_config_without_thresholds(tmp_path: Path) -> N
     assert isinstance(plugin.config, LifeEngineConfig)
 
 
-async def test_heartbeat_system_prompt_filters_memory_sections(tmp_path: Path) -> None:
-    """心跳态应只注入结构化 MEMORY 摘要，不带 Fading 和编辑说明。"""
+async def test_heartbeat_system_prompt_keeps_memory_verbatim(tmp_path: Path) -> None:
+    """心跳 Prefix 注入 MEMORY 原文，不替主体过滤 Fading 或编辑说明。"""
     (tmp_path / "SOUL.md").write_text("SOUL_CONTENT", encoding="utf-8")
     (tmp_path / "USER.md").write_text("USER_CONTENT", encoding="utf-8")
     (tmp_path / "TOOL.md").write_text(
@@ -583,17 +586,16 @@ async def test_heartbeat_system_prompt_filters_memory_sections(tmp_path: Path) -
     assert "USER_CONTENT" in prompt
     assert "EXISTENCE_CONTENT" in prompt
     assert "TOOL_CONTENT" in prompt
-    assert "心跳工具边界" in prompt
-    assert "不是后台助手或任务执行器" in prompt
+    assert "你是爱莉希雅的内在自我" in prompt
     assert "每次心跳必须调用至少一个工具" not in prompt
     assert "先看待办再行动" not in prompt
     assert "禁止连续发呆" not in prompt
     assert "想到就做" not in prompt
     assert "D1" in prompt
     assert "A1" in prompt
-    assert "历史事实和关系线索，不是当前心跳的行动指令" in prompt
-    assert "F1" not in prompt
-    assert "给编辑者看的说明" not in prompt
+    assert "F1" in prompt
+    assert "给编辑者看的说明" in prompt
+    assert "author_self_continuity_checkpoint" in prompt
 
 
 async def test_heartbeat_system_prompt_strips_retired_tool_names(tmp_path: Path) -> None:
@@ -1507,7 +1509,9 @@ async def test_heartbeat_success_consumes_delta_without_replay(
     assert first_reply == second_reply == "已处理"
     assert "只应该被心跳看到一次" in contexts[0]
     assert "只应该被心跳看到一次" not in contexts[1]
-    assert "chat_global" in contexts[1]
+    assert "<transient_world_perception>" not in contexts[0]
+    assert "<transient_world_perception>" not in contexts[1]
+    assert not contexts[1].strip()
     assert first_prepared.acknowledged_event_ids == [event.event_id]
     assert second_prepared.selected_event_ids == []
     assert event.heartbeat_context_consumed is True
@@ -1625,35 +1629,39 @@ async def test_heartbeat_failure_keeps_delta_for_retry(
     assert service._state.heartbeat_context_cursor >= event.sequence
 
 
-async def test_heartbeat_without_exact_world_receipt_keeps_delta_pending(
+async def test_heartbeat_without_world_perception_consumes_delta(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """潜意识窗口不再注入世界感知；缺 World receipt 不得挡住本拍消费。"""
     service = _make_service(tmp_path)
     event = service._event_builder.build_direct_message_event(
-        "没有精确投递证明时不能推进",
+        "没有世界感知也应推进",
         stream_id="stream-1",
     )
     await service._queue_pending_event(event)
 
-    async def _unverified_model(
+    async def _model_without_world(
         wake_context: str,
         *,
         heartbeat_run_id: str | None = None,
         world_perception: Any = None,
         heartbeat_deadline: float | None = None,
     ) -> HeartbeatModelResult:
-        assert wake_context and heartbeat_run_id and world_perception is not None
-        return HeartbeatModelResult("看似成功", None)
+        assert wake_context and heartbeat_run_id
+        assert world_perception is None
+        return _heartbeat_result("已处理", None, wake_context)
 
-    monkeypatch.setattr(service, "_run_heartbeat_model", _unverified_model)
+    monkeypatch.setattr(service, "_run_heartbeat_model", _model_without_world)
 
-    with pytest.raises(PerceptionDeliveryUnverified):
-        await service._run_heartbeat_round(collect_background_agents=False)
+    reply, prepared = await service._run_heartbeat_round(
+        collect_background_agents=False,
+    )
 
-    assert service._state.heartbeat_context_cursor == 0
-    assert event.heartbeat_context_consumed is False
-    assert any(item.event_id == event.event_id for item in service._event_history)
+    assert reply == "已处理"
+    assert prepared.acknowledged_event_ids == [event.event_id]
+    assert event.heartbeat_context_consumed is True
+    assert service._state.heartbeat_context_cursor >= event.sequence
 
 
 async def test_heartbeat_without_exact_subconscious_receipt_keeps_delta_pending(
@@ -1674,16 +1682,11 @@ async def test_heartbeat_without_exact_subconscious_receipt_keeps_delta_pending(
         world_perception: Any = None,
         heartbeat_deadline: float | None = None,
     ) -> HeartbeatModelResult:
-        assert wake_context and heartbeat_run_id and world_perception is not None
+        assert wake_context and heartbeat_run_id
+        assert world_perception is None
         return HeartbeatModelResult(
             text="看似成功",
-            perception_receipt=PerceptionDeliveryReceipt(
-                delivery_id=world_perception.delivery_id,
-                projection_sha256=world_perception.projection_sha256,
-                delivered_bytes=world_perception.delivered_bytes,
-                exact=True,
-                transport_request_id="test-world-only",
-            ),
+            perception_receipt=None,
             subconscious_receipt=None,
         )
 

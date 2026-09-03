@@ -5,12 +5,14 @@ mixed together:
 
 * context pressure is a content-neutral transport fact;
 * continuity text is authored only by the active consciousness instance;
-* emergency omission is mechanical and contains only immutable references.
+* mechanical omission is a retired emergency projection, not a success path.
 
 No helper in this module decides which experience matters or rewrites subject
 meaning.  Exact released prompt groups are archived by content hash before a
 checkpoint is installed, while authoritative Life Events and trajectories stay
-untouched.
+untouched.  A hard model window that still cannot fit must fail closed; it
+must not drop groups or emit ``<mechanical_context_omission>`` as compressed
+context.
 """
 
 from __future__ import annotations
@@ -41,6 +43,7 @@ from src.kernel.llm import (
     ToolResult,
     Video,
 )
+from src.kernel.llm.exceptions import LLMContextError
 from src.kernel.llm.token_counter import count_payload_tokens
 from src.kernel.storage import canonical_json, canonical_json_sha256
 
@@ -779,6 +782,31 @@ def ensure_compression_required_appended(
     if notice is None:
         return typed
     return [*typed, notice]
+
+
+def install_fail_closed_context_hook(request: Any) -> None:
+    """Refuse kernel group-dropping instead of emitting mechanical omission."""
+
+    context_manager = getattr(request, "context_manager", None)
+    if context_manager is None or not hasattr(context_manager, "compression_hook"):
+        return
+    if getattr(context_manager, "compression_hook", None) is not None:
+        return
+
+    def compression_hook(
+        dropped_groups: list[list[LLMPayload]],
+        remaining_payloads: list[LLMPayload],
+    ) -> list[LLMPayload]:
+        del remaining_payloads
+        if dropped_groups:
+            raise LLMContextError(
+                "subject rolling context exceeds the model window; "
+                "mechanical group omission is not a success path. "
+                "author_self_continuity_checkpoint must release groups first."
+            )
+        return []
+
+    context_manager.compression_hook = compression_hook
 
 
 def _checkpoint_payload(
@@ -1688,6 +1716,7 @@ __all__ = [
     "ensure_compression_required_appended",
     "get_live_context",
     "has_compression_required_payload",
+    "install_fail_closed_context_hook",
     "is_compression_required_payload",
     "is_legacy_summary_payload",
     "mechanically_bound_payloads",

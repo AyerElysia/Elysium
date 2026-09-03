@@ -294,6 +294,7 @@ from ..core.context_stewardship import (
     archive_target_for_runtime,
     ensure_compression_required_appended,
     has_compression_required_payload,
+    install_fail_closed_context_hook,
     payloads_require_compression,
     register_live_context,
     unregister_live_context,
@@ -10296,6 +10297,7 @@ class LifeEngineService(BaseService):
         heartbeat_deadline: float | None = None,
     ) -> HeartbeatModelResult:
         """调用 life 任务模型生成内部报文；请求失败必须向上抛出。"""
+        del world_perception
         cfg = self._cfg()
         configured_timeout = float(
             getattr(cfg.settings, "heartbeat_timeout_seconds", 0)
@@ -10310,6 +10312,7 @@ class LifeEngineService(BaseService):
             model_set=model_set,
             request_name="life_engine_heartbeat",
         )
+        install_fail_closed_context_hook(request)
 
         system_prompt = await self._build_heartbeat_system_prompt()
         if system_prompt is None:
@@ -10396,6 +10399,7 @@ class LifeEngineService(BaseService):
                         model_set=fallback_model_set,
                         request_name="life_engine_heartbeat_fallback",
                     )
+                    install_fail_closed_context_hook(fallback_request)
                     # 复制 payloads 到 fallback request
                     for payload in request.payloads:
                         fallback_request.add_payload(payload)
@@ -10533,6 +10537,9 @@ class LifeEngineService(BaseService):
 
             round_results = _heartbeat_tool_results(response)[result_count_before:]
             self._print_heartbeat_receipt_panel(round_results)
+            if self._apply_heartbeat_subject_checkpoint(response):
+                checkpoint_installed = True
+            self._ensure_heartbeat_compression_turn(response)
             last_round_outcomes = _heartbeat_tool_round_outcomes(
                 call_list, round_results
             )
@@ -10588,23 +10595,11 @@ class LifeEngineService(BaseService):
             pending_memory_deliveries = (
                 self._register_pending_heartbeat_memory_deliveries(current_response)
             )
-            if world_perception is not None:
-                current_response.register_context_delivery(
-                    world_perception.delivery_id,
-                    user_prompt,
-                    marker=world_perception.delivery_marker,
-                )
             if subconscious_delivery_id:
                 current_response.register_context_delivery(
                     subconscious_delivery_id,
-                    user_prompt,
+                    wake_text,
                     marker=subconscious_delivery_marker,
-                )
-            if opportunity_page is not None:
-                current_response.register_context_delivery(
-                    str(opportunity_page.delivery_id),
-                    user_prompt,
-                    marker=str(opportunity_page.delivery_marker),
                 )
 
             async def _send_followup_request() -> Any:
@@ -10654,15 +10649,6 @@ class LifeEngineService(BaseService):
                     response,
                     pending_memory_deliveries,
                 )
-                if world_perception is not None:
-                    perception_receipt = self._heartbeat_perception_receipt(
-                        response,
-                        world_perception,
-                    )
-                    if perception_receipt is None:
-                        raise PerceptionDeliveryUnverified(
-                            "heartbeat follow-up lost the exact World projection"
-                        )
                 if subconscious_delivery_id:
                     subconscious_receipt = self._heartbeat_subconscious_receipt(
                         response,
@@ -10672,11 +10658,6 @@ class LifeEngineService(BaseService):
                         raise PerceptionDeliveryUnverified(
                             "heartbeat follow-up lost the exact subconscious activity projection"
                         )
-                if opportunity_page is not None:
-                    opportunity_receipt = self._heartbeat_subconscious_receipt(
-                        response,
-                        str(opportunity_page.delivery_id),
-                    )
             except HeartbeatBudgetExhausted as exc:
                 self._discard_pending_heartbeat_memory_deliveries(
                     pending_memory_deliveries
@@ -10773,28 +10754,54 @@ class LifeEngineService(BaseService):
             # in the event ledger; this heartbeat simply has no final text.
             last_text = ""
 
-        if (
-            opportunity_page is not None
-            and bus is not None
-            and opportunity_receipt is not None
-        ):
-            try:
-                await bus.commit_page_delivery(
-                    str(opportunity_page.delivery_id),
-                    opportunity_receipt,
+        final_payloads = rolling_payloads_only(
+            list(getattr(response, "payloads", None) or [])
+        )
+        still_requires_compression = payloads_require_compression(
+            final_payloads,
+            estimate=estimate_payload_chars,
+            trigger_chars=self._heartbeat_compaction_trigger_chars(),
+        )
+        compression_unresolved = still_requires_compression and not checkpoint_installed
+        persist_payloads = final_payloads
+        if compression_unresolved:
+            persist_payloads = list(baseline_rolling)
+            if payloads_require_compression(
+                persist_payloads,
+                estimate=estimate_payload_chars,
+                trigger_chars=self._heartbeat_compaction_trigger_chars(),
+            ) or has_compression_required_payload(final_payloads):
+                persist_payloads = ensure_compression_required_appended(
+                    persist_payloads,
+                    estimate=estimate_payload_chars,
+                    trigger_chars=self._heartbeat_compaction_trigger_chars(),
+                    max_groups=max_groups,
+                    max_bytes=max_bytes,
                 )
-            except asyncio.CancelledError:
+            logger.warning(
+                "心跳压缩回合未完成，本拍不把新经历写入滚动链: "
+                f"#{self._state.heartbeat_count}"
+            )
+        try:
+            await save_heartbeat_rolling(
+                persist_payloads,
+                service=self,
+                workspace_path=workspace,
+            )
+        except Exception as exc:  # noqa: BLE001 - derived snapshot must not crash the beat
+            logger.warning(
+                "保存心跳滚动上下文失败: "
+                f"error_type={type(exc).__name__}"
+            )
+            if not compression_unresolved:
                 raise
-            except Exception as error:  # noqa: BLE001 - invitation repeats safely
-                logger.warning(
-                    "opportunity page delivery projection failed: "
-                    f"error_type={type(error).__name__}"
-                )
-
+        unregister_live_context(HEARTBEAT_RUNTIME_KEY)
         return HeartbeatModelResult(
             last_text,
             perception_receipt,
             subconscious_receipt,
+            compression_unresolved=compression_unresolved,
+            rolling_payloads=tuple(persist_payloads),
         )
 
     async def _run_learning_heartbeat_maintenance(self) -> None:
@@ -11663,12 +11670,23 @@ class LifeEngineService(BaseService):
                         except Exception as mark_exc:  # noqa: BLE001
                             logger.warning(f"多写者 heartbeat 超时释放异常: {mark_exc}")
                     return "", prepared
+                finally:
+                    unregister_live_context(HEARTBEAT_RUNTIME_KEY)
                 model_reply = model_result.text
                 await self._record_model_reply(
                     model_reply,
                     heartbeat_run_id=heartbeat_run_id,
                     persist=False,
                 )
+                if model_result.compression_unresolved:
+                    logger.warning(
+                        f"life_engine 心跳 #{self._state.heartbeat_count} "
+                        "压缩回合未完成，不推进潜意识游标"
+                    )
+                    await self._save_runtime_context(
+                        recoverable_on_shared_conflict=True
+                    )
+                    return str(model_reply or ""), prepared
                 await self._commit_heartbeat_context(
                     prepared,
                     model_reply,

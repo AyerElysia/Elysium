@@ -89,8 +89,8 @@ from .context_stewardship import (
     DEFAULT_PRESSURE_MAX_GROUPS,
     apply_pending_subject_checkpoint,
     archive_target_for_runtime,
-    build_mechanical_omission_payloads,
     ensure_compression_required_appended,
+    install_fail_closed_context_hook,
     LiveContextWindow,
     register_live_context,
     reset_pending_subject_checkpoint,
@@ -2102,54 +2102,10 @@ class LifeChatter(BaseChatter):
         *,
         chatter_config: Any = None,
     ) -> None:
-        """Install a content-neutral emergency omission hook.
+        """Refuse kernel group-dropping; subject checkpoints release groups."""
 
-        Semantic continuity is authored through the subject action. The kernel
-        hook exists only so a hard model limit never copies random fragments.
-        """
-        context_manager = getattr(request, "context_manager", None)
-        if context_manager is None or not hasattr(context_manager, "compression_hook"):
-            return
-
-        existing_hook = getattr(context_manager, "compression_hook", None)
-        if existing_hook is not None:
-            return
-
-        max_groups = max(
-            1,
-            int(
-                getattr(
-                    chatter_config,
-                    "context_compression_max_groups",
-                    _CONTEXT_COMPRESSION_MAX_GROUPS,
-                )
-                or _CONTEXT_COMPRESSION_MAX_GROUPS
-            ),
-        )
-        max_reference_bytes = max(
-            256,
-            int(
-                getattr(
-                    chatter_config,
-                    "context_emergency_reference_max_bytes",
-                    DEFAULT_EMERGENCY_REFERENCE_MAX_BYTES,
-                )
-                or DEFAULT_EMERGENCY_REFERENCE_MAX_BYTES
-            ),
-        )
-
-        def compression_hook(
-            dropped_groups: list[list[LLMPayload]],
-            remaining_payloads: list[LLMPayload],
-        ) -> list[LLMPayload]:
-            del remaining_payloads
-            return build_mechanical_omission_payloads(
-                dropped_groups,
-                max_group_refs=max_groups,
-                max_bytes=max_reference_bytes,
-            )
-
-        context_manager.compression_hook = compression_hook
+        del chatter_config
+        install_fail_closed_context_hook(request)
 
     def _rolling_context_snapshot_path(self) -> Path:
         """返回意识实例的滚动上下文快照文件路径。
