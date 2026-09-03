@@ -6,9 +6,14 @@
 // decides what Elysia should want; receipts prove dispatch, not intent success.
 
 import mineflayer from "mineflayer";
+import collectBlockPkg from "mineflayer-collectblock";
 import minecraftData from "minecraft-data";
 import pathfinderPkg from "mineflayer-pathfinder";
+import vec3Pkg from "vec3";
+import { MINECRAFT_TASK_KINDS, MinecraftTaskEngine } from "./task_engine.js";
 const { pathfinder, Movements, goals } = pathfinderPkg;
+const { plugin: collectBlock } = collectBlockPkg;
+const { Vec3 } = vec3Pkg;
 
 const WORLD_COORDINATE_LIMIT = 30_000_000;
 const PLAYER_NAME_PATTERN = /^[A-Za-z0-9_]{1,16}$/;
@@ -67,6 +72,44 @@ function optionalBoundedFloat(parameters, name, minimum, maximum) {
   return value;
 }
 
+function optionalBoundedInt(parameters, name, minimum, maximum, fallback) {
+  if (parameters?.[name] === undefined || parameters?.[name] === null) {
+    return fallback;
+  }
+  return boundedInt(parameters, name, minimum, maximum);
+}
+
+function resourceName(parameters, name) {
+  let value = requiredString(parameters, name).toLowerCase();
+  if (!RESOURCE_ID_PATTERN.test(value)) {
+    throw new Error(`${name} must be a Minecraft resource identifier`);
+  }
+  if (!value.includes(":")) value = `minecraft:${value}`;
+  return value;
+}
+
+function shortResourceName(value) {
+  return String(value).split(":", 2).at(-1);
+}
+
+function assertTaskActive(context) {
+  if (context.signal.aborted || !context.ownsBody()) {
+    throw new Error("high-level task no longer owns the body gate");
+  }
+}
+
+async function taskDelay(context, milliseconds) {
+  assertTaskActive(context);
+  await new Promise((resolve) => {
+    const timer = setTimeout(resolve, milliseconds);
+    context.signal.addEventListener("abort", () => {
+      clearTimeout(timer);
+      resolve();
+    }, { once: true });
+  });
+  assertTaskActive(context);
+}
+
 /** Headless Minecraft body joining one configured server endpoint. */
 export class MineflayerBody {
   constructor(config, log = console.error) {
@@ -82,6 +125,12 @@ export class MineflayerBody {
     this.recentChat = [];
     this.activeMine = null;
     this.lastActionOutcome = null;
+    this.lastHealth = null;
+    this.onEvent = null;
+    this.taskEngine = new MinecraftTaskEngine(
+      this,
+      (kind, payload) => this.emitEvent(kind, payload),
+    );
   }
 
   /** Join the configured server; bounded backoff keeps failures diagnosable. */
@@ -108,6 +157,7 @@ export class MineflayerBody {
     }
     this.connectingBot = bot;
     bot.loadPlugin(pathfinder);
+    bot.loadPlugin(collectBlock);
     const onSpawn = () => {
       if (this.stopped) {
         bot.quit("body stopped while connecting");
@@ -117,12 +167,17 @@ export class MineflayerBody {
       this.joinFailures = 0;
       this.connectingBot = null;
       this.bot = bot;
+      this.lastHealth = Number(bot.health ?? 0);
       try {
         bot.pathfinder.setMovements(new Movements(bot));
       } catch (error) {
         this.log(`pathfinder movement setup failed: ${error.message}`);
       }
       this.recordChat("system", "", `body joined ${this.endpointDescription()}`);
+      this.emitEvent("minecraft.body.spawned", {
+        username: String(bot.username ?? this.config.username),
+        endpoint: this.endpointDescription(),
+      });
       this.onBotReady?.();
     };
     const onEnd = (reason) => {
@@ -131,6 +186,12 @@ export class MineflayerBody {
         this.connectingBot = null;
         this.joining = false;
         this.recordChat("system", "", `body left the world: ${reason}`);
+        this.emitEvent("minecraft.body.disconnected", {
+          reason: String(reason || "connection ended").slice(0, 512),
+        });
+        void this.taskEngine.stop("Minecraft body disconnected").catch((error) => {
+          this.log(`task cleanup after disconnect failed: ${error.message}`);
+        });
         this.scheduleRetry(String(reason || "connection ended"));
       }
     };
@@ -166,11 +227,27 @@ export class MineflayerBody {
     bot.on("playerLeft", (player) => {
       this.recordChat("leave", player.username, `${player.username} left the game`);
     });
+    bot.on("health", () => {
+      const health = Number(bot.health ?? 0);
+      const food = Number(bot.food ?? 0);
+      if (this.lastHealth !== health) {
+        this.lastHealth = health;
+        this.emitEvent("minecraft.player.health_changed", { health, food });
+      }
+    });
+    bot.on("death", () => {
+      this.emitEvent("minecraft.player.died", {
+        position: this.positionFacts(),
+      });
+    });
   }
 
   /** Leave the world and stop retrying; safe to call more than once. */
   quit() {
     this.stopped = true;
+    void this.taskEngine.stop("body stopping").catch((error) => {
+      this.log(`task cleanup while stopping failed: ${error.message}`);
+    });
     if (this.retryTimer) {
       clearTimeout(this.retryTimer);
       this.retryTimer = null;
@@ -210,14 +287,39 @@ export class MineflayerBody {
   }
 
   recordChat(kind, username, message) {
-    this.recentChat.push({
+    const entry = {
       kind,
       username: String(username ?? "").slice(0, 64),
       message: String(message ?? "").slice(0, 512),
       at: new Date().toISOString(),
-    });
+    };
+    this.recentChat.push(entry);
     if (this.recentChat.length > MAX_RECENT_CHAT_EVENTS) {
       this.recentChat.splice(0, this.recentChat.length - MAX_RECENT_CHAT_EVENTS);
+    }
+    const ownName = String(this.bot?.username ?? this.config.username ?? "");
+    if ((kind === "chat" || kind === "whisper") && entry.username === ownName) {
+      return;
+    }
+    const eventKinds = {
+      chat: "minecraft.chat.received",
+      whisper: "minecraft.whisper.received",
+      system: "minecraft.system.received",
+      join: "minecraft.player.joined",
+      leave: "minecraft.player.left",
+    };
+    const eventKind = eventKinds[kind];
+    if (eventKind) {
+      this.emitEvent(eventKind, {
+        username: entry.username,
+        message: entry.message,
+      }, entry.at);
+    }
+  }
+
+  emitEvent(kind, payload, occurredAt = new Date().toISOString()) {
+    if (typeof this.onEvent === "function") {
+      this.onEvent(kind, payload, occurredAt);
     }
   }
 
@@ -311,6 +413,7 @@ export class MineflayerBody {
     facts.baritone = { available: false, pathing: Boolean(bot.pathfinder.isMoving()) };
     facts.chat = [...this.recentChat];
     facts.bot_tasks = {
+      high_level: this.taskEngine.snapshot(),
       active_mine: this.activeMine
         ? {
             block: this.activeMine.block,
@@ -389,7 +492,24 @@ export class MineflayerBody {
 
   /** Execute one validated operation and return dispatch facts. */
   async execute(operation, parameters) {
+    const bodyGateExempt = new Set([
+      "chat.send",
+      "control.release_all",
+      "task.cancel",
+      "task.status",
+    ]);
+    if (this.taskEngine.ownsBody() && !bodyGateExempt.has(operation)) {
+      if (operation !== "task.start") {
+        throw new Error("body gate is occupied by an active high-level task");
+      }
+    }
     switch (operation) {
+      case "task.start":
+        return this.taskEngine.start(parameters);
+      case "task.cancel":
+        return this.taskEngine.cancel(parameters);
+      case "task.status":
+        return this.taskEngine.status(parameters);
       case "movement.input":
         return this.movementInput(parameters);
       case "navigation.goto":
@@ -683,6 +803,183 @@ export class MineflayerBody {
     this.activeMine = null;
   }
 
+  /** Execute one typed high-level task while TaskEngine owns the body gate. */
+  async runHighLevelTask(kind, parameters, context) {
+    this.requireWorld();
+    assertTaskActive(context);
+    switch (kind) {
+      case "follow_player":
+        return this.taskFollowPlayer(parameters, context);
+      case "go_to_player":
+        return this.taskGoToPlayer(parameters, context);
+      case "go_to_position":
+        return this.taskGoToPosition(parameters, context);
+      case "gather_block":
+        return this.taskGatherBlock(parameters, context);
+      case "craft_item":
+        return this.taskCraftItem(parameters, context);
+      case "place_block":
+        return this.taskPlaceBlock(parameters, context);
+      case "eat_item":
+        return this.taskEatItem(parameters, context);
+      default:
+        throw new Error(`unsupported high-level task kind: ${kind}`);
+    }
+  }
+
+  visiblePlayer(name) {
+    const player = requiredString({ player: name }, "player");
+    if (!PLAYER_NAME_PATTERN.test(player)) {
+      throw new Error("player must match the Minecraft account-name contract");
+    }
+    const target = this.bot.players[player]?.entity;
+    if (!target) throw new Error(`player is not visible from this body: ${player}`);
+    return { player, target };
+  }
+
+  async taskFollowPlayer(parameters, context) {
+    const distance = optionalBoundedInt(parameters, "distance", 1, 16, 3);
+    const { player, target } = this.visiblePlayer(parameters.player);
+    this.bot.pathfinder.setGoal(new goals.GoalFollow(target, distance), true);
+    context.progress("following", { player, distance });
+    while (true) {
+      await taskDelay(context, 1000);
+      const current = this.bot.players[player]?.entity;
+      if (!current) throw new Error(`follow target left visibility: ${player}`);
+    }
+  }
+
+  async taskGoToPlayer(parameters, context) {
+    const distance = optionalBoundedInt(parameters, "distance", 1, 16, 2);
+    const { player, target } = this.visiblePlayer(parameters.player);
+    context.progress("navigating", { player, distance });
+    await this.bot.pathfinder.goto(new goals.GoalNear(
+      Math.floor(target.position.x),
+      Math.floor(target.position.y),
+      Math.floor(target.position.z),
+      distance,
+    ));
+    assertTaskActive(context);
+    return { player, distance, position: this.positionFacts() };
+  }
+
+  async taskGoToPosition(parameters, context) {
+    const x = boundedInt(parameters, "x", -WORLD_COORDINATE_LIMIT, WORLD_COORDINATE_LIMIT);
+    const y = boundedInt(parameters, "y", -2048, 2048);
+    const z = boundedInt(parameters, "z", -WORLD_COORDINATE_LIMIT, WORLD_COORDINATE_LIMIT);
+    const distance = optionalBoundedInt(parameters, "distance", 0, 16, 1);
+    context.progress("navigating", { target: { x, y, z }, distance });
+    await this.bot.pathfinder.goto(new goals.GoalNear(x, y, z, distance));
+    assertTaskActive(context);
+    return { target: { x, y, z }, distance, position: this.positionFacts() };
+  }
+
+  async taskGatherBlock(parameters, context) {
+    const block = resourceName(parameters, "block");
+    const count = optionalBoundedInt(parameters, "count", 1, 16, 1);
+    const maxDistance = optionalBoundedInt(parameters, "max_distance", 4, 64, 32);
+    const mcData = minecraftData(this.bot.version);
+    const blockType = mcData.blocksByName?.[shortResourceName(block)];
+    if (!blockType) throw new Error(`unknown block identifier: ${block}`);
+    const positions = this.bot.findBlocks({
+      matching: blockType.id,
+      maxDistance,
+      count,
+    });
+    const targets = positions
+      .map((position) => this.bot.blockAt(position))
+      .filter((target) => target && Number(target.type) === Number(blockType.id));
+    if (targets.length < count) {
+      throw new Error(`found only ${targets.length}/${count} ${block} blocks`);
+    }
+    context.progress("collecting", { block, requested: count, found: targets.length });
+    await this.bot.collectBlock.collect(targets);
+    assertTaskActive(context);
+    return { block, collected: targets.length, position: this.positionFacts() };
+  }
+
+  async taskCraftItem(parameters, context) {
+    const item = resourceName(parameters, "item");
+    const count = optionalBoundedInt(parameters, "count", 1, 64, 1);
+    const mcData = minecraftData(this.bot.version);
+    const itemType = mcData.itemsByName?.[shortResourceName(item)];
+    if (!itemType) throw new Error(`unknown item identifier: ${item}`);
+    let table = null;
+    let recipes = this.bot.recipesFor(itemType.id, null, count, null);
+    if (!recipes.length) {
+      const tableType = mcData.blocksByName?.crafting_table;
+      table = tableType ? this.bot.findBlock({
+        matching: tableType.id,
+        maxDistance: 16,
+      }) : null;
+      if (!table) throw new Error(`no available recipe or crafting table for ${item}`);
+      context.progress("approaching_crafting_table", {
+        x: table.position.x,
+        y: table.position.y,
+        z: table.position.z,
+      });
+      await this.bot.pathfinder.goto(new goals.GoalNear(
+        table.position.x,
+        table.position.y,
+        table.position.z,
+        2,
+      ));
+      assertTaskActive(context);
+      recipes = this.bot.recipesFor(itemType.id, null, count, table);
+    }
+    const recipe = recipes[0];
+    if (!recipe) throw new Error(`inventory cannot satisfy a recipe for ${item}`);
+    const resultCount = Math.max(1, Number(recipe.result?.count ?? 1));
+    const craftOperations = Math.ceil(count / resultCount);
+    context.progress("crafting", { item, count, craft_operations: craftOperations });
+    await this.bot.craft(recipe, craftOperations, table);
+    assertTaskActive(context);
+    return { item, requested: count, craft_operations: craftOperations };
+  }
+
+  inventoryItem(resource) {
+    const shortName = shortResourceName(resource);
+    const item = this.bot.inventory.items().find((candidate) => candidate.name === shortName);
+    if (!item) throw new Error(`item is not present in inventory: ${resource}`);
+    return item;
+  }
+
+  async taskPlaceBlock(parameters, context) {
+    const itemName = resourceName(parameters, "item");
+    const x = boundedInt(parameters, "reference_x", -WORLD_COORDINATE_LIMIT, WORLD_COORDINATE_LIMIT);
+    const y = boundedInt(parameters, "reference_y", -2048, 2048);
+    const z = boundedInt(parameters, "reference_z", -WORLD_COORDINATE_LIMIT, WORLD_COORDINATE_LIMIT);
+    const faceX = boundedInt(parameters, "face_x", -1, 1);
+    const faceY = boundedInt(parameters, "face_y", -1, 1);
+    const faceZ = boundedInt(parameters, "face_z", -1, 1);
+    if (Math.abs(faceX) + Math.abs(faceY) + Math.abs(faceZ) !== 1) {
+      throw new Error("placement face must contain exactly one unit axis");
+    }
+    const reference = this.bot.blockAt(new Vec3(x, y, z));
+    if (!reference) throw new Error("placement reference block is not loaded");
+    context.progress("approaching_placement", { reference: { x, y, z } });
+    await this.bot.pathfinder.goto(new goals.GoalNear(x, y, z, 3));
+    assertTaskActive(context);
+    await this.bot.equip(this.inventoryItem(itemName), "hand");
+    const face = new Vec3(faceX, faceY, faceZ);
+    await this.bot.placeBlock(reference, face);
+    assertTaskActive(context);
+    return {
+      item: itemName,
+      placed_at: { x: x + faceX, y: y + faceY, z: z + faceZ },
+    };
+  }
+
+  async taskEatItem(parameters, context) {
+    const itemName = resourceName(parameters, "item");
+    context.progress("eating", { item: itemName });
+    await this.bot.equip(this.inventoryItem(itemName), "hand");
+    assertTaskActive(context);
+    await this.bot.consume();
+    assertTaskActive(context);
+    return { item: itemName, food: Number(this.bot.food ?? 0) };
+  }
+
   pulseAttack() {
     this.requireWorld();
     const target = this.nearestAttackableEntity();
@@ -740,6 +1037,7 @@ export class MineflayerBody {
       throw new Error(`message must not exceed ${MAX_CHAT_MESSAGE_LENGTH} characters`);
     }
     this.bot.chat(message);
+    this.emitEvent("minecraft.chat.sent", { message });
     return { message_dispatched: message };
   }
 
@@ -753,8 +1051,18 @@ export class MineflayerBody {
   }
 
   /** Release every held control and stop pathing for one explicit reason. */
-  releaseAll(reason) {
+  async cancelHighLevelTask(_taskId, reason) {
     if (this.bot) {
+      try {
+        await this.bot.collectBlock?.cancelTask?.();
+      } catch {
+        // The plugin may already have completed its target queue.
+      }
+      try {
+        this.bot.stopDigging?.();
+      } catch {
+        // A disconnected body cannot retain a digging action.
+      }
       for (const name of HELD_CONTROL_NAMES) {
         try {
           this.bot.setControlState(name, false);
@@ -769,15 +1077,22 @@ export class MineflayerBody {
       }
     }
     this.cancelPendingMine(reason);
-    return { controls_released: true, reason };
+  }
+
+  async releaseAll(reason) {
+    const task = await this.taskEngine.stop(reason);
+    await this.cancelHighLevelTask("", reason);
+    return { controls_released: true, reason, ...task };
   }
 
   /** Interrupt one intention: stop pathing and release every held control. */
-  interrupt(intentId, reason) {
-    this.releaseAll(reason);
+  async interrupt(intentId, reason) {
+    await this.releaseAll(reason);
     this.log(`interrupted intent ${intentId}: ${reason}`);
   }
 }
+
+export { MINECRAFT_TASK_KINDS };
 
 function entityTypeName(entity) {
   if (entity.name) {
