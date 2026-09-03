@@ -172,8 +172,17 @@ input:focus, select:focus { border-color: var(--line-strong); }
 .check input { min-height: auto; accent-color: var(--pink); }
 .button { min-height: 38px; padding: 8px 14px; border: 1px solid transparent; border-radius: 9px; cursor: pointer; transition: 150ms ease; }
 .button:disabled { opacity: 0.45; cursor: default; }
+.button:not(.button-secondary):not(.button-danger) { color: #170d14; background: var(--pink-soft); }
+.button:not(.button-secondary):not(.button-danger):hover:not(:disabled) { background: #ffd5e5; }
 .button-secondary { border-color: var(--line); background: rgba(255, 255, 255, 0.035); }
 .button-secondary:hover:not(:disabled) { border-color: var(--line-strong); background: rgba(255, 143, 190, 0.07); }
+.button-danger { color: #ffd6dc; border-color: rgba(255, 124, 146, 0.35); background: rgba(255, 124, 146, 0.09); }
+.button-danger:hover:not(:disabled) { background: rgba(255, 124, 146, 0.16); }
+.field-label { display: block; margin: 18px 0 7px; color: var(--muted); font-size: 11px; }
+.field-label + input { width: 100%; }
+.minecraft-steps { margin: 0; padding-left: 22px; color: var(--muted); line-height: 1.9; }
+.minecraft-actions { display: flex; gap: 9px; flex-wrap: wrap; margin-top: 13px; }
+#minecraft-result { min-height: 160px; max-height: 320px; margin-top: 13px; padding: 15px; }
 
 .timeline { position: relative; display: grid; gap: 12px; padding-left: 23px; }
 .timeline::before { content: ""; position: absolute; inset: 8px auto 8px 5px; width: 1px; background: linear-gradient(var(--pink), rgba(116, 219, 242, 0.12)); }

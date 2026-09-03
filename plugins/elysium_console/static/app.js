@@ -8,6 +8,7 @@ const viewTitles = {
   world: "世界状态",
   attention: "持续关注",
   workspace: "文件空间",
+  minecraft: "Minecraft 陪玩",
   catalog: "数据地图",
 };
 
@@ -106,12 +107,18 @@ function markConnected() {
   connection.querySelector("span:last-child").textContent = "本机只读连接";
 }
 
-async function api(path) {
+async function api(path, options = {}) {
   setBusy(true);
   try {
+    const method = options.method || "GET";
+    const headers = { Accept: "application/json" };
+    if (method !== "GET") {
+      headers["X-Elysium-Console-Action"] = "minecraft-control-v1";
+    }
     const response = await fetch(path, {
+      method,
       credentials: "same-origin",
-      headers: { Accept: "application/json" },
+      headers,
     });
     if (!response.ok) {
       let detail = `读取失败（${response.status}）`;
@@ -576,6 +583,61 @@ async function loadCatalog() {
   }));
 }
 
+function minecraftDetail(label, value) {
+  const row = node("div", "stack-item");
+  row.append(node("strong", "", label), node("span", "tag", value || "—"));
+  return row;
+}
+
+function renderMinecraft(data) {
+  const active = Boolean(data.active);
+  const consciousness = data.consciousness || {};
+  const observation = data.latest_observation || {};
+  const tasks = observation.bot_tasks?.high_level || {};
+  const activeTask = tasks.active || null;
+  const readiness = data.readiness || (data.available ? "idle" : "disabled");
+  $("#minecraft-state-tag").textContent = active ? "正在世界中" : readiness;
+  $("#minecraft-stats").replaceChildren(
+    statCard("陪玩身体", active ? (data.body_name || "在线") : "未加入", active ? "独立玩家身体" : "等待你启动"),
+    statCard("游戏连接", data.bridge_connected ? "已连接" : "未连接", data.game_instance_id ? compactId(data.game_instance_id, 18) : "bridge"),
+    statCard("专属意识", consciousness.running ? "在场" : "未运行", consciousness.phase || "not started"),
+    statCard("游戏事件", formatNumber(data.body_event_count), "持久化后才确认"),
+  );
+  $("#minecraft-detail").replaceChildren(
+    minecraftDetail("就绪状态", readiness),
+    minecraftDetail("当前任务", activeTask ? `${activeTask.kind} · ${activeTask.phase}` : "无"),
+    minecraftDetail("会话", compactId(data.session_id, 22)),
+    minecraftDetail("最近错误", data.last_error || "无"),
+  );
+  $("#minecraft-start").disabled = active || !data.available;
+  $("#minecraft-stop").disabled = !active;
+}
+
+async function loadMinecraft() {
+  const data = await api("api/v1/minecraft");
+  renderMinecraft(data);
+}
+
+async function runMinecraftPreflight() {
+  const data = await api("api/v1/minecraft/preflight");
+  $("#minecraft-result").textContent = JSON.stringify(data.result || data, null, 2);
+  await loadMinecraft();
+}
+
+async function runMinecraftStart() {
+  const goal = $("#minecraft-goal").value.trim();
+  const query = new URLSearchParams({ goal });
+  const data = await api(`api/v1/minecraft/start?${query}`, { method: "POST" });
+  $("#minecraft-result").textContent = JSON.stringify(data.result || data, null, 2);
+  await loadMinecraft();
+}
+
+async function runMinecraftStop() {
+  const data = await api("api/v1/minecraft/stop", { method: "POST" });
+  $("#minecraft-result").textContent = JSON.stringify(data.result || data, null, 2);
+  await loadMinecraft();
+}
+
 const loaders = {
   overview: loadOverview,
   timeline: loadTimeline,
@@ -584,6 +646,7 @@ const loaders = {
   world: () => loadWorld(true),
   attention: () => loadAttention(true),
   workspace: () => loadWorkspace(""),
+  minecraft: loadMinecraft,
   catalog: loadCatalog,
 };
 
@@ -629,6 +692,15 @@ function bindEvents() {
     if (!state.workspaceText) return;
     try { await loadWorkspaceText(state.workspaceText.path, true); } catch (error) { showError(error.message); }
   });
+  $("#minecraft-preflight").addEventListener("click", async () => {
+    try { await runMinecraftPreflight(); } catch (error) { showError(error.message); }
+  });
+  $("#minecraft-start").addEventListener("click", async () => {
+    try { await runMinecraftStart(); } catch (error) { showError(error.message); }
+  });
+  $("#minecraft-stop").addEventListener("click", async () => {
+    try { await runMinecraftStop(); } catch (error) { showError(error.message); }
+  });
   $("#dialog-close").addEventListener("click", () => $("#value-dialog").close());
   $("#value-more").addEventListener("click", async () => {
     try { await loadWorldValue(true); } catch (error) { showError(error.message); }
@@ -638,3 +710,8 @@ function bindEvents() {
 
 bindEvents();
 activateView(window.location.hash.slice(1) || "overview");
+window.setInterval(() => {
+  if (state.currentView === "minecraft") {
+    loadMinecraft().catch((error) => showError(error.message));
+  }
+}, 3000);
