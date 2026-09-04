@@ -24,6 +24,7 @@ HEARTBEAT_ROLLING_NAMESPACE = "life_heartbeat.rolling_context"
 HEARTBEAT_ROLLING_STATE_KEY = "subconscious"
 HEARTBEAT_ROLLING_SNAPSHOT_VERSION = 1
 HEARTBEAT_ROLLING_FILENAME = "life_heartbeat_rolling_context.json"
+HEARTBEAT_QUIET_TURN_TEXT = "<heartbeat_turn/>"
 
 _VISIBLE_JSON_KEYS = (
     "assistant_message",
@@ -95,6 +96,60 @@ def rolling_payloads_only(payloads: Sequence[LLMPayload]) -> list[LLMPayload]:
         if isinstance(payload, LLMPayload)
         and getattr(payload, "role", None) not in {ROLE.SYSTEM, ROLE.TOOL}
     ]
+
+
+def is_heartbeat_quiet_turn_payload(payload: LLMPayload) -> bool:
+    """Return True for the request-only quiet-turn USER frame."""
+
+    if getattr(payload, "role", None) != ROLE.USER:
+        return False
+    texts = [
+        str(getattr(part, "text", "") or "")
+        for part in list(getattr(payload, "content", None) or [])
+        if isinstance(part, Text)
+    ]
+    return "".join(texts) == HEARTBEAT_QUIET_TURN_TEXT
+
+
+def ensure_heartbeat_user_turn(
+    payloads: Sequence[LLMPayload],
+) -> list[LLMPayload]:
+    """Guarantee the rolling conversation can legally start a model turn.
+
+    Kernel validation rejects assistant-first conversations.  A quiet
+    heartbeat has no new life-domain USER body; this inserts a stable,
+    content-free protocol frame so the request can still append an
+    assistant reply.  Callers must not persist the frame on a quiet beat.
+    """
+
+    typed = [payload for payload in payloads if isinstance(payload, LLMPayload)]
+    convo = rolling_payloads_only(typed)
+    if convo and convo[0].role != ROLE.ASSISTANT:
+        return typed
+    opener = LLMPayload(ROLE.USER, [Text(HEARTBEAT_QUIET_TURN_TEXT)])
+    if not convo:
+        typed.append(opener)
+        return typed
+    insert_at = 0
+    for index, payload in enumerate(typed):
+        if payload.role not in {ROLE.SYSTEM, ROLE.TOOL}:
+            insert_at = index
+            break
+    typed.insert(insert_at, opener)
+    return typed
+
+
+def copy_rolling_payloads(payloads: Sequence[LLMPayload]) -> list[LLMPayload]:
+    """Copy rolling payloads so live request merges cannot mutate the snapshot."""
+
+    copied: list[LLMPayload] = []
+    for payload in payloads:
+        if not isinstance(payload, LLMPayload):
+            continue
+        copied.append(
+            LLMPayload(payload.role, list(getattr(payload, "content", None) or []))
+        )
+    return copied
 
 
 def serialize_rolling_payloads(payloads: Sequence[LLMPayload]) -> list[dict[str, Any]]:

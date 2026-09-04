@@ -358,8 +358,7 @@ async def test_followup_retry_then_repeated_protocol_failure_stops_third_turn(
     assert request.send_calls == 1
     assert first.send_calls == 2
     assert second.send_calls == 0
-    assert result.perception_receipt is not None
-    assert result.perception_receipt.transport_request_id == "response-2"
+    assert result.perception_receipt is None
     assert result.text == ""
     assert any(row.get("stop_reason") == "consecutive_tool_stalls" for row in audit_rows)
     stopped = next(

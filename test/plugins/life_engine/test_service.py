@@ -1707,6 +1707,45 @@ async def test_heartbeat_without_exact_subconscious_receipt_keeps_delta_pending(
     assert any(item.event_id == event.event_id for item in service._event_history)
 
 
+async def test_heartbeat_compression_unresolved_does_not_consume_delta(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """压缩回合未完成时不得把本拍新经历当成已消费。"""
+    service = _make_service(tmp_path)
+    event = service._event_builder.build_direct_message_event(
+        "压缩未完成必须留下",
+        stream_id="stream-1",
+    )
+    await service._queue_pending_event(event)
+
+    async def _unresolved_model(
+        wake_context: str,
+        *,
+        heartbeat_run_id: str | None = None,
+        world_perception: Any = None,
+        heartbeat_deadline: float | None = None,
+    ) -> HeartbeatModelResult:
+        result = _heartbeat_result("还没检查点", None, wake_context)
+        return HeartbeatModelResult(
+            text=result.text,
+            perception_receipt=None,
+            subconscious_receipt=result.subconscious_receipt,
+            compression_unresolved=True,
+        )
+
+    monkeypatch.setattr(service, "_run_heartbeat_model", _unresolved_model)
+
+    reply, prepared = await service._run_heartbeat_round(
+        collect_background_agents=False,
+    )
+
+    assert reply == "还没检查点"
+    assert prepared.selected_event_ids == [event.event_id]
+    assert event.heartbeat_context_consumed is False
+    assert service._state.heartbeat_context_cursor == 0
+
+
 async def test_heartbeat_arrival_during_model_is_deferred_to_next_round(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1872,7 +1911,8 @@ async def test_consumed_heartbeat_events_remain_consumed_after_restart(
     assert restored._state.heartbeat_context_cursor >= event.sequence
     assert restored_event.heartbeat_context_consumed is True
     assert "重启后不能重新注入" not in prepared.content
-    assert "chat_global" in prepared.content
+    assert prepared.content == ""
+    assert prepared.world_perception is None
 
 
 @pytest.mark.parametrize("memory_index_enabled", [True, False])

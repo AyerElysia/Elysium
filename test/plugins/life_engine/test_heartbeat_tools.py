@@ -40,11 +40,16 @@ def _plugin(tmp_path) -> SimpleNamespace:
 def test_heartbeat_pool_matches_allowlist_exactly() -> None:
     service = LifeEngineService.__new__(LifeEngineService)
     tools = service._get_nucleus_tools()
-    names = tuple(tool.tool_name for tool in tools)
+    names = tuple(
+        str(getattr(tool, "tool_name", "") or getattr(tool, "action_name", "") or "")
+        for tool in tools
+    )
     assert names == HEARTBEAT_TOOL_NAMES
     assert "nucleus_learn" in names
     assert "nucleus_write_narrative" in names
     assert "nucleus_memory_continuity_review" in names
+    assert "author_self_continuity_checkpoint" in names
+    assert "read_context_group" in names
     banned = {
         "nucleus_reflect_now",
         "nucleus_review_subject_document",
@@ -65,6 +70,8 @@ def test_heartbeat_pool_matches_allowlist_exactly() -> None:
     assert banned.isdisjoint(names)
     schema_names = [tool.to_schema()["function"]["name"] for tool in tools]
     assert "tool-nucleus_learn" in schema_names
+    assert "action-author_self_continuity_checkpoint" in schema_names
+    assert "tool-read_context_group" in schema_names
     assert "tool-nucleus_reflect_now" not in schema_names
 
 
@@ -134,6 +141,13 @@ def test_heartbeat_idle_strips_tool_prefix_for_learn_and_todo() -> None:
         LifeEngineService._heartbeat_tool_call_counts_as_activity(
             "tool-nucleus_todo",
             {"action": "write"},
+        )
+        is True
+    )
+    assert (
+        LifeEngineService._heartbeat_tool_call_counts_as_activity(
+            "action-author_self_continuity_checkpoint",
+            {},
         )
         is True
     )
