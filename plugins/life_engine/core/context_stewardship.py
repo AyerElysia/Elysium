@@ -1023,7 +1023,32 @@ def prepare_subject_checkpoint(
         raise ContextStewardshipError("expected_revision must not be negative")
 
     typed = [payload for payload in payloads if isinstance(payload, LLMPayload)]
-    semantic_payloads = strip_compression_required_payloads(typed)
+    control_indexes = [
+        index
+        for index, payload in enumerate(typed)
+        if is_compression_required_payload(payload)
+    ]
+    if len(control_indexes) > 1:
+        raise ContextStewardshipError(
+            "multiple compression maintenance controls are not allowed"
+        )
+    if control_indexes:
+        control_index = control_indexes[0]
+        maintenance_suffix = typed[control_index + 1 :]
+        if any(payload.role == ROLE.USER for payload in maintenance_suffix):
+            # New subject input is never maintenance transport.  Refuse to
+            # compact rather than silently dropping a real USER turn.
+            raise ContextStewardshipError(
+                "compression maintenance suffix contains a USER payload"
+            )
+        # Tool calls/results after the control frame are the transport used to
+        # author this checkpoint.  They remain complete in the authoritative
+        # conscious-activity trajectory, but retaining them after removing
+        # their USER control would create an invalid assistant chain and would
+        # make maintenance noise part of the newly compacted working context.
+        semantic_payloads = typed[:control_index]
+    else:
+        semantic_payloads = strip_compression_required_payloads(typed)
     manifest = build_group_manifest(semantic_payloads)
     if manifest.source_manifest_sha256 != command.source_manifest_sha256:
         raise ContextStewardshipError("context group manifest is stale or mismatched")

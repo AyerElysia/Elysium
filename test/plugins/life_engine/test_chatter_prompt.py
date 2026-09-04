@@ -347,6 +347,7 @@ async def test_context_recovery_turn_blocks_visible_action_side_effect(
 
     class RecoveryResponse:
         def __init__(self) -> None:
+            self.context_manager = LLMContextManager()
             self.payloads = ensure_compression_required_appended(
                 [
                     LLMPayload(ROLE.USER, Text("旧消息")),
@@ -357,16 +358,23 @@ async def test_context_recovery_turn_blocks_visible_action_side_effect(
                 force=True,
             )
             self.call_list = [
-                SimpleNamespace(
+                ToolCall(
                     id="blocked-send",
                     name="action-life_send_text",
                     args={"content": "这条消息绝对不能发送"},
                 )
             ]
             self.message = ""
+            self._appended_to_context = False
 
         def add_payload(self, payload) -> None:
-            self.payloads.append(payload)
+            if payload.role == ROLE.TOOL_RESULT and not self._appended_to_context:
+                self.payloads = self.context_manager.add_payload(
+                    self.payloads,
+                    LLMPayload(ROLE.ASSISTANT, list(self.call_list)),
+                )
+                self._appended_to_context = True
+            self.payloads = self.context_manager.add_payload(self.payloads, payload)
 
     response = RecoveryResponse()
     rt = _WorkflowRuntime(
@@ -412,6 +420,15 @@ async def test_context_recovery_turn_blocks_visible_action_side_effect(
     assert rt.phase == _Phase.MODEL_TURN
     assert rt.sent_visible_reply is False
     assert rt.must_reply is True
+    assert response.payloads[-1].role == ROLE.TOOL_RESULT
+    assert all(
+        not (
+            previous.role == ROLE.ASSISTANT
+            and current.role == ROLE.ASSISTANT
+        )
+        for previous, current in zip(response.payloads, response.payloads[1:])
+    )
+    response.context_manager.validate_for_send(response.payloads)
     assert any(
         isinstance(part, ToolResult)
         and part.call_id == "blocked-send"
@@ -419,6 +436,138 @@ async def test_context_recovery_turn_blocks_visible_action_side_effect(
         for payload in response.payloads
         for part in payload.content
     )
+
+    # A second maintenance assistant/tool-result turn must remain a valid
+    # continuation.  The old branch inserted __SUSPEND__ before this turn and
+    # later exposed an assistant -> assistant chain after checkpoint install.
+    second_call = ToolCall(
+        id="checkpoint",
+        name="action-author_self_continuity_checkpoint",
+        args={},
+    )
+    response.payloads = response.context_manager.add_payload(
+        response.payloads,
+        LLMPayload(ROLE.ASSISTANT, [second_call]),
+    )
+    response.payloads = response.context_manager.add_payload(
+        response.payloads,
+        LLMPayload(
+            ROLE.TOOL_RESULT,
+            [ToolResult(value="checkpoint queued", call_id="checkpoint")],
+        ),
+    )
+    response.context_manager.validate_for_send(response.payloads)
+    assert all(
+        not (
+            previous.role == ROLE.ASSISTANT
+            and current.role == ROLE.ASSISTANT
+        )
+        for previous, current in zip(response.payloads, response.payloads[1:])
+    )
+
+    LifeChatter.reset_global_runtime()
+
+
+async def test_context_checkpoint_install_resumes_with_user_control_frame(
+    monkeypatch,
+) -> None:
+    LifeChatter.reset_global_runtime()
+
+    class RecoveryResponse:
+        def __init__(self) -> None:
+            self.context_manager = LLMContextManager()
+            self.payloads = ensure_compression_required_appended(
+                [
+                    LLMPayload(ROLE.USER, Text("已闭合的旧消息")),
+                    LLMPayload(ROLE.ASSISTANT, Text("已闭合的旧回复")),
+                    LLMPayload(ROLE.USER, Text("仍待处理的当前消息")),
+                ],
+                trigger_chars=1,
+                force=True,
+            )
+            self.call_list = [
+                ToolCall(
+                    id="checkpoint",
+                    name="action-author_self_continuity_checkpoint",
+                    args={},
+                )
+            ]
+            self.message = ""
+            self._appended_to_context = False
+
+        def add_payload(self, payload) -> None:
+            if payload.role == ROLE.TOOL_RESULT and not self._appended_to_context:
+                self.payloads = self.context_manager.add_payload(
+                    self.payloads,
+                    LLMPayload(ROLE.ASSISTANT, list(self.call_list)),
+                )
+                self._appended_to_context = True
+            self.payloads = self.context_manager.add_payload(self.payloads, payload)
+
+    response = RecoveryResponse()
+    rt = _WorkflowRuntime(
+        response=response,
+        phase=_Phase.TOOL_EXEC,
+        history_merged=True,
+        unreads=[],
+        cross_round_seen_signatures=set(),
+        unread_msgs_to_flush=[],
+        active_stream_id="stream-a",
+        active_unread_turn_key="turn-a",
+        must_reply=True,
+    )
+    LifeChatter._GLOBAL_RUNTIME = rt
+    LifeChatter._GLOBAL_USABLE_MAP = {}
+
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.plugin = SimpleNamespace(config=None)
+    chatter.stream_id = "stream-a"
+    chatter.instance_id = "chat:test"
+    chatter.instance_kind = "chat"
+
+    async def fake_fetch_unreads():
+        return [], []
+
+    async def fake_run_tool_call(call, target, *_args, **_kwargs):
+        target.add_payload(
+            LLMPayload(
+                ROLE.TOOL_RESULT,
+                [ToolResult(value="queued", call_id=call.id, name=call.name)],
+            )
+        )
+        return True, True
+
+    def fake_install_checkpoint(target):
+        target.payloads = [
+            LLMPayload(ROLE.USER, Text("仍待处理的当前消息")),
+            LLMPayload(ROLE.ASSISTANT, Text("主体亲自写下的连续性检查点")),
+        ]
+        return SimpleNamespace(triggered=True)
+
+    monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
+    monkeypatch.setattr(chatter, "run_tool_call", fake_run_tool_call)
+    monkeypatch.setattr(
+        chatter,
+        "_maybe_compact_runtime_context",
+        fake_install_checkpoint,
+    )
+    monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", _skip_snapshot_save)
+    monkeypatch.setattr(
+        "src.kernel.concurrency.get_watchdog",
+        lambda: SimpleNamespace(feed_dog=lambda _stream_id: None),
+    )
+
+    result = await chatter._drive_global_runtime_until_yield(
+        SimpleNamespace(stream_id="stream-a"),
+        service=None,
+    )
+
+    assert isinstance(result, Success)
+    assert rt.phase == _Phase.MODEL_TURN
+    assert rt.follow_up_rounds == 0
+    assert response.payloads[-1].role == ROLE.USER
+    assert "不是新的用户消息" in response.payloads[-1].content[0].text
+    response.context_manager.validate_for_send(response.payloads)
 
     LifeChatter.reset_global_runtime()
 

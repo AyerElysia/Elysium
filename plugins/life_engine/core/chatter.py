@@ -187,6 +187,12 @@ _NEW_MESSAGES_BLOCK_RE = re.compile(
     re.DOTALL,
 )
 _SUSPEND_TEXT = "__SUSPEND__"
+_SUBJECT_CHECKPOINT_RESUME_TEXT = (
+    "<subject_context_maintenance_completed>\n"
+    "主体亲自提交的连续性检查点已经安装。此帧只是技术续轮信号，不是新的用户消息；"
+    "请继续处理此前仍待完成的当前轮，并由你自己决定是否以及如何回应或行动。\n"
+    "</subject_context_maintenance_completed>"
+)
 _GLOBAL_RUNTIME_BUSY_RETRY_SECONDS = 1.0
 # Hard-window overflow must not Failure-spin the unread loop.  The recovery
 # hook is supposed to make the next send a bounded maintenance projection;
@@ -7263,16 +7269,16 @@ class LifeChatter(BaseChatter):
                         checkpoint_result is not None
                         and getattr(checkpoint_result, "triggered", False)
                     )
-                    if self._has_tool_result_tail(llm_response):
-                        llm_response.add_payload(
-                            LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT))
-                        )
                     if checkpoint_installed:
                         # Context maintenance does not spend the user's normal
                         # expression rounds.  Re-run the still-pending initial
                         # turn against the newly bounded, subject-authored
                         # rolling context; only that exact-delivery turn may
                         # flush the unread batch or advance its perception.
+                        self._append_follow_up_user_instruction(
+                            llm_response,
+                            _SUBJECT_CHECKPOINT_RESUME_TEXT,
+                        )
                         rt.follow_up_rounds = 0
                         self._transition(
                             rt,
@@ -7284,6 +7290,14 @@ class LifeChatter(BaseChatter):
 
                     rt.follow_up_rounds += 1
                     if rt.follow_up_rounds >= max_rounds:
+                        # This branch really ends the maintenance attempt, so a
+                        # TOOL_RESULT tail needs a closing assistant frame.
+                        # Continuing rounds deliberately keep TOOL_RESULT as
+                        # the causal boundary for the next assistant response.
+                        if self._has_tool_result_tail(llm_response):
+                            llm_response.add_payload(
+                                LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT))
+                            )
                         self._transition(
                             rt,
                             _Phase.WAIT_USER,

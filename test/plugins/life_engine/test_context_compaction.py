@@ -712,6 +712,110 @@ def test_compression_control_does_not_change_checkpoint_manifest() -> None:
     assert "current-user" in str(prepared.payloads)
 
 
+def test_checkpoint_drops_maintenance_transport_without_breaking_role_chain() -> None:
+    # Match the production failure shape: the ordinary turn is already closed
+    # by an assistant suspend frame when the compression USER control is added.
+    # Removing only that USER frame used to leave two adjacent assistants.
+    payloads = [
+        *_conversation(),
+        LLMPayload(
+            ROLE.ASSISTANT,
+            [ToolCall(id="visible", name="life_send_text", args={})],
+        ),
+        LLMPayload(
+            ROLE.TOOL_RESULT,
+            [ToolResult(value="sent", call_id="visible", name="life_send_text")],
+        ),
+        LLMPayload(ROLE.ASSISTANT, Text("__SUSPEND__")),
+    ]
+    LLMContextManager().validate_for_send(payloads)
+    command = _checkpoint_command(payloads)
+    with_control = ensure_compression_required_appended(
+        payloads,
+        estimate=_estimate,
+        trigger_chars=1,
+        max_groups=8,
+        max_bytes=8 * 1024,
+    )
+    maintenance_payloads = [
+        LLMPayload(
+            ROLE.ASSISTANT,
+            [ToolCall(id="read-old", name="read_context_group", args={})],
+        ),
+        LLMPayload(
+            ROLE.TOOL_RESULT,
+            [
+                ToolResult(
+                    value="PRIVATE-MAINTENANCE-RESULT",
+                    call_id="read-old",
+                    name="read_context_group",
+                )
+            ],
+        ),
+        LLMPayload(
+            ROLE.ASSISTANT,
+            [
+                Text("__SUSPEND__"),
+                ToolCall(
+                    id="write-checkpoint",
+                    name="author_self_continuity_checkpoint",
+                    args={"thought": "PRIVATE-MAINTENANCE-THOUGHT"},
+                ),
+            ],
+        ),
+        LLMPayload(
+            ROLE.TOOL_RESULT,
+            [
+                ToolResult(
+                    value="checkpoint queued",
+                    call_id="write-checkpoint",
+                    name="author_self_continuity_checkpoint",
+                )
+            ],
+        ),
+    ]
+
+    prepared = prepare_subject_checkpoint(
+        [*with_control, *maintenance_payloads],
+        command,
+    )
+
+    rendered = str(prepared.payloads)
+    assert CHECKPOINT_OPEN in rendered
+    assert command.continuity_text in rendered
+    assert "PRIVATE-MAINTENANCE-RESULT" not in rendered
+    assert "PRIVATE-MAINTENANCE-THOUGHT" not in rendered
+    assert "read_context_group" not in rendered
+    assert "author_self_continuity_checkpoint" not in rendered
+    assert not has_compression_required_payload(prepared.payloads)
+    LLMContextManager().validate_for_send(prepared.payloads)
+    assert all(
+        not (
+            previous.role == ROLE.ASSISTANT
+            and current.role == ROLE.ASSISTANT
+        )
+        for previous, current in zip(prepared.payloads, prepared.payloads[1:])
+    )
+
+
+def test_checkpoint_refuses_to_drop_user_payload_after_maintenance_control() -> None:
+    payloads = _conversation()
+    command = _checkpoint_command(payloads)
+    with_control = ensure_compression_required_appended(
+        payloads,
+        estimate=_estimate,
+        trigger_chars=1,
+        max_groups=8,
+        max_bytes=8 * 1024,
+    )
+
+    with pytest.raises(ContextStewardshipError, match="contains a USER payload"):
+        prepare_subject_checkpoint(
+            [*with_control, LLMPayload(ROLE.USER, Text("不能被压缩掉的新消息"))],
+            command,
+        )
+
+
 def test_successful_checkpoint_snapshot_must_not_use_mechanical_omission() -> None:
     payloads = _conversation()
     prepared = prepare_subject_checkpoint(payloads, _checkpoint_command(payloads))
