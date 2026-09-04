@@ -5,14 +5,16 @@ mixed together:
 
 * context pressure is a content-neutral transport fact;
 * continuity text is authored only by the active consciousness instance;
-* mechanical omission is a retired emergency projection, not a success path.
+* an emergency recovery projection may hide groups for one maintenance attempt,
+  but never mutates or replaces the full rolling context.
 
 No helper in this module decides which experience matters or rewrites subject
 meaning.  Exact released prompt groups are archived by content hash before a
 checkpoint is installed, while authoritative Life Events and trajectories stay
-untouched.  A hard model window that still cannot fit must fail closed; it
-must not drop groups or emit ``<mechanical_context_omission>`` as compressed
-context.
+untouched.  When the full window no longer fits, a bounded maintenance attempt
+may expose only content-neutral group references so the active subject can read
+exact groups and author a checkpoint.  That attempt is not a normal response
+path and the caller's full payload list remains unchanged.
 """
 
 from __future__ import annotations
@@ -185,6 +187,7 @@ _PENDING_LOCK = threading.Lock()
 _PENDING_CHECKPOINTS: dict[str, SubjectCheckpointCommand] = {}
 _TRANSIENT_PRESSURE_PARTS: dict[int, Text] = {}
 _LIVE_WINDOWS: dict[str, "LiveContextWindow"] = {}
+_RECOVERY_MARKER_ATTR = "_elysium_subject_context_recovery_used"
 
 
 @dataclass(frozen=True, slots=True)
@@ -463,7 +466,11 @@ def build_group_manifest(
 ) -> ContextGroupManifest:
     """Build stable refs without exposing group bodies in the pressure notice."""
 
-    _, tail = split_pinned_and_tail(payloads)
+    # The compression-required envelope is transport control, not a subject
+    # conversation group.  Ignoring it keeps the manifest stable before and
+    # after the envelope is appended to the durable rolling projection.
+    semantic_payloads = strip_compression_required_payloads(payloads)
+    _, tail = split_pinned_and_tail(semantic_payloads)
     groups = build_conversation_groups(tail)
     if exclude_latest_group and groups:
         groups = groups[:-1]
@@ -763,6 +770,7 @@ def ensure_compression_required_appended(
     trigger_chars: int,
     max_groups: int = DEFAULT_PRESSURE_MAX_GROUPS,
     max_bytes: int = DEFAULT_EMERGENCY_REFERENCE_MAX_BYTES,
+    force: bool = False,
 ) -> list[LLMPayload]:
     """Append the compression list once. Existing list bytes are not rewritten."""
 
@@ -770,7 +778,7 @@ def ensure_compression_required_appended(
     if has_compression_required_payload(typed):
         return typed
     estimated = rolling_char_estimate(typed, estimate)
-    if estimated <= max(1, int(trigger_chars)):
+    if not force and estimated <= max(1, int(trigger_chars)):
         return typed
     notice = build_compression_required_payload(
         typed,
@@ -807,6 +815,103 @@ def install_fail_closed_context_hook(request: Any) -> None:
         return []
 
     context_manager.compression_hook = compression_hook
+
+
+def install_subject_context_recovery_hook(
+    request: Any,
+    *,
+    max_groups: int = DEFAULT_PRESSURE_MAX_GROUPS,
+    max_bytes: int = DEFAULT_EMERGENCY_REFERENCE_MAX_BYTES,
+) -> None:
+    """Install a one-attempt recovery projection for subject-owned compaction.
+
+    The kernel may omit old groups only from the payload list sent in this
+    maintenance attempt.  ``LLMRequest`` deliberately retains the caller's
+    complete payload list on the returned response, so no rolling state is
+    released until ``author_self_continuity_checkpoint`` archives and commits
+    the active subject's explicit decision.
+    """
+
+    context_manager = getattr(request, "context_manager", None)
+    if context_manager is None or not hasattr(context_manager, "compression_hook"):
+        return
+    if getattr(context_manager, "compression_hook", None) is not None:
+        return
+
+    def compression_hook(
+        dropped_groups: list[list[LLMPayload]],
+        remaining_payloads: list[LLMPayload],
+    ) -> list[LLMPayload]:
+        if not dropped_groups:
+            return []
+        setattr(compression_hook, _RECOVERY_MARKER_ATTR, True)
+        if has_compression_required_payload(remaining_payloads):
+            # The durable control envelope is already the newest retained
+            # group.  Returning no replacement lets the kernel omit old groups
+            # for this attempt without inventing any semantic summary.
+            return []
+        complete_tail = [
+            payload
+            for group in dropped_groups
+            for payload in group
+            if isinstance(payload, LLMPayload)
+        ] + [
+            payload
+            for payload in remaining_payloads
+            if isinstance(payload, LLMPayload)
+        ]
+        notice = build_compression_required_payload(
+            complete_tail,
+            max_groups=max_groups,
+            max_bytes=max_bytes,
+            estimated_chars=rolling_char_estimate(complete_tail),
+            trigger_chars=0,
+        )
+        if notice is None:
+            raise LLMContextError(
+                "subject rolling context exceeds the model window and no "
+                "releasable closed context group is available"
+            )
+        return [notice]
+
+    setattr(compression_hook, _RECOVERY_MARKER_ATTR, False)
+    context_manager.compression_hook = compression_hook
+
+
+def reset_subject_context_recovery_marker(holder: Any) -> None:
+    """Reset attempt-local recovery evidence before one model send."""
+
+    context_manager = getattr(holder, "context_manager", None)
+    if context_manager is None:
+        context_manager = getattr(getattr(holder, "_upper", None), "context_manager", None)
+    hook = getattr(context_manager, "compression_hook", None)
+    if hook is not None and hasattr(hook, _RECOVERY_MARKER_ATTR):
+        setattr(hook, _RECOVERY_MARKER_ATTR, False)
+
+
+def is_subject_window_overflow_error(error: BaseException) -> bool:
+    """True when send failed because the subject rolling chain still cannot fit."""
+
+    if not isinstance(error, LLMContextError):
+        return False
+    text = str(error)
+    return (
+        "mechanical group omission is not a success path" in text
+        or "no releasable closed context group is available" in text
+    )
+
+
+def consume_subject_context_recovery_marker(holder: Any) -> bool:
+    """Return whether the final attempt used the bounded recovery projection."""
+
+    context_manager = getattr(holder, "context_manager", None)
+    if context_manager is None:
+        context_manager = getattr(getattr(holder, "_upper", None), "context_manager", None)
+    hook = getattr(context_manager, "compression_hook", None)
+    used = bool(getattr(hook, _RECOVERY_MARKER_ATTR, False))
+    if hook is not None and hasattr(hook, _RECOVERY_MARKER_ATTR):
+        setattr(hook, _RECOVERY_MARKER_ATTR, False)
+    return used
 
 
 def _checkpoint_payload(
@@ -918,7 +1023,8 @@ def prepare_subject_checkpoint(
         raise ContextStewardshipError("expected_revision must not be negative")
 
     typed = [payload for payload in payloads if isinstance(payload, LLMPayload)]
-    manifest = build_group_manifest(typed)
+    semantic_payloads = strip_compression_required_payloads(typed)
+    manifest = build_group_manifest(semantic_payloads)
     if manifest.source_manifest_sha256 != command.source_manifest_sha256:
         raise ContextStewardshipError("context group manifest is stale or mismatched")
     if manifest.current_checkpoint_revision != command.expected_revision:
@@ -960,7 +1066,7 @@ def prepare_subject_checkpoint(
         max_bytes=max_checkpoint_bytes,
         archive_namespace=archive_namespace,
     )
-    pinned, tail = split_pinned_and_tail(typed)
+    pinned, tail = split_pinned_and_tail(semantic_payloads)
     groups = build_conversation_groups(tail)
     # The manifest excludes the latest in-flight group.  Rebuild from the same
     # selected prefix and preserve every later/current group byte-for-byte.
@@ -1712,12 +1818,15 @@ __all__ = [
     "build_group_manifest",
     "build_mechanical_omission_payloads",
     "checkpoint_data",
+    "consume_subject_context_recovery_marker",
     "current_checkpoint_data",
     "ensure_compression_required_appended",
     "get_live_context",
     "has_compression_required_payload",
     "install_fail_closed_context_hook",
+    "install_subject_context_recovery_hook",
     "is_compression_required_payload",
+    "is_subject_window_overflow_error",
     "is_legacy_summary_payload",
     "mechanically_bound_payloads",
     "payloads_require_compression",
@@ -1726,6 +1835,7 @@ __all__ = [
     "read_context_group_archive",
     "register_live_context",
     "reset_pending_subject_checkpoint",
+    "reset_subject_context_recovery_marker",
     "reset_transient_context_pressure_notices",
     "rolling_char_estimate",
     "split_pinned_and_tail",

@@ -17,6 +17,7 @@ from plugins.life_engine.core.context_compaction import (
 )
 from plugins.life_engine.core.context_stewardship import (
     CHECKPOINT_OPEN,
+    COMPRESSION_REQUIRED_OPEN,
     OMISSION_OPEN,
     PRESSURE_OPEN,
     ContextStewardshipError,
@@ -29,6 +30,8 @@ from plugins.life_engine.core.context_stewardship import (
     build_context_pressure_notice,
     build_group_manifest,
     build_mechanical_omission_payloads,
+    ensure_compression_required_appended,
+    has_compression_required_payload,
     mechanically_bound_payloads,
     prepare_subject_checkpoint,
     read_context_group_archive,
@@ -640,20 +643,79 @@ def test_context_stewardship_tools_are_registered_and_visible_to_chat() -> None:
     assert "tool-read_context_group" in chat_manifest
 
 
-def test_retired_summary_is_recognized_but_never_emitted() -> None:
+def test_retired_summary_is_recognized_and_compact_does_not_rewrite() -> None:
     legacy = LLMPayload(
         ROLE.USER,
         [Text(f"{SUMMARY_INTRO}\n{SUMMARY_OPEN}\nlegacy body\n{SUMMARY_CLOSE}")],
     )
+    payloads = [legacy, *_conversation()[1:]]
     assert is_summary_payload(legacy)
     result = hierarchical_compact_payloads(
-        [legacy, *_conversation()[1:]],
+        payloads,
         estimate=_estimate,
         trigger_chars=1,
         target_chars=700,
         force=True,
     )
-    rendered = str(result.payloads)
     assert result.triggered
-    assert SUMMARY_OPEN not in rendered
-    assert "legacy body" not in rendered
+    assert result.dropped_groups == 0
+    assert result.payloads == payloads
+    assert "legacy body" in str(result.payloads)
+
+
+def test_compression_required_list_appends_once_without_group_bodies() -> None:
+    payloads = _conversation()
+    first = ensure_compression_required_appended(
+        payloads,
+        estimate=_estimate,
+        trigger_chars=8,
+        max_groups=8,
+        max_bytes=8 * 1024,
+    )
+    second = ensure_compression_required_appended(
+        first,
+        estimate=_estimate,
+        trigger_chars=8,
+        max_groups=8,
+        max_bytes=8 * 1024,
+    )
+
+    assert has_compression_required_payload(first)
+    assert first is not payloads
+    assert second == first
+    rendered = str(first[-1].content[0].text)
+    assert rendered.startswith(COMPRESSION_REQUIRED_OPEN)
+    assert "ctxg_" in rendered
+    assert "old-user-one" not in rendered
+    assert "old-assistant-one" not in rendered
+    assert "author_self_continuity_checkpoint" in rendered
+    listed = [payload for payload in first if payload is not first[-1]]
+    assert listed == payloads
+
+
+def test_compression_control_does_not_change_checkpoint_manifest() -> None:
+    payloads = _conversation()
+    command = _checkpoint_command(payloads)
+    with_control = ensure_compression_required_appended(
+        payloads,
+        estimate=_estimate,
+        trigger_chars=1,
+        max_groups=8,
+        max_bytes=8 * 1024,
+    )
+
+    assert build_group_manifest(with_control) == build_group_manifest(payloads)
+    prepared = prepare_subject_checkpoint(with_control, command)
+
+    assert not has_compression_required_payload(prepared.payloads)
+    assert CHECKPOINT_OPEN in str(prepared.payloads)
+    assert "current-user" in str(prepared.payloads)
+
+
+def test_successful_checkpoint_snapshot_must_not_use_mechanical_omission() -> None:
+    payloads = _conversation()
+    prepared = prepare_subject_checkpoint(payloads, _checkpoint_command(payloads))
+    rendered = str(prepared.payloads)
+    assert OMISSION_OPEN not in rendered
+    assert CHECKPOINT_OPEN in rendered
+    assert "我记得我们已经谈过前两件事" in rendered
