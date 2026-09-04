@@ -32,11 +32,13 @@ from plugins.life_engine.core.context_stewardship import (
     build_mechanical_omission_payloads,
     ensure_compression_required_appended,
     has_compression_required_payload,
+    is_compression_required_part,
     mechanically_bound_payloads,
     prepare_subject_checkpoint,
     read_context_group_archive,
     reset_pending_subject_checkpoint,
     reset_transient_context_pressure_notices,
+    strip_compression_required_payloads,
     strip_context_pressure_notices,
 )
 from plugins.life_engine.core.plugin import LifeEnginePlugin
@@ -683,14 +685,18 @@ def test_compression_required_list_appends_once_without_group_bodies() -> None:
     assert has_compression_required_payload(first)
     assert first is not payloads
     assert second == first
-    rendered = str(first[-1].content[0].text)
+    control_parts = [
+        part for part in first[-1].content if is_compression_required_part(part)
+    ]
+    assert len(control_parts) == 1
+    rendered = str(control_parts[0].text)
     assert rendered.startswith(COMPRESSION_REQUIRED_OPEN)
     assert "ctxg_" in rendered
     assert "old-user-one" not in rendered
     assert "old-assistant-one" not in rendered
     assert "author_self_continuity_checkpoint" in rendered
-    listed = [payload for payload in first if payload is not first[-1]]
-    assert listed == payloads
+    assert strip_compression_required_payloads(first) == payloads
+    LLMContextManager().validate_for_send(first)
 
 
 def test_compression_control_does_not_change_checkpoint_manifest() -> None:
@@ -798,7 +804,7 @@ def test_checkpoint_drops_maintenance_transport_without_breaking_role_chain() ->
     )
 
 
-def test_checkpoint_refuses_to_drop_user_payload_after_maintenance_control() -> None:
+def test_checkpoint_preserves_user_payload_after_maintenance_control() -> None:
     payloads = _conversation()
     command = _checkpoint_command(payloads)
     with_control = ensure_compression_required_appended(
@@ -809,11 +815,53 @@ def test_checkpoint_refuses_to_drop_user_payload_after_maintenance_control() -> 
         max_bytes=8 * 1024,
     )
 
-    with pytest.raises(ContextStewardshipError, match="contains a USER payload"):
-        prepare_subject_checkpoint(
-            [*with_control, LLMPayload(ROLE.USER, Text("不能被压缩掉的新消息"))],
-            command,
-        )
+    prepared = prepare_subject_checkpoint(
+        [
+            *with_control,
+            LLMPayload(
+                ROLE.ASSISTANT,
+                [ToolCall(id="read", name="read_context_group", args={})],
+            ),
+            LLMPayload(
+                ROLE.TOOL_RESULT,
+                [
+                    ToolResult(
+                        value="maintenance page",
+                        call_id="read",
+                        name="read_context_group",
+                    )
+                ],
+            ),
+            LLMPayload(ROLE.ASSISTANT, Text("__SUSPEND__")),
+            LLMPayload(ROLE.USER, Text("不能被压缩掉的新消息")),
+            LLMPayload(
+                ROLE.ASSISTANT,
+                [
+                    ToolCall(
+                        id="checkpoint",
+                        name="author_self_continuity_checkpoint",
+                        args={},
+                    )
+                ],
+            ),
+            LLMPayload(
+                ROLE.TOOL_RESULT,
+                [
+                    ToolResult(
+                        value="queued",
+                        call_id="checkpoint",
+                        name="author_self_continuity_checkpoint",
+                    )
+                ],
+            ),
+        ],
+        command,
+    )
+
+    assert "不能被压缩掉的新消息" in str(prepared.payloads)
+    assert "maintenance page" not in str(prepared.payloads)
+    assert not has_compression_required_payload(prepared.payloads)
+    LLMContextManager().validate_for_send(prepared.payloads)
 
 
 def test_successful_checkpoint_snapshot_must_not_use_mechanical_omission() -> None:

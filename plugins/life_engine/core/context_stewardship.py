@@ -417,6 +417,26 @@ def _strict_envelope_payload(
     return decoded
 
 
+def _compression_required_part_data(part: object) -> dict[str, Any] | None:
+    """Decode one exact compression control ``Text`` part."""
+
+    if not isinstance(part, Text):
+        return None
+    return _strict_envelope_payload(
+        LLMPayload(ROLE.USER, [part]),
+        role=ROLE.USER,
+        opening=COMPRESSION_REQUIRED_OPEN,
+        closing=COMPRESSION_REQUIRED_CLOSE,
+        schema=COMPRESSION_REQUIRED_SCHEMA,
+    )
+
+
+def is_compression_required_part(part: object) -> bool:
+    """Return whether ``part`` is the exact technical compression envelope."""
+
+    return _compression_required_part_data(part) is not None
+
+
 def checkpoint_data(payload: LLMPayload) -> dict[str, Any] | None:
     if getattr(payload, "role", None) != ROLE.ASSISTANT:
         return None
@@ -652,17 +672,17 @@ def reset_transient_context_pressure_notices() -> None:
 
 
 def is_compression_required_payload(payload: LLMPayload) -> bool:
-    """Recognize the durable compression-turn list; bodies are never included."""
+    """Recognize a USER payload carrying the durable compression control.
 
-    return (
-        _strict_envelope_payload(
-            payload,
-            role=ROLE.USER,
-            opening=COMPRESSION_REQUIRED_OPEN,
-            closing=COMPRESSION_REQUIRED_CLOSE,
-            schema=COMPRESSION_REQUIRED_SCHEMA,
-        )
-        is not None
+    The control may be its sole part or may share the current USER turn.  The
+    latter is required when pressure is discovered while that USER turn is
+    still open: emitting a second USER payload would make later helpers move
+    the control across its maintenance assistant/tool-result chain.
+    """
+
+    return getattr(payload, "role", None) == ROLE.USER and any(
+        is_compression_required_part(part)
+        for part in list(getattr(payload, "content", None) or [])
     )
 
 
@@ -677,11 +697,62 @@ def has_compression_required_payload(payloads: Sequence[LLMPayload]) -> bool:
 def strip_compression_required_payloads(
     payloads: Sequence[LLMPayload],
 ) -> list[LLMPayload]:
-    return [
-        payload
-        for payload in payloads
-        if isinstance(payload, LLMPayload) and not is_compression_required_payload(payload)
+    stripped: list[LLMPayload] = []
+    for payload in payloads:
+        if not isinstance(payload, LLMPayload):
+            continue
+        original = list(getattr(payload, "content", None) or [])
+        if getattr(payload, "role", None) != ROLE.USER:
+            stripped.append(payload)
+            continue
+        content = [
+            part for part in original if not is_compression_required_part(part)
+        ]
+        if not content:
+            continue
+        stripped.append(
+            payload
+            if len(content) == len(original)
+            else LLMPayload(payload.role, content)  # type: ignore[arg-type]
+        )
+    return stripped
+
+
+def strip_compression_maintenance_transport(
+    payloads: Sequence[LLMPayload],
+) -> list[LLMPayload]:
+    """Remove one compression control and its response-side transport.
+
+    Everything after the control is produced while the surface is in its
+    maintenance-only mode.  Assistant/tool-result frames there are transport
+    for exact-group reads and checkpoint submission, not subject continuity.
+    Real USER frames that arrived during maintenance are preserved verbatim;
+    pinned payloads are preserved as well.  Authoritative activity trajectories
+    are not touched by this derived-context helper.
+    """
+
+    typed = [payload for payload in payloads if isinstance(payload, LLMPayload)]
+    control_indexes = [
+        index
+        for index, payload in enumerate(typed)
+        if is_compression_required_payload(payload)
     ]
+    if not control_indexes:
+        return typed
+    if len(control_indexes) != 1:
+        raise ContextStewardshipError(
+            "multiple compression maintenance controls are not allowed"
+        )
+    control_index = control_indexes[0]
+    semantic_prefix = strip_compression_required_payloads(
+        typed[: control_index + 1]
+    )
+    preserved_suffix = [
+        payload
+        for payload in typed[control_index + 1 :]
+        if payload.role in {ROLE.SYSTEM, ROLE.TOOL, ROLE.USER}
+    ]
+    return [*semantic_prefix, *preserved_suffix]
 
 
 def rolling_char_estimate(
@@ -789,6 +860,17 @@ def ensure_compression_required_appended(
     )
     if notice is None:
         return typed
+    if typed and typed[-1].role == ROLE.USER:
+        # Keep the transport instruction as its own exact Text part inside the
+        # open USER turn.  A standalone USER frame here can later be detached
+        # and restored across maintenance replies, corrupting role order.
+        return [
+            *typed[:-1],
+            LLMPayload(
+                ROLE.USER,
+                [*list(typed[-1].content or []), *list(notice.content or [])],
+            ),
+        ]
     return [*typed, notice]
 
 
@@ -845,11 +927,6 @@ def install_subject_context_recovery_hook(
         if not dropped_groups:
             return []
         setattr(compression_hook, _RECOVERY_MARKER_ATTR, True)
-        if has_compression_required_payload(remaining_payloads):
-            # The durable control envelope is already the newest retained
-            # group.  Returning no replacement lets the kernel omit old groups
-            # for this attempt without inventing any semantic summary.
-            return []
         complete_tail = [
             payload
             for group in dropped_groups
@@ -860,6 +937,28 @@ def install_subject_context_recovery_hook(
             for payload in remaining_payloads
             if isinstance(payload, LLMPayload)
         ]
+        control_parts = [
+            part
+            for payload in complete_tail
+            if payload.role == ROLE.USER
+            for part in list(payload.content or [])
+            if is_compression_required_part(part)
+        ]
+        if len(control_parts) > 1:
+            raise LLMContextError(
+                "multiple compression maintenance controls are not allowed"
+            )
+        if has_compression_required_payload(remaining_payloads):
+            # The durable control envelope is already the newest retained
+            # group.  Returning no replacement lets the kernel omit old groups
+            # for this attempt without inventing any semantic summary.
+            return []
+        if control_parts:
+            # The existing control binds an earlier exact manifest.  If its
+            # USER group fell outside this attempt's model window, project the
+            # exact control part back into the attempt instead of generating a
+            # replacement whose manifest would not match retained state.
+            return [LLMPayload(ROLE.USER, [control_parts[0]])]
         notice = build_compression_required_payload(
             complete_tail,
             max_groups=max_groups,
@@ -1032,24 +1131,18 @@ def prepare_subject_checkpoint(
         raise ContextStewardshipError(
             "multiple compression maintenance controls are not allowed"
         )
+    semantic_payloads = strip_compression_maintenance_transport(typed)
     if control_indexes:
-        control_index = control_indexes[0]
-        maintenance_suffix = typed[control_index + 1 :]
-        if any(payload.role == ROLE.USER for payload in maintenance_suffix):
-            # New subject input is never maintenance transport.  Refuse to
-            # compact rather than silently dropping a real USER turn.
-            raise ContextStewardshipError(
-                "compression maintenance suffix contains a USER payload"
-            )
-        # Tool calls/results after the control frame are the transport used to
-        # author this checkpoint.  They remain complete in the authoritative
-        # conscious-activity trajectory, but retaining them after removing
-        # their USER control would create an invalid assistant chain and would
-        # make maintenance noise part of the newly compacted working context.
-        semantic_payloads = typed[:control_index]
+        # The control binds the manifest as it existed when maintenance began.
+        # USER input arriving later must survive the checkpoint, but it must
+        # not retroactively change which old groups that existing command was
+        # authorized to release.
+        manifest_payloads = strip_compression_required_payloads(
+            typed[: control_indexes[0] + 1]
+        )
     else:
-        semantic_payloads = strip_compression_required_payloads(typed)
-    manifest = build_group_manifest(semantic_payloads)
+        manifest_payloads = semantic_payloads
+    manifest = build_group_manifest(manifest_payloads)
     if manifest.source_manifest_sha256 != command.source_manifest_sha256:
         raise ContextStewardshipError("context group manifest is stale or mismatched")
     if manifest.current_checkpoint_revision != command.expected_revision:
@@ -1850,6 +1943,7 @@ __all__ = [
     "has_compression_required_payload",
     "install_fail_closed_context_hook",
     "install_subject_context_recovery_hook",
+    "is_compression_required_part",
     "is_compression_required_payload",
     "is_subject_window_overflow_error",
     "is_legacy_summary_payload",
@@ -1864,6 +1958,7 @@ __all__ = [
     "reset_transient_context_pressure_notices",
     "rolling_char_estimate",
     "split_pinned_and_tail",
+    "strip_compression_maintenance_transport",
     "strip_compression_required_payloads",
     "strip_context_pressure_notices",
     "unregister_live_context",

@@ -87,6 +87,7 @@ from .context_stewardship import (
     DEFAULT_CHECKPOINT_MAX_BYTES,
     DEFAULT_EMERGENCY_REFERENCE_MAX_BYTES,
     DEFAULT_PRESSURE_MAX_GROUPS,
+    ContextStewardshipError,
     LiveContextWindow,
     apply_pending_subject_checkpoint,
     archive_target_for_runtime,
@@ -95,12 +96,14 @@ from .context_stewardship import (
     ensure_compression_required_appended,
     has_compression_required_payload,
     install_subject_context_recovery_hook,
+    is_compression_required_part,
     is_compression_required_payload,
     is_subject_window_overflow_error,
     register_live_context,
     reset_pending_subject_checkpoint,
     reset_subject_context_recovery_marker,
     reset_transient_context_pressure_notices,
+    strip_compression_maintenance_transport,
     strip_context_pressure_notices,
     unregister_live_context,
 )
@@ -3122,6 +3125,15 @@ class LifeChatter(BaseChatter):
             payloads,
             strip_wake_envelopes=True,
         )
+        try:
+            # A queued checkpoint is process-local.  After restart, persisted
+            # compression control/call/result frames cannot complete that old
+            # transaction and are only orphaned transport.  Normalize the
+            # derived model view while leaving the stored snapshot and the
+            # authoritative conscious-activity trajectory untouched.
+            payloads = strip_compression_maintenance_transport(payloads)
+        except ContextStewardshipError as exc:
+            raise RuntimeError("RollingContextMaintenanceControlInvalid") from exc
         # Legacy snapshots migrate to v3 canonical digests on the next
         # successful save. Do not rewrite storage from a read path.
         return payloads
@@ -4171,62 +4183,28 @@ class LifeChatter(BaseChatter):
     def _append_suffix_context(response: Any, context_text: str) -> None:
         """把后缀提示词临时挂到最后一个 USER payload。"""
 
-        control_payloads = LifeChatter._detach_compression_required_payloads(
-            response
-        )
-        try:
-            LifeChatterContextAssembler.append_suffix_to_last_user(
-                response,
-                context_text,
-            )
-        finally:
-            LifeChatter._restore_compression_required_payloads(
-                response,
-                control_payloads,
-            )
-
-    @staticmethod
-    def _detach_compression_required_payloads(response: Any) -> list[LLMPayload]:
-        """Temporarily detach transport control from the conversation tail."""
-
+        suffix = LifeChatterContextAssembler.wrap_suffix_prompt(context_text)
+        if suffix is None:
+            return
         payloads = getattr(response, "payloads", None)
         if not isinstance(payloads, list):
-            return []
-        controls = [
-            payload
-            for payload in payloads
-            if isinstance(payload, LLMPayload)
-            and is_compression_required_payload(payload)
-        ]
-        if controls:
-            response.payloads = [
-                payload
-                for payload in payloads
-                if not (
-                    isinstance(payload, LLMPayload)
-                    and is_compression_required_payload(payload)
-                )
-            ]
-        return controls
-
-    @staticmethod
-    def _restore_compression_required_payloads(
-        response: Any,
-        controls: list[LLMPayload],
-    ) -> None:
-        payloads = getattr(response, "payloads", None)
-        if not controls or not isinstance(payloads, list):
             return
-        existing = {
-            str(payload.content[0].text)
-            for payload in payloads
-            if is_compression_required_payload(payload)
-        }
-        for payload in controls:
-            text = str(payload.content[0].text)
-            if text not in existing:
-                payloads.append(payload)
-                existing.add(text)
+        for payload in reversed(payloads):
+            if getattr(payload, "role", None) != ROLE.USER:
+                continue
+            content = list(getattr(payload, "content", None) or [])
+            control_indexes = [
+                index
+                for index, part in enumerate(content)
+                if is_compression_required_part(part)
+            ]
+            if control_indexes and len(control_indexes) == len(content):
+                # A standalone maintenance control is not the user's turn.
+                continue
+            insertion = control_indexes[0] if control_indexes else len(content)
+            content.insert(insertion, suffix)
+            payload.content = content
+            return
 
     def _append_context_pressure_notice(
         self,
@@ -4620,7 +4598,39 @@ class LifeChatter(BaseChatter):
     @staticmethod
     def _strip_suffix_context(response: Any) -> None:
         """从 payload 中移除发送前临时注入的后缀提示词。"""
-        LifeChatterContextAssembler.strip_suffix_from_user_payloads(response)
+        payloads = getattr(response, "payloads", None)
+        controls_by_payload: list[tuple[LLMPayload, list[tuple[int, Content]]]] = []
+        if isinstance(payloads, list):
+            for payload in payloads:
+                if getattr(payload, "role", None) != ROLE.USER:
+                    continue
+                content = list(getattr(payload, "content", None) or [])
+                controls = [
+                    (index, part)
+                    for index, part in enumerate(content)
+                    if is_compression_required_part(part)
+                ]
+                if not controls:
+                    continue
+                controls_by_payload.append((payload, controls))
+                payload.content = [
+                    part
+                    for part in content
+                    if not is_compression_required_part(part)
+                ]
+        try:
+            # The legacy stripper intentionally removes only trailing suffix
+            # Text parts.  A compression control can sit after that suffix in
+            # the same USER payload, so take out only the exact control parts
+            # while stripping.  The payload itself never leaves its causal
+            # position in the conversation.
+            LifeChatterContextAssembler.strip_suffix_from_user_payloads(response)
+        finally:
+            for payload, controls in controls_by_payload:
+                content = list(getattr(payload, "content", None) or [])
+                for index, part in controls:
+                    content.insert(min(index, len(content)), part)
+                payload.content = content
         strip_context_pressure_notices(response)
 
     @staticmethod
@@ -4684,19 +4694,32 @@ class LifeChatter(BaseChatter):
     ) -> None:
         """合并滚动提示词到最后一个 USER payload。"""
 
-        control_payloads = LifeChatter._detach_compression_required_payloads(
-            response
+        payloads = getattr(response, "payloads", None)
+        if isinstance(payloads, list) and payloads:
+            tail = payloads[-1]
+            if (
+                getattr(tail, "role", None) == ROLE.USER
+                and is_compression_required_payload(tail)
+            ):
+                if isinstance(formatted_content, list):
+                    new_content: list[Content] = list(formatted_content)
+                elif isinstance(formatted_content, Text):
+                    new_content = [formatted_content]
+                else:
+                    new_content = [Text(str(formatted_content))]
+                content = list(getattr(tail, "content", None) or [])
+                insertion = next(
+                    index
+                    for index, part in enumerate(content)
+                    if is_compression_required_part(part)
+                )
+                content[insertion:insertion] = new_content
+                tail.content = content
+                return
+        LifeChatterContextAssembler.upsert_rolling_user_payload(
+            response,
+            formatted_content,
         )
-        try:
-            LifeChatterContextAssembler.upsert_rolling_user_payload(
-                response,
-                formatted_content,
-            )
-        finally:
-            LifeChatter._restore_compression_required_payloads(
-                response,
-                control_payloads,
-            )
 
     async def _inject_delta_unreads_if_any(
         self,

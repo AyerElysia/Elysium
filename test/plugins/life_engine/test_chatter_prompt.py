@@ -26,10 +26,12 @@ from plugins.life_engine.core.context_compaction import (
     SUMMARY_OPEN,
 )
 from plugins.life_engine.core.context_stewardship import (
+    build_group_manifest,
     consume_subject_context_recovery_marker,
     ensure_compression_required_appended,
     has_compression_required_payload,
     install_fail_closed_context_hook,
+    is_compression_required_part,
     is_compression_required_payload,
     is_subject_window_overflow_error,
 )
@@ -263,6 +265,60 @@ def test_life_chatter_context_hook_never_turns_dropped_bodies_into_summary() -> 
     assert not LifeChatter._is_context_stewardship_call("action-life_send_text")
 
 
+def test_context_hook_reprojects_exact_existing_control_when_its_group_is_dropped() -> None:
+    manager = LLMContextManager()
+    request = SimpleNamespace(context_manager=manager)
+    LifeChatter._install_context_compression_hook(request)
+
+    before_control = [
+        LLMPayload(ROLE.SYSTEM, Text("system")),
+        LLMPayload(ROLE.USER, Text("older user")),
+        LLMPayload(ROLE.ASSISTANT, Text("older assistant")),
+        LLMPayload(ROLE.USER, Text("maintenance owner turn")),
+    ]
+    manifest = build_group_manifest(before_control)
+    with_control = ensure_compression_required_appended(
+        before_control,
+        trigger_chars=1,
+        force=True,
+    )
+    exact_control = next(
+        part.text
+        for payload in with_control
+        for part in payload.content
+        if is_compression_required_part(part)
+    )
+    retained = [
+        *with_control,
+        LLMPayload(ROLE.ASSISTANT, Text("__SUSPEND__")),
+        LLMPayload(ROLE.USER, Text("new user while maintenance is pending")),
+        LLMPayload(ROLE.ASSISTANT, Text("maintenance continues")),
+    ]
+
+    effective = manager.maybe_trim(
+        retained,
+        max_token_budget=4,
+        token_counter=lambda items: len(items),
+    )
+
+    effective_controls = [
+        part.text
+        for payload in effective
+        for part in payload.content
+        if is_compression_required_part(part)
+    ]
+    retained_controls = [
+        part.text
+        for payload in retained
+        for part in payload.content
+        if is_compression_required_part(part)
+    ]
+    assert effective_controls == [exact_control]
+    assert retained_controls == [exact_control]
+    assert manifest.source_manifest_sha256 in exact_control
+    manager.validate_for_send(effective)
+
+
 def test_subject_window_overflow_backoff_is_slower_than_busy_retry() -> None:
     from plugins.life_engine.core.chatter import (
         _SUBJECT_WINDOW_OVERFLOW_RETRY_SECONDS,
@@ -320,24 +376,187 @@ def test_compression_control_stays_separate_from_unreads_and_suffix() -> None:
             force=True,
         )
     )
-    control_text = response.payloads[-1].content[0].text
+    control_parts = [
+        part
+        for part in response.payloads[-1].content
+        if is_compression_required_part(part)
+    ]
+    assert len(control_parts) == 1
+    control_text = control_parts[0].text
 
     LifeChatter._upsert_pending_unread_payload(response, Text("追加的新消息"))
     LifeChatter._append_suffix_context(response, "本轮潜意识投影")
 
     assert is_compression_required_payload(response.payloads[-1])
-    assert response.payloads[-1].content[0].text == control_text
-    assert len(response.payloads[-1].content) == 1
+    control_parts = [
+        part
+        for part in response.payloads[-1].content
+        if is_compression_required_part(part)
+    ]
+    assert [part.text for part in control_parts] == [control_text]
+    assert is_compression_required_part(response.payloads[-1].content[-1])
     assert any(
         isinstance(part, Text) and "追加的新消息" in part.text
-        for payload in response.payloads[:-1]
+        for payload in response.payloads
         for part in payload.content
     )
     assert any(
         isinstance(part, Text) and "<transient_life_context>" in part.text
-        for payload in response.payloads[:-1]
+        for payload in response.payloads
         for part in payload.content
     )
+    LLMContextManager().validate_for_send(response.payloads)
+
+    LifeChatter._strip_suffix_context(response)
+
+    assert not any(
+        isinstance(part, Text) and "<transient_life_context>" in part.text
+        for payload in response.payloads
+        for part in payload.content
+    )
+    assert [
+        part.text
+        for payload in response.payloads
+        for part in payload.content
+        if is_compression_required_part(part)
+    ] == [control_text]
+    assert is_compression_required_part(response.payloads[-1].content[-1])
+    LLMContextManager().validate_for_send(response.payloads)
+    assert "<transient_life_context>" not in str(
+        LifeChatter._snapshot_data_for_payloads(response.payloads)
+    )
+
+
+def test_compression_control_in_history_is_never_relocated_across_assistants() -> None:
+    """Reproduce the 2026-09-04 production snapshot role-chain failure."""
+
+    manager = LLMContextManager()
+
+    class Response:
+        def __init__(self, payloads: list[LLMPayload]) -> None:
+            self.payloads = payloads
+
+        def add_payload(self, payload: LLMPayload) -> None:
+            self.payloads = manager.add_payload(self.payloads, payload)
+
+    closed_turn = [
+        LLMPayload(ROLE.USER, Text("更早的消息")),
+        LLMPayload(ROLE.ASSISTANT, Text("更早的回复")),
+        LLMPayload(ROLE.USER, Text("待处理消息")),
+        LLMPayload(
+            ROLE.ASSISTANT,
+            [ToolCall(id="sent", name="action-life_send_text", args={})],
+        ),
+        LLMPayload(
+            ROLE.TOOL_RESULT,
+            [ToolResult(value="sent", call_id="sent", name="action-life_send_text")],
+        ),
+        LLMPayload(ROLE.ASSISTANT, Text("__SUSPEND__")),
+    ]
+    with_control = ensure_compression_required_appended(
+        closed_turn,
+        trigger_chars=1,
+        force=True,
+    )
+    assert has_compression_required_payload(with_control)
+    control = with_control[-1]
+    payloads = [
+        *with_control,
+        LLMPayload(
+            ROLE.ASSISTANT,
+            [
+                ToolCall(
+                    id="checkpoint",
+                    name="action-author_self_continuity_checkpoint",
+                    args={},
+                )
+            ],
+        ),
+        LLMPayload(
+            ROLE.TOOL_RESULT,
+            [
+                ToolResult(
+                    value="queued",
+                    call_id="checkpoint",
+                    name="action-author_self_continuity_checkpoint",
+                )
+            ],
+        ),
+        LLMPayload(ROLE.ASSISTANT, Text("__SUSPEND__")),
+    ]
+    manager.validate_for_send(payloads)
+    response = Response(payloads)
+    original_control_index = response.payloads.index(control)
+
+    LifeChatter._upsert_pending_unread_payload(response, Text("重启后的新消息"))
+    LifeChatter._append_suffix_context(response, "本轮潜意识投影")
+
+    assert response.payloads.index(control) == original_control_index
+    assert response.payloads[-1].role == ROLE.USER
+    assert "重启后的新消息" in str(response.payloads[-1])
+    assert "<transient_life_context>" in str(response.payloads[-1])
+    manager.validate_for_send(response.payloads)
+
+
+def test_snapshot_restore_drops_orphaned_maintenance_and_keeps_new_users() -> None:
+    manager = LLMContextManager()
+    base = [
+        LLMPayload(ROLE.USER, Text("旧消息")),
+        LLMPayload(ROLE.ASSISTANT, Text("旧回复")),
+        LLMPayload(ROLE.USER, Text("当前消息")),
+        LLMPayload(ROLE.ASSISTANT, Text("当前回复")),
+    ]
+    with_control = ensure_compression_required_appended(
+        base,
+        trigger_chars=1,
+        force=True,
+    )
+    assert has_compression_required_payload(with_control)
+    payloads = [
+        *with_control,
+        LLMPayload(
+            ROLE.ASSISTANT,
+            [ToolCall(id="read", name="action-read_context_group", args={})],
+        ),
+        LLMPayload(
+            ROLE.TOOL_RESULT,
+            [ToolResult(value="private page", call_id="read", name="read_context_group")],
+        ),
+        LLMPayload(ROLE.ASSISTANT, Text("__SUSPEND__")),
+        LLMPayload(ROLE.USER, Text("维护期间到达的真实消息")),
+        LLMPayload(
+            ROLE.ASSISTANT,
+            [
+                ToolCall(
+                    id="checkpoint",
+                    name="action-author_self_continuity_checkpoint",
+                    args={},
+                )
+            ],
+        ),
+        LLMPayload(
+            ROLE.TOOL_RESULT,
+            [
+                ToolResult(
+                    value="queued",
+                    call_id="checkpoint",
+                    name="author_self_continuity_checkpoint",
+                )
+            ],
+        ),
+        LLMPayload(ROLE.ASSISTANT, Text("__SUSPEND__")),
+    ]
+    manager.validate_for_send(payloads)
+    raw = LifeChatter._snapshot_data_for_payloads(payloads)
+    chatter = LifeChatter.__new__(LifeChatter)
+
+    restored = chatter._deserialize_rolling_context_snapshot(raw)
+
+    assert not has_compression_required_payload(restored)
+    assert "维护期间到达的真实消息" in str(restored)
+    assert "private page" not in str(restored)
+    assert "author_self_continuity_checkpoint" not in str(restored)
+    manager.validate_for_send(restored)
 
 
 async def test_context_recovery_turn_blocks_visible_action_side_effect(
