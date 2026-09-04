@@ -16,6 +16,8 @@ const AUTHENTICATION_DEADLINE_MS = 5000;
 const RECONNECT_DELAY_MS = 1000;
 const MAX_TERMINAL_COMMAND_RECEIPTS = 1024;
 const MAX_OUTBOUND_MESSAGES = 256;
+const MAX_UNACKNOWLEDGED_EVENTS = 128;
+const MAX_EVENT_BYTES = 16 * 1024;
 
 function uuidIdentifier(prefix) {
   return `${prefix}_${randomBytes(16).toString("hex")}`;
@@ -117,6 +119,8 @@ export class BridgeBodyEndpoint {
     this.sendQueue = [];
     this.flushing = false;
     this.droppedObservations = 0;
+    this.eventSequence = 0;
+    this.eventJournal = [];
   }
 
   start() {
@@ -143,7 +147,7 @@ export class BridgeBodyEndpoint {
     }
   }
 
-  /** Publish one factual snapshot with a contiguous connection-local sequence. */
+  /** Publish one factual snapshot with a process-lifetime contiguous sequence. */
   broadcastObservation(facts) {
     if (!this.socket || !this.authenticated) {
       return;
@@ -160,6 +164,35 @@ export class BridgeBodyEndpoint {
     this.send({ type: "observation", observation });
   }
 
+  /** Publish one durable-until-acknowledged factual body event. */
+  publishEvent(kind, payload, occurredAt = isoNow()) {
+    if (typeof kind !== "string" || !kind.startsWith("minecraft.")) {
+      throw new Error("body event kind must use the minecraft namespace");
+    }
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      throw new Error("body event payload must be a JSON object");
+    }
+    if (this.eventJournal.length >= MAX_UNACKNOWLEDGED_EVENTS) {
+      throw new Error("unacknowledged Minecraft body event journal is full");
+    }
+    const event = {
+      event_id: uuidIdentifier("minecraft_event"),
+      instance_id: this.config.instanceId,
+      sequence: ++this.eventSequence,
+      occurred_at: String(occurredAt || isoNow()),
+      source: this.config.bodyType,
+      kind,
+      payload,
+    };
+    const bytes = Buffer.byteLength(JSON.stringify(event), "utf8");
+    if (bytes > MAX_EVENT_BYTES) {
+      throw new Error(`Minecraft body event exceeds ${MAX_EVENT_BYTES} bytes`);
+    }
+    this.eventJournal.push(event);
+    if (this.authenticated) this.send({ type: "event", event });
+    return event;
+  }
+
   currentSequence() {
     return this.sequence;
   }
@@ -169,6 +202,8 @@ export class BridgeBodyEndpoint {
     return {
       pending_messages: this.sendQueue.length,
       dropped_observations: this.droppedObservations,
+      unacknowledged_events: this.eventJournal.length,
+      event_sequence: this.eventSequence,
     };
   }
 
@@ -207,7 +242,6 @@ export class BridgeBodyEndpoint {
   onOpen(socket) {
     this.nonce = randomBytes(32).toString("base64url");
     this.authenticated = false;
-    this.sequence = 0;
     this.authTimer = setTimeout(() => {
       if (this.socket === socket && !this.authenticated) {
         socket.close(1000, "authentication deadline expired");
@@ -223,6 +257,7 @@ export class BridgeBodyEndpoint {
       nonce: this.nonce,
       instance_id: this.config.instanceId,
       capabilities,
+      task_kinds: [...(this.config.taskKinds ?? [])].sort(),
     });
   }
 
@@ -251,12 +286,15 @@ export class BridgeBodyEndpoint {
           await this.handleCommand(socket, message);
           break;
         case "interrupt":
-          this.handleInterrupt(message);
+          await this.handleInterrupt(message);
           break;
         case "release_all":
-          this.handlers.onReleaseAll?.(
+          await this.handlers.onReleaseAll?.(
             typeof message.reason === "string" ? message.reason : "release_all",
           );
+          break;
+        case "event_ack":
+          this.acknowledgeEvent(message);
           break;
         default:
           throw new Error(`unsupported message type: ${message.type}`);
@@ -290,6 +328,7 @@ export class BridgeBodyEndpoint {
       this.authTimer = null;
     }
     this.sendOn(socket, { type: "authentication", accepted: true });
+    this.flushEventJournal();
     this.handlers.onAuthenticated?.();
   }
 
@@ -362,10 +401,26 @@ export class BridgeBodyEndpoint {
     this.sendReceipt(terminal);
   }
 
-  handleInterrupt(message) {
+  async handleInterrupt(message) {
     const intentId = requiredText(message, "intent_id");
     const reason = requiredText(message, "reason");
-    this.handlers.onInterrupt?.(intentId, reason);
+    await this.handlers.onInterrupt?.(intentId, reason);
+  }
+
+  flushEventJournal() {
+    for (const event of this.eventJournal) {
+      this.send({ type: "event", event });
+    }
+  }
+
+  acknowledgeEvent(message) {
+    const eventId = requiredText(message, "event_id");
+    const head = this.eventJournal[0];
+    if (!head) throw new Error("event_ack has no pending body event");
+    if (head.event_id !== eventId) {
+      throw new Error("event_ack is not for the oldest pending body event");
+    }
+    this.eventJournal.shift();
   }
 
   sendReceipt(receiptEnvelopePayload) {

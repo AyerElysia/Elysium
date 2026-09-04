@@ -1,11 +1,8 @@
 """Compatibility surface for bounded Life Chatter context projections.
 
 The retired implementation copied clipped messages, tool arguments and tool
-results into a synthetic USER summary. That was not semantic compression and
-it let infrastructure impersonate the subject. Production callers now use
-subject-authored checkpoints from :mod:`context_stewardship`; this module keeps
-the old import surface while making every automatic fallback mechanical and
-content-neutral.
+results into a synthetic USER summary. Production snapshots now keep exact
+payloads; only a subject-authored checkpoint may release old groups.
 """
 
 from __future__ import annotations
@@ -23,7 +20,6 @@ from .context_stewardship import (
     build_conversation_groups,
     build_mechanical_omission_payloads,
     is_legacy_summary_payload,
-    mechanically_bound_payloads,
     split_pinned_and_tail,
 )
 
@@ -89,33 +85,19 @@ def hierarchical_compact_payloads(
     max_part_chars: int = DEFAULT_MAX_PART_CHARS,
     force: bool = False,
 ) -> ContextCompactionResult:
-    """Compatibility wrapper around mechanical hard-budget omission."""
+    """Compatibility wrapper: never omit groups. Subject checkpoints release them."""
 
-    del min_recent_groups, summary_max_chars, max_part_chars
+    del min_recent_groups, summary_max_chars, max_part_chars, target_chars
     before = estimate(payloads)
-    if not force and before <= max(1, int(trigger_chars)):
-        return ContextCompactionResult(
-            triggered=False,
-            before_chars=before,
-            after_chars=before,
-            payloads=list(payloads),
-        )
-    result, _ = mechanically_bound_payloads(
-        payloads,
-        estimate=estimate,
-        hard_budget=max(1, int(target_chars)),
-        reference_max_groups=DEFAULT_MAX_GROUPS,
-        reference_max_bytes=DEFAULT_EMERGENCY_REFERENCE_MAX_BYTES,
-    )
-    after = estimate(result.payloads)
+    triggered = bool(force or before > max(1, int(trigger_chars)))
     return ContextCompactionResult(
-        triggered=result.triggered,
+        triggered=triggered,
         before_chars=before,
-        after_chars=after,
-        payloads=result.payloads,
-        dropped_groups=result.released_groups,
+        after_chars=before,
+        payloads=list(payloads),
+        dropped_groups=0,
         summary_updated=False,
-        target_reached=after <= max(1, int(target_chars)),
+        target_reached=not triggered,
     )
 
 
@@ -131,23 +113,19 @@ def compact_payloads(
     min_recent_groups: int = DEFAULT_MIN_RECENT_GROUPS,
     summary_max_chars: int = DEFAULT_SUMMARY_MAX_CHARS,
 ) -> tuple[list[LLMPayload], int, int]:
-    """Bound a snapshot mechanically; semantic text is never generated."""
+    """Keep the exact snapshot. Mechanical omission is not a success path."""
 
     del (
+        char_budget,
+        max_groups,
         max_part_chars,
         trigger_chars,
         target_chars,
         min_recent_groups,
         summary_max_chars,
     )
-    result, _ = mechanically_bound_payloads(
-        payloads,
-        estimate=estimate,
-        hard_budget=max(1, int(char_budget)),
-        reference_max_groups=max(1, int(max_groups)),
-        reference_max_bytes=DEFAULT_EMERGENCY_REFERENCE_MAX_BYTES,
-    )
-    return result.payloads, estimate(payloads), estimate(result.payloads)
+    before = estimate(payloads)
+    return list(payloads), before, before
 
 
 __all__ = [

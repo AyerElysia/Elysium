@@ -13,12 +13,14 @@ import plugins.life_engine.minecraft.session as session_module
 from plugins.life_engine.minecraft.consciousness import (
     MinecraftConsciousnessDecision,
     MinecraftConsciousnessTurnContext,
+    MinecraftTaskDirective,
 )
 from plugins.life_engine.minecraft.embodiment_contracts import (
     ActionCommand,
     ActionReceipt,
     EmbodiedIntent,
     IntentConclusion,
+    MinecraftBodyEvent,
     PlannerTurn,
     WorldObservation,
     utc_now,
@@ -33,6 +35,11 @@ from plugins.life_engine.service.consciousness import ConsciousnessRegistry
 from plugins.life_engine.service.subconscious_context import RecentSubconsciousContext
 
 _DURABLE_SCENE_LOOP_TIMEOUT_SECONDS = 10.0
+_RECENT_CONTEXT_REQUEST = {
+    "group_limit": 3,
+    "max_bytes": 4096,
+    "include_tool_payloads": False,
+}
 
 
 def _body_only_config(**kwargs: Any) -> MCConfig:
@@ -79,7 +86,7 @@ def _minecraft_subject_snapshot() -> dict[str, Any]:
             {"path": "MEMORY.md", "sha256": "4" * 64},
         ],
         "budget": {
-            "max_bytes": 16384,
+            "max_bytes": 8192,
             "delivered_bytes": len(encoded),
         },
     }
@@ -115,12 +122,12 @@ class _Launcher:
 class _Bridge:
     """In-memory authenticated body endpoint used by session tests."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, task_kinds: tuple[str, ...] = ()) -> None:
         """Create a disconnected body with an empty observation sequence."""
 
         self.connected = False
         self.instance_id = "minecraft-test"
-        self.capabilities = (
+        capabilities = [
             "chat.send",
             "control.release_all",
             "modded.operation",
@@ -129,11 +136,22 @@ class _Bridge:
             "navigation.stop",
             "player.respawn",
             "world.mine",
-        )
-        self.hello_metadata = {"bridge_version": "0.2.1"}
+        ]
+        if task_kinds:
+            capabilities.extend(("task.cancel", "task.start", "task.status"))
+        self.capabilities = tuple(capabilities)
+        self.hello_metadata = {
+            "bridge_version": "0.2.1",
+            "task_kinds": list(task_kinds),
+        }
         self.sequence = 0
         self.interruptions: list[tuple[str, str]] = []
         self.closed = False
+        self.commands: list[ActionCommand] = []
+        self.command_events: asyncio.Queue[ActionCommand] = asyncio.Queue()
+        self._event_queue: asyncio.Queue[MinecraftBodyEvent] = asyncio.Queue()
+        self._pending_event: MinecraftBodyEvent | None = None
+        self.acknowledged_events: list[str] = []
 
     async def open(self) -> None:
         """Mark the endpoint connected."""
@@ -170,13 +188,23 @@ class _Bridge:
     async def act(self, command: ActionCommand) -> ActionReceipt:
         """Return a terminal dispatch receipt for one command."""
 
+        self.commands.append(command)
+        self.command_events.put_nowait(command)
+        facts = {"operation_dispatched": command.operation}
+        if command.operation == "task.start":
+            facts.update(
+                {
+                    "task_accepted": True,
+                    "task_id": str(command.parameters.get("task_id") or ""),
+                }
+            )
         return ActionReceipt(
             command_id=command.command_id,
             intent_id=command.intent_id,
             accepted=True,
             completed=True,
             interrupted=False,
-            facts={"operation_dispatched": command.operation},
+            facts=facts,
             observation_sequence=self.sequence,
         )
 
@@ -184,6 +212,26 @@ class _Bridge:
         """Record control release for the active intention."""
 
         self.interruptions.append((intent_id, reason))
+
+    async def next_event(self) -> MinecraftBodyEvent:
+        """Peek one queued pushed occurrence until the controller acknowledges it."""
+
+        if self._pending_event is None:
+            self._pending_event = await self._event_queue.get()
+        return self._pending_event
+
+    async def acknowledge_event(self, event_id: str) -> None:
+        """Acknowledge only the currently peeked event."""
+
+        if self._pending_event is None or self._pending_event.event_id != event_id:
+            raise AssertionError("event acknowledgement is not FIFO")
+        self.acknowledged_events.append(event_id)
+        self._pending_event = None
+
+    def push_event(self, event: MinecraftBodyEvent) -> None:
+        """Queue one factual event exactly as a body bridge would push it."""
+
+        self._event_queue.put_nowait(event)
 
 
 class _TitleScreenBridge(_Bridge):
@@ -316,6 +364,42 @@ class _AutonomousDecisionSource:
         )
 
 
+class _TaskDecisionSource:
+    """Start one body-owned task, then react to the next pushed occurrence."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def decide(
+        self,
+        context: MinecraftConsciousnessTurnContext,
+    ) -> MinecraftConsciousnessDecision:
+        self.calls += 1
+        if self.calls == 1:
+            return MinecraftConsciousnessDecision(
+                decision_id="minecraft_decision_" + "c" * 64,
+                kind="pursue",
+                turn_index=context.turn_index,
+                authored_at=utc_now(),
+                intention="跟着同伴一起探索",
+                speech="我来啦，我们一起走吧♪",
+                task=MinecraftTaskDirective(
+                    kind="follow_player",
+                    arguments={"player": "Traveler", "distance": 3},
+                ),
+                reason="我想陪同伴一起走",
+                reconsider_after_seconds=30.0,
+            )
+        return MinecraftConsciousnessDecision(
+            decision_id=f"minecraft_wait_{context.turn_index}",
+            kind="wait",
+            turn_index=context.turn_index,
+            authored_at=utc_now(),
+            reason="我收到了游戏里的新事件，先看清现在的情况",
+            reconsider_after_seconds=30.0,
+        )
+
+
 class _AsyncRegistry:
     """Expose the synchronous registry through awaitable Presence callbacks."""
 
@@ -361,7 +445,10 @@ async def _started_session(
         observations.append({"report": report, **kwargs})
         return {"assertion_id": f"assertion-{len(observations)}"}
 
-    async def get_recent_subconscious_context() -> RecentSubconsciousContext:
+    async def get_recent_subconscious_context(
+        **kwargs: Any,
+    ) -> RecentSubconsciousContext:
+        assert kwargs == _RECENT_CONTEXT_REQUEST
         return _recent_subconscious("shared-subconscious")
 
     bridge = _Bridge()
@@ -404,11 +491,11 @@ async def test_dedicated_consciousness_runs_observe_decide_act_without_chat(
             return await super().act(command)
 
     async def subject_projection(**kwargs: Any) -> dict[str, Any]:
-        assert kwargs == {"projection_kind": "minecraft", "max_bytes": 16384}
+        assert kwargs == {"projection_kind": "minecraft", "max_bytes": 8192}
         return _minecraft_subject_snapshot()
 
     async def recent_subconscious(**kwargs: Any) -> RecentSubconsciousContext:
-        assert kwargs == {"group_limit": 5, "max_bytes": 8192}
+        assert kwargs == _RECENT_CONTEXT_REQUEST
         return _recent_subconscious("刚才还在聊天，现在我来到 Minecraft。")
 
     async def record_decision(
@@ -493,6 +580,98 @@ async def test_dedicated_consciousness_runs_observe_decide_act_without_chat(
     assert all(
         len(json.dumps(item, ensure_ascii=False).encode("utf-8")) <= 8192
         for item in trace_receipts
+    )
+
+
+async def test_pushed_chat_is_durable_then_wakes_dedicated_task_consciousness(
+    tmp_path: Path,
+) -> None:
+    """Prove speech/task dispatch and chat return through the durable FIFO path."""
+
+    body_events: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    recorded_event = asyncio.Event()
+    decision_source = _TaskDecisionSource()
+    bridge = _Bridge(task_kinds=("follow_player",))
+
+    async def subject_projection(**_kwargs: Any) -> dict[str, Any]:
+        return _minecraft_subject_snapshot()
+
+    async def recent_subconscious(**_kwargs: Any) -> RecentSubconsciousContext:
+        return RecentSubconsciousContext.empty()
+
+    async def record_decision(
+        _decision: dict[str, Any],
+        _context_reference: dict[str, Any],
+    ) -> None:
+        return None
+
+    async def record_body_event(
+        event: dict[str, Any],
+        context: dict[str, Any],
+    ) -> None:
+        body_events.append((event, context))
+        recorded_event.set()
+
+    config = MCConfig(
+        mc_home=tmp_path,
+        bridge_ready_timeout_seconds=1,
+        consciousness_retry_base_seconds=0.01,
+        consciousness_retry_max_seconds=0.02,
+    )
+    session = MinecraftSession(
+        workspace=tmp_path,
+        mc_config=config,
+        consciousness_registry=ConsciousnessRegistry(),
+        get_recent_subconscious_context=recent_subconscious,
+        get_subject_context_projection_snapshot=subject_projection,
+        record_minecraft_consciousness_decision=record_decision,
+        record_minecraft_body_event=record_body_event,
+        consciousness_decision_source=decision_source,
+    )
+    session._launcher = _Launcher()
+
+    async def wait_for_bridge(_profile: Any) -> _Bridge:
+        return bridge
+
+    session._wait_for_bridge = wait_for_bridge
+    started = await session.start(goal="陪同伴玩", body_name="agent")
+    assert started["success"] is True, started
+    dispatched = [
+        await asyncio.wait_for(bridge.command_events.get(), timeout=3.0),
+        await asyncio.wait_for(bridge.command_events.get(), timeout=3.0),
+    ]
+    assert [item.operation for item in dispatched] == [
+        "chat.send",
+        "task.start",
+    ]
+    bridge.push_event(
+        MinecraftBodyEvent(
+            event_id="minecraft_event_chat_1",
+            instance_id=bridge.instance_id,
+            sequence=1,
+            occurred_at=utc_now(),
+            source="mineflayer-bot",
+            kind="minecraft.chat.received",
+            payload={"username": "Traveler", "message": "爱莉，跟我来"},
+        )
+    )
+    await asyncio.wait_for(recorded_event.wait(), timeout=1.0)
+    for _ in range(100):
+        if decision_source.calls >= 2 and bridge.acknowledged_events:
+            break
+        await asyncio.sleep(0.01)
+    stopped = await session.stop()
+
+    assert stopped["success"] is True
+    assert decision_source.calls >= 2
+    assert bridge.acknowledged_events == ["minecraft_event_chat_1"]
+    assert body_events[0][0]["payload"]["message"] == "爱莉，跟我来"
+    assert body_events[0][1]["instance_id"].startswith("minecraft_")
+    records = await session._trace.verify()
+    assert any(
+        item.kind == "body.event"
+        and item.payload.get("event_id") == "minecraft_event_chat_1"
+        for item in records
     )
 
 
@@ -717,7 +896,10 @@ async def test_session_awaits_async_recent_subconscious_context(
 
     calls: list[str] = []
 
-    async def get_recent_subconscious_context() -> RecentSubconsciousContext:
+    async def get_recent_subconscious_context(
+        **kwargs: Any,
+    ) -> RecentSubconsciousContext:
+        assert kwargs == _RECENT_CONTEXT_REQUEST
         calls.append("recent")
         return _recent_subconscious("async recent activity")
 
@@ -754,7 +936,10 @@ async def test_session_reports_recent_subconscious_failure(
 ) -> None:
     """A failed continuity read cannot be reported as intent success."""
 
-    async def get_recent_subconscious_context() -> RecentSubconsciousContext:
+    async def get_recent_subconscious_context(
+        **kwargs: Any,
+    ) -> RecentSubconsciousContext:
+        assert kwargs == _RECENT_CONTEXT_REQUEST
         raise RuntimeError("recent subconscious unavailable")
 
     bridge = _Bridge()
@@ -786,7 +971,8 @@ async def test_session_rejects_invalid_recent_subconscious_contract(
 ) -> None:
     """The session fails closed when a producer violates the typed contract."""
 
-    async def get_recent_subconscious_context() -> Any:
+    async def get_recent_subconscious_context(**kwargs: Any) -> Any:
+        assert kwargs == _RECENT_CONTEXT_REQUEST
         return SimpleNamespace(content="untyped context")
 
     bridge = _Bridge()
@@ -1047,7 +1233,10 @@ async def test_large_recent_context_cannot_recurse_through_world_receipts(
     base_content = "潜意识近期上下文" * 100_000
     contexts: list[RecentSubconsciousContext] = []
 
-    async def get_recent_subconscious_context() -> RecentSubconsciousContext:
+    async def get_recent_subconscious_context(
+        **kwargs: Any,
+    ) -> RecentSubconsciousContext:
+        assert kwargs == _RECENT_CONTEXT_REQUEST
         context = _recent_subconscious(base_content)
         contexts.append(context)
         return context

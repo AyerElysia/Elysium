@@ -7,6 +7,7 @@ from src.kernel.logger import get_logger
 
 from ..agents import register_builtin_agents
 from ..agents.mission_tool import MISSION_TOOLS
+from ..learning.learn_tool import LEARN_TOOLS
 from ..learning.tools import LEARNING_TOOLS
 from ..memory.boundary_tools import MEMORY_BOUNDARY_TOOLS
 from ..memory.continuity_tools import CONTINUITY_REVIEW_TOOLS
@@ -107,6 +108,7 @@ class LifeEnginePlugin(BasePlugin):
             *SKILL_TOOLS,
             *EVENT_GREP_TOOLS,
             *LEARNING_TOOLS,
+            *LEARN_TOOLS,
             *PROACTIVE_TOOLS,
             *MISSION_TOOLS,
         ]

@@ -408,8 +408,7 @@ class RuntimeCommitmentsProvider:
         self, todo_id: str, *, session: SessionRecord
     ) -> list[dict[str, Any]]:
         todo = await self.get_todo(todo_id, session=session)
-        events = [dict(item) for item in todo.get("progress_log", [])]
-        events.extend(dict(item) for item in todo.get("completion_log", []))
+        events = [dict(item) for item in todo.get("history", [])]
         return sorted(events, key=lambda item: str(item.get("at") or ""))
 
     async def _schedule_summary(self, record: Any) -> dict[str, Any]:
@@ -612,13 +611,6 @@ class RuntimeAbilitiesProvider:
             "required_scopes": ("memory:read",),
         },
         {
-            "ability_id": "surface.presentation",
-            "name": "Neko Surface",
-            "description": "连接受管展示面并使用版本化 Surface 协议。",
-            "module": "surface",
-            "required_scopes": ("surface:read", "surface:connect"),
-        },
-        {
             "ability_id": "world.observation",
             "name": "世界观察",
             "description": "查看来源保留的世界断言，或追加明确外部观察。",
@@ -650,96 +642,6 @@ class RuntimeAbilitiesProvider:
         raise KeyError(ability_id)
 
 
-class RuntimeSurfaceProvider:
-    @staticmethod
-    def _gateway() -> Any:
-        plugin = get_plugin_manager().get_plugin("neko_surface")
-        gateway = getattr(plugin, "gateway", None) if plugin is not None else None
-        if gateway is None:
-            raise RuntimeError("surface capability is unavailable")
-        return gateway
-
-    async def list_surfaces(self, *, session: SessionRecord) -> list[dict[str, Any]]:
-        del session
-        snapshot = await self._gateway().snapshot()
-        surface_ids = sorted(
-            {
-                str(item.get("surface_id") or "")
-                for item in snapshot.get("clients", [])
-                if item.get("surface_id")
-            }
-        )
-        if not surface_ids:
-            surface_ids = ["neko-default"]
-        return [
-            {
-                "surface_id": surface_id,
-                "protocol": "elysia.surface.v1",
-                "connected": any(
-                    item.get("surface_id") == surface_id
-                    for item in snapshot.get("clients", [])
-                ),
-                "owns_identity": False,
-            }
-            for surface_id in surface_ids
-        ]
-
-    async def status(
-        self, surface_id: str, *, session: SessionRecord
-    ) -> dict[str, Any]:
-        del session
-        snapshot = await self._gateway().snapshot()
-        clients = [
-            item
-            for item in snapshot.get("clients", [])
-            if item.get("surface_id") == surface_id
-        ]
-        return {
-            "surface_id": surface_id,
-            "protocol": "elysia.surface.v1",
-            "connected": bool(clients),
-            "connection_count": len(clients),
-            "owns_identity": False,
-        }
-
-    async def serve(self, websocket: Any, *, surface_id: str, grant: Any) -> None:
-        # Gateway 的 hello 仍校验 surface_id；统一 ticket 已替代旧静态 token。
-        await self._gateway().serve_authorized(
-            websocket,
-            expected_surface_id=surface_id,
-            input_enabled="surface:input" in grant.scopes,
-            actor_id=grant.actor_id,
-        )
-
-    async def connections(
-        self, surface_id: str, *, session: SessionRecord
-    ) -> list[dict[str, Any]]:
-        del session
-        return await self._gateway().connection_summaries(surface_id)
-
-    async def disconnect(
-        self,
-        surface_id: str,
-        connection_id: str,
-        *,
-        reason: str,
-        session: SessionRecord,
-    ) -> dict[str, Any]:
-        del session
-        changed = await self._gateway().disconnect_connection(
-            surface_id,
-            connection_id,
-            reason=reason,
-        )
-        if not changed:
-            raise KeyError(connection_id)
-        return {
-            "surface_id": surface_id,
-            "connection_id": connection_id,
-            "disconnected": True,
-        }
-
-
 def create_runtime_p312_providers() -> P312Providers:
     """创建只持有无状态 wrapper 的 P3-12 生产依赖。"""
 
@@ -750,7 +652,6 @@ def create_runtime_p312_providers() -> P312Providers:
         commitments=RuntimeCommitmentsProvider(),
         autonomy=RuntimeAutonomyProvider(),
         abilities=RuntimeAbilitiesProvider(),
-        surfaces=RuntimeSurfaceProvider(),
     )
 
 

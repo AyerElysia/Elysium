@@ -74,7 +74,6 @@ PLUGIN_CONFIGS: Mapping[str, str] = {
     "config/plugins/napcat_adapter/config.toml": (
         '[plugin]\nenabled = false\n\n[bot]\nqq_id = ""\nqq_nickname = ""\n'
     ),
-    "config/plugins/neko_surface/config.toml": "[plugin]\nenabled = false\n",
     "config/plugins/skill_manager/config.toml": (
         "[plugin]\nenabled = false\n\n[manager]\nallow_script_execution = false\n"
     ),

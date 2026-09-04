@@ -40,7 +40,7 @@ class MCConfig:
     extra_jvm_args: list[str] = field(default_factory=list)
     # 是否失焦时暂停渲染（False = 后台继续渲染）
     pause_on_lost_focus: bool = False
-    default_body: str = "agent"
+    default_body: str = "bot"
     agent_bridge_uri: str = "ws://host.docker.internal:8765/elysium"
     agent_bridge_listen_uri: str | None = "ws://127.0.0.1:18765/elysium"
     agent_token_file: Path = field(
@@ -78,15 +78,15 @@ class MCConfig:
     planner_task_name: str = "agent"
     consciousness_enabled: bool = True
     consciousness_task_name: str = "agent"
-    consciousness_subject_context_max_bytes: int = 16384
-    consciousness_observation_max_bytes: int = 16384
-    consciousness_subconscious_max_bytes: int = 8192
-    consciousness_subconscious_group_limit: int = 5
+    consciousness_subject_context_max_bytes: int = 8192
+    consciousness_observation_max_bytes: int = 8192
+    consciousness_subconscious_max_bytes: int = 4096
+    consciousness_subconscious_group_limit: int = 3
     consciousness_min_wait_seconds: float = 2.0
     consciousness_max_wait_seconds: float = 45.0
     consciousness_retry_base_seconds: float = 2.0
     consciousness_retry_max_seconds: float = 30.0
-    consciousness_recent_turn_limit: int = 6
+    consciousness_recent_turn_limit: int = 4
     consciousness_stop_timeout_seconds: float = 10.0
     max_session_minutes: int = 60
     bridge_ready_timeout_seconds: float = 240.0

@@ -35,6 +35,7 @@ from .metrics import LearningMetrics
 from .scheduler import LearningScheduler
 from .skill_store import SkillMaturity, SkillPattern, SkillStore
 from .skill_distiller import SkillDistiller
+from .learn_tool import LEARN_TOOLS, NucleusLearnTool
 from .tools import LEARNING_TOOLS
 
 __all__ = [
@@ -64,4 +65,6 @@ __all__ = [
     "SkillDistiller",
     # Tools
     "LEARNING_TOOLS",
+    "LEARN_TOOLS",
+    "NucleusLearnTool",
 ]

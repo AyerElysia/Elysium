@@ -21,6 +21,7 @@ MEMORY_CONTENT_DIRECTORIES = frozenset({"archive", "diaries", "dreams", "narrati
 ROOT_DOCUMENT_NAMES = frozenset(
     {
         "AyerElysia_preferences.txt",
+        "EXISTENCE.md",
         "MEMORY.md",
         "MEMORY_GUIDE.md",
         "SOUL.md",

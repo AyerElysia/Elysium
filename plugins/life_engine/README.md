@@ -176,7 +176,7 @@ Life Event
 
 生产只有一个 `ProactiveAuthority` 和两个模型入口：`nucleus_proactive_query` / `nucleus_proactive_command`。`AttentionThread` 与 `InitiativeSeed` 是同一权威内的两种记录，不是两套主动系统。前者保存主体明确选择的持续关注，后者保存未来行动可能性；两者共享 actor gate、occurrence 防重、backend generation、健康和关闭链。
 
-旧 `ThoughtStreamManager` 已删除，`streams.json` 只保留逐字节只读审计；旧 Attention/Initiative/Reachability/Outreach 与 Autonomy 模型工具实现也已删除。派生 rolling context 会净化历史旧调用，但不可变 trajectory 保持原样可追溯。生产链已从 `AutonomyIntent + target_stream_id + 周期调度` 迁移：活跃意识实例可以保存第一人称 InitiativeSeed，或只安排一次重新相遇。重新相遇只进入 Life Event，不等于必须行动。旧延迟续话和 `nucleus_tell_dfc` 最近流唤醒也已退出生产注册。
+旧 `ThoughtStreamManager` 已删除，`streams.json` 只保留逐字节只读审计；旧 Attention/Initiative/Reachability/Outreach、Autonomy、`action-think`、延迟续话和 `nucleus_tell_dfc` 的模型工具实现类也已删除。`nucleus_tell_dfc` 不在滚动退役名单、心跳 TOOL.md 清洗名单或 agent 黑名单里留占位。派生 rolling context 会净化仍登记的历史旧调用，但不可变 trajectory 保持原样可追溯。生产链已从 `AutonomyIntent + target_stream_id + 周期调度` 迁移：活跃意识实例可以保存第一人称 InitiativeSeed，或只安排一次重新相遇。重新相遇只进入 Life Event，不等于必须行动。
 
 真正外联时，当前意识分别选择 `audience_ref` 与 `surface_ref`。来源实例不绑定未来平台；跨平台同一人只接受显式 `canonical_person_key`，不使用昵称、内容或最近聊天推断。目标表达实例在真实上下文中重新决定表达或沉默，`life_send_text` 只发送到当前表面。`spoke` 不是由布尔成功或任意 64 位字符串推断：传输层必须先把规范化平台回执写入统一主动权威的不可变 delivery-proof 账本，再由同一 action/claim/message 的精确证明结算。主动 health 会从 Attention/Initiative 不可变事件重放 head，并检出缺失、孤立或篡改的投影。完整契约见 [`docs/architecture/主体主动性与外联.md`](../../docs/architecture/主体主动性与外联.md)。
 

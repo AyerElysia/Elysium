@@ -132,11 +132,6 @@ plugins/ayla_adapter/**/*.py[cod]
 plugins/emoji/**/__pycache__/
 plugins/emoji/**/*.py[cod]
 !plugins/tts_voice_plugin/
-
-!plugins/neko_surface/
-!plugins/neko_surface/**
-plugins/neko_surface/**/__pycache__/
-plugins/neko_surface/**/*.py[cod]
 !plugins/elysium_console/
 !plugins/elysium_console/**
 plugins/elysium_console/**/__pycache__/

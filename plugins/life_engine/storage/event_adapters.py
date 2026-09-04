@@ -574,6 +574,59 @@ class SQLLifeEventStore:
             )
         return [self._decode_event(row) for row in reversed(rows)]
 
+    async def scan_window(
+        self,
+        *,
+        after_position: int = 0,
+        before_position: int | None = None,
+        occurred_after: str | None = None,
+        occurred_before: str | None = None,
+        limit: int,
+        descending: bool = False,
+    ) -> list[LifeEvent]:
+        """Read a bounded ledger window without scanning the whole history."""
+
+        bounded = int(limit)
+        if bounded <= 0:
+            return []
+        after = max(0, int(after_position))
+        before: int | None
+        if before_position is None:
+            before = None
+        else:
+            before = max(0, int(before_position))
+            if before <= after:
+                return []
+        clauses = ["ingest_position > :after_position"]
+        parameters: dict[str, Any] = {
+            "after_position": after,
+            "limit": bounded,
+        }
+        if before is not None:
+            clauses.append("ingest_position < :before_position")
+            parameters["before_position"] = before
+        if occurred_after:
+            clauses.append("occurred_at >= :occurred_after")
+            parameters["occurred_after"] = self._bind_time(occurred_after)
+        if occurred_before:
+            clauses.append("occurred_at <= :occurred_before")
+            parameters["occurred_before"] = self._bind_time(occurred_before)
+        order = "DESC" if descending else "ASC"
+        statement = f"""SELECT ingest_position, occurrence_id, source_sequence,
+            recorded_at, payload_json FROM raw_life_events
+            WHERE {' AND '.join(clauses)}
+            ORDER BY ingest_position {order} LIMIT :limit"""
+        async with self.runtime.unit_of_work() as uow:
+            floor = await self._history_floor(uow.session)
+            if after < floor:
+                raise RawEventGapError(after, floor + 1)
+            rows = (
+                (await uow.session.execute(text(statement), parameters))
+                .mappings()
+                .all()
+            )
+        return [self._decode_event(row) for row in rows]
+
     async def occurrence_digest(self, occurrence_id: str) -> LifeEventDigest | None:
         """Read one occurrence's immutable migration identity and digest."""
 

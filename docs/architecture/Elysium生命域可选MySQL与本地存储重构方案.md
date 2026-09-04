@@ -63,6 +63,7 @@
 MySQL 的并发收益不能消除网络/TLS、连接池 checkout、服务端调度、InnoDB 锁与 COMMIT 确认等固定成本。因此现役实现把性能目标定义为“减少往返并保持权威合同”，而不是让 MySQL 在所有单次调用上等同 local：
 
 - 启动时，对同一进程已验证的 authority audit head 复用哈希链验证结果；audit head 变化才重新完整验证，不能把审计链永久缓存；
+- 本地 FileAuthorityRegistry 把 **cutover 锁** 与 **audit 锁** 分开：写事务只在整段 UoW 持有 cutover 共享锁，验链与 state 变更只短暂持有 audit 锁；在位者续租只走 audit 锁，不得等待正在进行的写 fence。墙钟租约过期后，只要 epoch/owner/fencing hash 仍是同一在位者，续租可以补续；validate/fenced 写路径仍拒绝过期租约。事件循环阻塞时由 registry 自有 keepalive 线程续租，不依赖 asyncio 定时器；
 - shared generation 加入路径把 generation 与 registry 状态合并读取，减少控制面的串行往返；
 - 启动 readiness 不等待昂贵的全组件 health sweep，但 generation、schema、不可变 trigger、bounded outbox flush、World catch-up 和必要恢复仍是硬门；
 - Router 在完整主体快照验证后，只用三份主体 head 的 `current_version_id/revision` 形成 content-free change marker；marker 不变时复用进程内派生投影，变化时重新读取一致快照并校验 exact-byte revision；

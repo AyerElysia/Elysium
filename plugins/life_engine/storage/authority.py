@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import secrets
+import threading
 from collections.abc import Callable
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
@@ -27,6 +29,7 @@ from src.kernel.storage.outbox_primitives import canonical_json, canonical_json_
 from .models import AuthorityToken, BackendGeneration, BackendKind, GenerationStatus
 
 T = TypeVar("T")
+logger = logging.getLogger("life_engine.storage.authority")
 
 
 class AuthorityError(RuntimeError):
@@ -150,37 +153,77 @@ class _VerifiedFileAuditHead:
 
 
 class FileAuthorityRegistry:
-    """Host-local authority registry guarded by platform advisory locks.
+    """Host-local authority registry guarded by two advisory locks.
 
-    A shared lock remains held for the full local durable write.  Cutover takes
-    an exclusive lock, so it cannot overtake a writer that already passed its
-    token check.  This is a complete single-host control plane; multi-host
-    deployments must use :class:`MySQLAuthorityRegistry` or another external
-    consensus service.
+    Cutover lock: writers hold shared mode for one durable unit of work;
+    activate/revoke take exclusive mode so a new epoch cannot overtake an
+    in-flight writer.  Audit lock: brief shared/exclusive section covering
+    hash-chain verify and state mutation only.  Incumbent lease renewal uses
+    the audit lock and must not wait for in-flight writer fences.  Multi-host
+    deployments must use :class:`MySQLAuthorityRegistry`.
     """
 
     def __init__(self, state_path: str | Path, *, registry_id: str = "life-domain") -> None:
         self.state_path = Path(state_path)
         self.lock_path = self.state_path.with_suffix(self.state_path.suffix + ".lock")
+        self.audit_lock_path = self.state_path.with_suffix(
+            self.state_path.suffix + ".audit.lock"
+        )
         self.audit_path = self.state_path.with_suffix(self.state_path.suffix + ".audit.jsonl")
         self.registry_id = registry_id.strip()
         if not self.registry_id:
             raise ValueError("authority registry_id must not be empty")
         self._verified_audit_head: _VerifiedFileAuditHead | None = None
+        self._keepalive_stop = threading.Event()
+        self._keepalive_guard = threading.Lock()
+        self._keepalive_thread: threading.Thread | None = None
+        self._keepalive_token: AuthorityToken | None = None
+        self._keepalive_lease_seconds = 0
+        self._keepalive_interval_seconds = 0.0
+
+    def _ensure_lock_files(self) -> None:
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        for path in (self.lock_path, self.audit_lock_path):
+            path.touch(exist_ok=True)
+
+    def _prepare_lock_path(self, path: Path, *, create: bool) -> None:
+        if create:
+            self._ensure_lock_files()
+            return
+        if not self.lock_path.exists() and not self.audit_lock_path.exists():
+            raise AuthorityError("authority registry has not been initialized")
+        self._ensure_lock_files()
+        if not path.exists():
+            raise AuthorityError("authority registry has not been initialized")
 
     @contextmanager
-    def _lock(self, *, exclusive: bool, create: bool) -> Any:
-        if create:
-            self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.lock_path.exists() and not create:
-            raise AuthorityError("authority registry has not been initialized")
+    def _lock_file_ctx(self, path: Path, *, exclusive: bool, create: bool) -> Any:
+        self._prepare_lock_path(path, create=create)
         mode = "a+b" if create else "rb"
-        with self.lock_path.open(mode) as handle:
+        with path.open(mode) as handle:
             _lock_file(handle, exclusive=exclusive)
             try:
                 yield
             finally:
                 _unlock_file(handle)
+
+    @contextmanager
+    def _lock(self, *, exclusive: bool, create: bool) -> Any:
+        """Acquire the cutover lock used to isolate epoch changes from writers."""
+
+        with self._lock_file_ctx(
+            self.lock_path, exclusive=exclusive, create=create
+        ):
+            yield
+
+    @contextmanager
+    def _audit_lock(self, *, exclusive: bool, create: bool) -> Any:
+        """Acquire the brief lock used for audit verify and state mutation."""
+
+        with self._lock_file_ctx(
+            self.audit_lock_path, exclusive=exclusive, create=create
+        ):
+            yield
 
     def _read_state_unlocked(self, *, allow_missing: bool) -> dict[str, Any]:
         if not self.state_path.exists():
@@ -413,6 +456,8 @@ class FileAuthorityRegistry:
         self,
         state: dict[str, Any],
         token: AuthorityToken,
+        *,
+        require_live_lease: bool = True,
     ) -> None:
         if token.registry_id != self.registry_id:
             raise StaleAuthorityToken("authority registry identity mismatch")
@@ -438,11 +483,11 @@ class FileAuthorityRegistry:
             raise StaleAuthorityToken("authority lease timestamp is invalid") from exc
         if lease_until.tzinfo is None:
             lease_until = lease_until.replace(tzinfo=UTC)
-        if lease_until <= _utc_now():
+        if require_live_lease and lease_until <= _utc_now():
             raise StaleAuthorityToken("authority token lease has expired")
 
     def _register_generation_sync(self, generation: BackendGeneration) -> None:
-        with self._lock(exclusive=True, create=True):
+        with self._audit_lock(exclusive=True, create=True):
             state = self._read_state_unlocked(allow_missing=True)
             self._verify_audit_unlocked(state)
             generations = dict(state["generations"])
@@ -477,7 +522,7 @@ class FileAuthorityRegistry:
         await asyncio.to_thread(self._register_generation_sync, generation)
 
     def _get_generation_sync(self, generation_id: str) -> BackendGeneration | None:
-        with self._lock(exclusive=False, create=False):
+        with self._audit_lock(exclusive=False, create=False):
             state = self._read_state_unlocked(allow_missing=False)
             self._verify_audit_unlocked(state)
             raw = dict(state["generations"]).get(generation_id)
@@ -505,64 +550,67 @@ class FileAuthorityRegistry:
         owner = owner_id.strip()
         if not owner:
             raise ValueError("authority owner_id must not be empty")
-        with self._lock(exclusive=True, create=True):
-            state = self._read_state_unlocked(allow_missing=True)
-            self._verify_audit_unlocked(state)
-            current_epoch = int(state.get("authority_epoch") or 0)
-            if current_epoch != int(expected_epoch):
-                raise AuthorityConflict(
-                    f"authority epoch conflict: expected {expected_epoch}, actual {current_epoch}"
+        with (
+            self._lock(exclusive=True, create=True),
+            self._audit_lock(exclusive=True, create=True),
+        ):
+                state = self._read_state_unlocked(allow_missing=True)
+                self._verify_audit_unlocked(state)
+                current_epoch = int(state.get("authority_epoch") or 0)
+                if current_epoch != int(expected_epoch):
+                    raise AuthorityConflict(
+                        f"authority epoch conflict: expected {expected_epoch}, actual {current_epoch}"
+                    )
+                raw = dict(state["generations"]).get(generation_id)
+                if raw is None:
+                    raise GenerationNotVerified(f"generation is not registered: {generation_id}")
+                generation = self._assert_generation_immutable_unlocked(
+                    state,
+                    generation_id,
                 )
-            raw = dict(state["generations"]).get(generation_id)
-            if raw is None:
-                raise GenerationNotVerified(f"generation is not registered: {generation_id}")
-            generation = self._assert_generation_immutable_unlocked(
-                state,
-                generation_id,
-            )
-            if generation.status != GenerationStatus.VERIFIED:
-                raise GenerationNotVerified(
-                    f"generation is not verified: {generation_id} ({generation.status.value})"
+                if generation.status != GenerationStatus.VERIFIED:
+                    raise GenerationNotVerified(
+                        f"generation is not verified: {generation_id} ({generation.status.value})"
+                    )
+                if state.get("active_generation") and not confirm_previous_writers_stopped:
+                    raise AuthorityConflict(
+                        "active authority exists; explicit writer isolation confirmation is required"
+                    )
+                next_epoch = current_epoch + 1
+                secret = secrets.token_urlsafe(32)
+                lease_until = _utc_now() + timedelta(seconds=int(lease_seconds))
+                state.update(
+                    {
+                        "active_backend": generation.backend.value,
+                        "active_generation": generation.generation_id,
+                        "authority_epoch": next_epoch,
+                        "fencing_token_hash": hashlib.sha256(secret.encode("utf-8")).hexdigest(),
+                        "owner_id": owner,
+                        "lease_until": _iso(lease_until),
+                        "updated_at": _iso(_utc_now()),
+                    }
                 )
-            if state.get("active_generation") and not confirm_previous_writers_stopped:
-                raise AuthorityConflict(
-                    "active authority exists; explicit writer isolation confirmation is required"
+                self._append_event_unlocked(
+                    state,
+                    event_type="generation_activated",
+                    payload={
+                        "backend": generation.backend.value,
+                        "generation_id": generation.generation_id,
+                        "authority_epoch": next_epoch,
+                        "owner_id": owner,
+                        "lease_until": _iso(lease_until),
+                    },
                 )
-            next_epoch = current_epoch + 1
-            secret = secrets.token_urlsafe(32)
-            lease_until = _utc_now() + timedelta(seconds=int(lease_seconds))
-            state.update(
-                {
-                    "active_backend": generation.backend.value,
-                    "active_generation": generation.generation_id,
-                    "authority_epoch": next_epoch,
-                    "fencing_token_hash": hashlib.sha256(secret.encode("utf-8")).hexdigest(),
-                    "owner_id": owner,
-                    "lease_until": _iso(lease_until),
-                    "updated_at": _iso(_utc_now()),
-                }
-            )
-            self._append_event_unlocked(
-                state,
-                event_type="generation_activated",
-                payload={
-                    "backend": generation.backend.value,
-                    "generation_id": generation.generation_id,
-                    "authority_epoch": next_epoch,
-                    "owner_id": owner,
-                    "lease_until": _iso(lease_until),
-                },
-            )
-            self._write_state_unlocked(state)
-            return AuthorityToken(
-                registry_id=self.registry_id,
-                backend=generation.backend,
-                generation_id=generation.generation_id,
-                authority_epoch=next_epoch,
-                owner_id=owner,
-                lease_until=_iso(lease_until),
-                fencing_token=secret,
-            )
+                self._write_state_unlocked(state)
+                return AuthorityToken(
+                    registry_id=self.registry_id,
+                    backend=generation.backend,
+                    generation_id=generation.generation_id,
+                    authority_epoch=next_epoch,
+                    owner_id=owner,
+                    lease_until=_iso(lease_until),
+                    fencing_token=secret,
+                )
 
     async def activate_generation(
         self,
@@ -585,10 +633,24 @@ class FileAuthorityRegistry:
     def _renew_sync(self, token: AuthorityToken, lease_seconds: int) -> AuthorityToken:
         if int(lease_seconds) <= 0:
             raise ValueError("authority lease_seconds must be positive")
-        with self._lock(exclusive=True, create=False):
+        with self._audit_lock(exclusive=True, create=False):
             state = self._read_state_unlocked(allow_missing=False)
             self._verify_audit_unlocked(state)
-            self._assert_token_unlocked(state, token)
+            self._assert_token_unlocked(state, token, require_live_lease=False)
+            try:
+                previous_lease = datetime.fromisoformat(
+                    str(state.get("lease_until") or "")
+                )
+            except ValueError:
+                previous_lease = None
+            else:
+                if previous_lease.tzinfo is None:
+                    previous_lease = previous_lease.replace(tzinfo=UTC)
+            if previous_lease is not None and previous_lease <= _utc_now():
+                logger.warning(
+                    "incumbent file authority lease had expired; renewing "
+                    "without waiting for writer fences"
+                )
             lease_until = _utc_now() + timedelta(seconds=int(lease_seconds))
             state["lease_until"] = _iso(lease_until)
             state["updated_at"] = _iso(_utc_now())
@@ -598,7 +660,7 @@ class FileAuthorityRegistry:
                 payload={**token.safe_dict(), "lease_until": _iso(lease_until)},
             )
             self._write_state_unlocked(state)
-            return AuthorityToken(
+            renewed = AuthorityToken(
                 registry_id=token.registry_id,
                 backend=token.backend,
                 generation_id=token.generation_id,
@@ -607,6 +669,8 @@ class FileAuthorityRegistry:
                 lease_until=_iso(lease_until),
                 fencing_token=token.fencing_token,
             )
+            self._keepalive_token = renewed
+            return renewed
 
     async def renew(
         self,
@@ -617,35 +681,39 @@ class FileAuthorityRegistry:
         return await asyncio.to_thread(self._renew_sync, token, lease_seconds)
 
     def _revoke_sync(self, token: AuthorityToken) -> int:
-        with self._lock(exclusive=True, create=False):
-            state = self._read_state_unlocked(allow_missing=False)
-            self._verify_audit_unlocked(state)
-            self._assert_token_unlocked(state, token)
-            next_epoch = int(state["authority_epoch"]) + 1
-            self._append_event_unlocked(
-                state,
-                event_type="authority_revoked",
-                payload={**token.safe_dict(), "next_epoch": next_epoch},
-            )
-            state.update(
-                {
-                    "active_backend": "",
-                    "active_generation": "",
-                    "authority_epoch": next_epoch,
-                    "fencing_token_hash": "",
-                    "owner_id": "",
-                    "lease_until": "",
-                    "updated_at": _iso(_utc_now()),
-                }
-            )
-            self._write_state_unlocked(state)
-            return next_epoch
+        with (
+            self._lock(exclusive=True, create=False),
+            self._audit_lock(exclusive=True, create=False),
+        ):
+                state = self._read_state_unlocked(allow_missing=False)
+                self._verify_audit_unlocked(state)
+                self._assert_token_unlocked(state, token)
+                next_epoch = int(state["authority_epoch"]) + 1
+                self._append_event_unlocked(
+                    state,
+                    event_type="authority_revoked",
+                    payload={**token.safe_dict(), "next_epoch": next_epoch},
+                )
+                state.update(
+                    {
+                        "active_backend": "",
+                        "active_generation": "",
+                        "authority_epoch": next_epoch,
+                        "fencing_token_hash": "",
+                        "owner_id": "",
+                        "lease_until": "",
+                        "updated_at": _iso(_utc_now()),
+                    }
+                )
+                self._write_state_unlocked(state)
+                return next_epoch
 
     async def revoke(self, token: AuthorityToken) -> int:
+        await asyncio.to_thread(self.stop_keepalive)
         return await asyncio.to_thread(self._revoke_sync, token)
 
     def _validate_sync(self, token: AuthorityToken) -> None:
-        with self._lock(exclusive=False, create=False):
+        with self._audit_lock(exclusive=False, create=False):
             state = self._read_state_unlocked(allow_missing=False)
             self._verify_audit_unlocked(state)
             self._assert_token_unlocked(state, token)
@@ -655,9 +723,10 @@ class FileAuthorityRegistry:
 
     def _run_fenced_sync(self, token: AuthorityToken, operation: Callable[[], T]) -> T:
         with self._lock(exclusive=False, create=False):
-            state = self._read_state_unlocked(allow_missing=False)
-            self._verify_audit_unlocked(state)
-            self._assert_token_unlocked(state, token)
+            with self._audit_lock(exclusive=False, create=False):
+                state = self._read_state_unlocked(allow_missing=False)
+                self._verify_audit_unlocked(state)
+                self._assert_token_unlocked(state, token)
             return operation()
 
     async def run_fenced(self, token: AuthorityToken, operation: Callable[[], T]) -> T:
@@ -666,15 +735,14 @@ class FileAuthorityRegistry:
         return await asyncio.to_thread(self._run_fenced_sync, token, operation)
 
     def _acquire_fence_sync(self, token: AuthorityToken) -> Any:
-        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.lock_path.exists():
-            raise AuthorityError("authority registry has not been initialized")
+        self._prepare_lock_path(self.lock_path, create=False)
         handle = self.lock_path.open("rb")
         try:
             _lock_file(handle, exclusive=False)
-            state = self._read_state_unlocked(allow_missing=False)
-            self._verify_audit_unlocked(state)
-            self._assert_token_unlocked(state, token)
+            with self._audit_lock(exclusive=False, create=False):
+                state = self._read_state_unlocked(allow_missing=False)
+                self._verify_audit_unlocked(state)
+                self._assert_token_unlocked(state, token)
             return handle
         except BaseException:
             _unlock_file(handle)
@@ -698,6 +766,66 @@ class FileAuthorityRegistry:
         finally:
             await asyncio.to_thread(self._release_fence_sync, handle)
 
+    def start_keepalive(
+        self,
+        token: AuthorityToken,
+        *,
+        lease_seconds: int,
+        interval_seconds: float,
+    ) -> None:
+        """Keep the incumbent file lease alive off the asyncio event loop."""
+
+        if int(lease_seconds) <= 0:
+            raise ValueError("authority lease_seconds must be positive")
+        interval = float(interval_seconds)
+        if interval <= 0:
+            return
+        with self._keepalive_guard:
+            self._keepalive_token = token
+            self._keepalive_lease_seconds = int(lease_seconds)
+            self._keepalive_interval_seconds = interval
+            if self._keepalive_thread is not None and self._keepalive_thread.is_alive():
+                return
+            self._keepalive_stop.clear()
+            thread = threading.Thread(
+                target=self._keepalive_loop,
+                name=f"file-authority-keepalive:{self.registry_id}",
+                daemon=True,
+            )
+            self._keepalive_thread = thread
+            thread.start()
+
+    def stop_keepalive(self) -> None:
+        """Stop the incumbent keepalive thread and wait for it to exit."""
+
+        self._keepalive_stop.set()
+        thread: threading.Thread | None
+        with self._keepalive_guard:
+            thread = self._keepalive_thread
+            self._keepalive_thread = None
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=5.0)
+
+    def _keepalive_loop(self) -> None:
+        interval = max(0.05, float(self._keepalive_interval_seconds))
+        while not self._keepalive_stop.wait(timeout=interval):
+            token = self._keepalive_token
+            lease_seconds = int(self._keepalive_lease_seconds)
+            if token is None or lease_seconds <= 0:
+                continue
+            try:
+                self._renew_sync(token, lease_seconds)
+            except StaleAuthorityToken:
+                logger.error(
+                    "file authority keepalive stopped after incumbent token was rejected"
+                )
+                return
+            except Exception:
+                logger.warning(
+                    "file authority keepalive renew failed; will retry",
+                    exc_info=True,
+                )
+
     def _health_sync(self) -> dict[str, Any]:
         if not self.state_path.exists():
             return {
@@ -705,7 +833,7 @@ class FileAuthorityRegistry:
                 "registry_id": self.registry_id,
                 "reason": "authority registry is not initialized",
             }
-        with self._lock(exclusive=False, create=False):
+        with self._audit_lock(exclusive=False, create=False):
             state = self._read_state_unlocked(allow_missing=False)
             audit_event_count = self._verify_audit_unlocked(state)
             lease_until = str(state.get("lease_until") or "")
@@ -722,6 +850,7 @@ class FileAuthorityRegistry:
                     state,
                     active_generation,
                 )
+            keepalive_thread = self._keepalive_thread
             return {
                 "status": "disabled" if not active else ("degraded" if expired else "healthy"),
                 "registry_id": self.registry_id,
@@ -734,6 +863,11 @@ class FileAuthorityRegistry:
                 "generation_count": len(dict(state.get("generations") or {})),
                 "audit_event_count": audit_event_count,
                 "audit_chain_valid": True,
+                "incumbent_keepalive": (
+                    "running"
+                    if keepalive_thread is not None and keepalive_thread.is_alive()
+                    else "stopped"
+                ),
                 "updated_at": str(state.get("updated_at") or ""),
             }
 

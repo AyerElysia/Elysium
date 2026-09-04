@@ -915,7 +915,12 @@ class LifeEngineDeepResearchTool(BaseTool):
 
 
 class NucleusWebTool(BaseTool):
-    """统一的网络操作工具（合并原 search/fetch/batch/research 四个工具）。"""
+    """程序内转发 search/fetch/batch/research。
+
+    不向 LLM 注册。``execute`` 使用 ``**kwargs``，公共 schema 生成器会丢掉
+    可变参数，模型因此只能看到 ``action``，无法传入 ``url`` / ``query``。
+    聊天、心跳和子代理必须调用 ``WEB_TOOLS`` 里的专用工具。
+    """
 
     tool_name: str = "nucleus_web"
     tool_description: str = (
@@ -951,5 +956,6 @@ class NucleusWebTool(BaseTool):
 
 
 WEB_TOOLS = [
-    NucleusWebTool,
+    LifeEngineWebSearchTool,
+    LifeEngineBrowserFetchTool,
 ]

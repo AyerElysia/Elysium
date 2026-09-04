@@ -1,7 +1,7 @@
 {
   "name": "life_engine",
   "version": "3.4.0",
-  "description": "生命中枢 - 独立于 DFC 的并行存在系统，具有统一事件流模型、文件搜索、TODO 系统、仿生记忆系统与 Tavily 网络能力",
+  "description": "生命中枢：统一事件流、文件搜索、TODO、仿生记忆与网络能力",
   "author": "Elysium",
   "dependencies": {
     "plugins": [],
@@ -40,6 +40,18 @@
     },
     {
       "component_type": "tool",
+      "component_name": "nucleus_apply_patch",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
+      "component_type": "tool",
+      "component_name": "nucleus_glob_file",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
+      "component_type": "tool",
       "component_name": "nucleus_list_files",
       "dependencies": [],
       "enabled": true
@@ -64,13 +76,7 @@
     },
     {
       "component_type": "tool",
-      "component_name": "nucleus_manage_todo",
-      "dependencies": [],
-      "enabled": true
-    },
-    {
-      "component_type": "tool",
-      "component_name": "nucleus_list_todos",
+      "component_name": "nucleus_todo",
       "dependencies": [],
       "enabled": true
     },
@@ -137,6 +143,12 @@
     {
       "component_type": "tool",
       "component_name": "nucleus_skill",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
+      "component_type": "tool",
+      "component_name": "nucleus_learn",
       "dependencies": [],
       "enabled": true
     },

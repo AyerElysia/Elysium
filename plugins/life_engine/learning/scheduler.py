@@ -1699,17 +1699,14 @@ class LearningScheduler:
             "documents": snapshots,
         }
 
-    async def get_subject_review_prompt(self) -> str:
-        """Render a bounded invitation; silence and no-change remain valid choices."""
-
-        if self._projector_quiesced:
-            return ""
-        snapshot = await self.get_subject_review_snapshot(mark_offered=False)
-        due = [item for item in snapshot["documents"] if item.get("due")]
+    def _subject_review_offer_material(
+        self,
+        snapshot: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        due = [item for item in snapshot.get("documents", []) if item.get("due")]
         if not due:
-            self._pending_subject_review_offer = None
-            return ""
-        offer_material = {
+            return None
+        return {
             "subject_revision": snapshot["subject_revision"],
             "documents": [
                 {
@@ -1724,6 +1721,71 @@ class LearningScheduler:
                 for item in due
             ],
         }
+
+    async def collect_subject_review_offer_facts(self) -> dict[str, Any] | None:
+        """Prepare due-document facts without writing cooldown or invitation poetry."""
+
+        if self._projector_quiesced:
+            self._pending_subject_review_offer = None
+            return None
+        snapshot = await self.get_subject_review_snapshot(mark_offered=False)
+        material = self._subject_review_offer_material(snapshot)
+        if material is None:
+            self._pending_subject_review_offer = None
+            return None
+        self._pending_subject_review_offer = {
+            "delivery_id": "",
+            "delivery_marker": "",
+            **material,
+        }
+        due = [item for item in snapshot["documents"] if item.get("due")]
+        return {
+            "subject_revision": snapshot["subject_revision"],
+            "due_count": len(due),
+            "documents": [
+                {
+                    "target_path": item["target_path"],
+                    "due_reasons": list(item.get("due_reasons") or []),
+                    "size_bytes": item.get("size_bytes"),
+                    "candidate_id": item.get("last_candidate_id"),
+                    "changed_at": item.get("changed_at"),
+                    "review_pressure_bytes": item.get("review_pressure_bytes"),
+                }
+                for item in due
+            ],
+        }
+
+    def bind_subject_review_offer_delivery(
+        self,
+        delivery_id: str,
+        delivery_marker: str,
+    ) -> None:
+        """Attach the opportunity-page delivery identity to the pending review."""
+
+        pending = self._pending_subject_review_offer
+        if not isinstance(pending, dict):
+            return
+        identity = str(delivery_id or "").strip()
+        marker = str(delivery_marker or "").strip()
+        if not identity or not marker:
+            return
+        pending["delivery_id"] = identity
+        pending["delivery_marker"] = marker
+
+    async def get_subject_review_prompt(self) -> str:
+        """Render a bounded invitation; silence and no-change remain valid choices."""
+
+        if self._projector_quiesced:
+            return ""
+        snapshot = await self.get_subject_review_snapshot(mark_offered=False)
+        due = [item for item in snapshot["documents"] if item.get("due")]
+        if not due:
+            self._pending_subject_review_offer = None
+            return ""
+        offer_material = self._subject_review_offer_material(snapshot)
+        if offer_material is None:
+            self._pending_subject_review_offer = None
+            return ""
         delivery_id = (
             "subject_review_offer_"
             + hashlib.sha256(
@@ -1781,8 +1843,8 @@ class LearningScheduler:
         lines.extend(
             [
                 "- 你可以保持原样、稍后再看，或安静结束；后台不能替你解释或改写。",
-                "- 复盘 SOUL.md 或 USER.md 时使用 `nucleus_review_subject_document`；"
-                "MEMORY.md 只使用统一的 `nucleus_memory_continuity_review` 会话。",
+                "- 复盘 SOUL.md 或 USER.md 时也可以用 `nucleus_learn`（操作说明在 learning skill）；"
+                "MEMORY.md 的结构化整理仍可用 `nucleus_memory_continuity_review`。普通改写可以直接用文件工具。",
             ]
         )
         if any(item["target_path"] == "MEMORY.md" for item in due):
@@ -1801,8 +1863,7 @@ class LearningScheduler:
             ):
                 lines.append(
                     "- 若这是统一会话上线前遗留的 MEMORY 通用候选，只能用 "
-                    "`nucleus_list_subject_candidates` 和 `nucleus_read_subject_candidate` "
-                    "作只读迁移审计；通用决定/接受入口会明确拒绝，不会自动转换或写入主体。"
+                    "`nucleus_learn` 按 learning skill 作只读迁移审计；通用决定/接受入口会明确拒绝，不会自动转换或写入主体。"
                     "新的 MEMORY 候选与决定只能重新从 `nucleus_memory_continuity_review` "
                     "开始，并完成精确全文投递证明。"
                 )
@@ -1812,16 +1873,15 @@ class LearningScheduler:
             for item in due
         ):
             lines.append(
-                "- 使用 `nucleus_list_subject_candidates` 和 "
-                "`nucleus_read_subject_candidate` 重新核对候选；只有另行调用 "
-                "`nucleus_decide_subject_candidate` 才会形成决定。"
+                "- 使用 `nucleus_learn` 按 learning skill 重新核对 SOUL/USER 候选；"
+                "只有另行作出 accepted/rejected/kept_open 决定才会形成决定。"
             )
         if snapshot["authority_status"] == "selected_ready" and any(
             item["target_path"] != "MEMORY.md" for item in due
         ):
             lines.append(
                 "- 若你为 SOUL.md 或 USER.md 形成了完整新版本，只能先提交候选，"
-                "再单独使用主体候选决定工具接受；不会自动合并或自动接受。"
+                "再单独用 `nucleus_learn` 按 learning skill 接受；不会自动合并或自动接受。"
             )
         elif snapshot["authority_status"] != "selected_ready":
             lines.append(

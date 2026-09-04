@@ -506,7 +506,8 @@ async def test_historical_memory_candidate_is_reoffered_as_audit_only(
     assert "只保留为迁移审计证据" in prompt
     assert "不能再被决定、接受或自动转换" in prompt
     assert "nucleus_memory_continuity_review" in prompt
-    assert "nucleus_read_subject_candidate" in prompt
+    assert "nucleus_learn" in prompt
+    assert "nucleus_read_subject_candidate" not in prompt
     assert "旧候选读/决定入口完成兼容处理" not in prompt
     assert "主体候选决定工具接受" not in prompt
     assert pending is not None

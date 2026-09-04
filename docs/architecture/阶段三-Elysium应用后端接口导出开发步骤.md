@@ -41,8 +41,8 @@
 本文不再按“全仓发现了什么”罗列候选接口，而按**是否能对应一个合理的前端页面或交互流程**决定是否纳入。只保留用户层或管理层可能使用的后端接口；没有可说明前端消费者、仅供内部模块互调、纯属未来泛化预留的能力不进入阶段三接口目录。
 
 1. **两层共用基础接口**：鉴权、bootstrap、capability、Life Event、命令状态、媒体、实时订阅、错误、幂等和断线恢复。
-2. **用户层接口**：面向日常使用者的聊天、图片／语音媒体、直播观看与互动、语音通话、狼人杀、Neko 展示面，以及被授权的个人历史和状态。
-3. **管理层接口**：面向汐汐持有的全能管理员身份，提供运行总览、平台连接、聊天与群管理、直播控制、通话监督、桌游裁判、媒体资产、命令追踪、事件审计、记忆／世界／意识观察、计划与后台任务状态及 Surface 管理。
+2. **用户层接口**：面向日常使用者的聊天、图片／语音媒体、直播观看与互动、语音通话、狼人杀，以及被授权的个人历史和状态。
+3. **管理层接口**：面向汐汐持有的全能管理员身份，提供运行总览、平台连接、聊天与群管理、直播控制、通话监督、桌游裁判、媒体资产、命令追踪、事件审计、记忆／世界／意识观察、计划与后台任务状态。
 
 纳入规则：
 
@@ -60,7 +60,6 @@
 | 用户层  | 直播间、互动区、字幕／舞台         | livestream、media、events                |
 | 用户层  | 实时语音通话页               | voice-calls、transcripts、tickets        |
 | 用户层  | 狼人杀大厅、房间、玩家私密操作、复盘    | tabletop、events                        |
-| 用户层  | Neko 展示与交互页           | surfaces、tickets、events                |
 | 管理层  | 系统总览、模块健康、同步与积压       | bootstrap、readiness、health、diagnostics |
 | 管理层  | 平台／Adapter 连接和权限诊断    | integrations、capabilities、audit        |
 | 管理层  | 消息、群组、成员、公告、申请管理      | chat administration                    |
@@ -166,9 +165,8 @@
 - `plugins/life_engine/service/world_projection.py`：世界观察页所需的来源、矛盾并存断言、change cursor、重建和健康。
 - 已加载插件 manifest 与各领域 capability：作为“爱莉当前可用能力”展示目录的数据源；不能原样导出内部工具清单或提供任意执行。
 - `plugins/life_engine/autonomy.py`：自主执行状态页所需的意向 occurrence、lease、结果和错误摘要。
-- `plugins/life_engine/tools/todo_tools.py`：承诺／TODO 页面所需的可见性、进度和复发状态。
+- `plugins/life_engine/tools/todo_tools.py`：TODO 板只读导出（`content` / `status` / `visibility` / `history`）。无优先级排序，管理层不能写入。
 - `plugins/life_engine/tools/schedule_tools.py`：定时计划页面所需的计划登记与技术状态。
-- `plugins/neko_surface/router.py`：Neko 展示页和管理页所需的 Surface 状态与认证 WebSocket。
 
 未发现可对应当前前端页面、且没有稳定领域 owner 的 STS2 泛化入口、任意终端／设备通道等不列入阶段三接口目录。以后若产品明确新增页面，再通过独立变更补充，不能以本阶段“预留”为由提前暴露内部接口。
 
@@ -1046,9 +1044,9 @@ register／terminate 继续由场景生命周期 owner 持有，不提供任意�
 
 | 方法   | 路径                                                       | 用途                           |
 | ---- | -------------------------------------------------------- | ---------------------------- |
-| GET  | `/api/v1/admin/commitments/todos`                        | 按 visibility、状态和时间查询 TODO    |
-| GET  | `/api/v1/admin/commitments/todos/{todo_id}`              | 详情、进度和安全摘要                   |
-| GET  | `/api/v1/admin/commitments/todos/{todo_id}/events`       | 状态变化历史                       |
+| GET  | `/api/v1/admin/commitments/todos`                        | 列出 TODO 板：id、content、status、visibility |
+| GET  | `/api/v1/admin/commitments/todos/{todo_id}`              | 单条详情 |
+| GET  | `/api/v1/admin/commitments/todos/{todo_id}/events`       | `history` 状态变化 |
 | GET  | `/api/v1/admin/commitments/schedules`                    | 计划、trigger、recurring 和下一运行时间 |
 | GET  | `/api/v1/admin/commitments/schedules/{record_id}`        | 技术状态、owner 和执行历史             |
 | POST | `/api/v1/admin/commitment-suggestions`                   | 向爱莉提交明确标注为外部建议的候选事项          |
@@ -1077,20 +1075,9 @@ register／terminate 继续由场景生命周期 owner 持有，不提供任意�
 
 不得原样返回工具 Python 路径、内部 tool schema、密钥需求或任意执行入口。能力目录用于展示和解释，不实现关键词匹配、自动技能触发或前端绕过主体选择直接调用工具。
 
-## 19. 用户层与管理层：Neko Surface
+## 19. 已退役：Neko Surface
 
-现有 `elysia.surface.v1` 已是认证 gateway。阶段三统一导出：
-
-| 方法   | 路径                                                                           | 层级与用途                        |
-| ---- | ---------------------------------------------------------------------------- | ---------------------------- |
-| GET  | `/api/v1/surfaces`                                                           | 用户层列出可用展示面；管理层查看全部授权 Surface |
-| GET  | `/api/v1/surfaces/{surface_id}/status`                                       | 连接、显示和最近回执状态                 |
-| POST | `/api/v1/surfaces/{surface_id}/tickets`                                      | 生成短时、单次、绑定资源的连接 ticket       |
-| WS   | `/api/v1/surfaces/{surface_id}/ws`                                           | 展示状态和受控输入                    |
-| GET  | `/api/v1/admin/surfaces/{surface_id}/connections`                            | 管理层查看在线连接和安全摘要               |
-| POST | `/api/v1/admin/surfaces/{surface_id}/connections/{connection_id}:disconnect` | 断开异常或未授权连接                   |
-
-Surface 是展示／输入端，不拥有独立人格或长期记忆。只读观察和发送输入使用不同 scope；状态、dispatch 和 delivery receipt 进入技术事件。保留旧 `/api/neko-surface` 兼容入口直到新入口真实验收。
+N.E.K.O 展示面插件、`elysia.surface.v1` gateway、`/api/neko-surface` 兼容入口与 `/api/v1/surfaces*` 已从生产代码删除。当前没有展示面通道；聊天、直播、通话与桌游不经由 Surface 协议。历史 Life Event 不受此删除改写。
 
 ## 20. 明确不导出的内部能力
 
@@ -1400,7 +1387,7 @@ Provider 边界必须如实保留：NapCat notice 已覆盖撤回、回应、戳
 2. 实现 world assertions／changes、外部 observation 和 projection rebuild。
 3. 实现 memory 只读投影与 projection rebuild，不提供主体语义写入口；全能管理员可读取正式导出的全部记忆视图。
 4. 实现 TODO／schedule／autonomy 状态、外部 commitment suggestion、计划 pause／resume 和 occurrence cancel。
-5. 统一 Neko Surface 用户连接与管理连接接口。
+5. Neko Surface 用户连接与管理连接接口已退役删除，不再导出。
 6. 实现安全能力目录；不原样导出 tool manifest，也不提供任意工具执行。
 
 验收门：每项均对应本文页面矩阵；没有主体语义写入口；Presence 不被误作信念；外部观察和建议只追加；普通用户无法读取 private TODO／motivation；全能管理员读取高敏数据有审计；没有 Minecraft、STS2、任意终端或未来设备接口混入。
@@ -1453,7 +1440,6 @@ Provider 边界必须如实保留：NapCat notice 已覆盖撤回、回应、戳
 - `plugins/livestream/runtime.py`／`ledger.py`：增加统一 facade 所需的稳定查询和发送弹幕 owner。
 - `plugins/voice_live/router.py`／`session.py`：接入统一 ticket／auth，保留二进制协议。
 - `plugins/werewolf_game/`：新增 projection、ledger 和 recovery，不从 API 层读取 raw state。
-- `plugins/neko_surface/router.py`：兼容统一 auth／ticket。
 - 各 Adapter：只补 capability 和必要 receipt，不把公共 Router 塞进 Adapter。
 - `docs/operations/deployment_and_usage.md`：同轮更新。
 
@@ -1611,8 +1597,8 @@ Provider 边界必须如实保留：NapCat notice 已覆盖撤回、回应、戳
 - 语音通话的建立、双向音频、转写、打断、恢复和结束有稳定合同。
 - 狼人杀房间、玩家视图、动作、历史和复盘有接口，隐藏信息测试通过。
 - 媒体上传、保存、授权下载和识别使用稳定 media id。
-- 用户层的聊天、直播、通话、狼人杀和 Neko 页面所需接口全部完成或被 capability 明确标记不可用。
-- 管理层的总览、会话／凭据、受控设置、同步／日志、集成观察与测试、聊天与群管理、直播控制、通话监督、桌游裁判、媒体资产、命令／作业追踪、审计、主体观察、计划和 Surface 页面所需接口全部完成。
+- 用户层的聊天、直播、通话、狼人杀页面所需接口全部完成或被 capability 明确标记不可用。
+- 管理层的总览、会话／凭据、受控设置、同步／日志、集成观察与测试、聊天与群管理、直播控制、通话监督、桌游裁判、媒体资产、命令／作业追踪、审计、主体观察和计划页面所需接口全部完成。
 - 每个导出接口都能对应本文页面矩阵；STS2、任意终端／设备、任意工具执行和其他无前端消费者的内部能力未混入公共合同。
 - OpenAPI、事件目录、权限矩阵、部署文档和验证报告已同步。
 - 远程服务不可用不影响 Elysium 本地存续。

@@ -17,6 +17,7 @@ from src.core.transport.wire import MessageEnvelope
 
 from .client import KookAPIClient
 from .config import KookAdapterConfig
+from .outbound_media import prepare_kook_image_asset, prepare_kook_voice_asset
 
 logger = get_logger("kook_adapter")
 
@@ -193,10 +194,23 @@ class KookSender:
             return
 
         if seg_type in ("image", "emoji"):
-            url = await self._client.resolve_and_upload(data_str, "image.png")
+            payload = await self._client.resolve_media_bytes(data_str)
+            named = prepare_kook_image_asset(payload)
+            url = await self._client.upload_asset(
+                named.body, named.filename, content_type=named.content_type
+            )
             await self._send_raw(channel_type, target_id, user_id, url, 2, quote)
         elif seg_type in ("voice", "voiceurl"):
-            url = await self._client.resolve_and_upload(data_str, "voice.mp3")
+            payload = await self._client.resolve_media_bytes(data_str)
+            named = prepare_kook_voice_asset(payload)
+            url = await self._client.upload_asset(
+                named.body, named.filename, content_type=named.content_type
+            )
+            logger.info(
+                "KOOK 语音资产已就绪: "
+                f"name={named.filename} bytes={len(named.body)} "
+                f"sha256={named.digest[:16]} source_bytes={len(payload)}"
+            )
             try:
                 await self._send_raw(channel_type, target_id, user_id, url, 8, quote)
             except Exception as exc:

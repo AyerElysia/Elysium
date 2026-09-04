@@ -16,7 +16,7 @@
         <div class="brand-mark" aria-hidden="true">E</div>
         <div>
           <strong>Elysium</strong>
-          <span>生命数据观测台</span>
+          <span>生命观测与具身控制</span>
         </div>
       </div>
       <nav id="primary-nav">
@@ -41,13 +41,16 @@
         <button class="nav-item" data-view="workspace">
           <span class="nav-index">07</span><span>文件空间</span>
         </button>
+        <button class="nav-item" data-view="minecraft">
+          <span class="nav-index">08</span><span>Minecraft 陪玩</span>
+        </button>
         <button class="nav-item" data-view="catalog">
-          <span class="nav-index">08</span><span>数据地图</span>
+          <span class="nav-index">09</span><span>数据地图</span>
         </button>
       </nav>
       <div class="sidebar-note">
         <span class="status-dot"></span>
-        <div><strong>只读观测</strong><small>不修改任何权威数据</small></div>
+        <div><strong>本机受控</strong><small>MC 操作必须由你主动点击</small></div>
       </div>
     </aside>
 
@@ -173,6 +176,37 @@
             <p class="view-description">区分权威证据、可重建投影、检索索引与文件作品。</p>
           </div>
           <div id="catalog-grid" class="catalog-grid"></div>
+        </section>
+
+        <section class="view" id="view-minecraft">
+          <div class="view-intro">
+            <div><p class="eyebrow">DEDICATED GAME CONSCIOUSNESS</p><h2>Minecraft 陪玩</h2></div>
+            <span id="minecraft-state-tag" class="tag">正在读取</span>
+          </div>
+          <p class="view-description">爱莉以独立玩家 ElysiaBot 进入你开放的世界；她拥有专属 MC 意识和自己的游戏节奏，游戏聊天会直接唤醒她，而不是等待核心心跳。</p>
+          <div id="minecraft-stats" class="stat-grid compact"></div>
+          <div class="two-column">
+            <article class="panel">
+              <div class="panel-heading"><h3>进入世界</h3><span class="tag">BodyGate</span></div>
+              <ol class="minecraft-steps">
+                <li>用 AyerElysia 进入要一起玩的世界。</li>
+                <li>选择“对局域网开放”，端口填写 <strong>25565</strong>。</li>
+                <li>先点“检查连接”，通过后再让爱莉加入。</li>
+              </ol>
+              <label class="field-label" for="minecraft-goal">这次想一起做什么（可留空）</label>
+              <input id="minecraft-goal" type="text" maxlength="500" placeholder="例如：和我一起探索、聊天，遇到危险先保护自己">
+              <div class="minecraft-actions">
+                <button id="minecraft-preflight" class="button button-secondary" type="button">检查连接</button>
+                <button id="minecraft-start" class="button" type="button">让爱莉加入</button>
+                <button id="minecraft-stop" class="button button-danger" type="button">让爱莉离开</button>
+              </div>
+            </article>
+            <article class="panel">
+              <div class="panel-heading"><h3>当前链路</h3><span class="tag">Evidence</span></div>
+              <div id="minecraft-detail" class="stack-list"></div>
+              <pre id="minecraft-result" class="document-content muted-content">尚未执行操作。</pre>
+            </article>
+          </div>
         </section>
 
         <div id="loading" class="loading-overlay" aria-live="polite">

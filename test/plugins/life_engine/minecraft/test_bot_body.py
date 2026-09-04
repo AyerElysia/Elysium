@@ -48,6 +48,9 @@ class _ServerWorldBridge:
             "navigation.goto",
             "navigation.stop",
             "player.respawn",
+            "task.cancel",
+            "task.start",
+            "task.status",
             "world.mine",
         )
         self.hello_metadata = {"bridge_version": "0.2.1"}
@@ -120,12 +123,14 @@ class _BotLauncher:
         self,
         *,
         dependencies_installed: bool = True,
+        server_available: bool = True,
         fail_stop: bool = False,
     ) -> None:
         """Create a fake launcher with configurable dependency facts."""
 
         self.directory = Path("/fake/minecraft_bot")
         self.dependencies_installed = dependencies_installed
+        self.server_available = server_available
         self.fail_stop = fail_stop
         self.starts: list[dict[str, Any]] = []
         self.stops = 0
@@ -145,6 +150,16 @@ class _BotLauncher:
             "lockfile_exists": True,
             "dependencies_installed": self.dependencies_installed,
             "missing_modules": () if self.dependencies_installed else ("mineflayer",),
+        }
+
+    async def check_server(self, _host: str, port: int) -> dict[str, Any]:
+        """Return an isolated shared-world reachability fact."""
+
+        return {
+            "available": self.server_available,
+            "host": "172.20.0.1",
+            "port": port,
+            "error": None if self.server_available else "ConnectionRefusedError",
         }
 
     async def start(self, **kwargs: Any) -> dict[str, Any]:
@@ -202,6 +217,9 @@ def test_bot_profile_contract() -> None:
             "navigation.goto",
             "navigation.stop",
             "player.respawn",
+            "task.cancel",
+            "task.start",
+            "task.status",
             "world.mine",
         }
     )
@@ -357,6 +375,20 @@ async def test_bot_preflight_reports_missing_dependencies(tmp_path: Path) -> Non
     result = await session.preflight(body_name="bot")
     assert result["ready_to_start"] is False
     assert any("npm ci" in blocker for blocker in result["blockers"])
+
+
+async def test_bot_preflight_reports_closed_shared_world_port(tmp_path: Path) -> None:
+    """The user sees the exact LAN action before a bot process is launched."""
+
+    launcher = _BotLauncher(server_available=False)
+    session = _session(tmp_path, launcher, _ServerWorldBridge())
+
+    result = await session.preflight(body_name="bot")
+
+    assert result["ready_to_start"] is False
+    assert result["server"]["available"] is False
+    assert any("open it to LAN on port 25565" in item for item in result["blockers"])
+    assert launcher.starts == []
 
 
 async def test_bot_start_and_stop_own_the_process(tmp_path: Path) -> None:

@@ -139,7 +139,7 @@ backend_generation = "<NEW_VERIFIED_LOCAL_GENERATION_ID>"
 schema_version = 3
 ```
 
-用户手工启动后必须核验：active backend/generation、owner PID 与进程一致；同一 owner/epoch 上 lease 和 authority audit head 至少推进一次；Life Event、Learning event、Subject、Presence/World 与 Proactive 都绑定同一 runtime；主体文档 head 与工作区投影逐字节一致。任何一项失败都不得删除源、覆盖旧 generation 或接受主体候选来制造全绿。
+用户手工启动后必须核验：active backend/generation、owner PID 与进程一致；同一 owner/epoch 上 lease 和 authority audit head 至少推进一次；file authority health 含 `incumbent_keepalive=running`；Life Event、Learning event、Subject、Presence/World 与 Proactive 都绑定同一 runtime；主体文档 head 与工作区投影逐字节一致。本地 file authority 的 cutover 锁只隔离 epoch 切换，续租不得等待正在进行的写 fence。任何一项失败都不得删除源、覆盖旧 generation 或接受主体候选来制造全绿。
 
 ### 6.1 Memory 隔离合同验证
 

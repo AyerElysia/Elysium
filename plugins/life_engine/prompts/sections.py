@@ -11,7 +11,11 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
+import json
+import re
 
 from src.app.plugin_system.api import log_api
 
@@ -88,156 +92,192 @@ class CuriositySection(HeartbeatSectionProvider):
         return body
 
 
-class AttentionOpportunitySection(HeartbeatSectionProvider):
-    """Present open thought and curiosity evidence once, without choosing an action."""
+class OpportunitySection(HeartbeatSectionProvider):
+    """One heartbeat opportunity page: continuity clues plus infrastructure invitations."""
 
-    section_id = "attention_opportunity"
-
-    def enabled(self, ctx: SectionContext) -> bool:
-        if getattr(ctx.service, "_proactive_authority", None) is not None:
-            return True
-        curiosity_cfg = getattr(ctx.config, "curiosity", None)
-        curiosity_enabled = curiosity_cfg is None or (
-            bool(getattr(curiosity_cfg, "enabled", True))
-            and bool(getattr(curiosity_cfg, "inject_to_heartbeat", True))
-        )
-        return curiosity_enabled
+    section_id = "opportunity_page"
 
     async def render(self, ctx: SectionContext) -> str | None:
-        service = ctx.service
-        blocks: list[str] = []
-
-        attention_available = getattr(service, "_proactive_authority", None) is not None
-        if attention_available:
-            from ..attention_threads import AttentionThreadPageQuery
-
-            try:
-                page = await service.page_attention_threads(
-                    AttentionThreadPageQuery(
-                        statuses=("open", "paused"),
-                        limit=16,
-                        max_bytes=16 * 1024,
-                        projection_kind="heartbeat_attention_opportunity",
-                        focus_instance_id="chat_global",
-                    )
-                )
-            except Exception as exc:  # noqa: BLE001 - health reports exact failure
-                logger.debug(
-                    "canonical attention projection unavailable: "
-                    f"{type(exc).__name__}"
-                )
-            else:
-                if page.items:
-                    blocks.append(f"#### 主体持续关注线索\n{page.content}")
-        curiosity_cfg = getattr(ctx.config, "curiosity", None)
-        curiosity_enabled = curiosity_cfg is None or (
-            bool(getattr(curiosity_cfg, "enabled", True))
-            and bool(getattr(curiosity_cfg, "inject_to_heartbeat", True))
-        )
-        if curiosity_enabled:
-            try:
-                body = await service._get_curiosity_engine().format_for_prompt(
-                    max_chars=1200
-                )
-            except Exception:  # noqa: BLE001
-                body = ""
-            if body:
-                blocks.append(body)
-
-        if not blocks:
+        bus = getattr(ctx.service, "_opportunity_bus", None)
+        if bus is None:
             return None
-
-        lines = [
-            "### 注意机会（attention_opportunity）",
-            "",
-            "以下只是当前可见的未闭合线索投影，不是任务、命令或行动请求。",
-            "它不替你决定创建、推进、记录、搁置或关闭任何线索；是否回应、如何回应都由你自己决定。",
-            "",
-            "\n\n".join(blocks),
-            "",
-            "保持原样或安静结束本轮同样是完整决定。",
-        ]
-        return "\n".join(lines)
+        page = await bus.collect_and_render(config=ctx.config)
+        if page is None:
+            return None
+        return page.text
 
 
-class RiverReflectionSection(HeartbeatSectionProvider):
-    """回望长河：到期时把未沉淀的转折点摆给她，由她决定是否讲述。
+_DIARY_DATE_PREFIX = re.compile(r"^(\d{4}-\d{2}-\d{2})")
 
-    沉淀必须经过她的语言——本段落只呈现素材与邀请，绝不替她总结；
-    低频（min_interval_hours）+ 邀请冷却（invite_cooldown_hours），
-    回望是想起，不是作业。
+
+def build_handwritten_diary_inventory(
+    diaries_root: Path,
+    *,
+    today: str,
+    limit_dates: int = 16,
+) -> str | None:
+    """List top-level dated handwritten diaries, excluding witness projections.
+
+    This is a workspace census, not an importance ranking or a writing prompt.
     """
+    if not diaries_root.is_dir():
+        return None
 
-    section_id = "river_reflection"
+    dated: dict[str, list[Path]] = {}
+    for entry in diaries_root.iterdir():
+        if not entry.is_file() or entry.suffix.lower() != ".md":
+            continue
+        match = _DIARY_DATE_PREFIX.match(entry.name)
+        if match is None:
+            continue
+        dated.setdefault(match.group(1), []).append(entry)
+    if not dated:
+        return None
 
-    def enabled(self, ctx: SectionContext) -> bool:
-        narrative_cfg = getattr(ctx.config, "narrative", None)
-        if (
-            narrative_cfg is None
-            or getattr(ctx.service, "_workspace_dir", None) is None
-        ):
-            return False
-        return bool(getattr(narrative_cfg, "enabled", True)) and bool(
-            getattr(narrative_cfg, "inject_to_heartbeat", True)
+    total = sum(len(paths) for paths in dated.values())
+    chronological = sorted(dated)
+    recent_dates = list(reversed(chronological))[: max(1, int(limit_dates))]
+    lines = [
+        "### 手写日记目录（工作区事实，非见证回望）",
+        "",
+        f"`diaries/` 根目录共有 {total} 篇带日期的手写 Markdown，不含 `diaries/witness/` 见证投影。",
+        f"最早一篇日期 {chronological[0]}。下面是最近 {len(recent_dates)} 个有日记的日期，从新到旧。",
+        "",
+        "这是文件清单，不是任务，不是重要性排序，也不催你写。若要打开某篇，用 `nucleus_read_file`。",
+        "",
+    ]
+    for day in recent_dates:
+        files = sorted(dated[day], key=lambda path: path.name)
+        primary = diaries_root / f"{day}.md"
+        if not primary.is_file():
+            primary = files[0]
+        modified = datetime.fromtimestamp(
+            primary.stat().st_mtime, tz=timezone.utc
+        ).astimezone().isoformat(timespec="minutes")
+        extra = f" 等{len(files)}篇" if len(files) > 1 else ""
+        marker = "（今天）" if day == today else ""
+        lines.append(
+            f"- {day}{marker}  {len(files)}篇  `{primary.name}`{extra}  {modified}"
         )
+    return "\n".join(lines)
+
+
+class RecentHandwrittenDiariesSection(HeartbeatSectionProvider):
+    """Deterministic census of recent handwritten diary files."""
+
+    section_id = "recent_handwritten_diaries"
 
     async def render(self, ctx: SectionContext) -> str | None:
-        from datetime import datetime, timezone
-
-        from ..narrative.store import _parse_iso
-
-        cfg = ctx.config.narrative
-        store = ctx.service.narrative_store()
-        state = await store.load_state()
-        now = datetime.now(timezone.utc).astimezone()
-
-        last_consolidated = _parse_iso(state.get("last_consolidated_at", ""))
-        if last_consolidated is not None:
-            elapsed_hours = (now - last_consolidated).total_seconds() / 3600.0
-            if elapsed_hours < float(cfg.min_interval_hours):
-                return None
-
-        last_invited = _parse_iso(state.get("last_invited_at", ""))
-        if last_invited is not None:
-            since_invite = (now - last_invited).total_seconds() / 3600.0
-            if since_invite < float(cfg.invite_cooldown_hours):
-                return None
-
-        pending = store.pending_moments(
-            await ctx.service.life_trace_store().recent(limit=500),
-            state,
-        )
-        if len(pending) < int(cfg.min_moments):
+        workspace_fn = getattr(ctx.service, "_workspace_dir", None)
+        if workspace_fn is None:
             return None
+        try:
+            diaries_root = workspace_fn() / "diaries"
+        except Exception:  # noqa: BLE001
+            return None
+        return build_handwritten_diary_inventory(
+            diaries_root, today=str(ctx.today_str or "")
+        )
 
-        await store.mark_invited(now=now)
 
-        shown = pending[-int(cfg.max_moments_shown):]
-        lines = [
-            "### 回望长河",
+_FILE_CARE_STATE = "runtime/file_care_state.json"
+_FILE_CARE_COOLDOWN_HOURS = 168.0
+_FILE_CARE_MIN_TOP_LEVEL = 60
+_FILE_CARE_MIN_DAY_FRAGMENTS = 6
+
+
+def inspect_handwritten_diary_clutter(
+    diaries_root: Path,
+    *,
+    min_top_level: int = _FILE_CARE_MIN_TOP_LEVEL,
+    min_day_fragments: int = _FILE_CARE_MIN_DAY_FRAGMENTS,
+) -> dict[str, Any] | None:
+    """Return a census when top-level handwritten diaries look crowded.
+
+    Does not recommend a filing scheme. Witness projections are ignored.
+    """
+    if not diaries_root.is_dir():
+        return None
+    dated: dict[str, list[str]] = {}
+    for entry in diaries_root.iterdir():
+        if not entry.is_file() or entry.suffix.lower() != ".md":
+            continue
+        match = _DIARY_DATE_PREFIX.match(entry.name)
+        if match is None:
+            continue
+        dated.setdefault(match.group(1), []).append(entry.name)
+    if not dated:
+        return None
+    total = sum(len(names) for names in dated.values())
+    busiest_day, busiest_names = max(
+        dated.items(), key=lambda item: (len(item[1]), item[0])
+    )
+    if total < min_top_level and len(busiest_names) < min_day_fragments:
+        return None
+    return {
+        "total": total,
+        "days": len(dated),
+        "earliest": min(dated),
+        "latest": max(dated),
+        "busiest_day": busiest_day,
+        "busiest_count": len(busiest_names),
+    }
+
+
+def build_file_care_invitation(census: dict[str, Any]) -> str:
+    """Invitation copy: facts only, no filing command."""
+    return "\n".join(
+        [
+            "### 文件收拾机会（不是任务）",
             "",
-            f"自上次沉淀以来，你的长河里多了 {len(pending)} 条留痕：",
+            f"`diaries/` 根目录现在摊着 {census['total']} 篇带日期的手写日记，覆盖 {census['days']} 天"
+            f"（{census['earliest']} → {census['latest']}）。"
+            f"最挤的一天是 {census['busiest_day']}，当天有 {census['busiest_count']} 个文件。",
             "",
+            "`diaries/witness/` 是记忆见证的回望投影，不是你的手写本，不要去整理那棵树。",
+            "",
+            "这不是命令，也不是重要性评分。旧文件不能搬、不能删——记忆账本把路径当成历史身份。"
+            "若你觉得乱，可以给以后的新文字建子目录（`nucleus_mkdir`），或写一篇目录方便自己找；"
+            "继续摊在根目录也同样完整。查找时可用 `max_depth=1` 或 `exclude_glob=diaries/witness`。",
+            "",
+            "现在不想收拾，跳过就好。",
         ]
-        for record in shown:
-            label = record.summary or record.path or record.operation
-            lines.append(f"- {record.timestamp[:16]} [{record.kind}] {label}")
-        if len(pending) > len(shown):
-            lines.append(f"- ……以及更早的 {len(pending) - len(shown)} 条")
-        last_entry = await store.last_entry()
-        if last_entry is not None and last_entry.text:
-            snippet = last_entry.text[:80]
-            lines.extend(["", f"上次你写道：「{snippet}」"])
-        lines.extend([
-            "",
-            "如果你愿意回望这段日子，可以用 `nucleus_write_narrative` "
-            "写下它对你意味着什么——"
-            "用你自己的话，长短不限。"
-            "如果你觉得没什么值得说的，传 nothing_to_say=true "
-            "也同样是一次完整的回望。"
-            "现在不想回望，跳过也很好。",
-        ])
-        return "\n".join(lines)
+    )
+
+
+def _file_care_state_path(workspace: Path) -> Path:
+    return workspace / _FILE_CARE_STATE
+
+
+def _read_file_care_invited_at(workspace: Path) -> datetime | None:
+    path = _file_care_state_path(workspace)
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        raw = str(payload.get("last_invited_at") or "").strip()
+        if not raw:
+            return None
+        parsed = datetime.fromisoformat(raw)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _write_file_care_invited_at(workspace: Path, when: datetime) -> None:
+    path = _file_care_state_path(workspace)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {"last_invited_at": when.isoformat()},
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 class SelfKnowledgeSection(HeartbeatSectionProvider):
@@ -291,27 +331,6 @@ class LearningProgressSection(HeartbeatSectionProvider):
         return progress or None
 
 
-class SubjectReviewOpportunitySection(HeartbeatSectionProvider):
-    """Low-frequency invitation to revisit authority documents, never a task."""
-
-    section_id = "subject_review_opportunity"
-
-    def enabled(self, ctx: SectionContext) -> bool:
-        learning_cfg = getattr(ctx.config, "learning", None)
-        return bool(
-            learning_cfg is not None
-            and getattr(learning_cfg, "enabled", True)
-            and getattr(learning_cfg, "subject_review_enabled", True)
-        )
-
-    async def render(self, ctx: SectionContext) -> str | None:
-        scheduler = getattr(ctx.service, "_learning_scheduler", None)
-        if scheduler is None:
-            return None
-        prompt = await scheduler.get_subject_review_prompt()
-        return prompt or None
-
-
 class SkillCatalogSection(HeartbeatSectionProvider):
     """程序性学习账本；由当前意识决定是否采用其中的做法。
 
@@ -348,11 +367,68 @@ class SkillCatalogSection(HeartbeatSectionProvider):
         return f"### 程序性学习账本（可质疑，非主体权威）\n{catalog}"
 
 
+class TodoBoardSection(HeartbeatSectionProvider):
+    """Compact durable TODO board. State, not an invitation or ranking."""
+
+    section_id = "todo_board"
+
+    async def render(self, ctx: SectionContext) -> str | None:
+        from ..tools.todo_tools import TodoStorage, format_todo_board
+
+        workspace_fn = getattr(ctx.service, "_workspace_dir", None)
+        if not callable(workspace_fn):
+            return None
+        try:
+            storage = TodoStorage(workspace_fn())
+            todos = storage.load()
+        except Exception:  # noqa: BLE001
+            return None
+        return format_todo_board(todos)
+
+
+class HeartbeatCapabilityCatalogSection(HeartbeatSectionProvider):
+    """Names capabilities without repeating ROLE.TOOL schemas."""
+
+    section_id = "capability_catalog"
+    _MAX_BYTES = 1024
+
+    async def render(self, ctx: SectionContext) -> str | None:
+        text = "\n".join(
+            [
+                "### 能力目录（不是任务）",
+                "",
+                "本窗口可调用的工具以 ROLE.TOOL 为准，这里不重复参数表。",
+                "机会页邀请栏只给到期事实。动手说明书要么是 skill，要么是已常驻工具。",
+                "学习：`nucleus_learn action=help` 读 `skills/learning/SKILL.md`。",
+                "MEMORY：文件工具可改；结构化整理可用 continuity_review。长河：`nucleus_write_narrative`。",
+                "文件收拾：`nucleus_read_file` / `nucleus_edit_file` / `nucleus_apply_patch` / `nucleus_mkdir`。",
+                "日记旧路径勿搬删；SOUL/USER/MEMORY/EXISTENCE 与日记同类。",
+                "忽略、不调用、安静结束都完整，不等于拒绝；到期不会自动打开 skill 正文。",
+                "未注入本拍但仍存在的能力在聊天或其他意识窗口：",
+                "`nucleus_bash`、`nucleus_view_screen`、`nucleus_run_agent`、联网、",
+                "`platform_action`、`conversation_evidence`、`nucleus_trace`、",
+                "`nucleus_relations`、`nucleus_memory_stats`、表情收藏。",
+                "没出现在本轮 schema ≠ 主体不想用。",
+            ]
+        )
+        encoded = text.encode("utf-8")
+        if len(encoded) <= self._MAX_BYTES:
+            return text
+        clipped = encoded[: self._MAX_BYTES]
+        while clipped:
+            try:
+                return clipped.decode("utf-8")
+            except UnicodeDecodeError:
+                clipped = clipped[:-1]
+        return None
+
+
 DEFAULT_HEARTBEAT_SECTIONS: list[HeartbeatSectionProvider] = [
-    AttentionOpportunitySection(),
-    RiverReflectionSection(),
+    RecentHandwrittenDiariesSection(),
+    TodoBoardSection(),
+    OpportunitySection(),
+    HeartbeatCapabilityCatalogSection(),
     SelfKnowledgeSection(),
     SkillCatalogSection(),
     LearningProgressSection(),
-    SubjectReviewOpportunitySection(),
 ]

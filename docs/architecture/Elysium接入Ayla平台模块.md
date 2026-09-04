@@ -163,7 +163,6 @@ class AylaAdapter(BaseAdapter):
 _KNOWN_ADAPTER_PLUGINS = {
     "feishu_adapter": "feishu",
     "napcat_adapter": "qq",
-    "neko_surface": "neko",
     "ayla_adapter": "ayla",   # 新增
 }
 ```
@@ -362,7 +361,7 @@ Ayla `_handle_envelope`（`elysia_bridge/services.py`）先按 `envelope.stream_
 
 ## 9. 相关文档
 
-- [平台适配器.md](./平台适配器.md) — QQ/飞书/Kook/N.E.K.O 适配器权威文档（Ayla 为第四个通道）
+- [平台适配器.md](./平台适配器.md) — QQ/飞书/Kook 适配器权威文档（Ayla 为第四个通道）
 - [阶段三 - Elysium 应用后端接口导出开发步骤](./阶段三-Elysium应用后端接口导出开发步骤.md) — inject / SSE / 命令 / scope 契约
 - Ayla 侧 `Ayla/backend/apps/elysia_bridge/` — M4-4 爱莉桥接（入站 inject + SSE 出站投影）
 - Ayla 侧 `Ayla/docs/plans/阶段四-M4-4爱莉桥接开发步骤.md` — M4-4 开发步骤与验收清单

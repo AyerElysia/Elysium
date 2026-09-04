@@ -12,7 +12,6 @@
 | Message Timeline `/message_timeline/` | 独立时间线 | 同源 embedded | 原生 dashboard | Stage 3 | 生命事件语义、分页、时间轴状态、旧 URL 兼容 |
 | LLM Inspector | 独立诊断工具 | link/diagnostic | 受控 embedded diagnostic | Stage 3 | Owner-only、脱敏、无 prompt/secret 外泄 |
 | Minecraft | Bridge + 多条控制链路 | 原生入口 + readiness；细节页暂保留 | 原生具身体験中心 | Stage 3 | 仿生/Agent 双路径、意图归属、OBS、服务器、安全停机 |
-| N.E.K.O 兼容层 | 后端兼容能力 | 不直接成为用户页面 | API/适配器能力 | 持续 | 不泄漏实现细节、不反向绑死 Console |
 | Werewolf / Art Studio 等后续插件 | 可能动态出现 | contribution 驱动 link/native | 按体验复杂度选择 | Stage 4+ | 安装即出现、移除即降级、无需改 Shell 导航 |
 
 ## 迁移约束

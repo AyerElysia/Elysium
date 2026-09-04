@@ -13,7 +13,7 @@
 //   ELYSIUM_BOT_ENTITY_RADIUS_BLOCKS    sensor radius, default 32
 
 import { BridgeBodyEndpoint } from "./protocol.js";
-import { MineflayerBody } from "./body.js";
+import { MINECRAFT_TASK_KINDS, MineflayerBody } from "./body.js";
 
 const log = (line) => {
   process.stderr.write(`[elysium-minecraft-bot] ${line}\n`);
@@ -79,6 +79,9 @@ const operations = [
   "navigation.stop",
   "observation.wait",
   "player.respawn",
+  "task.cancel",
+  "task.start",
+  "task.status",
   "world.mine",
 ];
 
@@ -90,6 +93,7 @@ const endpoint = new BridgeBodyEndpoint(
     bodyType: "mineflayer-bot",
     minecraftVersion,
     capabilities: operations,
+    taskKinds: MINECRAFT_TASK_KINDS,
   },
   {
     onAuthenticated: () => {
@@ -103,6 +107,10 @@ const endpoint = new BridgeBodyEndpoint(
   },
   log,
 );
+
+body.onEvent = (kind, payload, occurredAt) => {
+  endpoint.publishEvent(kind, payload, occurredAt);
+};
 
 function collectFacts() {
   return {
@@ -145,7 +153,7 @@ async function shutdown(signal) {
     observationTimer = null;
   }
   try {
-    body.releaseAll("process stopping");
+    await body.releaseAll("process stopping");
   } catch (error) {
     log(`control release failed: ${error.message}`);
   }

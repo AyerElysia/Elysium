@@ -165,7 +165,7 @@ ELYSIUM_MYSQL_URL='mysql+asyncmy://...' \
 
 ## 8. 可选能力
 
-基础配置默认关闭 Ayla、飞书、KOOK、NapCat adapter、Emoji、N.E.K.O Surface、SkillManager、系统命令、遗留 TTS、Voice Live、直播和狼人杀。AstrBot sister bridge 的 manifest 也默认关闭，因而在导入入口前就会从加载计划排除。SkillManager 即使显式启用，脚本执行仍默认关闭。启用任一能力前：
+基础配置默认关闭 Ayla、飞书、KOOK、NapCat adapter、Emoji、SkillManager、系统命令、遗留 TTS、Voice Live、直播和狼人杀。AstrBot sister bridge 的 manifest 也默认关闭，因而在导入入口前就会从加载计划排除。SkillManager 即使显式启用，脚本执行仍默认关闭。启用任一能力前：
 
 1. 阅读该组件架构与运行手册；
 2. 配置最小权限凭据与固定端口；

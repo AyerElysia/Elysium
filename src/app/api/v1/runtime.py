@@ -83,7 +83,6 @@ WS_RESOURCE_SCOPES = {
     "/api/v1/voice-calls/{call_id}/observe": "voice_call:observe",
     "/api/v1/tabletop/rooms/{room_id}/ws": "tabletop:play",
     "/api/v1/admin/voice-calls/{call_id}/observe": "voice_call:admin",
-    "/api/v1/surfaces/{surface_id}/ws": "surface:connect",
 }
 
 

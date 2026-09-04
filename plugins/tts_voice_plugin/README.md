@@ -7,7 +7,6 @@ Elysium 的本地消息 TTS Service。它用一个稳定接口支持 **IndexTTS2
 - `tts_voice_plugin:service:tts`：把已经决定表达的文本合成为 Base64 音频；
 - `tts_voice_action`：供非 Life Chatter 场景显式发送语音；
 - Life Chatter 使用自己的 `life_send_voice`，通过 Service 签名调用本插件，不再经过 `tasks.tts`；
-- N.E.K.O Surface 的普通文字回复由 Surface Adapter 自动调用 Service，显式 Action 会被抑制，避免重复播放；
 - 直播与 Voice Live 有独立运行合同，不由本 Action 冒充。
 
 TTS 不决定正文、情绪或是否表达。Service 缺失、合成失败、返回空音频或平台发送失败时必须如实失败，禁止换成陌生默认音色。

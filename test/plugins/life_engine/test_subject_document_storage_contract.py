@@ -628,6 +628,52 @@ async def test_generic_subject_writer_rejects_root_authority_without_mutation(
         assert (workspace / root_name).read_bytes() == original
 
 
+async def test_file_tool_commit_advances_root_subject_head(tmp_path: Path) -> None:
+    async with _local_store(tmp_path) as (_, store, _):
+        data_root = tmp_path / "data"
+        workspace = data_root / "life_engine_workspace"
+        logical_path = "life_engine_workspace/SOUL.md"
+        original = b"original soul\n"
+        await store.append_version(
+            _command(
+                path=logical_path,
+                occurrence="subject:original:SOUL.md",
+                content=original,
+            )
+        )
+        service = _selected_local_service(store, data_root=data_root)
+        projected = await service._subject_workspace_projector.project_one(
+            logical_path=logical_path
+        )
+        assert projected.status == "projected", projected.detail
+
+        result = await service.commit_subject_authority_file_write(
+            workspace_relative_path="SOUL.md",
+            content_bytes=b"rewritten soul\n",
+            occurrence_id="file-tool:soul-rewrite",
+            recorded_by="life_engine",
+            recorded_source="nucleus_file_tool",
+            encoding="utf-8",
+            reason="subject owns standing prompts",
+        )
+
+        assert result is not None
+        assert result["status"] == "committed"
+        head = await store.get_head(logical_path)
+        assert head is not None
+        current = await store.get_version(head.current_version_id)
+        assert current.content_bytes == b"rewritten soul\n"
+        with pytest.raises(RootSubjectAuthorityRequired):
+            await service.write_selected_subject_document(
+                workspace_relative_path="SOUL.md",
+                content_bytes=b"should still be rejected",
+                occurrence_id="subject:generic-root-write",
+                recorded_by="generic-writer",
+                recorded_source="generic-writer",
+                encoding="utf-8",
+            )
+
+
 async def test_root_authority_guard_precedes_disabled_local_fallback() -> None:
     service = object.__new__(LifeEngineService)
     service._selectable_storage_enabled = False

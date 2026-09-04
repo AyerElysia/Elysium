@@ -157,6 +157,7 @@ _global_config: dict[str, Any] = {
     # 空字符串表示不写文件镜像；由 initialize_logger_system(log_dir=...) 设置。
     "log_dir": "",
     "log_level": "DEBUG",  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+    "console_log_level": "DEBUG",
     "enable_db": False,
     "db_path": "data/logs.db",
     "retention_debug_days": 3,
@@ -178,6 +179,23 @@ _LOG_LEVEL_PRIORITY = {
     "ERROR": 3,
     "CRITICAL": 4,
 }
+
+# Terminal is for subject health, not infrastructure bootstrap.
+# Exact life_engine / life_chatter keep INFO; child loggers (audit JSON,
+# tools) stay at WARNING so the main pane is not a second SQLite dump.
+# message_receiver keeps the inbound channel line: <qq> 小星星: …
+_OPERATOR_CONSOLE_INFO_LOGGERS = frozenset(
+    {"life_engine", "life_chatter", "message_receiver"}
+)
+
+
+def _operator_console_floor(name: str) -> int | None:
+    identity = str(name or "")
+    if identity in _OPERATOR_CONSOLE_INFO_LOGGERS:
+        return _LOG_LEVEL_PRIORITY["INFO"]
+    if identity.startswith(("life_engine.", "life_chatter.")):
+        return _LOG_LEVEL_PRIORITY["WARNING"]
+    return None
 
 
 class Logger:
@@ -309,8 +327,9 @@ class Logger:
             color: 日志颜色
             **metadata: 额外的元数据
         """
-        should_output = self._should_log(level)
-        if not should_output:
+        should_persist = self._should_log(level)
+        should_console = self._should_console_log(level)
+        if not should_persist and not should_console:
             return
 
         with self._lock:
@@ -340,8 +359,7 @@ class Logger:
                 else:
                     exc_lines = [str(exc_info)]
 
-            # 输出到控制台（按日志级别过滤）
-            if should_output:
+            if should_console:
                 # 使用 rich.Text 构建彩色输出
                 text = Text()
                 text.append(f"[{timestamp_short}] ", style="dim")
@@ -367,8 +385,8 @@ class Logger:
                     exc_text = Text("".join(exc_lines), style="dim")
                     self.console.print(exc_text)
 
-            # 输出到数据库（如果启用，不受日志级别过滤）
-            if self._db_enabled():
+            # SQLite / 文本镜像跟随 log_level，不跟终端阈值。
+            if should_persist and self._db_enabled():
                 if _global_log_store is not None:
                     plain_message = _strip_rich_markup(message)
                     meta = dict(all_metadata)
@@ -381,8 +399,7 @@ class Logger:
                         metadata=meta or None,
                     )
 
-            # 发布事件广播（如果启用）
-            if self._enable_event_broadcast:
+            if self._enable_event_broadcast and (should_persist or should_console):
                 self._emit_log_event(timestamp_iso, level, message, all_metadata)
 
     def _emit_log_event(
@@ -449,6 +466,29 @@ class Logger:
         level_priority = _LOG_LEVEL_PRIORITY.get(level.upper(), 0)
         current_priority = _LOG_LEVEL_PRIORITY.get(current_level, 0)
         return level_priority >= current_priority
+
+    def _should_console_log(self, level: str) -> bool:
+        """Whether this line should print to the operator terminal.
+
+        Per-logger ``log_level`` still gates both sinks, so unit tests stay
+        isolated.  Loggers following the global config use ``console_log_level``.
+        life_engine / life_chatter keep INFO on the operator pane; their child
+        loggers stay at WARNING so audit JSON does not flood the terminal.
+        message_receiver keeps the inbound channel line.
+        """
+        if not self._use_global_level:
+            return self._should_log(level)
+
+        level_priority = _LOG_LEVEL_PRIORITY.get(level.upper(), 0)
+        with _config_lock:
+            raw_console = str(
+                _global_config.get("console_log_level") or _global_config["log_level"]
+            ).upper()
+        threshold = _LOG_LEVEL_PRIORITY.get(raw_console, _LOG_LEVEL_PRIORITY["INFO"])
+        operator_floor = _operator_console_floor(self.name)
+        if operator_floor is not None:
+            threshold = min(threshold, operator_floor)
+        return level_priority >= threshold
 
     def _db_enabled(self) -> bool:
         """检查是否应该写入数据库。
@@ -576,6 +616,7 @@ def initialize_logger_system(
     retention_info_days: int = 30,
     enable_event_broadcast: bool = True,
     log_dir: str | Path | None = None,
+    console_log_level: str | None = None,
     **_legacy: Any,
 ) -> None:
     """初始化日志系统全局配置
@@ -586,7 +627,7 @@ def initialize_logger_system(
     所有 logger 共享同一个 SQLite 日志存储（data/logs.db）。
 
     Args:
-        log_level: 全局日志等级（DEBUG, INFO, WARNING, ERROR, CRITICAL）
+        log_level: 持久化日志等级（DEBUG, INFO, WARNING, ERROR, CRITICAL）
         enable_db: 是否启用 SQLite 结构化存储
         db_path: SQLite 数据库文件路径
         retention_debug_days: DEBUG 级别日志保留天数
@@ -594,6 +635,8 @@ def initialize_logger_system(
         enable_event_broadcast: 是否默认启用事件广播
         log_dir: 按日期滚动的纯文本镜像目录；``None`` 表示不写文件镜像。
             调用方必须显式传入，测试因此不会意外在仓库里落下日志文件。
+        console_log_level: 终端日志等级。``None`` 时与 ``log_level`` 相同，
+            保持测试和旧调用行为。生产默认由 CoreConfig 设为 ERROR。
 
     Example:
         >>> from src.kernel.logger import initialize_logger_system
@@ -602,8 +645,10 @@ def initialize_logger_system(
     global _global_log_store, _stdlib_bridge_handler
     _set_event_broadcast_stopped(False)
 
+    resolved_console = str(console_log_level or log_level).upper()
     with _config_lock:
         _global_config["log_level"] = log_level.upper()
+        _global_config["console_log_level"] = resolved_console
         _global_config["enable_db"] = enable_db
         _global_config["db_path"] = str(db_path)
         _global_config["retention_debug_days"] = retention_debug_days

@@ -14,10 +14,12 @@ from __future__ import annotations
 import asyncio
 import difflib
 import hashlib
+import os
 import time
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any
+from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING, Annotated, Any, Literal
+from uuid import uuid4
 
 from src.app.plugin_system.api import log_api
 from src.app.plugin_system.base import BaseTool
@@ -34,6 +36,12 @@ from ._utils import (
     _get_workspace,
     _resolve_path,
 )
+from .apply_patch import (
+    ApplyPatchError,
+    apply_ops_to_contents,
+    parse_apply_patch,
+    strip_read_line_prefixes,
+)
 from .bounded_projection import (
     BoundedContinuationError,
     project_bounded_items,
@@ -46,7 +54,11 @@ if TYPE_CHECKING:
 
 logger = log_api.get_logger("life_engine.tools")
 
+FILE_CHATTER_ALLOW = ["life_engine_internal", "life_chatter"]
+_GLOB_IGNORE_DIRS = {".memory", "__pycache__", ".git", ".svn", "node_modules"}
+
 _MEMORY_READ_MAX_BYTES = DEFAULT_MAX_DOCUMENT_BYTES
+DEFAULT_READ_LINE_LIMIT = 80
 _SUBJECT_AUTHORITY_PATHS = frozenset({"SOUL.md", "USER.md", "MEMORY.md"})
 _PROACTIVE_PATH_DEFAULTS = {
     "local_database_path": "runtime/proactive/proactive.sqlite3",
@@ -78,6 +90,53 @@ def _format_size(size: int) -> str:
 def _format_time(timestamp: float) -> str:
     """格式化时间戳。"""
     return datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone().isoformat()
+
+
+def _list_glob_matches(rel_path: str, name: str, glob: str) -> bool:
+    """Match a workspace-relative path or basename against comma-separated globs."""
+    patterns = [item.strip() for item in str(glob or "").split(",") if item.strip()]
+    if not patterns:
+        return True
+    relative = PurePosixPath(str(rel_path or "").replace("\\", "/"))
+    basename = PurePosixPath(str(name or ""))
+    return any(
+        relative.match(pattern)
+        or basename.match(pattern)
+        or (
+            pattern.startswith("**/")
+            and (
+                basename.match(pattern[3:])
+                or relative.match(pattern[3:])
+            )
+        )
+        for pattern in patterns
+    )
+
+
+def select_read_line_window(
+    total_lines: int,
+    *,
+    offset: int,
+    limit: int,
+    from_end: bool,
+) -> tuple[int, int]:
+    """Return a half-open line window ``[start_idx, end_idx)``.
+
+    ``limit <= 0`` means the whole file. ``from_end`` takes the last ``limit``
+    lines and ignores ``offset``.
+    """
+    if total_lines <= 0:
+        return 0, 0
+    if int(limit) <= 0:
+        return 0, total_lines
+    window = min(int(limit), total_lines)
+    if from_end:
+        start_idx = max(0, total_lines - window)
+        return start_idx, total_lines
+    start_idx = max(0, int(offset) - 1)
+    if start_idx >= total_lines:
+        return total_lines, total_lines
+    return start_idx, min(total_lines, start_idx + window)
 
 
 
@@ -351,7 +410,7 @@ def _tool_trace_context(tool: Any) -> dict[str, str]:
 
 
 def _subject_authority_path(plugin: Any, target: Path) -> str | None:
-    """Recognize exact authority files after symlink/path resolution."""
+    """Recognize standing prompt files after symlink/path resolution."""
 
     workspace = _get_workspace(plugin)
     try:
@@ -361,18 +420,93 @@ def _subject_authority_path(plugin: Any, target: Path) -> str | None:
     return relative if relative in _SUBJECT_AUTHORITY_PATHS else None
 
 
-def _subject_direct_mutation_error(path: str) -> str:
-    review_tool = (
-        "nucleus_memory_continuity_review"
-        if path == "MEMORY.md"
-        else "nucleus_review_subject_document"
-    )
+def _standing_prompt_content_error(
+    plugin: Any,
+    target: Path,
+    content: str,
+) -> str | None:
+    """Reject only the writes that would make the next turn un-assemblable."""
+
+    subject_path = _subject_authority_path(plugin, target)
+    if subject_path == "SOUL.md" and not str(content or "").strip():
+        return (
+            "StandingPromptSoulEmpty: `SOUL.md` 会固定进入每一轮提示词，"
+            "需要保持有实质内容。空掉它，这一轮的你就无法被装配出来。"
+        )
+    return None
+
+
+def _standing_prompt_structural_error(plugin: Any, target: Path) -> str | None:
+    """Keep SOUL/USER/MEMORY at their assembled paths; content edits stay free."""
+
+    subject_path = _subject_authority_path(plugin, target)
+    if subject_path is None:
+        return None
     return (
-        f"SubjectAuthorityDirectMutationBlocked: `{path}` 是统一主体权威的一部分，"
-        f"通用 file 工具不能直接修改。请使用 {review_tool} "
-        "查看精确 revision、记录保持不变/稍后再看，或在正式 Subject Authority "
-        "可用后提交候选并另行作出接受决定。"
+        f"StandingPromptPathProtected: `{subject_path}` 会固定进入每一轮提示词，"
+        "不能删除或改名。要改内容请直接编辑。"
     )
+
+
+def _plugin_life_service(plugin: Any) -> Any:
+    service = getattr(plugin, "service", None)
+    if service is not None:
+        return service
+    return _get_life_engine_service(plugin)
+
+
+async def _commit_subject_authority_file_write(
+    plugin: Any,
+    target: Path,
+    content: str,
+    *,
+    encoding: str,
+    reason: str,
+    occurrence_id: str,
+) -> tuple[bool, str | None]:
+    """CAS-append SOUL/USER/MEMORY so the next prompt reads what she just wrote."""
+
+    subject_path = _subject_authority_path(plugin, target)
+    if subject_path is None:
+        return True, None
+    service = _plugin_life_service(plugin)
+    if service is None or not bool(
+        getattr(service, "_selectable_storage_enabled", False)
+    ):
+        return True, None
+    commit = getattr(service, "commit_subject_authority_file_write", None)
+    if not callable(commit):
+        return True, None
+    try:
+        await commit(
+            workspace_relative_path=subject_path,
+            content_bytes=str(content).encode(encoding),
+            occurrence_id=occurrence_id,
+            recorded_by="life_engine",
+            recorded_source="nucleus_file_tool",
+            encoding=encoding,
+            reason=reason,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            f"写入主体固定提示词账本失败 {subject_path}: {exc}",
+            exc_info=True,
+        )
+        return False, f"写入主体固定提示词账本失败: {exc}"
+    return True, None
+
+
+def _guard_workspace_mutation(plugin: Any, path: str) -> tuple[bool, Any]:
+    """Resolve a workspace path and reject runtime-reserved mutations."""
+
+    valid, result = _resolve_path(plugin, path)
+    if not valid:
+        return False, result
+    target = result
+    reserved = _workspace_authority_mutation_path(plugin, target)
+    if reserved is not None:
+        return False, _workspace_authority_mutation_error(*reserved)
+    return True, target
 
 
 def _workspace_relative(workspace: Path, target: Path) -> str | None:
@@ -475,52 +609,6 @@ def _workspace_authority_mutation_error(path: str, owner: str) -> str:
     )
 
 
-class LifeEngineWakeDFCTool(BaseTool):
-    """Fail-closed shell for historical direct calls of the retired wake tool."""
-
-    tool_name: str = "nucleus_tell_dfc"
-    tool_description: str = (
-        "Retired compatibility shell. It is not registered for model use and cannot "
-        "select a current, recent, named, account, group, or stream target. Shared "
-        "context uses canonical projections; proactive contact uses InitiativeSeed, "
-        "explicit reachability, and an audience/surface-bound outreach decision."
-    )
-    chatter_allow: list[str] = ["life_engine_internal"]
-
-    async def execute(
-        self,
-        message: Annotated[str, "Historical context text"],
-        reason: Annotated[str, "Historical reason"] = "",
-        importance: Annotated[str, "Historical importance"] = "normal",
-        proactive_wake: Annotated[bool, "Historical wake flag"] = True,
-        stream_id: Annotated[str, "Historical stream id"] = "",
-        target_type: Annotated[str, "Historical target type"] = "auto",
-        platform: Annotated[str, "Historical platform"] = "",
-        target_user_id: Annotated[str, "Historical user id"] = "",
-        target_user_name: Annotated[str, "Historical user name"] = "",
-        target_group_id: Annotated[str, "Historical group id"] = "",
-        target_group_name: Annotated[str, "Historical group name"] = "",
-    ) -> tuple[bool, str | dict]:
-        del (
-            message,
-            reason,
-            importance,
-            proactive_wake,
-            stream_id,
-            target_type,
-            platform,
-            target_user_id,
-            target_user_name,
-            target_group_id,
-            target_group_name,
-        )
-        return (
-            False,
-            "LegacyRecentStreamWakeRetired: shared context uses canonical projections; "
-            "proactive contact requires explicit audience_ref and surface_ref.",
-        )
-
-
 class LifeEngineReadFileTool(BaseTool):
     """读取文件内容工具。"""
 
@@ -537,16 +625,31 @@ class LifeEngineReadFileTool(BaseTool):
         "- ✗ 不知道文件路径 → 先用 nucleus_list_files 或 nucleus_grep_file 找\n"
         "- ✗ 想搜索内容关键词 → 用 nucleus_grep_file\n"
         "\n"
-        "**注意：** 结果包含行号（从 1 开始），方便后续用 nucleus_edit_file 时定位。"
-        "大文件建议用 offset 和 limit 参数只读取需要的部分。"
+        "**怎么读，由你决定：**\n"
+        "- 默认只读 80 行（文件开头）。不是全文。\n"
+        "- 日记、追加记录看最新一段：`from_end=true`。\n"
+        "- 已经知道大概位置：`offset` 从第几行起，`limit` 读几行。\n"
+        "- 先 `nucleus_grep_file` 要命中行，再按行号读周围。\n"
+        "- 确实要全文：`limit=0`。被截断时看 remaining_lines / next_offset 再续。\n"
+        "\n"
+        "**注意：** 结果每行是 `行号<TAB>正文`。行号只用于定位。"
+        "`nucleus_edit_file` / `nucleus_apply_patch` 的文本必须是去掉行号之后的原文，"
+        "不要把 `12\\t` 这种前缀拷进去。"
     )
-    chatter_allow: list[str] = ["life_engine_internal"]
+    chatter_allow: list[str] = FILE_CHATTER_ALLOW
 
     async def execute(
         self,
         path: Annotated[str, "相对于工作空间的文件路径"],
-        offset: Annotated[int, "从第几行开始读（1-indexed），默认从头开始"] = 1,
-        limit: Annotated[int, "最多读取多少行，0 表示全部"] = 0,
+        offset: Annotated[int, "从第几行开始读（1-indexed），from_end=true 时忽略"] = 1,
+        limit: Annotated[
+            int,
+            "最多读取多少行。默认 80；0 表示全部",
+        ] = DEFAULT_READ_LINE_LIMIT,
+        from_end: Annotated[
+            bool,
+            "true 时从文件末尾往前取 limit 行，适合日记看最新一段",
+        ] = False,
         encoding: Annotated[str, "文件编码，默认utf-8"] = "utf-8",
         continuation: Annotated[
             str,
@@ -586,12 +689,12 @@ class LifeEngineReadFileTool(BaseTool):
             lines = raw_content.splitlines()
             total_lines = len(lines)
 
-            # 应用 offset 和 limit
-            start_idx = max(0, offset - 1)
-            if limit > 0:
-                end_idx = min(total_lines, start_idx + limit)
-            else:
-                end_idx = total_lines
+            start_idx, end_idx = select_read_line_window(
+                total_lines,
+                offset=offset,
+                limit=limit,
+                from_end=from_end,
+            )
 
             selected_lines = lines[start_idx:end_idx]
             # 添加行号（cat -n 格式）
@@ -614,9 +717,12 @@ class LifeEngineReadFileTool(BaseTool):
                 "source_file_bytes": stat.st_size,
                 "file_content_sha256": file_sha256,
             }
+            if start_idx > 0:
+                base_payload["remaining_lines_before"] = start_idx
             if end_idx < total_lines:
                 base_payload["source_selection_truncated"] = True
                 base_payload["remaining_lines"] = total_lines - end_idx
+                base_payload["next_offset"] = end_idx + 1
 
             result_data = project_bounded_text(
                 projection_name="workspace-file-read",
@@ -626,6 +732,7 @@ class LifeEngineReadFileTool(BaseTool):
                     "path": normalized_path,
                     "offset": int(offset),
                     "limit": int(limit),
+                    "from_end": bool(from_end),
                     "encoding": str(encoding),
                 },
                 frontier={
@@ -676,11 +783,12 @@ class LifeEngineWriteFileTool(BaseTool):
         "\n"
         "**⚠️ 注意：** 如果文件已存在，其全部内容会被覆盖。"
         "修改文件的局部内容，优先使用 nucleus_edit_file。\n"
-        "SOUL.md、USER.md、MEMORY.md 不能由本工具直接修改；请走主体复盘候选与显式决定链。\n"
+        "SOUL.md、USER.md、MEMORY.md、EXISTENCE.md 会固定进入下一轮提示词；"
+        "改它们和改日记一样，由你判断。不要清空 SOUL.md，也不要删除或改名这三份身份文件。\n"
         "**💡 记忆提示：** 写入新文件后，想一想它和已有文件有没有关联？"
         "如需由当前主体明确表达关系，请使用 nucleus_relations(action=add)。"
     )
-    chatter_allow: list[str] = ["life_engine_internal"]
+    chatter_allow: list[str] = FILE_CHATTER_ALLOW
 
     async def execute(
         self,
@@ -700,14 +808,25 @@ class LifeEngineWriteFileTool(BaseTool):
             return False, str(result)
 
         target = result
-        subject_path = _subject_authority_path(self.plugin, target)
-        if subject_path is not None:
-            return False, _subject_direct_mutation_error(subject_path)
+        standing_error = _standing_prompt_content_error(self.plugin, target, content)
+        if standing_error is not None:
+            return False, standing_error
         reserved = _workspace_authority_mutation_path(self.plugin, target)
         if reserved is not None:
             return False, _workspace_authority_mutation_error(*reserved)
         existed = target.exists()
         before_content = _read_trace_before_content(target, encoding)
+        occurrence_id = f"file-tool:{uuid4().hex}"
+        committed, commit_error = await _commit_subject_authority_file_write(
+            self.plugin,
+            target,
+            content,
+            encoding=encoding,
+            reason=reason,
+            occurrence_id=occurrence_id,
+        )
+        if not committed:
+            return False, str(commit_error)
 
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -772,16 +891,16 @@ class LifeEngineEditFileTool(BaseTool):
         "\n"
         "**使用规则：**\n"
         "- 必须先用 nucleus_read_file 读取文件，确认要替换的内容\n"
-        "- old_text 必须与文件中的内容完全一致（包括缩进）\n"
+        "- old_text 必须与文件中的内容完全一致（包括缩进），不要包含读结果里的行号前缀\n"
         "- 如果 old_text 在文件中出现多次且你只想改一处，提供更长的上下文使其唯一\n"
         "- 用 replace_all=True 可以替换所有出现位置（如重命名变量）\n"
         "\n"
         "**何时不用：**\n"
         "- ✗ 想重写整个文件 → 用 nucleus_write_file\n"
         "- ✗ 还没看过文件内容 → 先用 nucleus_read_file\n"
-        "- ✗ 修改 SOUL.md、USER.md、MEMORY.md → 用主体复盘候选与显式决定链"
+        "- ✗ 一次改多处或不连续片段 → 用 nucleus_apply_patch"
     )
-    chatter_allow: list[str] = ["life_engine_internal"]
+    chatter_allow: list[str] = FILE_CHATTER_ALLOW
 
     async def execute(
         self,
@@ -803,9 +922,6 @@ class LifeEngineEditFileTool(BaseTool):
             return False, str(result)
 
         target = result
-        subject_path = _subject_authority_path(self.plugin, target)
-        if subject_path is not None:
-            return False, _subject_direct_mutation_error(subject_path)
         reserved = _workspace_authority_mutation_path(self.plugin, target)
         if reserved is not None:
             return False, _workspace_authority_mutation_error(*reserved)
@@ -816,13 +932,19 @@ class LifeEngineEditFileTool(BaseTool):
 
         try:
             content = target.read_text(encoding=encoding)
-            count = content.count(old_text)
+            search_text = old_text
+            count = content.count(search_text)
+            if count == 0:
+                stripped = strip_read_line_prefixes(old_text)
+                if stripped is not None:
+                    search_text = stripped
+                    count = content.count(search_text)
 
             if count == 0:
                 return False, (
                     "未找到要替换的文本。请确认：\n"
                     "1. 是否先用 nucleus_read_file 读取了最新内容？\n"
-                    "2. old_text 是否与文件内容完全一致（注意空格和缩进）？"
+                    "2. old_text 是否与文件内容完全一致（注意空格和缩进，不要包含行号）？"
                 )
 
             if count > 1 and not replace_all:
@@ -831,12 +953,35 @@ class LifeEngineEditFileTool(BaseTool):
                     "请提供更多上下文使 old_text 唯一，或使用 replace_all=True 替换全部。"
                 )
 
+            replacement = new_text
+            if search_text != old_text:
+                stripped_new = strip_read_line_prefixes(new_text)
+                if stripped_new is not None:
+                    replacement = stripped_new
+
             if replace_all:
-                new_content = content.replace(old_text, new_text)
+                new_content = content.replace(search_text, replacement)
                 replacements = count
             else:
-                new_content = content.replace(old_text, new_text, 1)
+                new_content = content.replace(search_text, replacement, 1)
                 replacements = 1
+
+            standing_error = _standing_prompt_content_error(
+                self.plugin, target, new_content
+            )
+            if standing_error is not None:
+                return False, standing_error
+            occurrence_id = f"file-tool:{uuid4().hex}"
+            committed, commit_error = await _commit_subject_authority_file_write(
+                self.plugin,
+                target,
+                new_content,
+                encoding=encoding,
+                reason=reason,
+                occurrence_id=occurrence_id,
+            )
+            if not committed:
+                return False, str(commit_error)
 
             trace_context = _tool_trace_context(self)
             await asyncio.to_thread(
@@ -885,8 +1030,191 @@ class LifeEngineEditFileTool(BaseTool):
             return False, f"编辑文件失败: {e}"
 
 
-# LifeEngineMoveFileTool 和 LifeEngineDeleteFileTool 已移除；只读 sandbox
-# 中的 nucleus_bash 也不能移动或删除 workspace 文件。
+class LifeEngineApplyPatchTool(BaseTool):
+    """Codex-style multi-file / multi-hunk patch."""
+
+    tool_name: str = "nucleus_apply_patch"
+    tool_description: str = (
+        "用 Codex apply_patch 格式一次精确改一个或多个文件（可多 hunk、可新增/删除/重命名）。"
+        "\n\n"
+        "**何时使用：**\n"
+        "- ✓ 同一文件改多处，或不连续片段\n"
+        "- ✓ 一次提交里新增、更新、删除、重命名多个文件\n"
+        "\n"
+        "**何时不用：**\n"
+        "- ✗ 只改一处连续原文 → 用 nucleus_edit_file\n"
+        "- ✗ 整篇覆盖或新建一篇完整文档 → 用 nucleus_write_file\n"
+        "- ✗ 删除或改名 SOUL.md / USER.md / MEMORY.md（改内容可以直接做）\n"
+        "\n"
+        "**格式：**\n"
+        "```\n"
+        "*** Begin Patch\n"
+        "*** Add File: notes/new.md\n"
+        "+hello\n"
+        "*** Update File: notes/old.md\n"
+        "@@\n"
+        " context\n"
+        "-old\n"
+        "+new\n"
+        "*** Delete File: notes/gone.md\n"
+        "*** End Patch\n"
+        "```\n"
+        "每个 hunk 必须在文件中唯一匹配。不要把 nucleus_read_file 的行号前缀写进 patch。"
+        "Add File 在目标已存在时会失败，应改用 Update File。"
+        "删除和重命名只通过本工具（*** Delete File / *** Move to:）。"
+    )
+    chatter_allow: list[str] = FILE_CHATTER_ALLOW
+
+    async def execute(
+        self,
+        input: Annotated[str, "完整 patch，必须包含 *** Begin Patch 与 *** End Patch"],
+        reason: Annotated[str, "可选：这次改写的原因，便于未来追溯"] = "",
+        encoding: Annotated[str, "文件编码，默认utf-8"] = "utf-8",
+    ) -> tuple[bool, str | dict]:
+        try:
+            ops = parse_apply_patch(input)
+        except ApplyPatchError as exc:
+            return False, str(exc)
+
+        relative_paths: list[str] = []
+        for op in ops:
+            relative_paths.append(op.path)
+            if op.move_to:
+                relative_paths.append(op.move_to)
+
+        resolved: dict[str, Path] = {}
+        for relative in relative_paths:
+            ok, result = _guard_workspace_mutation(self.plugin, relative)
+            if not ok:
+                return False, str(result)
+            resolved[relative] = result
+
+        for op in ops:
+            structural = _standing_prompt_structural_error(
+                self.plugin, resolved[op.path]
+            )
+            if op.kind == "delete" and structural is not None:
+                return False, structural
+            if op.move_to:
+                source_error = _standing_prompt_structural_error(
+                    self.plugin, resolved[op.path]
+                )
+                dest_error = _standing_prompt_structural_error(
+                    self.plugin, resolved[op.move_to]
+                )
+                if source_error is not None or dest_error is not None:
+                    return False, source_error or dest_error
+
+        files: dict[str, str | None] = {}
+        for relative, target in resolved.items():
+            if target.exists() and not target.is_file():
+                return False, f"路径不是文件: {relative}"
+            if target.exists():
+                try:
+                    files[relative] = target.read_text(encoding=encoding)
+                except UnicodeDecodeError as exc:
+                    return False, f"文件编码错误: {exc}"
+            else:
+                files[relative] = None
+
+        try:
+            planned = apply_ops_to_contents(ops, files)
+        except ApplyPatchError as exc:
+            return False, str(exc)
+
+        for item in planned:
+            if item.action != "write":
+                continue
+            standing_error = _standing_prompt_content_error(
+                self.plugin,
+                resolved[item.path],
+                item.content or "",
+            )
+            if standing_error is not None:
+                return False, standing_error
+            occurrence_id = f"file-tool:{uuid4().hex}"
+            committed, commit_error = await _commit_subject_authority_file_write(
+                self.plugin,
+                resolved[item.path],
+                item.content or "",
+                encoding=encoding,
+                reason=reason,
+                occurrence_id=occurrence_id,
+            )
+            if not committed:
+                return False, str(commit_error)
+
+        trace_context = _tool_trace_context(self)
+        writes = [item for item in planned if item.action == "write"]
+        deletes = [item for item in planned if item.action == "delete"]
+        try:
+            for item in writes:
+                target = resolved[item.path]
+                target.parent.mkdir(parents=True, exist_ok=True)
+                await asyncio.to_thread(
+                    target.write_text,
+                    item.content or "",
+                    encoding=encoding,
+                )
+            for item in deletes:
+                target = resolved[item.path]
+                if target.exists():
+                    await asyncio.to_thread(target.unlink)
+        except Exception as exc:
+            logger.exception("应用 patch 失败")
+            return False, f"应用 patch 失败: {exc}"
+
+        files_out: list[dict[str, Any]] = []
+        for item in planned:
+            before = files.get(item.path)
+            if item.action == "write" and item.operation == "move":
+                before = files.get(item.source_path)
+            after = item.content if item.action == "write" else ""
+            trace_id = await _record_file_trace(
+                self.plugin,
+                path=item.path,
+                before_content=before,
+                after_content=after if item.action == "write" else None,
+                operation=item.operation,
+                tool_name=self.tool_name,
+                reason=reason,
+                **trace_context,
+            )
+            artifact_id = ""
+            if item.action == "write":
+                artifact_id = await _record_memory_artifact_version(
+                    self.plugin,
+                    path=item.path,
+                    before_content=before,
+                    after_content=item.content or "",
+                    operation=item.operation,
+                    reason=reason,
+                    trace_id=trace_id,
+                    **trace_context,
+                )
+                _notify_router_context_source_changed(self.plugin, item.path)
+                await _sync_memory_embedding_for_file(
+                    self.plugin, item.path, item.content or ""
+                )
+            entry: dict[str, Any] = {
+                "path": item.path,
+                "operation": item.operation,
+                "trace_id": trace_id,
+                "artifact_version_id": artifact_id,
+            }
+            if item.source_path:
+                entry["source_path"] = item.source_path
+            files_out.append(entry)
+
+        return True, {
+            "action": "apply_patch",
+            "files": files_out,
+            **({"reason": reason} if reason else {}),
+        }
+
+
+# 独立的 move/delete 工具不再提供。删除和重命名只走 nucleus_apply_patch。
+# 只读 sandbox 中的 nucleus_bash 也不能移动或删除 workspace 文件。
 
 
 class LifeEngineListFilesTool(BaseTool):
@@ -894,23 +1222,37 @@ class LifeEngineListFilesTool(BaseTool):
 
     tool_name: str = "nucleus_list_files"
     tool_description: str = (
-        "列出目录中的文件和子目录。\n\n"
+        "列出目录中的文件和子目录。默认按最近修改时间倒序，所以第一页是最近动过的文件，"
+        "不是档案里最早的那几篇。\n\n"
         "**何时使用：**\n"
         "- ✓ 浏览自己的文件结构\n"
-        "- ✓ 确认某个目录下有什么文件\n"
+        "- ✓ 确认某个目录下有什么文件（可加 glob，如 `2026-09*.md`）\n"
         "- ✓ 用 recursive=True 查看文件树\n"
+        "- ✓ 需要按名字从旧到新翻档案时，传 sort=\"name\"\n"
+        "\n"
+        "**截断：** 目录很大时看 truncated / omitted_items / continuation，那一页不是全集。"
+        "不要用 nucleus_grep_file 的 pattern=\".\" 来列目录。\n"
         "\n"
         "**何时不用：**\n"
         "- ✗ 想搜索文件内容 → 用 nucleus_grep_file\n"
+        "- ✗ 只知道文件名模式、不知道在哪一层 → 用 nucleus_glob_file\n"
         "- ✗ 想看文件的大小/修改时间等 → nucleus_list_files 返回的列表已经包含这些信息"
     )
-    chatter_allow: list[str] = ["life_engine_internal"]
+    chatter_allow: list[str] = FILE_CHATTER_ALLOW
 
     async def execute(
         self,
         path: Annotated[str, "相对于工作空间的目录路径，空字符串表示根目录"] = "",
         recursive: Annotated[bool, "是否递归列出子目录"] = False,
         max_depth: Annotated[int, "递归最大深度（仅recursive=True时有效）"] = 3,
+        sort: Annotated[
+            Literal["name", "mtime"],
+            "排序：mtime=最近修改在前（默认）；name=每层目录优先、再按名字，适合翻旧档案",
+        ] = "mtime",
+        glob: Annotated[
+            str,
+            "可选通配符，逗号分隔。匹配工作区相对路径或文件名，如 '2026-09*.md'",
+        ] = "",
         continuation: Annotated[
             str,
             "Optional continuation returned by the previous directory page",
@@ -1003,6 +1345,26 @@ class LifeEngineListFilesTool(BaseTool):
                 return flattened
 
             source_items = flatten(items)
+            glob_filter = str(glob or "").strip()
+            if glob_filter:
+                source_items = [
+                    item
+                    for item in source_items
+                    if _list_glob_matches(
+                        str(item.get("path") or ""),
+                        str(item.get("name") or ""),
+                        glob_filter,
+                    )
+                ]
+            sort_mode = str(sort or "mtime").strip() or "mtime"
+            if sort_mode not in {"name", "mtime"}:
+                return False, f"不支持的 sort: {sort}"
+            if sort_mode == "mtime":
+                source_items.sort(key=lambda item: str(item.get("path") or ""))
+                source_items.sort(
+                    key=lambda item: str(item.get("modified_at") or ""),
+                    reverse=True,
+                )
             normalized_root = str(target.relative_to(workspace)) or "."
             item_refs = []
             for item in source_items:
@@ -1016,7 +1378,9 @@ class LifeEngineListFilesTool(BaseTool):
                 requested_max_bytes=max_bytes,
                 binding={
                     "root": normalized_root,
-                    "pattern": "",
+                    "pattern": glob_filter,
+                    "glob": glob_filter,
+                    "sort": sort_mode,
                     "recursive": bool(recursive),
                     "max_depth": int(max_depth),
                 },
@@ -1033,6 +1397,8 @@ class LifeEngineListFilesTool(BaseTool):
                     "normalized_root": normalized_root,
                     "recursive": recursive,
                     "max_depth": max_depth if recursive else None,
+                    "sort": sort_mode,
+                    "glob": glob_filter,
                     "total_items": len(source_items),
                 },
                 items_key="items",
@@ -1062,9 +1428,9 @@ class LifeEngineMakeDirectoryTool(BaseTool):
     tool_description: str = (
         "在工作空间内创建新目录（含所有父目录）。\n\n"
         "何时用：保存文件前确保目录存在；按项目/主题组织文件时建立子目录。\n"
-        "何时不用：写文件时父目录不存在可先调用本工具；不要用于检查目录是否存在（用 nucleus_ls）。"
+        "何时不用：不要用于检查目录是否存在（用 nucleus_list_files）。写文件时若父目录不存在，write_file 也会自动创建。"
     )
-    chatter_allow: list[str] = ["life_engine_internal"]
+    chatter_allow: list[str] = FILE_CHATTER_ALLOW
 
     async def execute(
         self,
@@ -1112,6 +1478,124 @@ class LifeEngineMakeDirectoryTool(BaseTool):
         except Exception as e:
             logger.error(f"创建目录失败 {path}: {e}", exc_info=True)
             return False, f"创建目录失败: {e}"
+
+
+class LifeEngineGlobFileTool(BaseTool):
+    """按 glob 查找 workspace 文件路径。"""
+
+    tool_name: str = "nucleus_glob_file"
+    tool_description: str = (
+        "按 glob 查找工作区内的文件路径，默认递归，按最近修改时间倒序。"
+        "\n\n"
+        "**何时使用：**\n"
+        "- ✓ 知道文件名模式但不知道目录（如 `**/*.md`、`diaries/2026-09*.md`）\n"
+        "- ✓ 只要路径列表，不要目录浏览\n"
+        "\n"
+        "**何时不用：**\n"
+        "- ✗ 已经知道目录、想看这一层有什么 → 用 nucleus_list_files\n"
+        "- ✗ 要搜文件内容 → 用 nucleus_grep_file\n"
+        "\n"
+        "忽略 .git / .memory / __pycache__ / node_modules 和隐藏路径。"
+    )
+    chatter_allow: list[str] = FILE_CHATTER_ALLOW
+
+    async def execute(
+        self,
+        pattern: Annotated[str, "glob，如 '**/*.md' 或 'notes/*.txt'，逗号分隔多个"],
+        path: Annotated[str, "搜索根目录，相对 workspace，空表示整个工作区"] = "",
+        continuation: Annotated[
+            str,
+            "Optional continuation returned by the previous glob page",
+        ] = "",
+        max_bytes: Annotated[
+            int | None,
+            "Optional result byte budget; the task hard cap still applies",
+        ] = None,
+    ) -> tuple[bool, str | dict]:
+        glob_filter = str(pattern or "").strip()
+        if not glob_filter:
+            return False, "glob pattern 不能为空"
+
+        valid, result = _resolve_path(self.plugin, path or ".")
+        if not valid:
+            return False, str(result)
+        search_root = result
+        if not search_root.exists():
+            return False, f"目录不存在: {path or '(root)'}"
+        if not search_root.is_dir():
+            return False, f"路径不是目录: {path}"
+
+        workspace = _get_workspace_read_only(self.plugin)
+        source_items: list[dict[str, Any]] = []
+        try:
+            for root, dirs, filenames in os.walk(search_root):
+                dirs[:] = [
+                    name
+                    for name in dirs
+                    if name not in _GLOB_IGNORE_DIRS and not name.startswith(".")
+                ]
+                root_path = Path(root)
+                for filename in filenames:
+                    if filename.startswith("."):
+                        continue
+                    entry = root_path / filename
+                    if not entry.is_file():
+                        continue
+                    rel_path = str(entry.relative_to(workspace))
+                    if not _list_glob_matches(rel_path, filename, glob_filter):
+                        continue
+                    stat = entry.stat()
+                    source_items.append(
+                        {
+                            "path": rel_path,
+                            "name": filename,
+                            "size": stat.st_size,
+                            "size_human": _format_size(stat.st_size),
+                            "modified_at": _format_time(stat.st_mtime),
+                            "_mtime": stat.st_mtime,
+                        }
+                    )
+            source_items.sort(key=lambda item: str(item.get("path") or ""))
+            source_items.sort(
+                key=lambda item: float(item.get("_mtime") or 0.0),
+                reverse=True,
+            )
+            for item in source_items:
+                item.pop("_mtime", None)
+            item_refs = [
+                f"workspace-entry:{item.get('path') or 'unknown'}:sha256:{sha256_json(item)}"
+                for item in source_items
+            ]
+            normalized_root = str(search_root.relative_to(workspace)) or "."
+            payload = project_bounded_items(
+                projection_name="workspace-file-glob",
+                task_name=getattr(self, "_runtime_task_name", ""),
+                requested_max_bytes=max_bytes,
+                binding={
+                    "root": normalized_root,
+                    "pattern": glob_filter,
+                },
+                frontier={"items_sha256": sha256_json(source_items)},
+                base_payload={
+                    "action": "glob_file",
+                    "pattern": glob_filter,
+                    "path": path or "(root)",
+                    "total_items": len(source_items),
+                },
+                items_key="items",
+                items=source_items,
+                item_refs=item_refs,
+                continuation=continuation,
+                compact=True,
+            )
+            if len(str(payload).encode("utf-8")) > payload["budget_bytes"]:
+                return False, "glob file projection exceeded its byte budget"
+            return True, payload
+        except BoundedContinuationError as exc:
+            return False, f"查找文件失败: {exc}"
+        except Exception as exc:
+            logger.exception("查找文件失败 %s", pattern)
+            return False, f"查找文件失败: {exc}"
 
 
 class LifeEngineRunAgentTool(BaseTool):
@@ -1438,7 +1922,10 @@ ALL_TOOLS = [
     LifeEngineReadFileTool,
     LifeEngineWriteFileTool,
     LifeEngineEditFileTool,
+    LifeEngineApplyPatchTool,
     LifeEngineListFilesTool,
+    LifeEngineGlobFileTool,
+    LifeEngineMakeDirectoryTool,
     LifeEngineRunAgentTool,
     FetchLifeMemoryTool,
 ]

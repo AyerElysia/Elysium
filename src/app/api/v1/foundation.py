@@ -66,10 +66,6 @@ _PUBLIC_FEATURES: dict[str, dict[str, str]] = {
         "werewolf.read": "tabletop:read",
         "werewolf.play": "tabletop:play",
     },
-    "surface": {
-        "surface.read": "surface:read",
-        "surface.connect": "surface:connect",
-    },
 }
 
 _MODULE_PLUGIN = {
@@ -79,7 +75,6 @@ _MODULE_PLUGIN = {
     "livestream": "Livestream",
     "voice_call": "Voice-Live",
     "tabletop": "werewolf_game",
-    "surface": "neko_surface",
 }
 _MODULE_PROVIDER = {
     "chat": "feishu",
@@ -87,12 +82,10 @@ _MODULE_PROVIDER = {
     "livestream": "bilibili",
     "voice_call": "realtime_provider",
     "tabletop": "werewolf",
-    "surface": "neko",
 }
 _KNOWN_ADAPTER_PLUGINS = {
     "feishu_adapter": "feishu",
     "napcat_adapter": "qq",
-    "neko_surface": "neko",
     "ayla_adapter": "ayla",
 }
 _REQUIRED_LOCAL_COMPONENTS = {"api", "life_event_ledger"}

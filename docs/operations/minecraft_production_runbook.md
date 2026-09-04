@@ -2,11 +2,11 @@
 
 ## 当前支持范围
 
-生产默认身体是 `agent`：可见的 NeoForge 1.21.1 客户端加载 Elysium Bridge 0.2.1，由游戏主动连接 WSL 中的 Life Engine。它提供结构化世界观察、经过类型校验的动作、Baritone 导航、终态回执和哈希证据链。
+生产默认身体是 `bot`：一个由 Elysium 会话独占生命周期的 Mineflayer 玩家加入用户已经打开的局域网世界。它拥有独立游戏身份、结构化观察、游戏聊天、高层任务、终态事件和哈希证据链，不占用用户的窗口、键鼠或视角，适合“爱莉和我一起玩”。
 
-`biomimetic` 是可选实验身体，使用 DXcam 与 Windows 原生输入。它依赖唯一的前台 Minecraft 窗口，不能与人同时争用同一桌面的键鼠，也不能在旧 sidecar 仍运行时启动新实例。生产任务应保持 `default_body = "agent"`。
+`biomimetic` 是可选实验身体，使用 DXcam 与 Windows 原生输入。它依赖唯一的前台 Minecraft 窗口，不能与人同时争用同一桌面的键鼠，也不能在旧 sidecar 仍运行时启动新实例。只有明确进行仿生实验时才应显式选择它；普通陪玩保持 `default_body = "bot"`。
 
-`bot` 是无头共享世界身体：一个 mineflayer 玩家作为独立账号加入服务器或局域网世界，与使用自己客户端的人类处在同一个世界里。它实现与 `agent` 完全相同的 `elysium.minecraft.bridge/1` 协议与操作集（导航由 pathfinder 承担 Baritone 的角色），不需要 Windows 客户端、窗口控制或 quick-play 参数。它的用途是"一起玩"，不是单人托管世界的生产默认路径。
+`agent` 是可见的 NeoForge 1.21.1 客户端路线：Elysium Bridge 0.2.1 主动连接 WSL，Baritone 提供导航，并能把自己的第一人称画面直接交给多模态模型。需要“爱莉自己的眼睛”或 OBS 捕获她的视角时显式选择 `agent`；它不是共享桌面上陪玩场景的默认值。
 
 ## 固定环境
 
@@ -56,7 +56,7 @@
    ```toml
    [minecraft]
    enabled = true
-   default_body = "agent"
+   default_body = "bot"
    world_name = "Elysian Realm"
    mc_home = "/mnt/g/Game/Minecraft/.minecraft"
    launch_bat = "G:\\Game\\Minecraft\\PCL\\LaunchElysia.bat"
@@ -67,15 +67,15 @@
    agent_shared_username = "Elysia"
    consciousness_enabled = true
    consciousness_task_name = "agent"
-   consciousness_subject_context_max_bytes = 16384
-   consciousness_observation_max_bytes = 16384
-   consciousness_subconscious_max_bytes = 8192
-   consciousness_subconscious_group_limit = 5
+   consciousness_subject_context_max_bytes = 8192
+   consciousness_observation_max_bytes = 8192
+   consciousness_subconscious_max_bytes = 4096
+   consciousness_subconscious_group_limit = 3
    consciousness_min_wait_seconds = 2
    consciousness_max_wait_seconds = 45
    consciousness_retry_base_seconds = 2
    consciousness_retry_max_seconds = 30
-   consciousness_recent_turn_limit = 6
+   consciousness_recent_turn_limit = 4
    consciousness_stop_timeout_seconds = 10
    max_session_minutes = 60
    ```
@@ -91,7 +91,7 @@
 - 身体完成预检和 playable 判定后，session 启动独立 `minecraft` 意识实例。它不是核心 heartbeat 的“加速模式”：核心 heartbeat 始终保持原周期和原载荷，专属实例拥有自己的串行模型轮次、Presence、phase、失败退避、session 上限与停止信号。
 - 她拥有自己的客户端窗口，即她自己的眼睛：每个专属意识轮次调用 `session.grab_vision_frame_bytes()` 截取第一人称 JPEG，并作为原生 `Image` part 直接进入多模态请求，不做文字转述。无窗口可截时（如 bot 身体）保留结构化观察并显式没有像素；不会伪造画面。
 - 每轮还读取新的 Bridge 结构化观察、同一主体的固定身份投影、有界近期潜意识和 content-free 最近结果。agent 能从像素与 `players/entities` 感知同服玩家；bot 额外提供最近 16 条游戏聊天/私聊/系统/加入/离开事件的结构化环形缓冲。
-- 场景模型可以形成开放文本意图、主动等待一段自己选择的时间，或离开本次游戏。新动作结果和外部中断会提前唤醒；无弹幕、无聊天消息时仍会按自己的节奏继续观察与选择。模型空响应只让该 scene 有界退避，不会卡住核心 heartbeat，也不会被伪装成一次有效决定。
+- 场景模型可以说话、启动一个身体高层任务、主动等待一段自己选择的时间，或离开本次游戏。新游戏聊天、玩家进出、生命变化和任务终态会提前唤醒；无聊天消息时仍会按自己的节奏继续观察与选择。模型空响应只让该 scene 有界退避，不会卡住核心 heartbeat，也不会被伪装成一次有效决定。
 - `game_turn_interval_seconds` 与 `consciousness_interval_seconds` 仅为旧配置兼容项，已不改变任何运行节奏。不要再通过缩短核心 heartbeat 获得“连续游玩”。
 
 ## 无头 bot 身体（共享世界）
@@ -131,14 +131,16 @@ bot 身体用于和人一起玩同一个世界：人类用自己的客户端进�
 
 bot 观察 facts 与 `StateCollector` 结构对齐（world/player/players/entities/inventory/crosshair/biome 等），并额外携带有界 `chat` 环形缓冲（最近 16 条公共聊天、私聊、系统、加入、离开事件）、最多 64 名可见玩家、最多 128 个附近实体及 `bot_tasks` 执行状态。桥接出站队列有硬上限；拥塞时优先丢弃过时观察而保留命令回执，并在后续观察报告累计丢弃数。`world.mine` 会先寻路到精确目标，再校验方块未变化且可挖后执行 dig。回执语义不变：只证明接单与派发，导航、挖掘、交互结果必须由后续观察证明。
 
+专属意识不再为每一步移动反复请求模型，而是选择 `follow_player`、`go_to_player`、`go_to_position`、`gather_block`、`craft_item`、`place_block` 或 `eat_item` 之一。任务在身体侧连续运行，独占 BodyGate，默认 180 秒技术截止；同时她仍可发送聊天、查看状态或明确取消/替换任务。任务 accepted/progress/completed/failed/cancelled 与聊天等身体事件保留在有界 journal 中，只有 Life Event 成功落账后才按 FIFO ACK；控制器断线后同一认证身体重连会重放未确认事件，不会重复执行。
+
 ## 社区实现取舍
 
 - 用户保留的 `MC集成包.zip` / `MC插件源码.zip` 已做源码级对照。其可复用核心是 Mineflayer 独立玩家、pathfinder 长任务、聊天环形缓冲、进程就绪探测和“靠后续状态确认结果”；本实现采用了这些成熟方向。没有直接搬用其静态 secret + 通用 RPC + 分散工具插件链，因为那条链缺少当前 Elysium 所要求的 HMAC 握手、命令幂等账本、统一 Presence/World、content-free durable receipt 和失败后仍可重试的资源所有权。
 - Neuro SDK 的公开契约采用“文本状态 + 注册动作 + WebSocket 执行结果”，并明确建议实时游戏把低层操作交给专门执行器。这里沿用这一分层：Life Engine 决定高层意图，Mineflayer/pathfinder 负责连续移动与挖掘，观察而非模型自述证明结果。
-- N.E.K.O. 公开仓库展示的是通用插件 SDK/市场与跨场景记忆架构；截至本实现审计时，公开资料中没有可复用、可验证的 Minecraft 专项插件源码。因此只参考其“核心主体与外部插件解耦”的边界，没有把不存在的 MC 实现当作依赖。
+- N.E.K.O. 当前公开的 `game_agent_minecraft` 插件使用单一 `minecraft_task`、稳定 `task_id`、WebSocket、截图缓存、busy-skip、约 15 秒任务提醒、120 秒任务超时与重连。这里采用了它“专属长任务执行器、不中断主对话、结果回送”的成熟结构，但没有复制其基于回复文本判断阻塞的启发式逻辑；Elysium 以类型化任务事件和后置世界证据判断状态。
 - Mineflayer 提供成熟的协议、实体、背包、聊天与物理抽象，适合让爱莉作为独立玩家进入同服；Elysium 额外补上认证桥、幂等命令账本、Presence/World 投影、durable trace 与进程所有权。
 
-参考：[Mineflayer](https://github.com/PrismarineJS/mineflayer)、[Neuro SDK](https://github.com/VedalAI/neuro-sdk)、[Project N.E.K.O.](https://github.com/Project-N-E-K-O/N.E.K.O)。
+参考：[Mineflayer](https://github.com/PrismarineJS/mineflayer)、[Mineflayer Pathfinder](https://github.com/PrismarineJS/mineflayer-pathfinder)、[Mineflayer CollectBlock](https://github.com/PrismarineJS/mineflayer-collectblock)、[Neuro SDK 协议](https://github.com/VedalAI/neuro-sdk/blob/main/API/SPECIFICATION.md)、[Neuro SDK 最佳实践](https://github.com/VedalAI/neuro-sdk/blob/main/API/BEST_PRACTICES.md)、[N.E.K.O. Minecraft 插件](https://github.com/Project-N-E-K-O/N.E.K.O/tree/main/plugin/plugins/game_agent_minecraft)。
 
 ## 启动与就绪语义
 
@@ -174,6 +176,8 @@ data/life_engine_workspace/minecraft/traces/<session_id>.jsonl
 
 专属意识的可观察决定先写入不可变 Life Event，`content_type=minecraft_consciousness_decision`，并归属当前 instance/session/stream；只有落账成功才会执行 `pursue` 意图。重试复用同一 decision ID、事件 sequence 与时间，不会因为存储结果不确定而重复物理动作。trace 中随后出现的 `intent.issued` 应通过 `consciousness_decision_id` 引用这个高层决定。
 
+Minecraft 专属意识不复用 `life_chatter` 的大后缀。主体、当前观察和近期潜意识分别作为独立、可核验的 `Text` part 注入专属请求；默认上限分别为 8192、8192、4096 UTF-8 字节，最近潜意识最多 3 个因果组，最近结果只留 4 个 content-free 引用。World Perception 不再作为跨意识同步默认来源。
+
 ## 独立真实烟雾测试
 
 该测试不会启动或停止 Elysium；若游戏未运行会按托管脚本启动，结束时只释放控制并断开桥接，游戏保持运行：
@@ -194,6 +198,8 @@ PYTHONPATH=. uv run --frozen --no-sync python \
 - `WSLInterop` 缺失：Windows 桥会尝试恢复标准 WSL 注册项；失败时返回明确错误。
 - 多个匹配窗口或 sidecar：由用户手动关闭多余实例；系统不会猜测、抢占或终止进程。
 - 游戏先断开：客户端清理会释放等待者并幂等结束；断线不能被写成动作成功。
+- bot 与控制器断开：反向监听继续存在；只接受同 instance、能力和元数据的认证重连。未 ACK 的身体事件按原 event ID/sequence 重放，已耐久消费但 ACK 丢失的事件只补 ACK，不重新落账或重新唤醒。
+- 高层任务长期无终态：BodyGate 在默认 180 秒技术截止触发取消并记录 `timed_out` 失败；不得把超时写成完成，也不得在旧任务仍占有身体时并发启动第二个任务。
 - 模组崩溃：以 crash report 的首个业务栈为准，只隔离有直接证据的模组，并保留可恢复副本。不要批量禁用模组。
 - `Minecraft subject projection byte count does not match its text`：这表示身体尚未启动，主体投影的正文与元数据不再逐字节一致。消费端必须保留快照原始 UTF-8（包括渲染器固定写入的末尾换行），再校验 `delivered_bytes` 与 `projection_sha256`；不得对正文 `strip()` 后比较，也不得跳过该 fail-closed 门。修复后需要用户手动重启 Elysium，再重新执行 `start`。
 - life_chatter 后缀突然变大：检查 World 中 `domain=minecraft/predicate=embodied_trace` 的 value schema。新记录必须是 8 KiB 内的 `minecraft.embodied_trace_projection.v1`；若看到完整 `payload.context`、`transient_world_perception` 或 `recent_subconscious_context`，这是旧递归投影或新的边界违约证据。不要删除或重写历史数据库；保留原文并交由 World owner 做有来源隔离、分页或 superseding projection。

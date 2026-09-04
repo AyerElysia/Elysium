@@ -41,18 +41,66 @@ logger = logging.getLogger("life_engine.minecraft.consciousness")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SUBJECT_SOURCES = frozenset({"SOUL.md", "USER.md", "MEMORY.md"})
 _DECISION_KINDS = frozenset({"pursue", "wait", "end_session"})
+_OBSERVATION_PROMPT_FACT_ORDER = (
+    "world_loaded",
+    "world",
+    "screen",
+    "player",
+    "chat",
+    "bot_tasks",
+    "players",
+    "inventory",
+    "entities",
+)
+
+_TASK_ARGUMENT_GUIDANCE: dict[str, dict[str, str]] = {
+    "follow_player": {
+        "player": "visible Minecraft account name",
+        "distance": "optional integer 1..16, default 3",
+    },
+    "go_to_player": {
+        "player": "visible Minecraft account name",
+        "distance": "optional integer 1..16, default 2",
+    },
+    "go_to_position": {
+        "x": "integer block coordinate",
+        "y": "integer block coordinate",
+        "z": "integer block coordinate",
+        "distance": "optional integer 0..16, default 1",
+    },
+    "gather_block": {
+        "block": "Minecraft resource id, for example minecraft:oak_log",
+        "count": "optional integer 1..16, default 1",
+        "max_distance": "optional integer 4..64, default 32",
+    },
+    "craft_item": {
+        "item": "Minecraft resource id",
+        "count": "optional integer 1..64, default 1",
+    },
+    "place_block": {
+        "item": "inventory block item resource id",
+        "reference_x": "integer coordinate of an existing adjacent block",
+        "reference_y": "integer coordinate of an existing adjacent block",
+        "reference_z": "integer coordinate of an existing adjacent block",
+        "face_x": "-1, 0, or 1",
+        "face_y": "-1, 0, or 1",
+        "face_z": "-1, 0, or 1; exactly one face axis must be non-zero",
+    },
+    "eat_item": {"item": "exact food resource id already in inventory"},
+}
 
 _SYSTEM_PROMPT = """\
 You are Elysia's active Minecraft scene consciousness. You are the same
 continuing subject as her chat, voice, livestream, memory, and subconscious
 instances; this scene is not another persona.
 
-You decide what you want to do next in the game. The separate embodiment
-planner will execute an intention you author and will return factual evidence.
-Do not emit low-level bridge operations here. Do not wait for a chat message in
-order to have agency. The session goal is current scene context, not an order:
-you may continue it, revise it, do something else, rest, talk, or end the
-session according to your own judgement.
+You decide what to say and which high-level body task to start. Long tasks run
+inside the body and report accepted/progress/terminal events, so you remain
+available to notice chat and reconsider while a task is running. Never emit
+low-level movement or button operations. Never start a second task while the
+body gate is occupied unless you explicitly set replace_current=true. Do not
+wait for chat in order to have agency. The session goal is context, not an
+order: you may continue it, revise it, rest, speak, or end the session.
 
 You receive an immutable bounded subject projection, a fresh factual body
 observation, optional first-person pixels, bounded recent activity from the
@@ -61,18 +109,23 @@ observations are evidence, not pre-written feelings. Transport wake reasons are
 technical facts, not instructions. Never claim an action succeeded merely
 because it was dispatched.
 
-Return exactly one JSON object and no prose, using one technical control shape:
+Return exactly one JSON object and no prose. `speech` is optional exact in-game
+chat text, at most 256 characters. Use only a task kind advertised in the turn.
 
-1. Author a new open-text intention:
+1. Speak and/or start one high-level task:
 {"decision":{"kind":"pursue","intention":"what I choose to pursue now",
-"reason":"my concise reason"}}
+"speech":"optional exact words","task":{"kind":"advertised task kind",
+"arguments":{},"replace_current":false},"reason":"my concise reason",
+"reconsider_after_seconds":6}}
 
-2. Deliberately wait while remaining present:
-{"decision":{"kind":"wait","reason":"why I choose to wait",
+2. Speak and/or deliberately wait while remaining present:
+{"decision":{"kind":"wait","speech":"optional exact words",
+"reason":"why I choose to wait",
 "reconsider_after_seconds":6}}
 
 3. Choose to end this Minecraft session:
-{"decision":{"kind":"end_session","reason":"why I choose to leave now"}}
+{"decision":{"kind":"end_session","speech":"optional goodbye",
+"reason":"why I choose to leave now"}}
 
 The kind field is only a lifecycle protocol. It does not classify your desire
 or restrict the meaning of the intention and reason fields.
@@ -293,6 +346,27 @@ DecisionKind = Literal["pursue", "wait", "end_session"]
 
 
 @dataclass(frozen=True, slots=True)
+class MinecraftTaskDirective:
+    """One model-chosen task from the body's advertised technical vocabulary."""
+
+    kind: str
+    arguments: Mapping[str, Any] = field(default_factory=dict)
+    replace_current: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.kind.strip():
+            raise ValueError("Minecraft task kind must not be empty")
+        object.__setattr__(self, "arguments", dict(self.arguments))
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "arguments": dict(self.arguments),
+            "replace_current": self.replace_current,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class MinecraftConsciousnessDecision:
     """One model-authored scene decision under a lifecycle schema."""
 
@@ -301,6 +375,8 @@ class MinecraftConsciousnessDecision:
     turn_index: int
     authored_at: str
     intention: str = ""
+    speech: str = ""
+    task: MinecraftTaskDirective | None = None
     reason: str = ""
     reconsider_after_seconds: float | None = None
     transport_request_id: str = ""
@@ -311,12 +387,14 @@ class MinecraftConsciousnessDecision:
         """Return the complete decision for immutable Life Event storage."""
 
         return {
-            "schema": "minecraft.consciousness_decision.v1",
+            "schema": "minecraft.consciousness_decision.v2",
             "decision_id": self.decision_id,
             "kind": self.kind,
             "turn_index": self.turn_index,
             "authored_at": self.authored_at,
             "intention": self.intention,
+            "speech": self.speech,
+            "task": self.task.to_record() if self.task is not None else None,
             "reason": self.reason,
             "reconsider_after_seconds": self.reconsider_after_seconds,
             "transport_request_id": self.transport_request_id,
@@ -391,6 +469,7 @@ class MinecraftConsciousnessTurnContext:
     subject: MinecraftSubjectContextBinding
     perception: MinecraftConsciousnessPerception
     recent_outcomes: tuple[MinecraftConsciousnessOutcome, ...]
+    task_kinds: tuple[str, ...] = ()
 
     def reference(self) -> dict[str, Any]:
         """Return a bounded content-free reference for the durable event."""
@@ -408,6 +487,7 @@ class MinecraftConsciousnessTurnContext:
             "recent_outcome_decision_ids": [
                 item.decision_id for item in self.recent_outcomes
             ],
+            "task_kinds": list(self.task_kinds),
         }
 
 
@@ -430,6 +510,32 @@ def _utf8_prefix(value: str, max_bytes: int) -> str:
     if len(encoded) <= max_bytes:
         return value
     return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def _prompt_ordered_observation_wire(
+    observation: WorldObservation,
+) -> dict[str, Any]:
+    """Order technical sensor channels before large optional collections."""
+
+    wire = observation.to_wire()
+    raw_facts = wire.get("facts")
+    if not isinstance(raw_facts, Mapping):
+        return wire
+    facts = dict(raw_facts)
+    ordered_facts: dict[str, Any] = {}
+    for key in _OBSERVATION_PROMPT_FACT_ORDER:
+        if key in facts:
+            ordered_facts[key] = facts.pop(key)
+    for key in sorted(facts):
+        ordered_facts[str(key)] = facts[key]
+    return {
+        "observation_id": wire.get("observation_id"),
+        "instance_id": wire.get("instance_id"),
+        "sequence": wire.get("sequence"),
+        "observed_at": wire.get("observed_at"),
+        "source": wire.get("source"),
+        "facts": ordered_facts,
+    }
 
 
 def build_observation_projection(
@@ -479,6 +585,7 @@ def build_observation_projection(
         "source_sha256": source_hash,
         "source_bytes": len(source_bytes),
         "truncated": True,
+        "prefix_order": "minecraft-core-facts-v1",
         "utf8_prefix": "",
     }
     overhead = len(
@@ -490,8 +597,16 @@ def build_observation_projection(
         ).encode("utf-8")
     )
     prefix_budget = max(0, max_bytes - overhead - 32)
+    prompt_source_text = json.dumps(
+        _prompt_ordered_observation_wire(observation),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
     while True:
-        envelope["utf8_prefix"] = _utf8_prefix(source_text, prefix_budget)
+        envelope["utf8_prefix"] = _utf8_prefix(
+            prompt_source_text,
+            prefix_budget,
+        )
         rendered = json.dumps(
             envelope,
             ensure_ascii=False,
@@ -541,6 +656,13 @@ class ElysiumMinecraftDecisionSource:
         observation_max_bytes: int,
         min_wait_seconds: float,
         max_wait_seconds: float,
+        failed_turn_recorder: (
+            Callable[
+                [Any, MinecraftConsciousnessTurnContext],
+                Awaitable[None],
+            ]
+            | None
+        ) = None,
     ) -> None:
         if not str(model_task_name or "").strip():
             raise ValueError("Minecraft consciousness task name must not be empty")
@@ -550,6 +672,7 @@ class ElysiumMinecraftDecisionSource:
         self._observation_max_bytes = int(observation_max_bytes)
         self._min_wait_seconds = float(min_wait_seconds)
         self._max_wait_seconds = float(max_wait_seconds)
+        self._failed_turn_recorder = failed_turn_recorder
 
     async def decide(
         self,
@@ -609,6 +732,15 @@ class ElysiumMinecraftDecisionSource:
             "wake_reasons": list(context.wake_reasons),
             "subject_context_reference": context.subject.reference(),
             "recent_outcomes": [item.to_prompt() for item in context.recent_outcomes],
+            "task_contract": {
+                "available_kinds": list(context.task_kinds),
+                "argument_schemas": {
+                    kind: _TASK_ARGUMENT_GUIDANCE[kind]
+                    for kind in context.task_kinds
+                    if kind in _TASK_ARGUMENT_GUIDANCE
+                },
+                "body_gate": "one active high-level task at a time",
+            },
             "wait_contract": {
                 "min_seconds": self._min_wait_seconds,
                 "max_seconds": self._max_wait_seconds,
@@ -664,23 +796,33 @@ class ElysiumMinecraftDecisionSource:
         request.add_payload(LLMPayload(ROLE.USER, user_parts))
 
         response = await request.send(stream=False)
-        await response
-        _verify_delivery(response, subject_delivery_id, subject_text)
-        _verify_delivery(response, observation_delivery_id, observation_part)
-        if subconscious_delivery_id:
-            _verify_delivery(response, subconscious_delivery_id, subconscious_part)
-        raw = str(getattr(response, "message", "") or "").strip()
-        return self._parse_decision(
-            raw,
-            context,
-            transport_request_id=str(
-                getattr(response, "request_record_id", "")
-                or f"minecraft:{context.session_id}:turn:{context.turn_index}"
-            ),
-            provider_reasoning_content=str(
-                getattr(response, "reasoning_content", "") or ""
-            ),
-        )
+        try:
+            await response
+            _verify_delivery(response, subject_delivery_id, subject_text)
+            _verify_delivery(response, observation_delivery_id, observation_part)
+            if subconscious_delivery_id:
+                _verify_delivery(
+                    response,
+                    subconscious_delivery_id,
+                    subconscious_part,
+                )
+            raw = str(getattr(response, "message", "") or "").strip()
+            return self._parse_decision(
+                raw,
+                context,
+                transport_request_id=str(
+                    getattr(response, "request_record_id", "")
+                    or f"minecraft:{context.session_id}:turn:{context.turn_index}"
+                ),
+                provider_reasoning_content=str(
+                    getattr(response, "reasoning_content", "") or ""
+                ),
+            )
+        except Exception:
+            recorder = self._failed_turn_recorder
+            if recorder is not None:
+                await recorder(response, context)
+            raise
 
     def _parse_decision(
         self,
@@ -712,6 +854,8 @@ class ElysiumMinecraftDecisionSource:
         allowed = {
             "kind",
             "intention",
+            "speech",
+            "task",
             "reason",
             "reconsider_after_seconds",
         }
@@ -727,6 +871,44 @@ class ElysiumMinecraftDecisionSource:
                 f"Minecraft decision kind is invalid: {kind or 'empty'}"
             )
         intention = str(decision.get("intention") or "").strip()
+        speech = str(decision.get("speech") or "").strip()
+        if len(speech) > 256:
+            raise MinecraftConsciousnessOutputError(
+                "Minecraft speech must not exceed 256 characters"
+            )
+        task: MinecraftTaskDirective | None = None
+        raw_task = decision.get("task")
+        if raw_task is not None:
+            if not isinstance(raw_task, dict):
+                raise MinecraftConsciousnessOutputError("task must be a JSON object")
+            unknown_task_fields = set(raw_task).difference(
+                {"kind", "arguments", "replace_current"}
+            )
+            if unknown_task_fields:
+                raise MinecraftConsciousnessOutputError(
+                    "Minecraft task contains unknown fields: "
+                    + ", ".join(sorted(str(item) for item in unknown_task_fields))
+                )
+            task_kind = str(raw_task.get("kind") or "").strip()
+            if task_kind not in context.task_kinds:
+                raise MinecraftConsciousnessOutputError(
+                    f"Minecraft task kind was not advertised: {task_kind or 'empty'}"
+                )
+            arguments = raw_task.get("arguments", {})
+            if not isinstance(arguments, dict):
+                raise MinecraftConsciousnessOutputError(
+                    "Minecraft task arguments must be a JSON object"
+                )
+            replace_current = raw_task.get("replace_current", False)
+            if not isinstance(replace_current, bool):
+                raise MinecraftConsciousnessOutputError(
+                    "Minecraft task replace_current must be boolean"
+                )
+            task = MinecraftTaskDirective(
+                kind=task_kind,
+                arguments=arguments,
+                replace_current=replace_current,
+            )
         reason = str(decision.get("reason") or "").strip()
         reconsider: float | None = None
         if kind == "pursue":
@@ -734,9 +916,24 @@ class ElysiumMinecraftDecisionSource:
                 raise MinecraftConsciousnessOutputError(
                     "pursue decision requires a non-empty intention"
                 )
-            if "reconsider_after_seconds" in decision:
+            if context.task_kinds and task is None:
                 raise MinecraftConsciousnessOutputError(
-                    "pursue decision cannot carry a wait deadline"
+                    "pursue decision requires one advertised high-level task"
+                )
+            if task is not None:
+                try:
+                    reconsider = float(decision["reconsider_after_seconds"])
+                except (KeyError, TypeError, ValueError) as exception:
+                    raise MinecraftConsciousnessOutputError(
+                        "task pursue decision requires reconsider_after_seconds"
+                    ) from exception
+                if not self._min_wait_seconds <= reconsider <= self._max_wait_seconds:
+                    raise MinecraftConsciousnessOutputError(
+                        "task reconsideration deadline is outside technical bounds"
+                    )
+            elif "reconsider_after_seconds" in decision:
+                raise MinecraftConsciousnessOutputError(
+                    "legacy pursue decision cannot carry a wait deadline"
                 )
         elif kind == "wait":
             if not reason:
@@ -753,18 +950,18 @@ class ElysiumMinecraftDecisionSource:
                 raise MinecraftConsciousnessOutputError(
                     "wait deadline is outside the technical bounds"
                 )
-            if intention:
+            if intention or task is not None:
                 raise MinecraftConsciousnessOutputError(
-                    "wait decision cannot carry an intention"
+                    "wait decision cannot carry an intention or task"
                 )
         else:
             if not reason:
                 raise MinecraftConsciousnessOutputError(
                     "end_session decision requires a non-empty reason"
                 )
-            if intention or "reconsider_after_seconds" in decision:
+            if intention or task is not None or "reconsider_after_seconds" in decision:
                 raise MinecraftConsciousnessOutputError(
-                    "end_session cannot carry intention or wait fields"
+                    "end_session cannot carry intention, task, or wait fields"
                 )
 
         canonical = json.dumps(
@@ -787,6 +984,8 @@ class ElysiumMinecraftDecisionSource:
             turn_index=context.turn_index,
             authored_at=datetime.now(UTC).isoformat(),
             intention=intention,
+            speech=speech,
+            task=task,
             reason=reason,
             reconsider_after_seconds=reconsider,
             transport_request_id=str(transport_request_id or ""),
@@ -797,6 +996,9 @@ class ElysiumMinecraftDecisionSource:
 
 PerceptionSource = Callable[[], Awaitable[MinecraftConsciousnessPerception]]
 IntentExecutor = Callable[[str], Awaitable[Mapping[str, Any]]]
+SceneDecisionExecutor = Callable[
+    [MinecraftConsciousnessDecision], Awaitable[Mapping[str, Any]]
+]
 DecisionRecorder = Callable[
     [MinecraftConsciousnessDecision, MinecraftConsciousnessTurnContext],
     Awaitable[None],
@@ -826,6 +1028,8 @@ class MinecraftConsciousnessRuntime:
     retry_max_seconds: float = 30.0
     stop_timeout_seconds: float = 10.0
     max_session_seconds: float = 3600.0
+    execute_scene_decision: SceneDecisionExecutor | None = None
+    task_kinds: tuple[str, ...] = ()
     _stop_event: asyncio.Event = field(default_factory=asyncio.Event, init=False)
     _wake_event: asyncio.Event = field(default_factory=asyncio.Event, init=False)
     _wake_reasons: deque[str] = field(
@@ -855,6 +1059,12 @@ class MinecraftConsciousnessRuntime:
             raise ValueError("Minecraft consciousness stop timeout must be positive")
         if self.max_session_seconds <= 0:
             raise ValueError("Minecraft consciousness max session must be positive")
+        normalized_task_kinds = tuple(
+            str(item).strip() for item in self.task_kinds if str(item).strip()
+        )
+        if len(normalized_task_kinds) != len(set(normalized_task_kinds)):
+            raise ValueError("Minecraft consciousness task kinds must be unique")
+        self.task_kinds = normalized_task_kinds
         self._recent_outcomes = deque(maxlen=self.recent_turn_limit)
 
     @property
@@ -957,6 +1167,7 @@ class MinecraftConsciousnessRuntime:
             ),
             "recent_outcome_count": len(self._recent_outcomes),
             "pending_wake_count": len(self._wake_reasons),
+            "task_kinds": list(self.task_kinds),
             "subject_context_reference": self.subject.reference(),
         }
 
@@ -993,6 +1204,7 @@ class MinecraftConsciousnessRuntime:
                             subject=self.subject,
                             perception=perception,
                             recent_outcomes=tuple(self._recent_outcomes),
+                            task_kinds=self.task_kinds,
                         )
                         self._phase = "deliberating"
                         pending_decision = await self.decision_source.decide(
@@ -1018,7 +1230,7 @@ class MinecraftConsciousnessRuntime:
                         self._phase = "acting"
                         self._last_intention = decision.intention
                         try:
-                            result = await self.execute_intent(decision.intention)
+                            result = await self._execute_authored_action(decision)
                         except Exception as exception:  # noqa: BLE001
                             result = {
                                 "success": False,
@@ -1036,10 +1248,21 @@ class MinecraftConsciousnessRuntime:
                         )
                         if bool(result.get("success")):
                             self._last_success_at = datetime.now(UTC).isoformat()
-                        self.wake("intention_finished")
+                        if decision.task is None:
+                            self.wake("intention_finished")
+                        else:
+                            self._phase = "waiting_for_body_event"
+                            await self.refresh_presence(
+                                "minecraft_consciousness_task_dispatched"
+                            )
+                            await self._wait_for_wake(
+                                float(decision.reconsider_after_seconds or 0.0)
+                            )
                         continue
                     if decision.kind == "end_session":
                         self._phase = "ending_session"
+                        if decision.speech:
+                            await self._execute_authored_action(decision)
                         await self.request_end_session(decision.reason)
                         pending_decision = None
                         pending_context = None
@@ -1047,6 +1270,18 @@ class MinecraftConsciousnessRuntime:
 
                     pending_decision = None
                     pending_context = None
+                    if decision.speech:
+                        self._phase = "speaking"
+                        result = await self._execute_authored_action(decision)
+                        self._recent_outcomes.append(
+                            MinecraftConsciousnessOutcome.from_result(
+                                decision.decision_id,
+                                decision.speech,
+                                result,
+                            )
+                        )
+                        if bool(result.get("success")):
+                            self._last_success_at = datetime.now(UTC).isoformat()
                     self._phase = "waiting"
                     await self.refresh_presence("minecraft_consciousness_wait")
                     await self._wait_for_wake(
@@ -1078,6 +1313,20 @@ class MinecraftConsciousnessRuntime:
             self._active_decision_id = ""
             if self._phase != "ending_session":
                 self._phase = "stopped"
+
+    async def _execute_authored_action(
+        self,
+        decision: MinecraftConsciousnessDecision,
+    ) -> Mapping[str, Any]:
+        """Dispatch speech/high-level work without blocking on task completion."""
+
+        if decision.task is not None or decision.speech:
+            if self.execute_scene_decision is None:
+                raise RuntimeError(
+                    "Minecraft scene decision executor is absent for speech/task"
+                )
+            return await self.execute_scene_decision(decision)
+        return await self.execute_intent(decision.intention)
 
     def _drain_wake_reasons(self) -> tuple[str, ...]:
         """Drain bounded transport reasons without semantic ranking."""
@@ -1113,5 +1362,6 @@ __all__ = [
     "MinecraftConsciousnessTurnContext",
     "MinecraftSubjectContextBinding",
     "MinecraftSubjectContextError",
+    "MinecraftTaskDirective",
     "build_observation_projection",
 ]

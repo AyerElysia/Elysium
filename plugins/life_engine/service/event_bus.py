@@ -96,6 +96,12 @@ def _legacy_channel(event: LifeEngineEvent) -> LifeEventChannel:
         return LifeEventChannel.PROACTIVE
     if content_type == "initiative_reencounter":
         return LifeEventChannel.LIFE
+    if content_type in {
+        "inner_dialogue",
+        "inner_dialogue_return",
+        "inner_dialogue_return_delivery",
+    }:
+        return LifeEventChannel.LIFE
     if content_type.startswith("autonomy_intent_"):
         return LifeEventChannel.LIFE
     if event.event_type == EventType.CONSCIOUS_ACTIVITY:
@@ -111,7 +117,12 @@ def _legacy_priority_and_salience(event: LifeEngineEvent) -> tuple[int, float]:
     content_type = str(event.content_type or "").strip().lower()
     if event.event_type == EventType.TOOL_RESULT and event.tool_success is False:
         return int(LifeEventPriority.URGENT), 1.0
-    if content_type in {"direct_message", "dfc_message", "inner_dialogue"}:
+    if content_type in {
+        "direct_message",
+        "dfc_message",
+        "inner_dialogue",
+        "inner_dialogue_return",
+    }:
         return int(LifeEventPriority.HIGH), 0.9
     if content_type == "proactive_opportunity":
         return int(LifeEventPriority.HIGH), 0.82
@@ -216,6 +227,120 @@ def life_event_from_legacy(event: LifeEngineEvent) -> LifeEvent:
         causation_id=str(getattr(event, "causation_id", None) or ""),
         correlation_id=correlation_id,
         content_ref=content_ref,
+    )
+
+
+def legacy_event_from_life_event(event: LifeEvent) -> LifeEngineEvent | None:
+    """Rebuild a compatibility LifeEngineEvent from one ledger row.
+
+    Returns None when the row was not published from a LifeEngineEvent
+    (for example a chat fact or world assertion). Callers must not invent
+    a legacy type for those rows.
+    """
+
+    metadata = event.metadata if isinstance(event.metadata, dict) else {}
+    legacy_type = str(metadata.get("legacy_event_type") or "").strip()
+    if not legacy_type:
+        return None
+    try:
+        event_type = EventType(legacy_type)
+    except ValueError:
+        return None
+    sequence = int(event.source_sequence or 0)
+    raw_content = str(event.content or "")
+    content_type = str(metadata.get("content_type") or event.event_type or "")
+    tool_success = metadata.get("tool_success")
+    parsed_success: bool | None
+    if isinstance(tool_success, bool):
+        parsed_success = tool_success
+    else:
+        parsed_success = None
+    tool_args = metadata.get("tool_args")
+    if not isinstance(tool_args, dict):
+        tool_args = None
+    stream_id = str(event.stream_id or "").strip() or None
+    heartbeat_index = metadata.get("heartbeat_index")
+    parsed_index: int | None
+    try:
+        parsed_index = int(heartbeat_index) if heartbeat_index is not None else None
+    except (TypeError, ValueError):
+        parsed_index = None
+    return LifeEngineEvent(
+        event_id=str(event.event_id or ""),
+        event_type=event_type,
+        timestamp=str(event.timestamp or ""),
+        sequence=sequence,
+        source=str(event.source or ""),
+        source_detail=str(metadata.get("source_detail") or ""),
+        content=raw_content,
+        content_type=content_type,
+        sender=(
+            str(metadata["sender"])
+            if metadata.get("sender") is not None
+            else None
+        ),
+        sender_id=(
+            str(metadata["sender_id"])
+            if metadata.get("sender_id") is not None
+            else None
+        ),
+        sender_platform_account_key=(
+            str(metadata["sender_platform_account_key"])
+            if metadata.get("sender_platform_account_key") is not None
+            else None
+        ),
+        canonical_person_key=(
+            str(metadata["canonical_person_key"])
+            if metadata.get("canonical_person_key") is not None
+            else None
+        ),
+        identity_resolution_status=(
+            str(metadata["identity_resolution_status"])
+            if metadata.get("identity_resolution_status") is not None
+            else None
+        ),
+        chat_type=(
+            str(metadata["chat_type"])
+            if metadata.get("chat_type") is not None
+            else None
+        ),
+        stream_id=stream_id,
+        heartbeat_index=parsed_index,
+        heartbeat_run_id=(
+            str(metadata["heartbeat_run_id"])
+            if metadata.get("heartbeat_run_id") is not None
+            else None
+        ),
+        call_id=(
+            str(metadata["call_id"]) if metadata.get("call_id") is not None else None
+        ),
+        parent_event_id=(
+            str(metadata["parent_event_id"])
+            if metadata.get("parent_event_id") is not None
+            else None
+        ),
+        occurrence_id=str(event.occurrence_id or event.event_id or "") or None,
+        causation_id=str(event.causation_id or metadata.get("causation_id") or "")
+        or None,
+        tool_name=(
+            str(metadata["tool_name"])
+            if metadata.get("tool_name") is not None
+            else None
+        ),
+        tool_args=tool_args,
+        tool_success=parsed_success,
+        heartbeat_context_consumed=bool(metadata.get("heartbeat_context_consumed")),
+        source_instance_id=str(
+            event.source_instance_id or metadata.get("source_instance_id") or ""
+        )
+        or None,
+        correlation_id=str(
+            event.correlation_id or metadata.get("correlation_id") or ""
+        )
+        or None,
+        content_ref=str(event.content_ref or metadata.get("content_ref") or "")
+        or None,
+        raw_content=raw_content,
     )
 
 
@@ -545,6 +670,8 @@ class RawEventStore(_LegacyJSONLEventStore):
             );
             CREATE INDEX IF NOT EXISTS idx_raw_life_events_source
                 ON raw_life_events(source_event_id, occurred_at, ingest_position);
+            CREATE INDEX IF NOT EXISTS idx_raw_life_events_occurred
+                ON raw_life_events(occurred_at, ingest_position);
             CREATE TABLE IF NOT EXISTS raw_event_consumer_offsets (
                 consumer_id TEXT PRIMARY KEY,
                 ingest_position INTEGER NOT NULL,
@@ -914,6 +1041,73 @@ class RawEventStore(_LegacyJSONLEventStore):
     ) -> list[LifeEvent]:
         return await asyncio.to_thread(self._read_since_sync, sequence, limit)
 
+    def _scan_window_sync(
+        self,
+        *,
+        after_position: int,
+        before_position: int | None,
+        occurred_after: str | None,
+        occurred_before: str | None,
+        limit: int,
+        descending: bool,
+    ) -> list[LifeEvent]:
+        self._ensure_ready_sync()
+        bounded = int(limit)
+        if bounded <= 0:
+            return []
+        after = max(0, int(after_position))
+        clauses = ["ingest_position > ?"]
+        params: list[Any] = [after]
+        if before_position is not None:
+            before = max(0, int(before_position))
+            if before <= after:
+                return []
+            clauses.append("ingest_position < ?")
+            params.append(before)
+        if occurred_after:
+            clauses.append("occurred_at >= ?")
+            params.append(str(occurred_after))
+        if occurred_before:
+            clauses.append("occurred_at <= ?")
+            params.append(str(occurred_before))
+        order = "DESC" if descending else "ASC"
+        sql = f"""SELECT * FROM raw_life_events
+        WHERE {' AND '.join(clauses)}
+        ORDER BY ingest_position {order} LIMIT ?"""
+        params.append(bounded)
+        with self._connect() as db:
+            bounds = db.execute(
+                """SELECT MIN(ingest_position) AS earliest,
+                MAX(ingest_position) AS latest FROM raw_life_events"""
+            ).fetchone()
+            earliest = int(bounds["earliest"] or 0) if bounds is not None else 0
+            if after > 0 and earliest > after + 1:
+                raise RawEventGapError(after, earliest)
+            rows = db.execute(sql, params).fetchall()
+        return [self._event_from_row(row) for row in rows]
+
+    async def scan_window(
+        self,
+        *,
+        after_position: int = 0,
+        before_position: int | None = None,
+        occurred_after: str | None = None,
+        occurred_before: str | None = None,
+        limit: int,
+        descending: bool = False,
+    ) -> list[LifeEvent]:
+        """Read a bounded ledger window by position and occurred_at."""
+
+        return await asyncio.to_thread(
+            self._scan_window_sync,
+            after_position=after_position,
+            before_position=before_position,
+            occurred_after=occurred_after,
+            occurred_before=occurred_before,
+            limit=limit,
+            descending=descending,
+        )
+
     def _get_by_event_id_sync(self, event_id: str) -> LifeEvent | None:
         self._ensure_ready_sync()
         with self._connect() as db:
@@ -949,6 +1143,42 @@ class RawEventStore(_LegacyJSONLEventStore):
                 (str(consumer_id),),
             ).fetchone()
         return int(row["ingest_position"]) if row is not None else 0
+
+    def _consumer_cursor_sync(self, consumer_id: str) -> Any:
+        from ..storage.event_contracts import LifeEventConsumerCursor
+
+        self._ensure_ready_sync()
+        identity = str(consumer_id or "").strip()
+        if not identity:
+            raise ValueError("consumer_id must not be empty")
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT ingest_position, updated_at, metadata_json
+                FROM raw_event_consumer_offsets WHERE consumer_id = ?""",
+                (identity,),
+            ).fetchone()
+        if row is None:
+            return LifeEventConsumerCursor(
+                consumer_id=identity,
+                position=0,
+                revision=0,
+                updated_at="",
+                metadata={},
+            )
+        raw_metadata = json.loads(str(row["metadata_json"] or "{}"))
+        metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
+        return LifeEventConsumerCursor(
+            consumer_id=identity,
+            position=int(row["ingest_position"]),
+            revision=0,
+            updated_at=str(row["updated_at"] or ""),
+            metadata=metadata,
+        )
+
+    async def consumer_cursor(self, consumer_id: str) -> Any:
+        """Return one consumer cursor without creating it."""
+
+        return await asyncio.to_thread(self._consumer_cursor_sync, consumer_id)
 
     async def get_consumer_offset(self, consumer_id: str) -> int:
         """Return one consumer's durable ingest cursor."""

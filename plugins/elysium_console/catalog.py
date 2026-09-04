@@ -199,7 +199,7 @@ async def _maybe_await(value: Any) -> Any:
 
 
 class ElysiumDataCatalog:
-    """Read-only, bounded facade over the active Life Engine service."""
+    """Bounded facade plus the explicit local Minecraft session controls."""
 
     def __init__(self, service_provider: Callable[[], Any] | None = None) -> None:
         self._service_provider = service_provider or get_life_engine_service
@@ -235,6 +235,84 @@ class ElysiumDataCatalog:
             memory=content_free_health(memory_health),
             presence=presence,
             workspace=workspace,
+        )
+
+    async def minecraft_status(self) -> dict[str, Any]:
+        """Return a bounded operational view without exposing full observations."""
+
+        session = getattr(self._service(), "minecraft_session", None)
+        if session is None:
+            return self._envelope(
+                "minecraft_status",
+                read_only=True,
+                available=False,
+                active=False,
+                readiness="disabled",
+                readiness_detail="Minecraft is not enabled or initialized",
+            )
+        raw = dict(await session.get_status())
+        observation = raw.pop("latest_observation", None)
+        if isinstance(observation, Mapping):
+            facts = observation.get("facts")
+            fact_map = dict(facts) if isinstance(facts, Mapping) else {}
+            raw["latest_observation"] = {
+                "observation_id": observation.get("observation_id"),
+                "sequence": observation.get("sequence"),
+                "observed_at": observation.get("observed_at"),
+                "world": safe_value(fact_map.get("world"), max_depth=2),
+                "player": safe_value(fact_map.get("player"), max_depth=2),
+                "bot_tasks": safe_value(fact_map.get("bot_tasks"), max_depth=4),
+            }
+        return self._envelope(
+            "minecraft_status",
+            read_only=True,
+            available=True,
+            **safe_value(raw, max_depth=5),
+        )
+
+    async def minecraft_preflight(self) -> dict[str, Any]:
+        """Check the companion body and configured LAN world without starting it."""
+
+        session = getattr(self._service(), "minecraft_session", None)
+        if session is None:
+            raise ConsoleDataUnavailable("Minecraft is not enabled or initialized")
+        result = await session.preflight(body_name="bot")
+        return self._envelope(
+            "minecraft_preflight",
+            read_only=True,
+            body_name="bot",
+            result=safe_value(result, max_depth=5),
+        )
+
+    async def minecraft_start(self, *, goal: str = "") -> dict[str, Any]:
+        """Start the explicitly selected independent companion body."""
+
+        normalized_goal = " ".join(str(goal or "").split())
+        if len(normalized_goal) > 500:
+            raise ConsoleDataInvalid("Minecraft session goal is too long")
+        session = getattr(self._service(), "minecraft_session", None)
+        if session is None:
+            raise ConsoleDataUnavailable("Minecraft is not enabled or initialized")
+        result = await session.start(goal=normalized_goal, body_name="bot")
+        return self._envelope(
+            "minecraft_start",
+            read_only=False,
+            body_name="bot",
+            result=safe_value(result, max_depth=6),
+        )
+
+    async def minecraft_stop(self) -> dict[str, Any]:
+        """Stop only the Elysium-owned companion session and bot process."""
+
+        session = getattr(self._service(), "minecraft_session", None)
+        if session is None:
+            raise ConsoleDataUnavailable("Minecraft is not enabled or initialized")
+        result = await session.stop()
+        return self._envelope(
+            "minecraft_stop",
+            read_only=False,
+            body_name="bot",
+            result=safe_value(result, max_depth=6),
         )
 
     async def timeline(self, *, limit: int = 80) -> dict[str, Any]:

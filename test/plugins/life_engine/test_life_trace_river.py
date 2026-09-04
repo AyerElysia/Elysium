@@ -6,8 +6,7 @@
 2. origin 源头概览
 3. 文件改写携带语境（stream_id / source_event_id 断链修复）
 4. 意图归宿入河（formed / silence）
-5. 思考流闭合与好奇承接入河
-6. chatter 注入行对非文件留痕的渲染
+5. chatter 注入行对非文件留痕的渲染
 """
 
 from __future__ import annotations
@@ -22,7 +21,6 @@ import pytest
 
 from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.service import LifeEngineService
-from plugins.life_engine.streams.tools import LifeEngineManageThoughtStreamTool
 from plugins.life_engine.trace.store import AsyncLocalLifeTraceStore, LifeTraceStore
 from src.core.config.core_config import CoreConfig
 
@@ -204,107 +202,7 @@ def test_retired_autonomy_cannot_create_life_trace_moments(tmp_path: Path) -> No
     assert LifeTraceStore(tmp_path).recent(limit=5, kind="intent") == []
 
 
-def _make_tool_env(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> tuple[LifeEngineManageThoughtStreamTool, list[dict], SimpleNamespace]:
-    from plugins.life_engine.curiosity.engine import CuriosityEngine, CuriositySignal
-
-    captured: list[dict] = []
-    curiosity_engine = CuriosityEngine(workspace_path=str(tmp_path))
-    asyncio.run(
-        curiosity_engine.save_signal(
-            CuriositySignal(active=True, anchor="反复出现的旋律", why="", unknown="", approach="")
-        )
-    )
-    snapshot_path = tmp_path / "thoughts" / "streams.json"
-    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-    snapshot_path.write_text(
-        json.dumps(
-            {
-                "schema_version": 2,
-                "global_revision": 1,
-                "streams": [
-                    {
-                        "id": "ts_legacy_melody",
-                        "title": "那段旋律",
-                        "status": "active",
-                        "created_at": "2026-08-01T00:00:00+00:00",
-                        "last_advanced_at": "2026-08-01T00:00:00+00:00",
-                        "revision": 1,
-                    }
-                ],
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ),
-        encoding="utf-8",
-    )
-    fake_service = SimpleNamespace(
-        _cfg=lambda: SimpleNamespace(
-            settings=SimpleNamespace(workspace_path=str(tmp_path))
-        ),
-        _get_curiosity_engine=lambda: curiosity_engine,
-        _record_life_moment=lambda **kwargs: captured.append(kwargs),
-        _legacy_snapshot_path=snapshot_path,
-    )
-    monkeypatch.setattr(
-        "plugins.life_engine.streams.tools._get_service",
-        lambda: fake_service,
-    )
-    tool = LifeEngineManageThoughtStreamTool(plugin=_DummyPlugin(config=_make_config(tmp_path)))
-    return tool, captured, fake_service
-
-
-def test_legacy_retire_fails_closed_without_attention_authority(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    tool, captured, service = _make_tool_env(tmp_path, monkeypatch)
-    before = service._legacy_snapshot_path.read_bytes()
-
-    ok, message = asyncio.run(
-        tool.execute(
-            action="retire",
-            stream_id="ts_legacy_melody",
-            new_status="completed",
-            conclusion="原来是她小时候的童谣",
-        )
-    )
-
-    assert ok is False
-    assert message == {
-        "action": "retire",
-        "authority_committed": False,
-        "error": "ThoughtStreamArchiveReadOnly",
-        "replacement": "nucleus_proactive_command",
-    }
-    assert service._legacy_snapshot_path.read_bytes() == before
-    assert captured == []
-
-
-def test_legacy_create_does_not_absorb_curiosity_without_attention_authority(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    tool, captured, service = _make_tool_env(tmp_path, monkeypatch)
-    before = service._legacy_snapshot_path.read_bytes()
-
-    ok, message = asyncio.run(
-        tool.execute(action="create", title="旋律之谜", absorb_curiosity=True)
-    )
-
-    signal = asyncio.run(service._get_curiosity_engine().load_signal())
-    assert ok is False
-    assert message == {
-        "action": "create",
-        "authority_committed": False,
-        "error": "ThoughtStreamArchiveReadOnly",
-        "replacement": "nucleus_proactive_command",
-    }
-    assert signal.active is True
-    assert service._legacy_snapshot_path.read_bytes() == before
-    assert captured == []
-
-
-# ── 6. chatter 注入行渲染 ───────────────────────────────────
+# ── 5. chatter 注入行渲染 ───────────────────────────────────
 
 
 def test_trace_line_renders_moment_kind(tmp_path: Path) -> None:

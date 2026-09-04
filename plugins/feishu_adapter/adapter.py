@@ -593,11 +593,19 @@ class FeishuAdapter(BaseAdapter):
             else:
                 asyncio.run(self.handle_event(payload))
 
+        def on_reaction(event: Any) -> None:
+            # 表情回应（reaction）事件：注册空处理器避免 SDK 报
+            # "processor not found" 错误；后续如需把回应当作输入，
+            # 可在此接入 handle_event。
+            return None
+
         return (
             lark_module.EventDispatcherHandler.builder(
                 config.app.encrypt_key, config.app.verification_token
             )
             .register_p2_im_message_receive_v1(on_message)
+            .register_p2_im_message_reaction_created_v1(on_reaction)
+            .register_p2_im_message_reaction_deleted_v1(on_reaction)
             .build()
         )
 

@@ -208,7 +208,10 @@ async def test_outreach_wake_uses_stable_message_identity_and_dedupes(
             assert stream_id == "qq-stream"
             return chat_stream
 
-    loop_manager = SimpleNamespace(_wait_states={"qq-stream": object()})
+    loop_manager = SimpleNamespace(
+        _wait_states={"qq-stream": object()},
+        start_stream_loop=AsyncMock(return_value=True),
+    )
     monkeypatch.setattr(
         "src.core.managers.get_stream_manager",
         lambda: _Streams(),
@@ -255,7 +258,10 @@ async def test_outreach_wake_uses_stable_message_identity_and_dedupes(
     assert not getattr(message, "target_user_name", "")
     assert "重新判断" in message.processed_plain_text
     assert "必须发送" not in message.processed_plain_text
+    assert message.extra["bypass_message_buffer"] is True
     assert loop_manager._wait_states == {}
+    assert loop_manager.start_stream_loop.await_count == 2
+    loop_manager.start_stream_loop.assert_awaited_with("qq-stream")
 
 
 def test_outreach_occurrence_scope_reads_only_exact_trigger_metadata() -> None:

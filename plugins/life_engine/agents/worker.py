@@ -21,6 +21,7 @@ from src.core.utils.llm_tool_call import exec_llm_usable
 from src.kernel.llm import ROLE, LLMPayload, Text, ToolRegistry, ToolResult
 from src.kernel.logger import get_logger
 
+from ..tools._utils import resolve_registry_tool
 from .activity import DelegatedActivityRecorder
 from .contracts import TaskContract, TaskKind, TaskResult, TaskStatus
 
@@ -38,6 +39,7 @@ logger = get_logger("life_engine.orchestration.worker")
 _READ_ONLY_TOOL_NAMES: frozenset[str] = frozenset({
     "nucleus_read_file",
     "nucleus_list_files",
+    "nucleus_glob_file",
     "nucleus_grep_file",
     "nucleus_grep_events",
     "nucleus_search_memory",
@@ -50,9 +52,7 @@ _READ_ONLY_TOOL_NAMES: frozenset[str] = frozenset({
     "nucleus_view_screen",
     "nucleus_minecraft",
     "nucleus_proactive_query",
-    "nucleus_todo",
     "nucleus_schedule",
-    "nucleus_list_todos",
     "nucleus_list_schedules",
 })
 
@@ -63,7 +63,6 @@ _FORBIDDEN_TOOL_NAMES: frozenset[str] = frozenset({
     "life_dispatch_mission",
     "life_mission_status",
     "life_mission_cancel",
-    "nucleus_tell_dfc",
 })
 
 # TaskKind → 是否只读
@@ -280,7 +279,7 @@ class Worker:
 
                 self._emit("tool_call", {"tool": tool_name, "args_keys": list(args.keys())})
 
-                usable_cls = tool_registry.get(tool_name)
+                usable_cls = resolve_registry_tool(tool_registry, tool_name)
                 tool_succeeded = False
                 if usable_cls:
                     try:

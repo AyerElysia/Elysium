@@ -19,9 +19,10 @@ if TYPE_CHECKING:
 _WRITE_TOOL_NAMES: frozenset[str] = frozenset({
     "nucleus_write_file",
     "nucleus_edit_file",
+    "nucleus_apply_patch",
     "nucleus_mkdir",
     "nucleus_bash",
-    "nucleus_manage_todo",
+    "nucleus_todo",
     "nucleus_manage_schedule",
     "nucleus_skill",
 })
@@ -29,7 +30,6 @@ _WRITE_TOOL_NAMES: frozenset[str] = frozenset({
 # 全局禁用——子智能体不应递归调用自身或直接对外沟通
 _UNIVERSAL_DISALLOW: frozenset[str] = frozenset({
     "nucleus_run_agent",
-    "nucleus_tell_dfc",
 })
 
 

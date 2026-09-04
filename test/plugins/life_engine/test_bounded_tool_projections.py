@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -22,8 +23,10 @@ from plugins.life_engine.tools.bounded_projection import (
 )
 from plugins.life_engine.tools.event_grep_tools import LifeEngineGrepEventsTool
 from plugins.life_engine.tools.file_tools import (
+    DEFAULT_READ_LINE_LIMIT,
     LifeEngineListFilesTool,
     LifeEngineReadFileTool,
+    select_read_line_window,
 )
 from plugins.life_engine.tools.grep_tools import LifeEngineGrepFileTool
 from src.kernel.llm.trajectory_types import sanitize_text_only
@@ -374,6 +377,47 @@ async def test_read_file_limit_zero_uses_utf8_safe_bounded_pages(
     assert hashlib.sha256(target.read_bytes()).hexdigest() == before_hash
 
 
+def test_select_read_line_window_caps_default_and_reads_tail() -> None:
+    assert select_read_line_window(
+        101, offset=1, limit=DEFAULT_READ_LINE_LIMIT, from_end=False
+    ) == (0, 80)
+    assert select_read_line_window(
+        101, offset=1, limit=DEFAULT_READ_LINE_LIMIT, from_end=True
+    ) == (21, 101)
+    assert select_read_line_window(101, offset=1, limit=0, from_end=False) == (0, 101)
+    assert select_read_line_window(40, offset=1, limit=80, from_end=False) == (0, 40)
+    assert select_read_line_window(40, offset=1, limit=80, from_end=True) == (0, 40)
+
+
+@pytest.mark.asyncio
+async def test_read_file_default_limit_is_a_page_not_the_whole_file(
+    tmp_path: Path,
+) -> None:
+    lines = [f"line-{index}" for index in range(1, 102)]
+    (tmp_path / "diary.md").write_text("\n".join(lines), encoding="utf-8")
+    tool = LifeEngineReadFileTool(plugin=_workspace_plugin(tmp_path))
+    tool._runtime_task_name = "core"
+
+    ok, payload = await tool.execute(path="diary.md")
+    assert ok is True
+    assert isinstance(payload, dict)
+    assert payload["showing"] == "1-80"
+    assert payload["total_lines"] == 101
+    assert payload["remaining_lines"] == 21
+    assert payload["next_offset"] == 81
+    assert "line-1" in payload["content"]
+    assert "line-101" not in payload["content"]
+
+    ok, tail = await tool.execute(path="diary.md", from_end=True)
+    assert ok is True
+    assert isinstance(tail, dict)
+    assert tail["showing"] == "22-101"
+    assert tail["remaining_lines_before"] == 21
+    assert "next_offset" not in tail
+    assert "line-101" in tail["content"]
+    assert "line-21" not in tail["content"]
+
+
 @pytest.mark.asyncio
 async def test_read_file_rejects_continuation_after_file_change(
     tmp_path: Path,
@@ -423,6 +467,7 @@ async def test_list_files_recursive_pages_are_stable_and_change_safe(
             path="",
             recursive=True,
             max_depth=3,
+            sort="name",
             continuation=continuation,
         )
         assert ok is True
@@ -447,6 +492,7 @@ async def test_list_files_recursive_pages_are_stable_and_change_safe(
         path="",
         recursive=True,
         max_depth=3,
+        sort="name",
         continuation=first_cursor,
     )
     assert ok is False
@@ -501,3 +547,175 @@ async def test_file_grep_pages_are_bounded_and_reject_changed_files(
     )
     assert ok is False
     assert "continuation" in str(error)
+
+
+@pytest.mark.asyncio
+async def test_list_files_defaults_to_recent_mtime(tmp_path: Path) -> None:
+    old = tmp_path / "old.md"
+    new = tmp_path / "new.md"
+    old.write_text("old", encoding="utf-8")
+    new.write_text("new", encoding="utf-8")
+    os.utime(old, (1_700_000_000, 1_700_000_000))
+    os.utime(new, (1_800_000_000, 1_800_000_000))
+    tool = LifeEngineListFilesTool(plugin=_workspace_plugin(tmp_path))
+    tool._runtime_task_name = "core"
+
+    ok, payload = await tool.execute(path="")
+    assert ok is True
+    assert isinstance(payload, dict)
+    assert payload["sort"] == "mtime"
+    names = [item["name"] for item in payload["items"] if item["type"] == "file"]
+    assert names[0] == "new.md"
+
+    ok, named = await tool.execute(path="", sort="name")
+    assert ok is True
+    assert isinstance(named, dict)
+    named_files = [item["name"] for item in named["items"] if item["type"] == "file"]
+    assert named_files == ["new.md", "old.md"]
+
+
+@pytest.mark.asyncio
+async def test_list_files_glob_filters_by_name_or_workspace_path(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "2026-08-01.md").write_text("aug", encoding="utf-8")
+    (tmp_path / "2026-09-02.md").write_text("sep", encoding="utf-8")
+    tool = LifeEngineListFilesTool(plugin=_workspace_plugin(tmp_path))
+    tool._runtime_task_name = "core"
+
+    ok, payload = await tool.execute(path="", glob="2026-09*.md")
+    assert ok is True
+    assert isinstance(payload, dict)
+    assert [item["name"] for item in payload["items"]] == ["2026-09-02.md"]
+
+
+@pytest.mark.asyncio
+async def test_file_grep_files_with_matches_counts_files_not_lines(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "2026-08-01.md").write_text(
+        "\n".join(f"line-{index}" for index in range(80)),
+        encoding="utf-8",
+    )
+    (tmp_path / "2026-09-02.md").write_text("today\nsecond\n", encoding="utf-8")
+    os.utime(tmp_path / "2026-08-01.md", (1_700_000_000, 1_700_000_000))
+    os.utime(tmp_path / "2026-09-02.md", (1_800_000_000, 1_800_000_000))
+    tool = LifeEngineGrepFileTool(plugin=_workspace_plugin(tmp_path))
+    tool._runtime_task_name = "core"
+
+    ok, payload = await tool.execute(
+        pattern=".",
+        glob="2026-08*.md,2026-09*.md",
+        output_mode="files_with_matches",
+        max_results=20,
+    )
+    assert ok is True
+    assert isinstance(payload, dict)
+    paths = [item["path"] for item in payload["results"]]
+    assert paths == ["2026-09-02.md", "2026-08-01.md"]
+    assert payload["candidate_files"] == 2
+    assert payload["files_returned"] == 2
+    assert payload["search_truncated"] is False
+    assert payload["limit_unit"] == "file"
+
+
+@pytest.mark.asyncio
+async def test_file_grep_files_with_matches_reports_search_truncation(
+    tmp_path: Path,
+) -> None:
+    for index in range(10):
+        path = tmp_path / f"note-{index:02d}.md"
+        path.write_text(f"needle {index}\n", encoding="utf-8")
+        os.utime(path, (1_700_000_000 + index, 1_700_000_000 + index))
+    tool = LifeEngineGrepFileTool(plugin=_workspace_plugin(tmp_path))
+    tool._runtime_task_name = "core"
+
+    ok, payload = await tool.execute(
+        pattern="needle",
+        output_mode="files_with_matches",
+        max_results=3,
+    )
+    assert ok is True
+    assert isinstance(payload, dict)
+    paths = [item["path"] for item in payload["results"]]
+    assert paths == ["note-09.md", "note-08.md", "note-07.md"]
+    assert payload["candidate_files"] == 10
+    assert payload["files_returned"] == 3
+    assert payload["search_truncated"] is True
+    assert "不是目录里只有这些文件" in str(payload.get("note") or "")
+
+
+@pytest.mark.asyncio
+async def test_file_grep_max_depth_stays_in_one_directory(tmp_path: Path) -> None:
+    (tmp_path / "root.md").write_text("needle root\n", encoding="utf-8")
+    nested = tmp_path / "sub"
+    nested.mkdir()
+    (nested / "nested.md").write_text("needle nested\n", encoding="utf-8")
+    tool = LifeEngineGrepFileTool(plugin=_workspace_plugin(tmp_path))
+    tool._runtime_task_name = "core"
+
+    ok, payload = await tool.execute(
+        pattern="needle",
+        max_depth=1,
+        output_mode="files_with_matches",
+    )
+    assert ok is True
+    assert isinstance(payload, dict)
+    assert [item["path"] for item in payload["results"]] == ["root.md"]
+    assert payload["candidate_files"] == 1
+
+
+@pytest.mark.asyncio
+async def test_file_grep_exclude_glob_skips_directory_prefix(tmp_path: Path) -> None:
+    (tmp_path / "keep.md").write_text("needle keep\n", encoding="utf-8")
+    witness = tmp_path / "diaries" / "witness"
+    witness.mkdir(parents=True)
+    (witness / "old.md").write_text("needle witness\n", encoding="utf-8")
+    tool = LifeEngineGrepFileTool(plugin=_workspace_plugin(tmp_path))
+    tool._runtime_task_name = "core"
+
+    ok, payload = await tool.execute(
+        pattern="needle",
+        exclude_glob="diaries/witness",
+        output_mode="files_with_matches",
+    )
+    assert ok is True
+    assert isinstance(payload, dict)
+    paths = [item["path"] for item in payload["results"]]
+    assert paths == ["keep.md"]
+
+
+@pytest.mark.asyncio
+async def test_file_grep_modified_after_and_fixed_string(tmp_path: Path) -> None:
+    old = tmp_path / "old.md"
+    new = tmp_path / "new.md"
+    old.write_text("needle old\n", encoding="utf-8")
+    new.write_text("needle new\n", encoding="utf-8")
+    os.utime(old, (1_700_000_000, 1_700_000_000))
+    os.utime(new, (1_800_000_000, 1_800_000_000))
+    tool = LifeEngineGrepFileTool(plugin=_workspace_plugin(tmp_path))
+    tool._runtime_task_name = "core"
+
+    ok, payload = await tool.execute(
+        pattern="needle",
+        modified_after="2026-01-01",
+        output_mode="files_with_matches",
+    )
+    assert ok is True
+    assert isinstance(payload, dict)
+    # 1_700_000_000 is 2023; 1_800_000_000 is 2027-01-15
+    assert [item["path"] for item in payload["results"]] == ["new.md"]
+
+    dotted = tmp_path / "dot.md"
+    dotted.write_text("a.b\nplain\n", encoding="utf-8")
+    ok, literal = await tool.execute(
+        pattern=".",
+        glob="dot.md",
+        fixed_string=True,
+        output_mode="content",
+        sort="name",
+    )
+    assert ok is True
+    assert isinstance(literal, dict)
+    assert literal["total_files"] == 1
+    assert literal["results"][0]["match_count"] == 1

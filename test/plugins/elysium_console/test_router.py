@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from plugins.elysium_console.router import (
+    MINECRAFT_ACTION_HEADER,
     ElysiumConsoleRouter,
     LocalConsoleSessions,
     _is_loopback_host,
@@ -49,6 +50,18 @@ class _Catalog:
 
     async def data_map(self) -> dict:
         return {"kind": "data_map", "domains": []}
+
+    async def minecraft_status(self) -> dict:
+        return {"kind": "minecraft_status", "available": True, "active": False}
+
+    async def minecraft_preflight(self) -> dict:
+        return {"kind": "minecraft_preflight", "result": {"success": True}}
+
+    async def minecraft_start(self, **kwargs) -> dict:
+        return {"kind": "minecraft_start", "goal": kwargs.get("goal", "")}
+
+    async def minecraft_stop(self) -> dict:
+        return {"kind": "minecraft_stop", "result": {"success": True}}
 
 
 def _app() -> FastAPI:
@@ -147,20 +160,53 @@ def test_manifest_registers_only_the_read_only_router() -> None:
     ]
 
 
-def test_console_router_exposes_no_mutating_http_methods() -> None:
+def test_console_router_exposes_only_narrow_minecraft_mutations() -> None:
     router = ElysiumConsoleRouter(SimpleNamespace(), catalog=_Catalog())
-    methods = {
-        method
+    mutations = {
+        (getattr(route, "path", ""), method)
         for route in router.app.routes
         for method in (getattr(route, "methods", None) or set())
+        if method not in {"GET", "HEAD"}
     }
 
-    assert methods <= {"GET", "HEAD"}
+    assert mutations == {
+        ("/api/v1/minecraft/start", "POST"),
+        ("/api/v1/minecraft/stop", "POST"),
+    }
+
+
+def test_minecraft_mutations_require_same_origin_and_explicit_action_header() -> None:
+    with TestClient(
+        _app(),
+        base_url="http://127.0.0.1:8000",
+        client=("127.0.0.1", 50102),
+    ) as client:
+        assert client.get("/console/").status_code == 200
+        path = "/console/api/v1/minecraft/start?goal=together"
+        assert client.post(path).status_code == 403
+        assert client.post(
+            path,
+            headers={
+                "Origin": "https://example.invalid",
+                "X-Elysium-Console-Action": MINECRAFT_ACTION_HEADER,
+            },
+        ).status_code == 403
+        accepted = client.post(
+            path,
+            headers={
+                "Origin": "http://127.0.0.1:8000",
+                "X-Elysium-Console-Action": MINECRAFT_ACTION_HEADER,
+            },
+        )
+        assert accepted.status_code == 200
+        assert accepted.json() == {"kind": "minecraft_start", "goal": "together"}
 
 
 def test_all_read_routes_are_mounted_without_cors() -> None:
     paths = [
         "/console/api/v1/overview",
+        "/console/api/v1/minecraft",
+        "/console/api/v1/minecraft/preflight",
         "/console/api/v1/timeline",
         "/console/api/v1/subject",
         "/console/api/v1/memory",

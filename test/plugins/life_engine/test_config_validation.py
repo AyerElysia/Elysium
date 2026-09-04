@@ -17,6 +17,8 @@ def test_heartbeat_tool_round_safety_defaults() -> None:
 
     assert settings.max_rounds_per_heartbeat == 5
     assert settings.max_consecutive_tool_stalls_per_heartbeat == 2
+    assert settings.heartbeat_panel_sink == "file"
+    assert settings.heartbeat_panel_path == "logs/heartbeat.console"
 
 
 def test_background_cognition_uses_quality_first_total_deadlines() -> None:
@@ -112,6 +114,11 @@ def test_heartbeat_tool_round_safety_rejects_out_of_range(
 ) -> None:
     with pytest.raises(ValueError):
         LifeEngineConfig.SettingsSection(**{field: value})
+
+
+def test_heartbeat_panel_sink_rejects_unknown_value() -> None:
+    with pytest.raises(ValueError, match="heartbeat_panel_sink"):
+        LifeEngineConfig.SettingsSection(heartbeat_panel_sink="tty")
 
 
 def test_life_config_rejects_removed_storage_section() -> None:

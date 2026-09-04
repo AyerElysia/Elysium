@@ -26,6 +26,7 @@ class AgentCoordinator:
         self.plugin = plugin
         self._running: dict[str, asyncio.Task] = {}
         self._results: dict[str, AgentResult] = {}
+        self._unacked_results: dict[str, AgentResult] = {}
         self._lock = asyncio.Lock()
         self._closed = False
 
@@ -90,26 +91,36 @@ class AgentCoordinator:
             if self._closed:
                 return {}
             running = dict(self._running)
+            restored = dict(self._unacked_results)
+            self._unacked_results.clear()
 
-        if not running:
-            return {}
+        results: dict[str, AgentResult] = dict(restored)
+        if running:
+            done, _ = await asyncio.wait(
+                running.values(),
+                timeout=timeout_seconds,
+                return_when=asyncio.ALL_COMPLETED,
+            )
 
-        done, _ = await asyncio.wait(
-            running.values(),
-            timeout=timeout_seconds,
-            return_when=asyncio.ALL_COMPLETED,
-        )
-
-        results: dict[str, AgentResult] = {}
-        async with self._lock:
-            for agent_id, task_obj in list(self._running.items()):
-                if task_obj in done:
-                    result = self._results.pop(agent_id, None)
-                    if result:
-                        results[agent_id] = result
-                    del self._running[agent_id]
+            async with self._lock:
+                for agent_id, task_obj in list(self._running.items()):
+                    if task_obj in done:
+                        result = self._results.pop(agent_id, None)
+                        if result:
+                            results[agent_id] = result
+                        del self._running[agent_id]
 
         return results
+
+    async def restore_results(self, results: dict[str, AgentResult]) -> None:
+        """Return collected results that were not durably queued."""
+
+        if not results:
+            return
+        async with self._lock:
+            if self._closed:
+                return
+            self._unacked_results.update(results)
 
     async def shutdown(self) -> None:
         """取消所有后台任务，并禁止该协调器继续接收任务。"""
@@ -118,6 +129,7 @@ class AgentCoordinator:
             tasks = list(self._running.values())
             self._running.clear()
             self._results.clear()
+            self._unacked_results.clear()
 
         for task_obj in tasks:
             if not task_obj.done():
@@ -131,8 +143,8 @@ class AgentCoordinator:
         return len(self._running)
 
     def has_pending(self) -> bool:
-        """是否有后台智能体正在运行。"""
-        return bool(self._running)
+        """是否有后台智能体正在运行，或已完成但尚未耐久入队。"""
+        return bool(self._running) or bool(self._unacked_results)
 
     async def _run_and_store(self, agent_id: str, runner: AgentRunner) -> AgentResult:
         """执行智能体并存储结果。"""

@@ -356,6 +356,11 @@ async def open_storage_backend(
             token = _build_token(settings, generation, authority_health, environment)
             await registry.validate(token)
             shared_writers = False
+            registry.start_keepalive(
+                token,
+                lease_seconds=settings.authority_lease_seconds,
+                interval_seconds=float(settings.authority_renew_interval_seconds),
+            )
 
         session_factory = async_sessionmaker(engine, expire_on_commit=False)
         runtime = StorageBackendRuntime(
@@ -382,6 +387,8 @@ async def open_storage_backend(
             runtime._writer_validator = lambda: registry.validate_shared(token)
         return runtime
     except BaseException:
+        if isinstance(registry, FileAuthorityRegistry):
+            registry.stop_keepalive()
         await engine.dispose()
         raise
 

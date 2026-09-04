@@ -32,12 +32,13 @@ def test_prefix_prompt_skips_empty_parts_and_preserves_order() -> None:
         soul_text="SOUL",
         user_text="",
         memory_text="MEMORY",
+        existence_text="EXISTENCE",
         tools_text="TOOLS",
         live_guidance="LIVE",
         primary_tool_guide="GUIDE",
     )
 
-    assert prompt == "SOUL\n\nMEMORY\n\nTOOLS\n\nLIVE\n\nGUIDE"
+    assert prompt == "SOUL\n\nMEMORY\n\nEXISTENCE\n\nTOOLS\n\nLIVE\n\nGUIDE"
 
 
 def test_rolling_prompt_contains_history_and_new_messages() -> None:

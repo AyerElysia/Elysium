@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from ..narrative.tools import NARRATIVE_TOOLS, LifeEngineWriteNarrativeTool
-from ..streams.tools import STREAM_TOOLS
 from ..trace.tools import LIFE_TRACE_TOOLS
 from .chat_history_tools import (
     CHAT_HISTORY_TOOLS,
@@ -19,7 +18,9 @@ from .file_tools import (
 )
 from .file_tools import (
     FetchLifeMemoryTool,
+    LifeEngineApplyPatchTool,
     LifeEngineEditFileTool,
+    LifeEngineGlobFileTool,
     LifeEngineListFilesTool,
     LifeEngineMakeDirectoryTool,
     LifeEngineReadFileTool,
@@ -53,28 +54,29 @@ ALL_TOOLS = [
 
 __all__ = [
     "ALL_TOOLS",
-    "TODO_TOOLS",
     "GREP_TOOLS",
-    "WEB_TOOLS",
-    "STREAM_TOOLS",
+    "LIFE_TRACE_TOOLS",
+    "NARRATIVE_TOOLS",
     "REST_TOOLS",
     "SCREEN_TOOLS",
     "SKILL_TOOLS",
-    "LIFE_TRACE_TOOLS",
-    "NARRATIVE_TOOLS",
-    "LifeEngineWriteNarrativeTool",
-    "LifeEngineFetchChatHistoryTool",
+    "TODO_TOOLS",
+    "WEB_TOOLS",
+    "FetchLifeMemoryTool",
+    "LifeEngineApplyPatchTool",
     "LifeEngineConversationEvidenceTool",
-    "LifeEngineSyncPlatformHistoryTool",
-    "LifeEngineRestHeartbeatTool",
-    "LifeEngineViewScreenTool",
-    "LifeEngineSkillTool",
-    "LifeEngineReadFileTool",
-    "LifeEngineWriteFileTool",
     "LifeEngineEditFileTool",
+    "LifeEngineFetchChatHistoryTool",
+    "LifeEngineGlobFileTool",
     "LifeEngineListFilesTool",
     "LifeEngineMakeDirectoryTool",
+    "LifeEngineReadFileTool",
+    "LifeEngineRestHeartbeatTool",
     "LifeEngineRunAgentTool",
-    "FetchLifeMemoryTool",
+    "LifeEngineSkillTool",
+    "LifeEngineSyncPlatformHistoryTool",
+    "LifeEngineViewScreenTool",
+    "LifeEngineWriteFileTool",
+    "LifeEngineWriteNarrativeTool",
     "PlatformActionTool",
 ]

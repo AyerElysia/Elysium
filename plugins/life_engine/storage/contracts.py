@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -456,6 +457,12 @@ class StorageBackendRuntime:
         if self._closed:
             return
         errors: list[BaseException] = []
+        registry = self.authority_registry
+        if isinstance(registry, FileAuthorityRegistry):
+            try:
+                await asyncio.to_thread(registry.stop_keepalive)
+            except BaseException as exc:  # noqa: BLE001 - dispose must still run
+                errors.append(exc)
         try:
             await self._release_managed_singleton_writers()
         except BaseException as exc:  # noqa: BLE001 - dispose must still run

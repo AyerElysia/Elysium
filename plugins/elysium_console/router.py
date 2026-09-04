@@ -38,6 +38,8 @@ CONTENT_SECURITY_POLICY = (
     "base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
 )
 ATTENTION_STATUSES_QUERY = Query(default=[])
+MINECRAFT_GOAL_QUERY = Query(default="", max_length=500)
+MINECRAFT_ACTION_HEADER = "minecraft-control-v1"
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -139,10 +141,10 @@ class _ConsoleSecurityHeadersMiddleware(BaseHTTPMiddleware):
 
 
 class ElysiumConsoleRouter(BaseRouter):
-    """Read-only local observatory mounted below ``/console``."""
+    """Local observatory with one explicit Minecraft companion control panel."""
 
     router_name = "elysium_console"
-    router_description = "Local read-only observatory for Elysium life data"
+    router_description = "Local Elysium observatory and Minecraft companion control"
     custom_route_path = "/console"
     cors_origins = None
 
@@ -174,6 +176,18 @@ class ElysiumConsoleRouter(BaseRouter):
         fetch_site = request.headers.get("sec-fetch-site", "").casefold()
         if fetch_site and fetch_site not in {"none", "same-origin"}:
             raise HTTPException(status_code=403, detail="cross-site request rejected")
+
+    def _authorize_minecraft_action(self, request: Request) -> None:
+        """Require a deliberate same-origin browser action for MC mutations."""
+
+        self._authorize(request)
+        if not request.headers.get("origin"):
+            raise HTTPException(status_code=403, detail="action origin is required")
+        if request.headers.get("x-elysium-console-action") != MINECRAFT_ACTION_HEADER:
+            raise HTTPException(
+                status_code=403,
+                detail="explicit Minecraft action header is required",
+            )
 
     async def _read(self, operation: Awaitable[dict[str, Any]]) -> dict[str, Any]:
         try:
@@ -232,6 +246,29 @@ class ElysiumConsoleRouter(BaseRouter):
         async def overview(request: Request) -> dict[str, Any]:
             self._authorize(request)
             return await self._read(self._catalog.overview())
+
+        @self.app.get("/api/v1/minecraft")
+        async def minecraft_status(request: Request) -> dict[str, Any]:
+            self._authorize(request)
+            return await self._read(self._catalog.minecraft_status())
+
+        @self.app.get("/api/v1/minecraft/preflight")
+        async def minecraft_preflight(request: Request) -> dict[str, Any]:
+            self._authorize(request)
+            return await self._read(self._catalog.minecraft_preflight())
+
+        @self.app.post("/api/v1/minecraft/start")
+        async def minecraft_start(
+            request: Request,
+            goal: str = MINECRAFT_GOAL_QUERY,
+        ) -> dict[str, Any]:
+            self._authorize_minecraft_action(request)
+            return await self._read(self._catalog.minecraft_start(goal=goal))
+
+        @self.app.post("/api/v1/minecraft/stop")
+        async def minecraft_stop(request: Request) -> dict[str, Any]:
+            self._authorize_minecraft_action(request)
+            return await self._read(self._catalog.minecraft_stop())
 
         @self.app.get("/api/v1/timeline")
         async def timeline(request: Request, limit: int = 80) -> dict[str, Any]:
@@ -353,6 +390,7 @@ class ElysiumConsoleRouter(BaseRouter):
 
 
 __all__ = [
+    "MINECRAFT_ACTION_HEADER",
     "SESSION_COOKIE",
     "ElysiumConsoleRouter",
     "LocalConsoleSessions",

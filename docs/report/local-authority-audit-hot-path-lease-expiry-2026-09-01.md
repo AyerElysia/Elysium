@@ -23,6 +23,10 @@ generation、epoch、owner、lease 或 fencing-token 校验。
 因此根因不是“60 秒租约天生太短”，而是已经写入架构/runbook 的
 “同一进程、同一审计头复用验链证明”没有在 FileAuthorityRegistry 落实。
 
+2026-09-02 复发证明：验链缓存是必要的，但**不是充分根因**。续租当时仍对
+与写 fence 相同的 cutover 锁取独占模式；本进程重叠的共享写事务会饿死续租。
+完整修复见 [本地 FileAuthority 续租与写 fence 锁耦合（2026-09-02）](./file-authority-renew-lock-decouple-2026-09-02.md)。
+
 ## 修复
 
 FileAuthorityRegistry 现在保存 content-free 的进程内已验证审计头：

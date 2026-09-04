@@ -123,18 +123,31 @@ class KookAPIClient:
 
     # ─── 文件上传 ───────────────────────────────────────────
 
-    async def upload_asset(self, file_data: bytes, filename: str) -> str:
+    async def upload_asset(
+        self,
+        file_data: bytes,
+        filename: str,
+        content_type: str | None = None,
+    ) -> str:
         """上传文件到 KOOK CDN，返回 URL。"""
         if not self._http:
             raise RuntimeError("KookAPIClient 未启动")
-        files = {"file": (filename, file_data)}
+        if content_type:
+            files: dict[str, tuple[str, bytes] | tuple[str, bytes, str]] = {
+                "file": (filename, file_data, content_type)
+            }
+        else:
+            files = {"file": (filename, file_data)}
         resp = await self._http.post("/asset/create", files=files)
         resp.raise_for_status()
         body = resp.json()
         if body.get("code") != 0:
             raise RuntimeError(f"KOOK 上传失败: {body.get('message')}")
         url = body.get("data", {}).get("url", "")
-        logger.debug(f"文件已上传: {filename} → {url[:50]}...")
+        logger.info(
+            f"KOOK 文件已上传: name={filename} bytes={len(file_data)} "
+            f"url={url[:80]}"
+        )
         return url
 
     # ─── 用户/频道信息 ──────────────────────────────────────
@@ -151,8 +164,9 @@ class KookAPIClient:
             resp.raise_for_status()
             return resp.content
 
-    async def upload_asset_from_base64(self, b64_data: str, filename: str) -> str:
-        """解码 base64（兼容 base64| 前缀与 data: URL）并上传，返回 CDN URL。"""
+    @staticmethod
+    def _decode_base64_payload(b64_data: str) -> bytes:
+        """解码 base64（兼容 base64| 前缀与 data: URL）。"""
         import base64 as _base64
 
         raw = b64_data
@@ -162,25 +176,45 @@ class KookAPIClient:
             raw = raw[len("base64|"):]
         elif raw.startswith("base64://"):
             raw = raw[len("base64://"):]
-        file_data = _base64.b64decode(raw)
-        return await self.upload_asset(file_data, filename)
+        return _base64.b64decode(raw)
 
-    async def resolve_and_upload(self, data: str, filename: str) -> str:
+    async def upload_asset_from_base64(
+        self,
+        b64_data: str,
+        filename: str,
+        content_type: str | None = None,
+    ) -> str:
+        """解码 base64（兼容 base64| 前缀与 data: URL）并上传，返回 CDN URL。"""
+        return await self.upload_asset(
+            self._decode_base64_payload(b64_data),
+            filename,
+            content_type=content_type,
+        )
+
+    async def resolve_media_bytes(self, data: str) -> bytes:
+        """将任意来源媒体解析为原始字节，尚未上传。"""
+        if not data:
+            raise ValueError("媒体数据为空")
+        if data.startswith(("http://", "https://")):
+            return await self.download_media_bytes(data)
+        if data.startswith(("base64|", "base64://", "data:")) or not os.path.exists(data):
+            return self._decode_base64_payload(data)
+        with open(data, "rb") as f:
+            return f.read()
+
+    async def resolve_and_upload(
+        self,
+        data: str,
+        filename: str,
+        content_type: str | None = None,
+    ) -> str:
         """将任意来源媒体（base64 / http(s) URL / 本地路径）上传到 KOOK CDN。
 
         KOOK 要求消息中的媒体资源必须由本 Bot 上传（否则"找不到资源"），
         因此外部 URL 需先下载再转存。
         """
-        if not data:
-            raise ValueError("媒体数据为空")
-        if data.startswith(("http://", "https://")):
-            file_data = await self.download_media_bytes(data)
-            return await self.upload_asset(file_data, filename)
-        if data.startswith(("base64|", "base64://", "data:")) or not os.path.exists(data):
-            return await self.upload_asset_from_base64(data, filename)
-        # 本地文件路径
-        with open(data, "rb") as f:
-            return await self.upload_asset(f.read(), filename)
+        file_data = await self.resolve_media_bytes(data)
+        return await self.upload_asset(file_data, filename, content_type=content_type)
 
     async def get_me(self) -> dict[str, Any]:
         """获取当前 Bot 信息。"""

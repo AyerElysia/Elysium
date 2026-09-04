@@ -254,6 +254,38 @@ async def test_life_event_positions_are_tokens_and_gaps_are_explicit(
         assert captured.value.earliest_available == 21
 
 
+async def test_life_event_scan_window_filters_by_time_and_position(
+    tmp_path: Path,
+) -> None:
+    async with _local_store(tmp_path) as (_, store, _, _):
+        first = await store.append(
+            replace(
+                _event("early"),
+                timestamp="2026-08-04T01:00:00+00:00",
+            )
+        )
+        later = await store.append(
+            replace(
+                _event("late"),
+                timestamp="2026-08-04T03:00:00+00:00",
+            )
+        )
+        window = await store.scan_window(
+            after_position=first.sequence,
+            occurred_after="2026-08-04T02:00:00+00:00",
+            limit=10,
+        )
+        assert [item.occurrence_id for item in window] == [later.occurrence_id]
+        newest_first = await store.scan_window(limit=1, descending=True)
+        assert [item.occurrence_id for item in newest_first] == [later.occurrence_id]
+        bounded = await store.scan_window(
+            after_position=0,
+            before_position=later.sequence,
+            limit=10,
+        )
+        assert [item.occurrence_id for item in bounded] == [first.occurrence_id]
+
+
 async def test_life_event_consumer_cursor_is_bounded_revision_cas(
     tmp_path: Path,
 ) -> None:

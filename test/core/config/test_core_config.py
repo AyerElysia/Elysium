@@ -22,6 +22,7 @@ class TestBotSection:
 
         assert config.stream_step_timeout == 300.0
         assert config.stream_restart_threshold > config.stream_step_timeout
+        assert config.console_log_level == "ERROR"
 
     def test_restart_threshold_must_exceed_enabled_step_budget(self) -> None:
         with pytest.raises(

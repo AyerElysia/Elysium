@@ -32,10 +32,7 @@ from plugins.life_engine.service.perception_gateway import (
     PerceptionDeliveryUnverified,
 )
 from plugins.life_engine.tools.exec_tools import LifeEngineBashTool
-from plugins.life_engine.tools.file_tools import (
-    LifeEngineRunAgentTool,
-    LifeEngineWakeDFCTool,
-)
+from plugins.life_engine.tools.file_tools import LifeEngineRunAgentTool
 from src.core.components.base.chatter import BaseChatter, Failure, Success, Wait
 from src.core.config.core_config import CoreConfig
 from src.core.models.media import MediaAttachment
@@ -106,7 +103,7 @@ def _exact_pending_perception_receipt(
 async def test_life_chatter_system_prompt_includes_memory_and_chatter_tools_not_heartbeat_tool(
     tmp_path,
 ) -> None:
-    """聊天态应共享 SOUL/USER/MEMORY/TOOLS，并保留核心工具说明。"""
+    """聊天态应共享 SOUL/USER/MEMORY/EXISTENCE/TOOLS，并保留核心工具说明。"""
     (tmp_path / "SOUL.md").write_text("SOUL_CONTENT", encoding="utf-8")
     (tmp_path / "USER.md").write_text("USER_CONTENT", encoding="utf-8")
     (tmp_path / "MEMORY.md").write_text(
@@ -130,6 +127,7 @@ async def test_life_chatter_system_prompt_includes_memory_and_chatter_tools_not_
     )
     (tmp_path / "TOOL.md").write_text("TOOL_CONTENT", encoding="utf-8")
     (tmp_path / "TOOLS.md").write_text("CHATTER_TOOLS_CONTENT", encoding="utf-8")
+    (tmp_path / "EXISTENCE.md").write_text("EXISTENCE_CONTENT", encoding="utf-8")
 
     config = LifeEngineConfig()
     config.settings.workspace_path = str(tmp_path)
@@ -144,6 +142,7 @@ async def test_life_chatter_system_prompt_includes_memory_and_chatter_tools_not_
     assert "MEMORY_FADING" not in prompt
     assert "给编辑者看的说明" not in prompt
     assert "TOOL_CONTENT" not in prompt
+    assert "EXISTENCE_CONTENT" in prompt
     assert "CHATTER_TOOLS_CONTENT" in prompt
     assert "assistant 纯文本 **不会被发送给用户**" in prompt
     assert "自己的内心独白" in prompt
@@ -151,6 +150,10 @@ async def test_life_chatter_system_prompt_includes_memory_and_chatter_tools_not_
     assert "life_send_text" in prompt
     assert "reason" in prompt
     assert "action-think" not in LifeChatter._build_primary_tool_guide()
+    assert "nucleus_browser_fetch" in LifeChatter._build_primary_tool_guide()
+    assert "nucleus_web_search" in LifeChatter._build_primary_tool_guide()
+    assert "nucleus_apply_patch" in LifeChatter._build_primary_tool_guide()
+    assert "nucleus_glob_file" in LifeChatter._build_primary_tool_guide()
     assert "需要的轻量思考应在当前模型决策内完成" in prompt
     assert "普通回复直接调用 `life_send_text`" in prompt
     assert "一次能完成的事拆成两次模型调用" in prompt
@@ -846,37 +849,6 @@ def test_life_chatter_primary_task_creation_error_falls_back_to_expression(monke
     assert calls == ["broken-life", "expression"]
 
 
-async def test_surface_private_message_skips_router_llm(monkeypatch) -> None:
-    chatter = _life_chatter_for_config(LifeEngineConfig())
-    unread = Message(
-        message_id="surface-direct-1",
-        content="爱莉爱莉",
-        processed_plain_text="爱莉爱莉",
-        sender_role="other",
-        platform="neko.surface",
-        stream_id="surface-stream",
-    )
-    chat_stream = SimpleNamespace(
-        stream_id="surface-stream",
-        platform="neko.surface",
-        chat_type="private",
-    )
-
-    async def must_not_read_history(*_args, **_kwargs):
-        raise AssertionError("Surface 实时私聊不应先读取路由历史")
-
-    monkeypatch.delenv("NEKO_SURFACE_LOW_LATENCY", raising=False)
-    monkeypatch.setattr(chatter, "_build_history_text_async", must_not_read_history)
-
-    decision = await chatter._should_respond("主人: 爱莉爱莉", [unread], chat_stream)
-
-    assert decision == {
-        "reason": "N.E.K.O 实时私聊直接进入表达层",
-        "should_respond": True,
-        "force_reply": True,
-    }
-
-
 def _life_chatter_group_mention_message() -> Message:
     return Message(
         message_id="group-mention-1",
@@ -1038,73 +1010,6 @@ def test_router_fallback_prompt_hands_direct_mentions_to_expression() -> None:
     assert "直接 @ 她的账号或点名她" in prompt
     assert "必须交给表达层" in prompt
     assert "不要写具体回复" in prompt
-
-
-async def test_surface_dynamic_context_includes_realtime_guidance(monkeypatch) -> None:
-    chatter = _life_chatter_for_config(LifeEngineConfig())
-    monkeypatch.delenv("NEKO_SURFACE_LOW_LATENCY", raising=False)
-
-    context_text, high_water = await chatter._build_dynamic_context_text(
-        SimpleNamespace(platform="neko.surface"),
-        service=None,
-    )
-
-    assert high_water == 0
-    assert "N.E.K.O 实时私聊" in context_text
-    assert "第一次模型决策里直接调用 `life_send_text`" in context_text
-    assert "不要主动调用任何 TTS/语音发送工具" in context_text
-
-
-def test_surface_request_overrides_are_temporary(monkeypatch) -> None:
-    class ThinkTool:
-        @classmethod
-        def get_signature(cls):
-            return "life_engine:action:think"
-
-    class SendTextTool:
-        @classmethod
-        def get_signature(cls):
-            return "life_engine:action:life_send_text"
-
-    class TtsTool:
-        @classmethod
-        def get_signature(cls):
-            return "tts_voice_plugin:action:tts_voice_action"
-
-    tool_payload = LLMPayload(ROLE.TOOL, [ThinkTool, SendTextTool, TtsTool])
-    original_model_set = [
-        {
-            "model_identifier": "neo-model",
-            "max_tokens": 3200,
-            "extra_params": {"enable_thinking": True, "thinking": {"type": "enabled"}},
-        }
-    ]
-    response = SimpleNamespace(
-        model_set=original_model_set,
-        payloads=[tool_payload],
-    )
-    monkeypatch.delenv("NEKO_SURFACE_LOW_LATENCY", raising=False)
-    monkeypatch.setenv("NEKO_SURFACE_FAST_MAX_TOKENS", "512")
-
-    state = LifeChatter._apply_surface_realtime_request_overrides(
-        response,
-        SimpleNamespace(platform="neko.surface"),
-        must_reply=True,
-    )
-
-    assert state[0] is True
-    assert response.model_set is not original_model_set
-    assert response.model_set[0]["max_tokens"] == 512
-    assert response.model_set[0]["extra_params"]["enable_thinking"] is False
-    assert response.model_set[0]["extra_params"]["tool_choice"] == "required"
-    assert [tool.get_signature() for tool in tool_payload.content] == [
-        "life_engine:action:life_send_text"
-    ]
-
-    LifeChatter._restore_surface_realtime_request_overrides(response, state)
-
-    assert response.model_set is original_model_set
-    assert tool_payload.content == [ThinkTool, SendTextTool, TtsTool]
 
 
 def test_chat_manifest_filters_legacy_think_from_model_request() -> None:
@@ -1325,6 +1230,272 @@ def test_rolling_context_projection_drops_retired_proactive_tool_chain() -> None
         cleaned,
         allow_incomplete_tail=False,
     )
+
+
+def _payloads_text(payloads: list[LLMPayload]) -> str:
+    chunks: list[str] = []
+    for payload in payloads:
+        for part in payload.content:
+            for attr in ("text", "name", "value"):
+                value = getattr(part, attr, None)
+                if value:
+                    chunks.append(str(value))
+            args = getattr(part, "args", None)
+            if args:
+                chunks.append(str(args))
+    return "\n".join(chunks)
+
+
+def test_rolling_context_projection_drops_prefixed_retired_proactive_tool_chain() -> None:
+    payloads = [
+        LLMPayload(ROLE.USER, Text("请继续")),
+        LLMPayload(
+            ROLE.ASSISTANT,
+            [
+                Text("__SUSPEND__"),
+                ToolCall(
+                    id="legacy-proactive",
+                    name="tool-nucleus_manage_thought_stream",
+                    args={"action": "advance"},
+                ),
+            ],
+        ),
+        LLMPayload(
+            ROLE.TOOL_RESULT,
+            ToolResult(
+                value="retired",
+                call_id="legacy-proactive",
+                name="tool-nucleus_manage_thought_stream",
+            ),
+        ),
+        LLMPayload(
+            ROLE.ASSISTANT,
+            ToolCall(
+                id="canonical-proactive",
+                name="tool-nucleus_proactive_query",
+                args={"resource": "attention"},
+            ),
+        ),
+        LLMPayload(
+            ROLE.TOOL_RESULT,
+            ToolResult(
+                value="bounded projection",
+                call_id="canonical-proactive",
+                name="tool-nucleus_proactive_query",
+            ),
+        ),
+        LLMPayload(ROLE.ASSISTANT, Text("__SUSPEND__")),
+    ]
+
+    cleaned = LifeChatter._without_retired_proactive_history(payloads)
+
+    assert [payload.role for payload in cleaned] == [
+        ROLE.USER,
+        ROLE.ASSISTANT,
+        ROLE.TOOL_RESULT,
+        ROLE.ASSISTANT,
+    ]
+    names = [
+        getattr(part, "name", "")
+        for payload in cleaned
+        for part in payload.content
+        if isinstance(part, (ToolCall, ToolResult))
+    ]
+    assert names == ["tool-nucleus_proactive_query", "tool-nucleus_proactive_query"]
+    LLMContextManager()._validate_payloads(
+        cleaned,
+        allow_incomplete_tail=False,
+    )
+
+
+def _inner_return_rolling_prompt(*, extra_unread: str = "") -> str:
+    unread = (
+        "【12:00】<other> [life_engine_inner_return] 系统（潜意识回声）： "
+        "这是你自己沉下去的内心对话回声，不是用户，也不是外联。\n"
+        "潜意识回声：秘密念头"
+    )
+    if extra_unread:
+        unread = extra_unread.rstrip() + "\n" + unread
+    return LifeChatterContextAssembler.build_rolling_prompt(
+        stream_name="私聊",
+        stream_id="stream-a",
+        unread_lines=unread,
+    )
+
+
+def test_derived_rolling_keeps_wake_envelope_until_explicit_strip() -> None:
+    prompt = _inner_return_rolling_prompt()
+    payloads = [
+        LLMPayload(ROLE.USER, Text(prompt)),
+        LLMPayload(
+            ROLE.ASSISTANT,
+            ToolCall(
+                id="send-1",
+                name="action-life_send_text",
+                args={"thought": "看见回声", "content": "看见了"},
+            ),
+        ),
+        LLMPayload(
+            ROLE.TOOL_RESULT,
+            ToolResult(value="sent", call_id="send-1", name="action-life_send_text"),
+        ),
+        LLMPayload(ROLE.ASSISTANT, Text("__SUSPEND__")),
+    ]
+
+    live = LifeChatter._derived_rolling_payloads(
+        payloads,
+        strip_wake_envelopes=False,
+    )
+    live_text = _payloads_text(live)
+    assert "life_engine_inner_return" in live_text
+    assert "秘密念头" in live_text
+
+    closed = LifeChatter._derived_rolling_payloads(
+        payloads,
+        strip_wake_envelopes=True,
+    )
+    closed_text = _payloads_text(closed)
+    assert "life_engine_inner_return" not in closed_text
+    assert "秘密念头" not in closed_text
+    names = [
+        getattr(part, "name", "")
+        for payload in closed
+        for part in payload.content
+        if isinstance(part, (ToolCall, ToolResult))
+    ]
+    assert names == ["action-life_send_text", "action-life_send_text"]
+    LLMContextManager()._validate_payloads(
+        closed,
+        allow_incomplete_tail=False,
+    )
+
+    snapshot = json.dumps(
+        LifeChatter._snapshot_data_for_payloads(payloads),
+        ensure_ascii=False,
+    )
+    assert "life_engine_inner_return" not in snapshot
+    assert "秘密念头" not in snapshot
+    assert "action-life_send_text" in snapshot
+
+
+def test_derived_rolling_keeps_real_user_line_when_stripping_wake_envelope() -> None:
+    prompt = _inner_return_rolling_prompt(
+        extra_unread="【12:00】<member> [u123] 小星星： 你好呀",
+    )
+    payloads = [
+        LLMPayload(ROLE.USER, Text("更早的真实对话")),
+        LLMPayload(ROLE.ASSISTANT, Text("上一句回应")),
+        LLMPayload(ROLE.USER, Text(prompt)),
+        LLMPayload(
+            ROLE.ASSISTANT,
+            ToolCall(
+                id="send-1",
+                name="action-life_send_text",
+                args={"content": "在的"},
+            ),
+        ),
+        LLMPayload(
+            ROLE.TOOL_RESULT,
+            ToolResult(value="sent", call_id="send-1", name="action-life_send_text"),
+        ),
+    ]
+
+    closed = LifeChatter._derived_rolling_payloads(
+        payloads,
+        strip_wake_envelopes=True,
+    )
+    closed_text = _payloads_text(closed)
+    assert "你好呀" in closed_text
+    assert "更早的真实对话" in closed_text
+    assert "life_engine_inner_return" not in closed_text
+    assert "秘密念头" not in closed_text
+    LLMContextManager()._validate_payloads(
+        closed,
+        allow_incomplete_tail=False,
+    )
+
+
+def test_derived_rolling_strips_initiative_wake_envelope() -> None:
+    prompt = LifeChatterContextAssembler.build_rolling_prompt(
+        stream_name="私聊",
+        stream_id="stream-a",
+        unread_lines=(
+            "【12:00】<other> [life_engine_initiative] 系统（主体主动外联）： "
+            "主体刚刚明确选择发起一次外联。\n"
+            "主体公开意向：想她了"
+        ),
+    )
+    payloads = [
+        LLMPayload(ROLE.USER, Text(prompt)),
+        LLMPayload(
+            ROLE.ASSISTANT,
+            ToolCall(
+                id="pass-1",
+                name="action-life_pass_and_wait",
+                args={},
+            ),
+        ),
+        LLMPayload(
+            ROLE.TOOL_RESULT,
+            ToolResult(value="wait", call_id="pass-1", name="action-life_pass_and_wait"),
+        ),
+        LLMPayload(ROLE.ASSISTANT, Text("__SUSPEND__")),
+    ]
+
+    closed = LifeChatter._derived_rolling_payloads(
+        payloads,
+        strip_wake_envelopes=True,
+    )
+    closed_text = _payloads_text(closed)
+    assert "life_engine_initiative" not in closed_text
+    assert "想她了" not in closed_text
+    LLMContextManager()._validate_payloads(
+        closed,
+        allow_incomplete_tail=False,
+    )
+
+
+def test_wait_user_transition_strips_wake_envelope_from_live_payloads() -> None:
+    prompt = _inner_return_rolling_prompt()
+    response = SimpleNamespace(
+        payloads=[
+            LLMPayload(ROLE.USER, Text(prompt)),
+            LLMPayload(
+                ROLE.ASSISTANT,
+                ToolCall(
+                    id="send-1",
+                    name="action-life_send_text",
+                    args={"content": "看见了"},
+                ),
+            ),
+            LLMPayload(
+                ROLE.TOOL_RESULT,
+                ToolResult(
+                    value="sent",
+                    call_id="send-1",
+                    name="action-life_send_text",
+                ),
+            ),
+            LLMPayload(ROLE.ASSISTANT, Text("__SUSPEND__")),
+        ]
+    )
+    rt = _WorkflowRuntime(
+        response=response,
+        phase=_Phase.TOOL_EXEC,
+        history_merged=True,
+        unreads=[],
+        cross_round_seen_signatures=set(),
+        unread_msgs_to_flush=[],
+        active_stream_id="stream-a",
+        active_unread_turn_key="turn-1",
+    )
+
+    LifeChatter._transition(rt, _Phase.WAIT_USER, "pass")
+
+    blob = _payloads_text(response.payloads)
+    assert "life_engine_inner_return" not in blob
+    assert "秘密念头" not in blob
+    assert rt.phase == _Phase.WAIT_USER
 
 
 def test_rolling_context_projection_drops_retired_reaction_guidance() -> None:
@@ -1964,113 +2135,6 @@ async def test_life_chatter_think_only_continues_loop(monkeypatch) -> None:
     assert isinstance(result, Success)
     assert rt.phase == _Phase.FOLLOW_UP
     assert rt.follow_up_rounds == 1
-
-    LifeChatter.reset_global_runtime()
-
-
-async def test_surface_think_only_follow_up_runs_without_driver_tick(monkeypatch) -> None:
-    """Surface 即使偶发 think-only，也应在同一次驱动中立刻续轮发出回复。"""
-
-    LifeChatter.reset_global_runtime()
-    tool_calls: list[str] = []
-
-    class FollowUpResponse:
-        def __init__(self) -> None:
-            self.payloads = []
-            self.model_set = []
-            self.call_list = [
-                SimpleNamespace(
-                    id="send-1",
-                    name="action-life_send_text",
-                    args={"content": "我在呢。"},
-                )
-            ]
-            self.message = ""
-
-        def add_payload(self, payload) -> None:
-            self.payloads.append(payload)
-
-        def __await__(self):
-            async def done():
-                return self
-
-            return done().__await__()
-
-    class ThinkOnlyResponse:
-        def __init__(self) -> None:
-            self.payloads = []
-            self.model_set = []
-            self.call_list = [
-                SimpleNamespace(id="think-1", name="action-think", args={"thought": "先想想"})
-            ]
-            self.message = ""
-            self.send_calls = 0
-
-        def add_payload(self, payload) -> None:
-            self.payloads.append(payload)
-
-        async def send(self, *, stream: bool = False):
-            assert stream is False
-            self.send_calls += 1
-            return FollowUpResponse()
-
-    response = ThinkOnlyResponse()
-    unread = Message(
-        message_id="surface-unread",
-        content="爱莉？",
-        processed_plain_text="爱莉？",
-        sender_role="other",
-        platform="neko.surface",
-        stream_id="surface-stream",
-    )
-    rt = _WorkflowRuntime(
-        response=response,
-        phase=_Phase.TOOL_EXEC,
-        history_merged=True,
-        unreads=[unread],
-        cross_round_seen_signatures=set(),
-        unread_msgs_to_flush=[],
-        active_stream_id="surface-stream",
-        must_reply=True,
-    )
-    LifeChatter._GLOBAL_RUNTIME = rt
-    LifeChatter._GLOBAL_USABLE_MAP = {}
-
-    chatter = LifeChatter.__new__(LifeChatter)
-    chatter.plugin = SimpleNamespace(config=None)
-    chatter.stream_id = "surface-stream"
-
-    async def fake_fetch_unreads():
-        return [], [unread]
-
-    async def fake_run_tool_call(call, *_args, **_kwargs):
-        calls = call if isinstance(call, list) else [call]
-        tool_calls.extend(str(item.name) for item in calls)
-        return [(False, True) for _ in calls]
-
-    async def immediate_model_turn(awaitable):
-        return await awaitable
-
-    monkeypatch.delenv("NEKO_SURFACE_LOW_LATENCY", raising=False)
-    monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
-    monkeypatch.setattr(chatter, "run_tool_call", fake_run_tool_call)
-    monkeypatch.setattr(chatter, "_await_model_turn", immediate_model_turn)
-    monkeypatch.setattr(chatter, "_maybe_compact_runtime_context", lambda _response: None)
-    monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", _skip_snapshot_save)
-    monkeypatch.setattr(
-        "src.kernel.concurrency.get_watchdog",
-        lambda: SimpleNamespace(feed_dog=lambda _stream_id: None),
-    )
-
-    result = await chatter._drive_global_runtime_until_yield(
-        SimpleNamespace(stream_id="surface-stream", platform="neko.surface"),
-        service=None,
-    )
-
-    assert isinstance(result, Wait)
-    assert response.send_calls == 1
-    assert tool_calls == ["action-think", "action-life_send_text"]
-    assert rt.phase == _Phase.WAIT_USER
 
     LifeChatter.reset_global_runtime()
 
@@ -3901,20 +3965,6 @@ def test_life_chatter_history_excludes_internal_prompt_messages() -> None:
     assert "内心独白" not in history
 
 
-def _legacy_tell_dfc_tool_description_frames_as_runtime_mode_sync() -> None:
-    """nucleus_tell_dfc 的叙事应指向运行模式同步，而不是双意识。"""
-    description = LifeEngineWakeDFCTool.tool_description
-
-    assert "同一主体的表达层" in description
-    assert "不是在和另一个意识体对话" in description
-    assert "信息差" in description
-    assert "不用于指导" in description
-    assert "事实、背景、记忆线索、情绪来源或潜在风险" in description
-    assert "台词、步骤或策略" in description
-    assert "你应该回复 X" in description
-    assert "不用于催表达层开口" in description
-
-
 def test_execution_tool_descriptions_respect_heartbeat_boundary() -> None:
     """执行类工具 schema 自身也要约束心跳态，不只依赖系统 prompt。"""
     bash_description = LifeEngineBashTool.tool_description
@@ -3930,30 +3980,6 @@ def test_execution_tool_descriptions_respect_heartbeat_boundary() -> None:
     assert "主动状态只能通过统一 proactive 工具读写" in agent_description
     assert "不要让子代理承接用户任务、查项目配置、跑命令、改代码、画图" in agent_description
     assert "交给 life_chatter / 表达层判断和执行" in agent_description
-
-
-def _legacy_heartbeat_prompt_bounds_tell_dfc_to_context_gap(tmp_path) -> None:
-    """心跳 prompt 应把 nucleus_tell_dfc 限定为补信息差，而不是指导表达层。"""
-    config = LifeEngineConfig()
-    config.settings.workspace_path = str(tmp_path)
-    service = LifeEngineService(_service_plugin(config))
-
-    prompt = "\n".join(service._build_prompt_header())
-
-    assert "观察、思考、联想和沉淀" in prompt
-    assert "不是后台执行器，也不是表达层" in prompt
-    assert "主动表达" not in prompt
-    assert "是否画画、是否查配置或跑命令，由表达层结合用户请求自行决定" in prompt
-    assert "只在表达层当前看不到事实、背景、线索或风险时" in prompt
-    assert "这个工具用于补充背景，不用于指导表达层怎么说、怎么做" in prompt
-    assert "不要拿它查项目配置、跑用户任务或处理外部操作" in prompt
-    assert "不要用子智能体承接用户任务、画图、查项目配置、跑命令" in prompt
-    assert "你应该回复 X" in prompt
-    assert "你去安慰/追问 Y" in prompt
-    assert "工具会默认唤醒表达层" in prompt
-    assert "唤醒只是让新上下文被看见，不代表表达层必须开口" in prompt
-    assert "没有明确需要时，可以安静结束本轮" in prompt
-    assert "有冲动就行动" not in prompt
 
 
 def test_heartbeat_prompt_uses_explicit_subject_initiative_contract(

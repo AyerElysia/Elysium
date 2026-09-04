@@ -12,14 +12,12 @@ from types import SimpleNamespace
 from fastapi.testclient import TestClient
 
 from plugins.livestream.router import LivestreamRouter
-from plugins.neko_surface.router import NekoSurfaceRouter
 from plugins.voice_live.router import VoiceLiveRouter
 
 # (Router 类, 挂载路径, 取代它的 /api/v1 前缀)
 LEGACY_ROUTERS = (
     (LivestreamRouter, "/livestream", "/api/v1/livestream"),
     (VoiceLiveRouter, "/voice-live", "/api/v1/voice-calls"),
-    (NekoSurfaceRouter, "/api/neko-surface", "/api/v1/surfaces"),
 )
 
 
@@ -61,24 +59,11 @@ def _instantiate(router_cls: type, *, plugin: object):
             ),
         )
         return router_cls(plugin=SimpleNamespace(config=config))
-    if router_cls is NekoSurfaceRouter:
-        from plugins.neko_surface.service import (
-            NekoSurfaceGateway,
-            SurfaceGatewayConfig,
-        )
-
-        gateway = NekoSurfaceGateway(SurfaceGatewayConfig(token="secret"))
-
-        async def handle_input(event) -> None:
-            return None
-
-        gateway.bind_input_handler(handle_input)
-        return router_cls(plugin=SimpleNamespace(gateway=gateway))
     raise AssertionError(f"unsupported legacy router: {router_cls.__name__}")
 
 
 def test_every_legacy_router_declares_deprecation() -> None:
-    """仍在迁移期的三组旧路由都必须声明弃用标记。"""
+    """仍在迁移期的旧路由都必须声明弃用标记。"""
     for router_cls, mount, replaced_by in LEGACY_ROUTERS:
         assert router_cls.deprecation_notice, (
             f"{router_cls.__name__} ({mount}) 必须声明 deprecation_notice"
@@ -99,7 +84,6 @@ def test_legacy_routers_still_serve_and_return_deprecation_headers() -> None:
     probe_paths = {
         LivestreamRouter: "/health",
         VoiceLiveRouter: "/health",
-        NekoSurfaceRouter: "/status",
     }
     for router_cls, _mount, _replaced_by in LEGACY_ROUTERS:
         router = _instantiate(router_cls, plugin=object())

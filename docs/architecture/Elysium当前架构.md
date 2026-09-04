@@ -40,7 +40,6 @@ main.py
           ├── napcat_adapter / lark_adapter
           ├── voice_live / livestream
           ├── tts_voice_plugin（当前消息 TTS：GPT-SoVITS api_v2）
-          ├── neko_surface
           └── 其他专用能力插件
 ```
 
@@ -208,7 +207,7 @@ Life Event（追加式发生历史）
 - `initiative/` 保存活跃意识明确写下的 `InitiativeSeed`，并支持一次性重新相遇；它没有分数、周期任务、目标 stream 或预写回复；
 - 真正行动时，当前意识分别选择对象 `audience_ref` 与物理表面 `surface_ref`；来源实例不会锁定未来平台，跨平台身份只接受显式 `canonical_person_key`；
 - 目标表达实例在该表面的真实上下文中重新决定表达或沉默，`life_send_text` 只作用于当前表面；
-- 旧 `AutonomyIntent`、延迟续话以及 `nucleus_tell_dfc` 最近流唤醒只读退役，不再注册、恢复调度或产生新主体决定；
+- 旧 `AutonomyIntent`、延迟续话以及 `nucleus_tell_dfc` 最近流唤醒的实现类已删除，且不为该名字保留退役/拒绝占位；旧快照只读，不再注册、恢复调度或产生新主体决定；
 - Narrative Store 追加记录叙事事件，自传投影由主体通过工具主动沉淀；
 - 系统只提供机会、连续性、可达事实与安全回执，不替爱莉决定什么时候行动、面向谁或什么对她有意义。
 
@@ -263,8 +262,7 @@ NapCat 适配器已按 `client / events / outgoing / utils` 模块化：
 
 - `voice_live`：全双工实时语音框架；
 - `livestream`：B站原始事件账本、同一意识导演、TTS、OBS 浏览器舞台、真实播放回执与记忆投射；
-- `tts_voice_plugin`：当前普通消息与 Surface 自动语音的本地 TTS Service；本机 live 后端是 GPT-SoVITS v2ProPlus `api_v2`（`legacy_compat`）。IndexTTS2.5 + vLLM-Omni 仍是可配置合同，不是本机正在服务的路径；
-- `neko_surface`：桌面/表面呈现；
+- `tts_voice_plugin`：当前普通消息的本地 TTS Service；本机 live 后端是 GPT-SoVITS v2ProPlus `api_v2`（`legacy_compat`）。IndexTTS2.5 + vLLM-Omni 仍是可配置合同，不是本机正在服务的路径；
 - `minecraft/`：视觉输入、Windows 桥接、键鼠输出和场景意识。
 
 这些场景依赖本地模型、GPU、Windows 桥接或平台认证；“代码存在”不等于环境已经完成生产验收。

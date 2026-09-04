@@ -39,8 +39,6 @@
 | `last_wake_context_at` | str | 唤醒执行者 | 最近写入 | 最近一次，无合并 | 保留在 global 技术 checkpoint |
 | `last_wake_context_size` | int | 唤醒执行者 | 最近写入 | 最近一次，无合并 | 保留在 global 技术 checkpoint |
 | `last_external_message_at` | str | 消息事实层 | 幂等事实 | 同一 occurrence 去重 | 可由 Life Event 派生，global 仅留技术镜像 |
-| `last_tell_dfc_at` | str | DFC 投递者 | 最近写入 | 最近一次，无合并 | 保留在 global 技术 checkpoint |
-| `tell_dfc_count` | int | DFC 投递者 | 原子计数 | 原子增量或 operation 去重派生 | 保留在 global 技术 checkpoint |
 | `self_pause_until` | str | 暂停裁决者 | 最近写入 | 最近一次，无合并 | `life_engine.pause:<instance_id>` |
 | `self_pause_started_at` | str | 暂停裁决者 | 最近写入 | 最近一次，无合并 | `life_engine.pause:<instance_id>` |
 | `self_pause_reason` | str | 暂停裁决者 | 最近写入 | 最近一次，无合并 | `life_engine.pause:<instance_id>` |
@@ -77,7 +75,6 @@
 event_sequence
 subconscious_summary（可重建投影）
 last_wake_context_at / last_wake_context_size
-last_tell_dfc_at / tell_dfc_count
 consecutive_rest_count / last_leisure_seen_at
 ```
 
