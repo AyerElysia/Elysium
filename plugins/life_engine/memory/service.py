@@ -66,7 +66,6 @@ from .epistemic import (
     RetrievalFeedback,
     RetrievalPlasticity,
     create_epistemic_schema,
-    new_claim,
 )
 from .experience import (
     EvidenceAwareMemoryResult,
@@ -96,7 +95,6 @@ from .lineage import (
 from .living import (
     ArtifactHead,
     ArtifactHeadConflict,
-    AssociationEvidence,
     AssociationSelection,
     CoRecallEvent,
     InterpretationSearchResult,
@@ -1454,32 +1452,6 @@ class LifeMemoryService:
 
         return appended
 
-    async def _reconcile_workspace_artifact_versions(
-        self,
-        documents: Sequence[Any],
-        workspace_paths: set[str],
-        *,
-        indexed_hashes: dict[str, str] | None = None,
-    ) -> int:
-        """Append artifact history and refresh externally changed search rows."""
-
-        loaded: dict[str, tuple[str, float]] = {}
-        workspace = self._get_workspace_path()
-        for document in documents:
-            try:
-                content, source_mtime, _size = await asyncio.to_thread(
-                    read_workspace_document,
-                    workspace,
-                    document.path,
-                )
-            except (FileNotFoundError, OSError, ValueError):
-                continue
-            loaded[document.path] = (content, source_mtime)
-        return await self._reconcile_workspace_artifact_versions_via_ports(
-            loaded,
-            workspace_paths,
-        )
-
     def _require_local_db(self) -> sqlite3.Connection:
         if self._db is None or self._closing:
             raise RuntimeError("记忆服务尚未初始化或正在关闭")
@@ -1492,73 +1464,6 @@ class LifeMemoryService:
         return (
             self._memory_storage is not None and self._initialized and not self._closing
         )
-
-    async def read_graph_projection(
-        self,
-        *,
-        limit_nodes: int = 80,
-        min_weight: float = 0.15,
-        focus_id: str | None = None,
-    ) -> Dict[str, Any]:
-        """Return the rebuildable legacy graph through a public service boundary."""
-
-        return await self._require_memory_storage().document_index.graph_snapshot(
-            limit_nodes=max(10, min(int(limit_nodes), 200)),
-            min_weight=max(0.0, min(float(min_weight), 1.0)),
-            focus_id=focus_id,
-        )
-
-    async def read_file_lineage_projection(
-        self,
-        file_path: str,
-    ) -> Dict[str, Any] | None:
-        """Return file evolution through the public backend-neutral boundary."""
-
-        graph = self._require_memory_storage().legacy_graph
-        node = await graph.get_node_by_file_path(file_path)
-        if node is None:
-            return None
-        outgoing, incoming, corrections = await asyncio.gather(
-            graph.get_edges_from(node.node_id, 0.0),
-            graph.get_edges_to(node.node_id, 0.0),
-            graph.list_corrections(
-                related_node_ids=(node.node_id,),
-                limit=10,
-            ),
-        )
-        evolution_trace: list[dict[str, Any]] = []
-        for direction, edges in (("later", outgoing), ("earlier", incoming)):
-            for edge in edges:
-                related_id = edge.target_id if direction == "later" else edge.source_id
-                related = await graph.get_node_by_id(related_id)
-                if related is None or not related.file_path:
-                    continue
-                evolution_trace.append(
-                    {
-                        "direction": direction,
-                        "relation": edge.edge_type.value,
-                        "file_path": related.file_path,
-                        "title": related.title,
-                        "reason": edge.reason,
-                        "weight": round(edge.weight, 2),
-                    }
-                )
-        corrections_data = [
-            {
-                "topic": item.topic,
-                "message": item.message,
-                "source": item.source,
-                "created_at": item.created_at,
-            }
-            for item in corrections
-        ]
-        if not evolution_trace and not corrections_data:
-            return None
-        return {
-            "evolution_trace": evolution_trace,
-            "corrections": corrections_data,
-            "has_history": True,
-        }
 
     async def read_lineage_edges(
         self,
@@ -1891,25 +1796,6 @@ class LifeMemoryService:
 
         return await self._require_memory_storage().experiences.append(records)
 
-    async def record_memory_artifact_version(
-        self,
-        version: MemoryArtifactVersion,
-        *,
-        derivations: Sequence[MemoryDerivation] = (),
-        expected_head_revision: int | None = None,
-    ) -> MemoryArtifactVersion:
-        """Append one immutable memory artifact version and provenance."""
-
-        living = self._require_memory_storage().living
-        if expected_head_revision is None:
-            head = await living.get_artifact_head(version.logical_key)
-            expected_head_revision = head.revision if head is not None else 0
-        return await living.append_artifact(
-            version,
-            derivations=derivations,
-            expected_head_revision=expected_head_revision,
-        )
-
     async def version_memory_artifact(
         self,
         *,
@@ -2013,19 +1899,6 @@ class LifeMemoryService:
 
         return await self._require_memory_storage().living.list_relations(entity_ref)
 
-    async def list_memory_interpretations(
-        self,
-        subject_id: str,
-        *,
-        recorded_as_of: str = "",
-    ) -> List[MemoryInterpretation]:
-        """Read the interpretation history available at a recorded time."""
-
-        return await self._require_memory_storage().living.list_interpretations(
-            subject_id,
-            recorded_as_of=recorded_as_of,
-        )
-
     async def search_memory_interpretations(
         self,
         query: str,
@@ -2097,19 +1970,6 @@ class LifeMemoryService:
         """Append a contextual co-recall hyperedge and update its projection."""
 
         return await self._require_memory_storage().living.append_corecall(event)
-
-    async def list_memory_association_evidence(
-        self,
-        entity_ref: str,
-        *,
-        context_key: str | None = None,
-    ) -> List[AssociationEvidence]:
-        """Return separate contextual association dimensions."""
-
-        return await self._require_memory_storage().living.list_association_evidence(
-            entity_ref,
-            context_key=context_key,
-        )
 
     async def rebuild_memory_association_projection(self) -> int:
         """Rebuild derived pairwise accessibility from immutable hyperedges."""
@@ -2746,12 +2606,6 @@ class LifeMemoryService:
                 **kwargs
             )
 
-    async def witness_migration_exists(self, migration_key: str) -> bool:
-        """检查旧日记迁移键，保证迁移幂等。"""
-        return await self._require_memory_storage().witnesses.migration_exists(
-            migration_key
-        )
-
     async def record_witness_migration(self, **kwargs: Any) -> None:
         """记录旧日记来源哈希与新见证 ID，不删除旧文件。"""
         async with self._index_write_lock:
@@ -2818,17 +2672,6 @@ class LifeMemoryService:
     async def _get_snippet_wrapper(self, node_id: str) -> str:
         """获取摘要的包装函数。"""
         return await self._require_memory_storage().document_index.get_snippet(node_id)
-
-    async def _filter_existing_scores_wrapper(
-        self,
-        scores: List[tuple],
-    ) -> tuple:
-        """过滤存在节点的包装函数。"""
-        return (
-            await self._require_memory_storage().document_index.filter_existing_scores(
-                scores
-            )
-        )
 
     # --------------------------------------------------------
     # 边操作（封装模块函数）
@@ -3048,41 +2891,6 @@ class LifeMemoryService:
 
         del topic, message, related_paths, source, query, stream_id
         raise RuntimeError("LegacyCorrectionMutationRetired")
-
-    async def _record_correction_claims(
-        self,
-        corrections: List[MemoryCorrection],
-    ) -> None:
-        """把旧 correction 兼容记录投影到新本体；候选来源不获确认权。
-
-        同一逻辑修正可能绑定多个文件节点（多行 correction），但认识论层
-        只需一条 claim。按 (topic, message) 去重。
-        """
-        seen_claims: set[tuple[str, str]] = set()
-        for correction in corrections:
-            dedup_key = (correction.topic, correction.message)
-            if dedup_key in seen_claims:
-                continue
-            seen_claims.add(dedup_key)
-            source = str(correction.source or "unknown").strip().lower()
-            claim = new_claim(
-                claim_id=f"correction_{correction.correction_id}",
-                subject_key=f"correction:{correction.topic}",
-                content=correction.message,
-                claim_kind="correction_candidate",
-                source=source,
-                authority="unasserted",
-                stream_scope=correction.stream_id or "",
-                metadata={
-                    "legacy_correction_id": correction.correction_id,
-                    "related_node_id": correction.related_node_id or "",
-                    "query": correction.query,
-                },
-                recorded_at=datetime.fromtimestamp(correction.created_at)
-                .astimezone()
-                .isoformat(),
-            )
-            await self.append_memory_claim(claim)
 
     async def resolve_canonical_path(
         self,
@@ -3407,76 +3215,6 @@ class LifeMemoryService:
             time_range_days=time_range_days,
             return_bundles=True,
         )
-
-    async def search_memory_simple(
-        self,
-        query: str,
-        top_k: int = 5,
-        enable_association: bool = True,
-        file_types: Optional[List[str]] = None,
-        time_range_days: int = 0,
-        *,
-        now: Any = None,
-        workspace_path: str | Path | None = None,
-    ) -> List[SearchResult]:
-        """简单检索模式，返回无演化历史的搜索结果列表。
-
-        警告：这是降级版本，仅用于特殊场景（如性能敏感的内部操作）。
-        正常情况下应该使用 search_memory()，它默认返回完整记忆包。
-        """
-        return await self.search_memory(
-            query=query,
-            top_k=top_k,
-            enable_association=enable_association,
-            file_types=file_types,
-            time_range_days=time_range_days,
-            now=now,
-            workspace_path=workspace_path,
-            return_bundles=False,
-        )
-
-    async def _get_or_create_file_node_from_workspace(
-        self, file_path: str
-    ) -> MemoryNode:
-        """Load an eligible workspace document, or reuse an indexed historical node.
-
-        This helper is used by explicit lineage and correction writes.  It must
-        never turn a typo or an internal runtime path into a new empty memory
-        node.  A missing file is only valid when the node already exists as
-        historical lineage evidence.
-        """
-        path_eligibility = assess_document_path(file_path)
-        if not path_eligibility.eligible:
-            raise ValueError(f"不支持索引的记忆文档路径: {path_eligibility.reason}")
-
-        workspace = self._get_workspace_path()
-        eligibility = assess_workspace_document(workspace, path_eligibility.path)
-        if eligibility.eligible:
-            try:
-                content, source_mtime, _ = read_workspace_document(
-                    workspace,
-                    eligibility.path,
-                )
-            except (OSError, UnicodeError, ValueError) as exc:
-                raise ValueError(f"无法读取记忆文档: {eligibility.path}") from exc
-            await self.upsert_document(
-                eligibility.path,
-                content,
-                title=Path(eligibility.path).stem,
-                source_mtime=source_mtime,
-            )
-            node = await self.get_node_by_file_path(eligibility.path)
-            if node is None:
-                raise RuntimeError(f"记忆文档写入后未找到节点: {eligibility.path}")
-            return node
-
-        if eligibility.reason == "stat_error":
-            historical_node = await self.get_node_by_file_path(path_eligibility.path)
-            if historical_node is not None:
-                return historical_node
-            raise ValueError(f"记忆文档不存在或不可访问: {path_eligibility.path}")
-
-        raise ValueError(f"不支持索引的记忆文档路径: {eligibility.reason}")
 
     async def _resolve_canonical_from_node(
         self,

@@ -68,16 +68,6 @@ class MemoryNode:
 # ============================================================
 
 
-def normalize_file_path(file_path: str) -> str:
-    """Return an eligible canonical path or an empty string.
-
-    Kept only for callers that need a non-raising compatibility helper. It
-    never strips a leading slash or collapses traversal into a valid identity.
-    """
-    eligibility = assess_document_path(file_path)
-    return eligibility.path if eligibility.eligible else ""
-
-
 def generate_file_node_id(file_path: str) -> str:
     """Return a deterministic ID for an already-canonical file path.
 
@@ -102,11 +92,6 @@ def canonical_file_node_id(file_path: str) -> tuple[str, str]:
 def generate_legacy_file_node_id(file_path: str) -> str:
     """兼容旧实现（直接使用原始字符串）的节点 ID 生成规则。"""
     return f"file:{hashlib.md5(str(file_path).encode()).hexdigest()[:12]}"
-
-
-def generate_concept_node_id(concept: str) -> str:
-    """根据概念名称生成节点 ID。"""
-    return f"concept:{hashlib.md5(concept.encode()).hexdigest()[:12]}"
 
 
 def compute_content_hash(content: str) -> str:
@@ -252,86 +237,6 @@ async def get_node_by_file_path(
         return valid_rows[0]
 
     return await run_db(_lookup_node)
-
-
-async def migrate_node_identity(
-    db: sqlite3.Connection,
-    old_node_id: str,
-    new_node_id: str,
-    new_file_path: str,
-    emit_visual_event: Any = None,
-    migrate_vector_identity_func: Any = None,
-) -> bool:
-    """Explicitly rekey one legacy file node through the SQLite authority.
-
-    This maintenance operation refuses implicit merges and never writes Chroma.
-    Vector convergence is represented by the SQLite outbox created by the
-    transactional rekey helper.
-    """
-    del emit_visual_event, migrate_vector_identity_func
-    canonical_path, canonical_node_id = canonical_file_node_id(new_file_path)
-    if str(new_node_id or "") != canonical_node_id:
-        raise ValueError("new_node_id 与 canonical 文件路径不一致")
-
-    from .indexing import rekey_document_rows_by_id
-
-    return await run_db(
-        rekey_document_rows_by_id,
-        db,
-        str(old_node_id or "").strip(),
-        canonical_path,
-    )
-
-
-async def migrate_file_path(
-    db: sqlite3.Connection,
-    old_path: str,
-    new_path: str,
-    migrate_node_identity_func: Any = None,
-) -> bool:
-    """Explicitly move a canonical file identity without widening paths."""
-    old_norm, old_node_id = canonical_file_node_id(old_path)
-    new_norm, new_node_id = canonical_file_node_id(new_path)
-    if old_norm == new_norm:
-        return True
-    if migrate_node_identity_func is None:
-        return False
-    migrated = await migrate_node_identity_func(
-        old_node_id=old_node_id,
-        new_node_id=new_node_id,
-        new_file_path=new_norm,
-    )
-    if migrated:
-        logger.info(f"已迁移记忆路径: {old_norm} -> {new_norm}")
-    return migrated
-
-
-async def update_fts(db: sqlite3.Connection, node_id: str, title: str, content: str) -> None:
-    """Compatibility wrapper that performs a complete transactional reindex.
-
-    Updating only legacy FTS would diverge from chunks and the embedding outbox,
-    so callers are resolved back to a strict canonical document identity first.
-    """
-    identifier = str(node_id or "").strip()
-
-    def _path_for_node() -> str | None:
-        row = db.execute(
-            "SELECT node_id, node_type, file_path FROM memory_nodes WHERE node_id = ?",
-            (identifier,),
-        ).fetchone()
-        if row is None or str(row["node_type"] or "file").lower() != NodeType.FILE.value:
-            return None
-        stored = assess_indexed_document_path(row["file_path"])
-        if not stored.eligible or str(row["node_id"] or "") != generate_file_node_id(stored.path):
-            return None
-        return stored.path
-
-    file_path = await run_db(_path_for_node)
-    if file_path is None:
-        return
-    from .indexing import upsert_document_rows
-
-    await run_db(upsert_document_rows, db, file_path, str(content or ""), title)
 
 
 async def increment_access(

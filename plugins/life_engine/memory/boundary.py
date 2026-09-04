@@ -674,12 +674,6 @@ class StoredMemoryBoundary:
         )
 
 
-@dataclass(frozen=True, slots=True)
-class _BoundaryState:
-    head: ArtifactHead | None
-    records: tuple[StoredMemoryBoundary, ...]
-
-
 class MemoryBoundaryRepository:
     """Store complete boundary manifests through an existing LivingMemoryStore."""
 
@@ -1028,89 +1022,6 @@ class MemoryBoundaryRepository:
             ),
         )
 
-    async def _audit_full_history(self, boundary_id: str) -> _BoundaryState:
-        """Explicit deep audit path; ordinary read/append never calls this scan."""
-        logical_key = memory_boundary_logical_key(boundary_id)
-        for _attempt in range(2):
-            head_before = await self._store.get_artifact_head(logical_key)
-            history = await self._store.list_artifact_history(logical_key)
-            head_after = await self._store.get_artifact_head(logical_key)
-            if head_before == head_after:
-                return self._validate_history(boundary_id, head_after, history)
-        raise ArtifactHeadConflict(
-            f"memory boundary head changed while reading: {boundary_id!r}"
-        )
-
-    def _validate_history(
-        self,
-        boundary_id: str,
-        head: ArtifactHead | None,
-        history: Sequence[MemoryArtifactVersion],
-    ) -> _BoundaryState:
-        if head is None:
-            if history:
-                raise MemoryBoundaryIntegrityError(
-                    f"MemoryBoundaryHistoryWithoutHead:{boundary_id}"
-                )
-            return _BoundaryState(head=None, records=())
-        if not history:
-            raise MemoryBoundaryIntegrityError(
-                f"MemoryBoundaryHeadWithoutHistory:{boundary_id}"
-            )
-        parsed = [
-            self._record_from_artifact(
-                artifact,
-                current_head_revision=head.revision,
-                is_current=(artifact.artifact_id == head.artifact_id),
-            )
-            for artifact in history
-        ]
-        parsed.sort(key=lambda item: item.manifest.manifest_revision)
-        expected_revisions = list(range(1, len(parsed) + 1))
-        actual_revisions = [item.manifest.manifest_revision for item in parsed]
-        if actual_revisions != expected_revisions:
-            raise MemoryBoundaryIntegrityError(
-                "MemoryBoundaryRevisionHistoryInvalid:"
-                f"expected={expected_revisions!r}:actual={actual_revisions!r}"
-            )
-        for index, record in enumerate(parsed):
-            expected_parents = (
-                () if index == 0 else (parsed[index - 1].artifact.artifact_id,)
-            )
-            if record.artifact.parent_artifact_ids != expected_parents:
-                raise MemoryBoundaryIntegrityError(
-                    "MemoryBoundaryParentHistoryInvalid:"
-                    f"artifact_id={record.artifact.artifact_id}"
-                )
-        if head.logical_key != memory_boundary_logical_key(boundary_id):
-            raise MemoryBoundaryIntegrityError(
-                f"MemoryBoundaryHeadLogicalKeyMismatch:{boundary_id}"
-            )
-        if head.revision != len(parsed):
-            raise MemoryBoundaryIntegrityError(
-                "MemoryBoundaryHeadRevisionMismatch:"
-                f"head={head.revision}:history={len(parsed)}"
-            )
-        if parsed[-1].artifact.artifact_id != head.artifact_id:
-            raise MemoryBoundaryIntegrityError(
-                f"MemoryBoundaryHeadArtifactMismatch:{boundary_id}"
-            )
-        operation_ids = [item.manifest.operation_occurrence_id for item in parsed]
-        if len(operation_ids) != len(set(operation_ids)):
-            raise MemoryBoundaryIntegrityError(
-                f"MemoryBoundaryOperationHistoryDuplicate:{boundary_id}"
-            )
-        records = tuple(
-            StoredMemoryBoundary(
-                manifest=item.manifest,
-                artifact=item.artifact,
-                head_revision=item.manifest.manifest_revision,
-                exact_uri=item.exact_uri,
-            )
-            for item in parsed
-        )
-        return _BoundaryState(head=head, records=records)
-
     def _record_from_artifact(
         self,
         artifact: MemoryArtifactVersion,
@@ -1178,26 +1089,6 @@ class MemoryBoundaryRepository:
             current_head_revision=current_head_revision,
             is_current=is_current,
         )
-
-    @staticmethod
-    def _match_operation(
-        state: _BoundaryState,
-        manifest: MemoryBoundaryManifest,
-    ) -> StoredMemoryBoundary | None:
-        for record in state.records:
-            if (
-                record.manifest.operation_occurrence_id
-                != manifest.operation_occurrence_id
-            ):
-                continue
-            if record.manifest.root_sha256 != manifest.root_sha256:
-                raise MemoryBoundaryOperationConflict(
-                    "MemoryBoundaryOperationIdentityConflict:"
-                    f"{manifest.operation_occurrence_id}"
-                )
-            return record
-        return None
-
 
 def _normalize_expected_revision(value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:

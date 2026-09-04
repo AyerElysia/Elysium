@@ -1752,44 +1752,6 @@ def _node_matches_filters(
     return True
 
 
-async def filter_results(
-    db: sqlite3.Connection,
-    results: List[Tuple[str, float]],
-    file_types: Optional[List[str]] = None,
-    time_range_days: int = 0,
-    *,
-    now: date | datetime | None = None,
-    workspace_path: str | Path | None = None,
-    event_date: date | None = None,
-) -> List[Tuple[str, float]]:
-    """过滤旧式分数列表；保留兼容 API 并使用严格路径/日期规则。"""
-    current_date = _coerce_search_date(now)
-    if current_date is None and time_range_days > 0:
-        current_date = datetime.now().astimezone().date()
-    cutoff_date = (
-        current_date - timedelta(days=max(0, int(time_range_days)))
-        if current_date is not None and time_range_days > 0 and event_date is None
-        else None
-    )
-    nodes = await _async_db_read(
-        _load_nodes_by_ids,
-        db,
-        (node_id for node_id, _ in results),
-    )
-    return [
-        (node_id, score)
-        for node_id, score in results
-        if node_id in nodes
-        and _node_matches_filters(
-            nodes[node_id],
-            file_types=file_types,
-            explicit_date=event_date,
-            cutoff_date=cutoff_date,
-            workspace_path=workspace_path,
-        )
-    ]
-
-
 # ============================================================
 # 混合检索
 # ============================================================

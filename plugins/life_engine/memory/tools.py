@@ -373,49 +373,6 @@ def _eligible_path_or_error(file_path: str) -> tuple[str | None, str | None]:
     return None, f"不是可操作的记忆文档: {decision.reason}"
 
 
-def _bundle_to_payload(bundle: MemoryBundle) -> dict[str, Any]:
-    """将可追溯记忆包压成工具返回结构。"""
-    return {
-        "primary_path": bundle.primary_path,
-        "current_understanding": bundle.current_understanding,
-        "evidence_files": [
-            {
-                "file_path": item.file_path,
-                "title": item.title,
-                "snippet": item.snippet,
-                "relevance": round(item.relevance, 3),
-                "source": item.source,
-                "relation": item.relation,
-                "relation_reason": item.relation_reason,
-                "exists": item.exists,
-            }
-            for item in bundle.evidence
-        ],
-        "history_trace": [
-            {
-                "direction": item.direction,
-                "relation": item.relation,
-                "file_path": item.file_path,
-                "title": item.title,
-                "snippet": item.snippet,
-                "reason": item.reason,
-                "exists": item.exists,
-            }
-            for item in bundle.history_trace
-        ],
-        "corrections": [
-            {
-                "topic": item.topic,
-                "message": item.message,
-                "source": item.source,
-                "created_at": item.created_at,
-            }
-            for item in bundle.corrections
-        ],
-        "uncertainty": bundle.uncertainty,
-    }
-
-
 # ============================================================
 # nucleus_search_memory - 语义检索 + 联想
 # ============================================================
