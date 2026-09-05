@@ -25,6 +25,16 @@ from plugins.life_engine.core.context_compaction import (
     SUMMARY_INTRO,
     SUMMARY_OPEN,
 )
+from plugins.life_engine.core.context_stewardship import (
+    build_group_manifest,
+    consume_subject_context_recovery_marker,
+    ensure_compression_required_appended,
+    has_compression_required_payload,
+    install_fail_closed_context_hook,
+    is_compression_required_part,
+    is_compression_required_payload,
+    is_subject_window_overflow_error,
+)
 from plugins.life_engine.service.core import LifeEngineService
 from plugins.life_engine.service.event_builder import EventType, LifeEngineEvent
 from plugins.life_engine.service.perception_gateway import (
@@ -49,6 +59,7 @@ from src.kernel.llm import (
     ToolRegistry,
     ToolResult,
 )
+from src.kernel.llm.exceptions import LLMContextError
 from src.kernel.storage import canonical_json_sha256
 
 _TEST_PNG_B64 = (
@@ -199,7 +210,7 @@ def test_life_chatter_persistent_user_prompt_excludes_dynamic_context() -> None:
     assert "<runtime_assistant_context>" not in prompt
 
 
-def test_life_chatter_context_hook_projects_only_content_neutral_refs() -> None:
+def test_life_chatter_context_hook_opens_bounded_subject_recovery_turn() -> None:
     manager = LLMContextManager()
     request = SimpleNamespace(context_manager=manager)
 
@@ -213,35 +224,28 @@ def test_life_chatter_context_hook_projects_only_content_neutral_refs() -> None:
         LLMPayload(ROLE.ASSISTANT, Text("新回复")),
     ]
 
-    trimmed = manager.maybe_trim(
+    effective = manager.maybe_trim(
         payloads,
         max_token_budget=4,
         token_counter=lambda items: len(items),
     )
 
-    assert len(trimmed) == 4
-    assert trimmed[0].role == ROLE.SYSTEM
-    assert trimmed[1].role == ROLE.USER
-    compressed = trimmed[1].content[0].text
-    assert "<mechanical_context_omission>" in compressed
-    assert "ctxg_" in compressed
-    assert "旧用户消息" not in compressed
-    assert "旧回复" not in compressed
-    assert trimmed[2].content[0].text == "新用户消息"
+    assert has_compression_required_payload(effective)
+    assert "旧用户消息" not in str(effective)
+    assert "旧回复" not in str(effective)
+    assert "旧用户消息" in str(payloads)
+    manager.validate_for_send(effective)
+    assert consume_subject_context_recovery_marker(request) is True
+    assert consume_subject_context_recovery_marker(request) is False
 
 
-def test_life_chatter_context_compression_hook_uses_configured_limits() -> None:
+def test_life_chatter_context_hook_never_turns_dropped_bodies_into_summary() -> None:
     manager = LLMContextManager()
     request = SimpleNamespace(context_manager=manager)
-    chatter_config = SimpleNamespace(
-        context_compression_max_groups=1,
-        context_compression_max_part_chars=16,
-    )
 
-    LifeChatter._install_context_compression_hook(
-        request, chatter_config=chatter_config
-    )
-    compressed_payloads = manager.compression_hook(
+    LifeChatter._install_context_compression_hook(request)
+
+    projected = manager.compression_hook(
         [
             [LLMPayload(ROLE.USER, Text("第一组用户消息" + "x" * 100))],
             [LLMPayload(ROLE.USER, Text("第二组用户消息" + "a" * 100))],
@@ -249,15 +253,545 @@ def test_life_chatter_context_compression_hook_uses_configured_limits() -> None:
         [],
     )
 
-    compressed = compressed_payloads[0].content[0].text
-    assert '"unlisted_earlier_group_count":1' in compressed
-    assert '"listed_group_count":1' in compressed
-    assert "第一组用户消息" not in compressed
-    assert "第二组用户消息" not in compressed
-    assert "ctxg_" in compressed
+    assert has_compression_required_payload(projected)
+    rendered = str(projected)
+    assert "第一组用户消息" not in rendered
+    assert "第二组用户消息" not in rendered
+    assert "ctxg_" in rendered
+    assert LifeChatter._is_context_stewardship_call(
+        "action-author_self_continuity_checkpoint"
+    )
+    assert LifeChatter._is_context_stewardship_call("tool-read_context_group")
+    assert not LifeChatter._is_context_stewardship_call("action-life_send_text")
 
 
-def test_life_chatter_rolling_context_snapshot_uses_mechanical_refs() -> None:
+def test_context_hook_reprojects_exact_existing_control_when_its_group_is_dropped() -> None:
+    manager = LLMContextManager()
+    request = SimpleNamespace(context_manager=manager)
+    LifeChatter._install_context_compression_hook(request)
+
+    before_control = [
+        LLMPayload(ROLE.SYSTEM, Text("system")),
+        LLMPayload(ROLE.USER, Text("older user")),
+        LLMPayload(ROLE.ASSISTANT, Text("older assistant")),
+        LLMPayload(ROLE.USER, Text("maintenance owner turn")),
+    ]
+    manifest = build_group_manifest(before_control)
+    with_control = ensure_compression_required_appended(
+        before_control,
+        trigger_chars=1,
+        force=True,
+    )
+    exact_control = next(
+        part.text
+        for payload in with_control
+        for part in payload.content
+        if is_compression_required_part(part)
+    )
+    retained = [
+        *with_control,
+        LLMPayload(ROLE.ASSISTANT, Text("__SUSPEND__")),
+        LLMPayload(ROLE.USER, Text("new user while maintenance is pending")),
+        LLMPayload(ROLE.ASSISTANT, Text("maintenance continues")),
+    ]
+
+    effective = manager.maybe_trim(
+        retained,
+        max_token_budget=4,
+        token_counter=lambda items: len(items),
+    )
+
+    effective_controls = [
+        part.text
+        for payload in effective
+        for part in payload.content
+        if is_compression_required_part(part)
+    ]
+    retained_controls = [
+        part.text
+        for payload in retained
+        for part in payload.content
+        if is_compression_required_part(part)
+    ]
+    assert effective_controls == [exact_control]
+    assert retained_controls == [exact_control]
+    assert manifest.source_manifest_sha256 in exact_control
+    manager.validate_for_send(effective)
+
+
+def test_subject_window_overflow_backoff_is_slower_than_busy_retry() -> None:
+    from plugins.life_engine.core.chatter import (
+        _SUBJECT_WINDOW_OVERFLOW_RETRY_SECONDS,
+    )
+
+    assert _SUBJECT_WINDOW_OVERFLOW_RETRY_SECONDS > _GLOBAL_RUNTIME_BUSY_RETRY_SECONDS
+
+
+def test_subject_window_overflow_error_is_specific() -> None:
+    overflow = LLMContextError(
+        "subject rolling context exceeds the model window; "
+        "mechanical group omission is not a success path. "
+        "author_self_continuity_checkpoint must release groups first."
+    )
+    unrecoverable = LLMContextError(
+        "subject rolling context exceeds the model window and no "
+        "releasable closed context group is available"
+    )
+    assert is_subject_window_overflow_error(overflow)
+    assert is_subject_window_overflow_error(unrecoverable)
+    assert not is_subject_window_overflow_error(
+        LLMContextError("对话不能以 assistant 开始")
+    )
+    assert not is_subject_window_overflow_error(ValueError(str(overflow)))
+
+
+def test_fail_closed_hook_still_refuses_mechanical_omission() -> None:
+    manager = LLMContextManager()
+    request = SimpleNamespace(context_manager=manager)
+    install_fail_closed_context_hook(request)
+    payloads = [
+        LLMPayload(ROLE.SYSTEM, Text("system")),
+        LLMPayload(ROLE.USER, Text("旧用户消息")),
+        LLMPayload(ROLE.ASSISTANT, Text("旧回复")),
+        LLMPayload(ROLE.USER, Text("新用户消息")),
+        LLMPayload(ROLE.ASSISTANT, Text("新回复")),
+    ]
+    with pytest.raises(LLMContextError, match="mechanical group omission"):
+        manager.maybe_trim(
+            payloads,
+            max_token_budget=4,
+            token_counter=lambda items: len(items),
+        )
+
+
+def test_compression_control_stays_separate_from_unreads_and_suffix() -> None:
+    response = SimpleNamespace(
+        payloads=ensure_compression_required_appended(
+            [
+                LLMPayload(ROLE.USER, Text("旧消息")),
+                LLMPayload(ROLE.ASSISTANT, Text("旧回复")),
+                LLMPayload(ROLE.USER, Text("当前消息")),
+            ],
+            trigger_chars=1,
+            force=True,
+        )
+    )
+    control_parts = [
+        part
+        for part in response.payloads[-1].content
+        if is_compression_required_part(part)
+    ]
+    assert len(control_parts) == 1
+    control_text = control_parts[0].text
+
+    LifeChatter._upsert_pending_unread_payload(response, Text("追加的新消息"))
+    LifeChatter._append_suffix_context(response, "本轮潜意识投影")
+
+    assert is_compression_required_payload(response.payloads[-1])
+    control_parts = [
+        part
+        for part in response.payloads[-1].content
+        if is_compression_required_part(part)
+    ]
+    assert [part.text for part in control_parts] == [control_text]
+    assert is_compression_required_part(response.payloads[-1].content[-1])
+    assert any(
+        isinstance(part, Text) and "追加的新消息" in part.text
+        for payload in response.payloads
+        for part in payload.content
+    )
+    assert any(
+        isinstance(part, Text) and "<transient_life_context>" in part.text
+        for payload in response.payloads
+        for part in payload.content
+    )
+    LLMContextManager().validate_for_send(response.payloads)
+
+    LifeChatter._strip_suffix_context(response)
+
+    assert not any(
+        isinstance(part, Text) and "<transient_life_context>" in part.text
+        for payload in response.payloads
+        for part in payload.content
+    )
+    assert [
+        part.text
+        for payload in response.payloads
+        for part in payload.content
+        if is_compression_required_part(part)
+    ] == [control_text]
+    assert is_compression_required_part(response.payloads[-1].content[-1])
+    LLMContextManager().validate_for_send(response.payloads)
+    assert "<transient_life_context>" not in str(
+        LifeChatter._snapshot_data_for_payloads(response.payloads)
+    )
+
+
+def test_compression_control_in_history_is_never_relocated_across_assistants() -> None:
+    """Reproduce the 2026-09-04 production snapshot role-chain failure."""
+
+    manager = LLMContextManager()
+
+    class Response:
+        def __init__(self, payloads: list[LLMPayload]) -> None:
+            self.payloads = payloads
+
+        def add_payload(self, payload: LLMPayload) -> None:
+            self.payloads = manager.add_payload(self.payloads, payload)
+
+    closed_turn = [
+        LLMPayload(ROLE.USER, Text("更早的消息")),
+        LLMPayload(ROLE.ASSISTANT, Text("更早的回复")),
+        LLMPayload(ROLE.USER, Text("待处理消息")),
+        LLMPayload(
+            ROLE.ASSISTANT,
+            [ToolCall(id="sent", name="action-life_send_text", args={})],
+        ),
+        LLMPayload(
+            ROLE.TOOL_RESULT,
+            [ToolResult(value="sent", call_id="sent", name="action-life_send_text")],
+        ),
+        LLMPayload(ROLE.ASSISTANT, Text("__SUSPEND__")),
+    ]
+    with_control = ensure_compression_required_appended(
+        closed_turn,
+        trigger_chars=1,
+        force=True,
+    )
+    assert has_compression_required_payload(with_control)
+    control = with_control[-1]
+    payloads = [
+        *with_control,
+        LLMPayload(
+            ROLE.ASSISTANT,
+            [
+                ToolCall(
+                    id="checkpoint",
+                    name="action-author_self_continuity_checkpoint",
+                    args={},
+                )
+            ],
+        ),
+        LLMPayload(
+            ROLE.TOOL_RESULT,
+            [
+                ToolResult(
+                    value="queued",
+                    call_id="checkpoint",
+                    name="action-author_self_continuity_checkpoint",
+                )
+            ],
+        ),
+        LLMPayload(ROLE.ASSISTANT, Text("__SUSPEND__")),
+    ]
+    manager.validate_for_send(payloads)
+    response = Response(payloads)
+    original_control_index = response.payloads.index(control)
+
+    LifeChatter._upsert_pending_unread_payload(response, Text("重启后的新消息"))
+    LifeChatter._append_suffix_context(response, "本轮潜意识投影")
+
+    assert response.payloads.index(control) == original_control_index
+    assert response.payloads[-1].role == ROLE.USER
+    assert "重启后的新消息" in str(response.payloads[-1])
+    assert "<transient_life_context>" in str(response.payloads[-1])
+    manager.validate_for_send(response.payloads)
+
+
+def test_snapshot_restore_drops_orphaned_maintenance_and_keeps_new_users() -> None:
+    manager = LLMContextManager()
+    base = [
+        LLMPayload(ROLE.USER, Text("旧消息")),
+        LLMPayload(ROLE.ASSISTANT, Text("旧回复")),
+        LLMPayload(ROLE.USER, Text("当前消息")),
+        LLMPayload(ROLE.ASSISTANT, Text("当前回复")),
+    ]
+    with_control = ensure_compression_required_appended(
+        base,
+        trigger_chars=1,
+        force=True,
+    )
+    assert has_compression_required_payload(with_control)
+    payloads = [
+        *with_control,
+        LLMPayload(
+            ROLE.ASSISTANT,
+            [ToolCall(id="read", name="action-read_context_group", args={})],
+        ),
+        LLMPayload(
+            ROLE.TOOL_RESULT,
+            [ToolResult(value="private page", call_id="read", name="read_context_group")],
+        ),
+        LLMPayload(ROLE.ASSISTANT, Text("__SUSPEND__")),
+        LLMPayload(ROLE.USER, Text("维护期间到达的真实消息")),
+        LLMPayload(
+            ROLE.ASSISTANT,
+            [
+                ToolCall(
+                    id="checkpoint",
+                    name="action-author_self_continuity_checkpoint",
+                    args={},
+                )
+            ],
+        ),
+        LLMPayload(
+            ROLE.TOOL_RESULT,
+            [
+                ToolResult(
+                    value="queued",
+                    call_id="checkpoint",
+                    name="author_self_continuity_checkpoint",
+                )
+            ],
+        ),
+        LLMPayload(ROLE.ASSISTANT, Text("__SUSPEND__")),
+    ]
+    manager.validate_for_send(payloads)
+    raw = LifeChatter._snapshot_data_for_payloads(payloads)
+    chatter = LifeChatter.__new__(LifeChatter)
+
+    restored = chatter._deserialize_rolling_context_snapshot(raw)
+
+    assert not has_compression_required_payload(restored)
+    assert "维护期间到达的真实消息" in str(restored)
+    assert "private page" not in str(restored)
+    assert "author_self_continuity_checkpoint" not in str(restored)
+    manager.validate_for_send(restored)
+
+
+async def test_context_recovery_turn_blocks_visible_action_side_effect(
+    monkeypatch,
+) -> None:
+    LifeChatter.reset_global_runtime()
+
+    class RecoveryResponse:
+        def __init__(self) -> None:
+            self.context_manager = LLMContextManager()
+            self.payloads = ensure_compression_required_appended(
+                [
+                    LLMPayload(ROLE.USER, Text("旧消息")),
+                    LLMPayload(ROLE.ASSISTANT, Text("旧回复")),
+                    LLMPayload(ROLE.USER, Text("仍待回复的当前消息")),
+                ],
+                trigger_chars=1,
+                force=True,
+            )
+            self.call_list = [
+                ToolCall(
+                    id="blocked-send",
+                    name="action-life_send_text",
+                    args={"content": "这条消息绝对不能发送"},
+                )
+            ]
+            self.message = ""
+            self._appended_to_context = False
+
+        def add_payload(self, payload) -> None:
+            if payload.role == ROLE.TOOL_RESULT and not self._appended_to_context:
+                self.payloads = self.context_manager.add_payload(
+                    self.payloads,
+                    LLMPayload(ROLE.ASSISTANT, list(self.call_list)),
+                )
+                self._appended_to_context = True
+            self.payloads = self.context_manager.add_payload(self.payloads, payload)
+
+    response = RecoveryResponse()
+    rt = _WorkflowRuntime(
+        response=response,
+        phase=_Phase.TOOL_EXEC,
+        history_merged=True,
+        unreads=[],
+        cross_round_seen_signatures=set(),
+        unread_msgs_to_flush=[],
+        active_stream_id="stream-a",
+        active_unread_turn_key="turn-a",
+        must_reply=True,
+    )
+    LifeChatter._GLOBAL_RUNTIME = rt
+    LifeChatter._GLOBAL_USABLE_MAP = {}
+
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.plugin = SimpleNamespace(config=None)
+    chatter.stream_id = "stream-a"
+    chatter.instance_id = "chat:test"
+    chatter.instance_kind = "chat"
+
+    async def fake_fetch_unreads():
+        return [], []
+
+    async def fail_run_tool_call(*_args, **_kwargs):
+        raise AssertionError("maintenance turn must not execute visible actions")
+
+    monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
+    monkeypatch.setattr(chatter, "run_tool_call", fail_run_tool_call)
+    monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", _skip_snapshot_save)
+    monkeypatch.setattr(
+        "src.kernel.concurrency.get_watchdog",
+        lambda: SimpleNamespace(feed_dog=lambda _stream_id: None),
+    )
+
+    result = await chatter._drive_global_runtime_until_yield(
+        SimpleNamespace(stream_id="stream-a"),
+        service=None,
+    )
+
+    assert isinstance(result, Success)
+    assert rt.phase == _Phase.MODEL_TURN
+    assert rt.sent_visible_reply is False
+    assert rt.must_reply is True
+    assert response.payloads[-1].role == ROLE.TOOL_RESULT
+    assert all(
+        not (
+            previous.role == ROLE.ASSISTANT
+            and current.role == ROLE.ASSISTANT
+        )
+        for previous, current in zip(response.payloads, response.payloads[1:])
+    )
+    response.context_manager.validate_for_send(response.payloads)
+    assert any(
+        isinstance(part, ToolResult)
+        and part.call_id == "blocked-send"
+        and "均未执行" in str(part.value)
+        for payload in response.payloads
+        for part in payload.content
+    )
+
+    # A second maintenance assistant/tool-result turn must remain a valid
+    # continuation.  The old branch inserted __SUSPEND__ before this turn and
+    # later exposed an assistant -> assistant chain after checkpoint install.
+    second_call = ToolCall(
+        id="checkpoint",
+        name="action-author_self_continuity_checkpoint",
+        args={},
+    )
+    response.payloads = response.context_manager.add_payload(
+        response.payloads,
+        LLMPayload(ROLE.ASSISTANT, [second_call]),
+    )
+    response.payloads = response.context_manager.add_payload(
+        response.payloads,
+        LLMPayload(
+            ROLE.TOOL_RESULT,
+            [ToolResult(value="checkpoint queued", call_id="checkpoint")],
+        ),
+    )
+    response.context_manager.validate_for_send(response.payloads)
+    assert all(
+        not (
+            previous.role == ROLE.ASSISTANT
+            and current.role == ROLE.ASSISTANT
+        )
+        for previous, current in zip(response.payloads, response.payloads[1:])
+    )
+
+    LifeChatter.reset_global_runtime()
+
+
+async def test_context_checkpoint_install_resumes_with_user_control_frame(
+    monkeypatch,
+) -> None:
+    LifeChatter.reset_global_runtime()
+
+    class RecoveryResponse:
+        def __init__(self) -> None:
+            self.context_manager = LLMContextManager()
+            self.payloads = ensure_compression_required_appended(
+                [
+                    LLMPayload(ROLE.USER, Text("已闭合的旧消息")),
+                    LLMPayload(ROLE.ASSISTANT, Text("已闭合的旧回复")),
+                    LLMPayload(ROLE.USER, Text("仍待处理的当前消息")),
+                ],
+                trigger_chars=1,
+                force=True,
+            )
+            self.call_list = [
+                ToolCall(
+                    id="checkpoint",
+                    name="action-author_self_continuity_checkpoint",
+                    args={},
+                )
+            ]
+            self.message = ""
+            self._appended_to_context = False
+
+        def add_payload(self, payload) -> None:
+            if payload.role == ROLE.TOOL_RESULT and not self._appended_to_context:
+                self.payloads = self.context_manager.add_payload(
+                    self.payloads,
+                    LLMPayload(ROLE.ASSISTANT, list(self.call_list)),
+                )
+                self._appended_to_context = True
+            self.payloads = self.context_manager.add_payload(self.payloads, payload)
+
+    response = RecoveryResponse()
+    rt = _WorkflowRuntime(
+        response=response,
+        phase=_Phase.TOOL_EXEC,
+        history_merged=True,
+        unreads=[],
+        cross_round_seen_signatures=set(),
+        unread_msgs_to_flush=[],
+        active_stream_id="stream-a",
+        active_unread_turn_key="turn-a",
+        must_reply=True,
+    )
+    LifeChatter._GLOBAL_RUNTIME = rt
+    LifeChatter._GLOBAL_USABLE_MAP = {}
+
+    chatter = LifeChatter.__new__(LifeChatter)
+    chatter.plugin = SimpleNamespace(config=None)
+    chatter.stream_id = "stream-a"
+    chatter.instance_id = "chat:test"
+    chatter.instance_kind = "chat"
+
+    async def fake_fetch_unreads():
+        return [], []
+
+    async def fake_run_tool_call(call, target, *_args, **_kwargs):
+        target.add_payload(
+            LLMPayload(
+                ROLE.TOOL_RESULT,
+                [ToolResult(value="queued", call_id=call.id, name=call.name)],
+            )
+        )
+        return True, True
+
+    def fake_install_checkpoint(target):
+        target.payloads = [
+            LLMPayload(ROLE.USER, Text("仍待处理的当前消息")),
+            LLMPayload(ROLE.ASSISTANT, Text("主体亲自写下的连续性检查点")),
+        ]
+        return SimpleNamespace(triggered=True)
+
+    monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
+    monkeypatch.setattr(chatter, "run_tool_call", fake_run_tool_call)
+    monkeypatch.setattr(
+        chatter,
+        "_maybe_compact_runtime_context",
+        fake_install_checkpoint,
+    )
+    monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", _skip_snapshot_save)
+    monkeypatch.setattr(
+        "src.kernel.concurrency.get_watchdog",
+        lambda: SimpleNamespace(feed_dog=lambda _stream_id: None),
+    )
+
+    result = await chatter._drive_global_runtime_until_yield(
+        SimpleNamespace(stream_id="stream-a"),
+        service=None,
+    )
+
+    assert isinstance(result, Success)
+    assert rt.phase == _Phase.MODEL_TURN
+    assert rt.follow_up_rounds == 0
+    assert response.payloads[-1].role == ROLE.USER
+    assert "不是新的用户消息" in response.payloads[-1].content[0].text
+    response.context_manager.validate_for_send(response.payloads)
+
+    LifeChatter.reset_global_runtime()
+
+
+def test_life_chatter_rolling_context_snapshot_keeps_exact_payloads() -> None:
     payloads = [
         LLMPayload(ROLE.USER, Text(f"旧用户消息-{index}" + "x" * 20_000))
         if index % 2 == 0
@@ -275,21 +809,14 @@ def test_life_chatter_rolling_context_snapshot_uses_mechanical_refs() -> None:
         payloads,
     )
 
-    assert after_chars < before_chars
-    assert after_chars <= 320_000
-    assert compacted[0].role == ROLE.USER
-    assert "<mechanical_context_omission>" in compacted[0].content[0].text
-    assert "ctxg_" in compacted[0].content[0].text
-    assert "旧用户消息" not in compacted[0].content[0].text
-    assert any(
-        part.text == "最新用户消息"
-        for payload in compacted
-        for part in payload.content
-        if isinstance(part, Text)
-    )
+    assert after_chars == before_chars
+    serialized = str(LifeChatter._snapshot_data_for_payloads(compacted))
+    assert "<mechanical_context_omission>" not in serialized
+    assert "旧用户消息-0" in serialized
+    assert "最新用户消息" in serialized
 
 
-def test_life_chatter_single_huge_snapshot_payload_has_hard_cap() -> None:
+def test_life_chatter_single_huge_snapshot_payload_is_not_mechanically_omitted() -> None:
     payloads = [LLMPayload(ROLE.USER, Text("超大消息" + "x" * 400_000))]
 
     compacted, before_chars, after_chars = LifeChatter._compact_rolling_context_payloads(
@@ -297,13 +824,13 @@ def test_life_chatter_single_huge_snapshot_payload_has_hard_cap() -> None:
     )
 
     assert before_chars > 320_000
-    assert after_chars <= 320_000
+    assert after_chars == before_chars
     assert LifeChatter._estimate_payload_chars(compacted) == after_chars
-    assert "<mechanical_context_omission>" in compacted[0].content[0].text
-    assert "超大消息" not in compacted[0].content[0].text
+    assert "<mechanical_context_omission>" not in compacted[0].content[0].text
+    assert "超大消息" in compacted[0].content[0].text
 
 
-def test_life_chatter_snapshot_compaction_drops_large_binary_and_tool_payloads() -> None:
+def test_life_chatter_snapshot_keeps_tool_payloads_and_media_descriptors() -> None:
     payloads = [
         LLMPayload(
             ROLE.USER,
@@ -328,16 +855,11 @@ def test_life_chatter_snapshot_compaction_drops_large_binary_and_tool_payloads()
         char_budget=2_000,
     )
 
-    assert before_chars > 2_000
-    assert after_chars <= 2_000
-    assert LifeChatter._estimate_payload_chars(compacted) == after_chars
+    assert after_chars == before_chars
     serialized = str(LifeChatter._snapshot_data_for_payloads(compacted))
-    assert "a" * 1_000 not in serialized
-    assert "z" * 1_000 not in serialized
-    assert "[图片]" not in serialized
-    assert "[工具结果]" not in serialized
-    assert "<mechanical_context_omission>" in serialized
+    assert "<mechanical_context_omission>" not in serialized
     assert "最新问题" in serialized
+    assert "请看附件" in serialized
 
 
 def test_life_chatter_snapshot_persists_only_media_descriptor() -> None:
@@ -457,18 +979,17 @@ def test_life_chatter_snapshot_media_restores_as_text_only() -> None:
     assert "legacy-image-body" not in restored_legacy.content[0].text
 
 
-def test_life_chatter_snapshot_compaction_handles_budget_below_summary_envelope() -> None:
+def test_life_chatter_snapshot_compaction_keeps_payload_when_over_budget() -> None:
     payloads = [LLMPayload(ROLE.USER, Text("x" * 10_000))]
-    empty_snapshot_chars = LifeChatter._estimate_payload_chars([])
 
     compacted, before_chars, after_chars = LifeChatter._compact_rolling_context_payloads(
         payloads,
-        char_budget=empty_snapshot_chars,
+        char_budget=1,
     )
 
-    assert before_chars > empty_snapshot_chars
-    assert compacted == []
-    assert after_chars == empty_snapshot_chars
+    assert before_chars == after_chars
+    assert compacted == payloads
+    assert "<mechanical_context_omission>" not in compacted[0].content[0].text
 
 
 @pytest.mark.parametrize("failure_stage", ["mkdir", "write", "replace"])
@@ -494,7 +1015,6 @@ async def test_life_chatter_snapshot_save_failure_does_not_mutate_runtime(
     compactable_response = SimpleNamespace(payloads=list(payloads))
     result = chatter._maybe_compact_runtime_context(compactable_response)
     assert result.triggered is False
-    assert compactable_response.payloads is not payloads
     assert compactable_response.payloads == payloads
 
     if failure_stage == "mkdir":

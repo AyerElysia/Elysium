@@ -1,6 +1,6 @@
 # TTS Voice Plugin (`tts_voice_plugin`)
 
-Elysium 的本地消息 TTS Service。它用一个稳定接口支持 **IndexTTS2.5 + vLLM-Omni** 的 OpenAI-compatible `/v1/audio/speech` 与 GPT-SoVITS `api_v2` 的 `/tts`；部署必须用 `[tts].backend` 明确选择，不能根据 URL 猜测或静默换音色。
+Elysium 的本地消息 TTS Service。它用一个稳定接口支持 **IndexTTS2.5 + vLLM-Omni** 的 OpenAI-compatible `/v1/audio/speech`、GPT-SoVITS `api_v2` 的 `/tts` 与 Breeze TTS 2 的 multipart `/v1/audio/speech`；部署必须用 `[tts].backend` 明确选择，不能根据 URL 猜测或静默换音色。当前本机 live 配置仍保持 GPT-SoVITS。
 
 ## 责任边界
 
@@ -17,6 +17,7 @@ TTS 不决定正文、情绪或是否表达。Service 缺失、合成失败、�
 
 - vLLM-Omni `/v1/audio/speech` 合成、健康检查与按需启动；
 - GPT-SoVITS `/tts` 合成、原生 `text_split_method` 与按需启动；
+- Breeze TTS 2 `/health`、multipart 流式 PCM、协议校验与按需启动；
 - 参考音频、多风格、语言检测与文本清洗；
 - vLLM-Omni 对长表达做有界运输切分；GPT-SoVITS 每条表达只请求一次并由后端原生切分；
 - 可选空间音效；
@@ -30,7 +31,7 @@ TTS 不决定正文、情绪或是否表达。Service 缺失、合成失败、�
 关键字段：
 
 - `[plugin].enable`：是否注册 Service/Action/Command；
-- `[tts].backend`：`vllm_omni` 或 `legacy_compat`，不根据 URL 猜测；
+- `[tts].backend`：`vllm_omni`、`legacy_compat` 或 `breeze_tts2`，不根据 URL 猜测；
 - `[tts].server`、`model`、`api_key_env`：vLLM-Omni 地址、served model name 与可选鉴权环境变量；
 - `[tts].auto_start`、`server_dir`、`start_command`、`startup_timeout`：后端按需启动合同；
 - `[tts].legacy_owned_startup_weights_ready`：仅声明当前插件自有启动器已经加载 `default` 权重对；外部服务永不消费；
@@ -38,13 +39,15 @@ TTS 不决定正文、情绪或是否表达。Service 缺失、合成失败、�
 - `[tts].timeout`：每个内部合成请求的时限；
 - `[tts].max_text_length`：一条完整表达的文本上限，超限显式失败，绝不静默截断；
 - `[tts].long_text_split_enabled`、`segment_max_units`、`segment_min_units`：不具备原生切分合同的 transport 的外层切句开关和片段预算；默认单段 24 个近似单位；
-- `[tts].segment_concurrency`：同一长表达在 vLLM-Omni 中的有界并发，默认 2、硬上限 4；GPT-SoVITS 不使用外层片段并发；
+- `[tts].segment_concurrency`：同一长表达在 vLLM-Omni 中的有界并发，默认 2、硬上限 4；Breeze 固定串行，GPT-SoVITS 不使用外层片段并发；
 - `[tts].phrase_pause_ms`、`clause_pause_ms`、`sentence_pause_ms`、`paragraph_pause_ms`：拼接时按原标点追加的停顿；
-- `[[tts_styles]]`：必须至少有 `default`，包含参考音频、提示文本、语言、速度，以及成对的 GPT/SoVITS 权重路径与 SHA-256；默认 `speed_factor=0.90`，部署值仍须试听验收；
+- `[[tts_styles]]`：必须至少有 `default`，包含参考音频、逐字准确的提示文本、语言、速度，以及成对的 GPT/SoVITS 权重路径与 SHA-256；Breeze 另消费可信 `breeze_instruction`、`breeze_cfg_scale` 与 `breeze_seed`；默认 `speed_factor=0.90`，部署值仍须试听验收；
 - `[tts_advanced].text_split_method`、`seed`：GPT-SoVITS 原生切分与语义采样合同；`seed=-1` 表示随机，生产固定值必须来自成对试听。`sample_steps/super_sampling` 是 V3 参数，当前 v2ProPlus 不以它们调清晰度；
 - `[spatial_effects]`：可选混响与卷积。
 
 vLLM-Omni 模式发送官方字段 `model/input/response_format/speed/ref_audio/extra_params`，不会发送历史 `text_lang/ref_audio_path`。参考音频在一条表达开始时读取并编码一次，各并发片段共享同一不可变 data URL；也可配置预先上传的命名音色，避免每次传输参考音频。客户端不会把历史 GPT-SoVITS 的 3～10 秒限制强加给 IndexTTS2.5。
+
+Breeze 模式发送 `text/instruction/cfg_scale/ref_text/seed/ref_audio` multipart 字段，参考文件以字节上传而不是把本地路径交给服务。`instruction` 只来自风格配置，正文不能覆盖它；参考音频与文字稿必须成对存在。返回的 `audio/pcm`、正采样率、`s16le` 和偶数字节边界全部通过后才封装为 WAV。服务的 409 Busy 只在当前请求总 deadline 内重试，不能形成无限后台队列。
 
 长文本拆分只是合成运输细节。对上游意识实例、trajectory、平台与记忆而言，输入仍是一条完整表达，输出仍是一条语音消息；内部片段不形成多条人格样本，也不允许分段发送。vLLM-Omni 可对片段做有限并行批处理，但结果必须按原序号归位，随后统一拼接、施加一次空间效果并编码一次；任何一段失败都会使整条语音显式失败。
 
@@ -59,6 +62,29 @@ vLLM-Omni 模式发送官方字段 `model/input/response_format/speed/ref_audio/
 ```
 
 禁止在 Elysium 启动事务中临时安装依赖。vLLM-Omni 应在独立 Linux/WSL 环境中预装并完成模型验收；TTS 后端可以由一次真实合成请求按配置启动，但不得启动、停止或重启 Elysium/NapCat，也不得建立操作系统自启动。
+
+Breeze 同样运行在独立环境中；Elysium 只消费其 HTTP 协议，不导入 Breeze 的模型包。示例部署应把 `[tts].server` 指向本地 `7862`，把 `server_dir/start_command` 指向独立 Breeze 工作区与虚拟环境，并把 `timeout` 调大到足以覆盖实测完整生成。模型只在切换 `backend = "breeze_tts2"` 且真正发生语音请求时按需加载；当前生产 `backend = "legacy_compat"` 时不会加载 Breeze，也不会占用它的显存。
+
+最小 Breeze 配置示例（仅供部署者复制到 ignored `config.toml`，不要提交本机绝对路径）：
+
+```toml
+[tts]
+backend = "breeze_tts2"
+server = "http://127.0.0.1:7862"
+timeout = 1200
+server_dir = "/absolute/path/to/BreezeTTS2"
+start_command = "/root/.venvs/breeze-tts2/bin/python -m breeze_infer.api pretrained_models/Breeze-TTS-2 --host 127.0.0.1 --port 7862 --fast-all"
+
+[[tts_styles]]
+style_name = "default"
+refer_wav_path = "/absolute/path/to/elysia-reference.wav"
+prompt_text = "与参考音频逐字一致的文本"
+breeze_instruction = "始终保持参考说话人的音色、年龄感和身份。自然交谈，咬字清楚。"
+breeze_cfg_scale = 3.8
+breeze_seed = -1
+```
+
+切回当前生产只需恢复原有 `backend = "legacy_compat"`、`server` 与 GPT 启动合同；禁止同时把两套启动命令拼进一个 shell 命令。
 
 闲置计时使用单调时钟并由项目任务管理器持有。新合成会取消旧计时；到期任务必须取得完整表达的合成锁，并复核仍是同一插件自有进程后才可关闭。关闭后下一次合成沿用按需启动 single-flight。Elysium 卸载时取消计时并回收自有进程；连接到已经存在的外部 TTS 时不建立闲置关闭任务。
 
@@ -83,6 +109,8 @@ vLLM-Omni 模式发送官方字段 `model/input/response_format/speed/ref_audio/
 13. GPT/SoVITS 权重对在任何网络切换前完成文件与 SHA-256 预检，任一缺失、替换或摘要不匹配都不得发出权重切换或 `/tts`。
 14. 同一自有进程复用确认过的权重 identity；外部服务和 replacement process 必须重新确认。
 15. WSL 启动器停止后 9880 不再监听，监督者和 API 子进程都不存在。
+16. Breeze `/health` 必须返回 ready 与正采样率，multipart 字段不含调用端路径，流式 PCM 协议不匹配或中断时不交付半截音频。
+17. Breeze 长表达串行生成、参考字节只读一次并最终拼成一条消息；服务已运行不等于配置自动切换，生产默认仍是 GPT-SoVITS。
 
 完整架构见 [TTS 语音合成](../../docs/architecture/TTS语音合成.md)。
 

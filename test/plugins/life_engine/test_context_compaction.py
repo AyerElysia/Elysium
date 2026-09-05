@@ -17,6 +17,7 @@ from plugins.life_engine.core.context_compaction import (
 )
 from plugins.life_engine.core.context_stewardship import (
     CHECKPOINT_OPEN,
+    COMPRESSION_REQUIRED_OPEN,
     OMISSION_OPEN,
     PRESSURE_OPEN,
     ContextStewardshipError,
@@ -29,11 +30,15 @@ from plugins.life_engine.core.context_stewardship import (
     build_context_pressure_notice,
     build_group_manifest,
     build_mechanical_omission_payloads,
+    ensure_compression_required_appended,
+    has_compression_required_payload,
+    is_compression_required_part,
     mechanically_bound_payloads,
     prepare_subject_checkpoint,
     read_context_group_archive,
     reset_pending_subject_checkpoint,
     reset_transient_context_pressure_notices,
+    strip_compression_required_payloads,
     strip_context_pressure_notices,
 )
 from plugins.life_engine.core.plugin import LifeEnginePlugin
@@ -640,20 +645,229 @@ def test_context_stewardship_tools_are_registered_and_visible_to_chat() -> None:
     assert "tool-read_context_group" in chat_manifest
 
 
-def test_retired_summary_is_recognized_but_never_emitted() -> None:
+def test_retired_summary_is_recognized_and_compact_does_not_rewrite() -> None:
     legacy = LLMPayload(
         ROLE.USER,
         [Text(f"{SUMMARY_INTRO}\n{SUMMARY_OPEN}\nlegacy body\n{SUMMARY_CLOSE}")],
     )
+    payloads = [legacy, *_conversation()[1:]]
     assert is_summary_payload(legacy)
     result = hierarchical_compact_payloads(
-        [legacy, *_conversation()[1:]],
+        payloads,
         estimate=_estimate,
         trigger_chars=1,
         target_chars=700,
         force=True,
     )
-    rendered = str(result.payloads)
     assert result.triggered
-    assert SUMMARY_OPEN not in rendered
-    assert "legacy body" not in rendered
+    assert result.dropped_groups == 0
+    assert result.payloads == payloads
+    assert "legacy body" in str(result.payloads)
+
+
+def test_compression_required_list_appends_once_without_group_bodies() -> None:
+    payloads = _conversation()
+    first = ensure_compression_required_appended(
+        payloads,
+        estimate=_estimate,
+        trigger_chars=8,
+        max_groups=8,
+        max_bytes=8 * 1024,
+    )
+    second = ensure_compression_required_appended(
+        first,
+        estimate=_estimate,
+        trigger_chars=8,
+        max_groups=8,
+        max_bytes=8 * 1024,
+    )
+
+    assert has_compression_required_payload(first)
+    assert first is not payloads
+    assert second == first
+    control_parts = [
+        part for part in first[-1].content if is_compression_required_part(part)
+    ]
+    assert len(control_parts) == 1
+    rendered = str(control_parts[0].text)
+    assert rendered.startswith(COMPRESSION_REQUIRED_OPEN)
+    assert "ctxg_" in rendered
+    assert "old-user-one" not in rendered
+    assert "old-assistant-one" not in rendered
+    assert "author_self_continuity_checkpoint" in rendered
+    assert strip_compression_required_payloads(first) == payloads
+    LLMContextManager().validate_for_send(first)
+
+
+def test_compression_control_does_not_change_checkpoint_manifest() -> None:
+    payloads = _conversation()
+    command = _checkpoint_command(payloads)
+    with_control = ensure_compression_required_appended(
+        payloads,
+        estimate=_estimate,
+        trigger_chars=1,
+        max_groups=8,
+        max_bytes=8 * 1024,
+    )
+
+    assert build_group_manifest(with_control) == build_group_manifest(payloads)
+    prepared = prepare_subject_checkpoint(with_control, command)
+
+    assert not has_compression_required_payload(prepared.payloads)
+    assert CHECKPOINT_OPEN in str(prepared.payloads)
+    assert "current-user" in str(prepared.payloads)
+
+
+def test_checkpoint_drops_maintenance_transport_without_breaking_role_chain() -> None:
+    # Match the production failure shape: the ordinary turn is already closed
+    # by an assistant suspend frame when the compression USER control is added.
+    # Removing only that USER frame used to leave two adjacent assistants.
+    payloads = [
+        *_conversation(),
+        LLMPayload(
+            ROLE.ASSISTANT,
+            [ToolCall(id="visible", name="life_send_text", args={})],
+        ),
+        LLMPayload(
+            ROLE.TOOL_RESULT,
+            [ToolResult(value="sent", call_id="visible", name="life_send_text")],
+        ),
+        LLMPayload(ROLE.ASSISTANT, Text("__SUSPEND__")),
+    ]
+    LLMContextManager().validate_for_send(payloads)
+    command = _checkpoint_command(payloads)
+    with_control = ensure_compression_required_appended(
+        payloads,
+        estimate=_estimate,
+        trigger_chars=1,
+        max_groups=8,
+        max_bytes=8 * 1024,
+    )
+    maintenance_payloads = [
+        LLMPayload(
+            ROLE.ASSISTANT,
+            [ToolCall(id="read-old", name="read_context_group", args={})],
+        ),
+        LLMPayload(
+            ROLE.TOOL_RESULT,
+            [
+                ToolResult(
+                    value="PRIVATE-MAINTENANCE-RESULT",
+                    call_id="read-old",
+                    name="read_context_group",
+                )
+            ],
+        ),
+        LLMPayload(
+            ROLE.ASSISTANT,
+            [
+                Text("__SUSPEND__"),
+                ToolCall(
+                    id="write-checkpoint",
+                    name="author_self_continuity_checkpoint",
+                    args={"thought": "PRIVATE-MAINTENANCE-THOUGHT"},
+                ),
+            ],
+        ),
+        LLMPayload(
+            ROLE.TOOL_RESULT,
+            [
+                ToolResult(
+                    value="checkpoint queued",
+                    call_id="write-checkpoint",
+                    name="author_self_continuity_checkpoint",
+                )
+            ],
+        ),
+    ]
+
+    prepared = prepare_subject_checkpoint(
+        [*with_control, *maintenance_payloads],
+        command,
+    )
+
+    rendered = str(prepared.payloads)
+    assert CHECKPOINT_OPEN in rendered
+    assert command.continuity_text in rendered
+    assert "PRIVATE-MAINTENANCE-RESULT" not in rendered
+    assert "PRIVATE-MAINTENANCE-THOUGHT" not in rendered
+    assert "read_context_group" not in rendered
+    assert "author_self_continuity_checkpoint" not in rendered
+    assert not has_compression_required_payload(prepared.payloads)
+    LLMContextManager().validate_for_send(prepared.payloads)
+    assert all(
+        not (
+            previous.role == ROLE.ASSISTANT
+            and current.role == ROLE.ASSISTANT
+        )
+        for previous, current in zip(prepared.payloads, prepared.payloads[1:])
+    )
+
+
+def test_checkpoint_preserves_user_payload_after_maintenance_control() -> None:
+    payloads = _conversation()
+    command = _checkpoint_command(payloads)
+    with_control = ensure_compression_required_appended(
+        payloads,
+        estimate=_estimate,
+        trigger_chars=1,
+        max_groups=8,
+        max_bytes=8 * 1024,
+    )
+
+    prepared = prepare_subject_checkpoint(
+        [
+            *with_control,
+            LLMPayload(
+                ROLE.ASSISTANT,
+                [ToolCall(id="read", name="read_context_group", args={})],
+            ),
+            LLMPayload(
+                ROLE.TOOL_RESULT,
+                [
+                    ToolResult(
+                        value="maintenance page",
+                        call_id="read",
+                        name="read_context_group",
+                    )
+                ],
+            ),
+            LLMPayload(ROLE.ASSISTANT, Text("__SUSPEND__")),
+            LLMPayload(ROLE.USER, Text("不能被压缩掉的新消息")),
+            LLMPayload(
+                ROLE.ASSISTANT,
+                [
+                    ToolCall(
+                        id="checkpoint",
+                        name="author_self_continuity_checkpoint",
+                        args={},
+                    )
+                ],
+            ),
+            LLMPayload(
+                ROLE.TOOL_RESULT,
+                [
+                    ToolResult(
+                        value="queued",
+                        call_id="checkpoint",
+                        name="author_self_continuity_checkpoint",
+                    )
+                ],
+            ),
+        ],
+        command,
+    )
+
+    assert "不能被压缩掉的新消息" in str(prepared.payloads)
+    assert "maintenance page" not in str(prepared.payloads)
+    assert not has_compression_required_payload(prepared.payloads)
+    LLMContextManager().validate_for_send(prepared.payloads)
+
+
+def test_successful_checkpoint_snapshot_must_not_use_mechanical_omission() -> None:
+    payloads = _conversation()
+    prepared = prepare_subject_checkpoint(payloads, _checkpoint_command(payloads))
+    rendered = str(prepared.payloads)
+    assert OMISSION_OPEN not in rendered
+    assert CHECKPOINT_OPEN in rendered
+    assert "我记得我们已经谈过前两件事" in rendered

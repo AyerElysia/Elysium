@@ -87,14 +87,23 @@ from .context_stewardship import (
     DEFAULT_CHECKPOINT_MAX_BYTES,
     DEFAULT_EMERGENCY_REFERENCE_MAX_BYTES,
     DEFAULT_PRESSURE_MAX_GROUPS,
+    ContextStewardshipError,
+    LiveContextWindow,
     apply_pending_subject_checkpoint,
     archive_target_for_runtime,
+    build_context_pressure_notice,
+    consume_subject_context_recovery_marker,
     ensure_compression_required_appended,
-    install_fail_closed_context_hook,
-    LiveContextWindow,
+    has_compression_required_payload,
+    install_subject_context_recovery_hook,
+    is_compression_required_part,
+    is_compression_required_payload,
+    is_subject_window_overflow_error,
     register_live_context,
     reset_pending_subject_checkpoint,
+    reset_subject_context_recovery_marker,
     reset_transient_context_pressure_notices,
+    strip_compression_maintenance_transport,
     strip_context_pressure_notices,
     unregister_live_context,
 )
@@ -181,7 +190,17 @@ _NEW_MESSAGES_BLOCK_RE = re.compile(
     re.DOTALL,
 )
 _SUSPEND_TEXT = "__SUSPEND__"
+_SUBJECT_CHECKPOINT_RESUME_TEXT = (
+    "<subject_context_maintenance_completed>\n"
+    "主体亲自提交的连续性检查点已经安装。此帧只是技术续轮信号，不是新的用户消息；"
+    "请继续处理此前仍待完成的当前轮，并由你自己决定是否以及如何回应或行动。\n"
+    "</subject_context_maintenance_completed>"
+)
 _GLOBAL_RUNTIME_BUSY_RETRY_SECONDS = 1.0
+# Hard-window overflow must not Failure-spin the unread loop.  The recovery
+# hook is supposed to make the next send a bounded maintenance projection;
+# this wait is the safety net if send still cannot start.
+_SUBJECT_WINDOW_OVERFLOW_RETRY_SECONDS = 8.0
 # 挂起前未读背板的连续推进上限：超过后转交下一事件恢复，避免消息洪流
 # 时长期占用全局 runtime。达到上限后消息仍在未读队列，不会被丢弃。
 _UNREAD_BACKSTOP_MAX_CONTINUES = 5
@@ -2102,10 +2121,29 @@ class LifeChatter(BaseChatter):
         *,
         chatter_config: Any = None,
     ) -> None:
-        """Refuse kernel group-dropping; subject checkpoints release groups."""
+        """Allow only an attempt-local recovery view at the hard window."""
 
-        del chatter_config
-        install_fail_closed_context_hook(request)
+        max_groups = int(
+            getattr(
+                chatter_config,
+                "context_pressure_max_groups",
+                DEFAULT_PRESSURE_MAX_GROUPS,
+            )
+            or DEFAULT_PRESSURE_MAX_GROUPS
+        )
+        max_bytes = int(
+            getattr(
+                chatter_config,
+                "context_emergency_reference_max_bytes",
+                DEFAULT_EMERGENCY_REFERENCE_MAX_BYTES,
+            )
+            or DEFAULT_EMERGENCY_REFERENCE_MAX_BYTES
+        )
+        install_subject_context_recovery_hook(
+            request,
+            max_groups=max_groups,
+            max_bytes=max_bytes,
+        )
 
     def _rolling_context_snapshot_path(self) -> Path:
         """返回意识实例的滚动上下文快照文件路径。
@@ -3087,6 +3125,15 @@ class LifeChatter(BaseChatter):
             payloads,
             strip_wake_envelopes=True,
         )
+        try:
+            # A queued checkpoint is process-local.  After restart, persisted
+            # compression control/call/result frames cannot complete that old
+            # transaction and are only orphaned transport.  Normalize the
+            # derived model view while leaving the stored snapshot and the
+            # authoritative conscious-activity trajectory untouched.
+            payloads = strip_compression_maintenance_transport(payloads)
+        except ContextStewardshipError as exc:
+            raise RuntimeError("RollingContextMaintenanceControlInvalid") from exc
         # Legacy snapshots migrate to v3 canonical digests on the next
         # successful save. Do not rewrite storage from a read path.
         return payloads
@@ -4135,9 +4182,36 @@ class LifeChatter(BaseChatter):
     @staticmethod
     def _append_suffix_context(response: Any, context_text: str) -> None:
         """把后缀提示词临时挂到最后一个 USER payload。"""
-        LifeChatterContextAssembler.append_suffix_to_last_user(response, context_text)
 
-    def _append_context_pressure_notice(self, response: Any) -> None:
+        suffix = LifeChatterContextAssembler.wrap_suffix_prompt(context_text)
+        if suffix is None:
+            return
+        payloads = getattr(response, "payloads", None)
+        if not isinstance(payloads, list):
+            return
+        for payload in reversed(payloads):
+            if getattr(payload, "role", None) != ROLE.USER:
+                continue
+            content = list(getattr(payload, "content", None) or [])
+            control_indexes = [
+                index
+                for index, part in enumerate(content)
+                if is_compression_required_part(part)
+            ]
+            if control_indexes and len(control_indexes) == len(content):
+                # A standalone maintenance control is not the user's turn.
+                continue
+            insertion = control_indexes[0] if control_indexes else len(content)
+            content.insert(insertion, suffix)
+            payload.content = content
+            return
+
+    def _append_context_pressure_notice(
+        self,
+        response: Any,
+        *,
+        force: bool = False,
+    ) -> None:
         """Append one durable compression-required list when over the trigger."""
 
         chatter = getattr(self._get_config(), "chatter", None)
@@ -4166,12 +4240,22 @@ class LifeChatter(BaseChatter):
             )
             or DEFAULT_EMERGENCY_REFERENCE_MAX_BYTES
         )
+        pressure_ratio = float(
+            getattr(chatter, "context_pressure_ratio", 0.75) or 0.75
+        )
+        token_pressure = build_context_pressure_notice(
+            response,
+            trigger_ratio=pressure_ratio,
+            max_groups=max_groups,
+            max_bytes=max_bytes,
+        )
         updated = ensure_compression_required_appended(
             [payload for payload in payloads if isinstance(payload, LLMPayload)],
             estimate=self._estimate_payload_chars,
             trigger_chars=trigger,
             max_groups=max_groups,
             max_bytes=max_bytes,
+            force=bool(force or token_pressure is not None),
         )
         response.payloads = updated
         self._register_chatter_live_context(response)
@@ -4514,7 +4598,39 @@ class LifeChatter(BaseChatter):
     @staticmethod
     def _strip_suffix_context(response: Any) -> None:
         """从 payload 中移除发送前临时注入的后缀提示词。"""
-        LifeChatterContextAssembler.strip_suffix_from_user_payloads(response)
+        payloads = getattr(response, "payloads", None)
+        controls_by_payload: list[tuple[LLMPayload, list[tuple[int, Content]]]] = []
+        if isinstance(payloads, list):
+            for payload in payloads:
+                if getattr(payload, "role", None) != ROLE.USER:
+                    continue
+                content = list(getattr(payload, "content", None) or [])
+                controls = [
+                    (index, part)
+                    for index, part in enumerate(content)
+                    if is_compression_required_part(part)
+                ]
+                if not controls:
+                    continue
+                controls_by_payload.append((payload, controls))
+                payload.content = [
+                    part
+                    for part in content
+                    if not is_compression_required_part(part)
+                ]
+        try:
+            # The legacy stripper intentionally removes only trailing suffix
+            # Text parts.  A compression control can sit after that suffix in
+            # the same USER payload, so take out only the exact control parts
+            # while stripping.  The payload itself never leaves its causal
+            # position in the conversation.
+            LifeChatterContextAssembler.strip_suffix_from_user_payloads(response)
+        finally:
+            for payload, controls in controls_by_payload:
+                content = list(getattr(payload, "content", None) or [])
+                for index, part in controls:
+                    content.insert(min(index, len(content)), part)
+                payload.content = content
         strip_context_pressure_notices(response)
 
     @staticmethod
@@ -4577,6 +4693,29 @@ class LifeChatter(BaseChatter):
         formatted_content: object,
     ) -> None:
         """合并滚动提示词到最后一个 USER payload。"""
+
+        payloads = getattr(response, "payloads", None)
+        if isinstance(payloads, list) and payloads:
+            tail = payloads[-1]
+            if (
+                getattr(tail, "role", None) == ROLE.USER
+                and is_compression_required_payload(tail)
+            ):
+                if isinstance(formatted_content, list):
+                    new_content: list[Content] = list(formatted_content)
+                elif isinstance(formatted_content, Text):
+                    new_content = [formatted_content]
+                else:
+                    new_content = [Text(str(formatted_content))]
+                content = list(getattr(tail, "content", None) or [])
+                insertion = next(
+                    index
+                    for index, part in enumerate(content)
+                    if is_compression_required_part(part)
+                )
+                content[insertion:insertion] = new_content
+                tail.content = content
+                return
         LifeChatterContextAssembler.upsert_rolling_user_payload(
             response,
             formatted_content,
@@ -5175,6 +5314,20 @@ class LifeChatter(BaseChatter):
             "action-draw_image",
             "action-generate_selfie",
             "action-tts_voice_action",
+        }
+
+    @staticmethod
+    def _is_context_stewardship_call(call_name: str) -> bool:
+        """Allow only exact-group reads and the subject checkpoint in recovery."""
+
+        normalized = str(call_name or "").strip().lower()
+        if normalized.startswith("action-"):
+            normalized = normalized[7:]
+        elif normalized.startswith("tool-"):
+            normalized = normalized[5:]
+        return normalized in {
+            "author_self_continuity_checkpoint",
+            "read_context_group",
         }
 
     @classmethod
@@ -5887,6 +6040,10 @@ class LifeChatter(BaseChatter):
             if not active_stream_id:
                 rt.active_stream_id = stream_id
         max_rounds = self._get_max_rounds()
+        initial_turn = False
+        payloads_before_model_request: list[LLMPayload] = []
+        source_response_before_model: Any | None = None
+        recovery_payloads_before_send: list[LLMPayload] = []
 
         async def complete_active_autonomy_as_failed(detail: str) -> None:
             if service is None:
@@ -6042,7 +6199,6 @@ class LifeChatter(BaseChatter):
                     strip_wake_envelopes=False,
                 )
                 self._maybe_compact_runtime_context(rt.response)
-                self._append_context_pressure_notice(rt.response)
                 pending_runtime_delivery: Any | None = None
                 if initial_turn:
                     try:
@@ -6096,6 +6252,11 @@ class LifeChatter(BaseChatter):
                         return Failure(
                             "life_chatter transient suffix preparation failed", error
                         )
+                # Keep the compression control envelope after the real USER
+                # message and its transient suffix.  Otherwise helpers that
+                # target the last USER payload would append private context to
+                # the control envelope and make its manifest unreadable.
+                self._append_context_pressure_notice(rt.response)
                 promoted_media_items = self._append_promoted_media_payload_items(
                     rt.response,
                     stream_id,
@@ -6113,16 +6274,18 @@ class LifeChatter(BaseChatter):
                     for promoted in promoted_media_items:
                         LifeInspectMediaTool._queue_promoted_media(stream_id, promoted)
 
+                source_response_before_model = rt.response
+                recovery_payloads_before_send = self._snapshot_payloads(rt.response)
+                reset_subject_context_recovery_marker(rt.response)
                 try:
 
                     async def _send_and_collect_response() -> Any:
-                        source_response = rt.response
                         self._bind_trajectory_identity(
-                            source_response,
+                            source_response_before_model,
                             chat_stream,
                             rt,
                         )
-                        response = await source_response.send(stream=False)
+                        response = await source_response_before_model.send(stream=False)
                         self._strip_suffix_context(response)
                         await response
                         return response
@@ -6237,6 +6400,20 @@ class LifeChatter(BaseChatter):
                             payloads_before_model_request,
                             initial_turn=initial_turn,
                         )
+                        if is_subject_window_overflow_error(error):
+                            logger.warning(
+                                "主体滚动上下文超过模型窗口，"
+                                "待处理消息已保留，转入压缩维护后重试: "
+                                f"{error}"
+                            )
+                            self._append_context_pressure_notice(
+                                rt.response,
+                                force=True,
+                            )
+                            await self._save_rolling_context_snapshot(rt.response)
+                            return Wait(
+                                time=_SUBJECT_WINDOW_OVERFLOW_RETRY_SECONDS
+                            )
                         if isinstance(error, _LifeChatterModelTurnTimeout):
                             logger.debug(
                                 "life_chatter 模型轮总预算耗尽，已安全回滚运行态",
@@ -6264,8 +6441,26 @@ class LifeChatter(BaseChatter):
                             await complete_active_initiative_outreach("failed")
                         return Failure(failure_message, error)
 
+                recovery_projection_used = consume_subject_context_recovery_marker(
+                    rt.response
+                )
+                if recovery_projection_used:
+                    # The hook's projection was attempt-local.  Install the
+                    # same content-neutral control envelope in the retained
+                    # rolling chain so the action validates against the exact
+                    # full manifest and the FSM can enforce maintenance-only
+                    # behavior.
+                    self._append_context_pressure_notice(rt.response, force=True)
+                compression_turn_required = has_compression_required_payload(
+                    list(getattr(rt.response, "payloads", None) or [])
+                )
+
                 perception_delivery_receipt: Any | None = None
-                if initial_turn and pending_runtime_delivery is not None:
+                if (
+                    initial_turn
+                    and not compression_turn_required
+                    and pending_runtime_delivery is not None
+                ):
                     perception_delivery_receipt = (
                         self._perception_receipt_from_model_response(
                             rt.response,
@@ -6273,7 +6468,7 @@ class LifeChatter(BaseChatter):
                         )
                     )
 
-                if initial_turn:
+                if initial_turn and not compression_turn_required:
                     if rt.unread_msgs_to_flush:
                         await self.flush_unreads(rt.unread_msgs_to_flush)
 
@@ -6292,6 +6487,7 @@ class LifeChatter(BaseChatter):
 
                 if (
                     initial_turn
+                    and not compression_turn_required
                     and service is not None
                     and pending_runtime_delivery is not None
                     and perception_delivery_receipt is not None
@@ -6359,8 +6555,52 @@ class LifeChatter(BaseChatter):
                     ),
                 )
 
+                compression_turn_required = has_compression_required_payload(
+                    list(getattr(llm_response, "payloads", None) or [])
+                )
+
                 # 空 call_list：纯文本是内心独白；空响应继续 loop（当作模型在想）。
                 if not call_list:
+                    if compression_turn_required:
+                        rt.follow_up_rounds += 1
+                        if (
+                            rt.follow_up_rounds >= max_rounds
+                            or source_response_before_model is None
+                        ):
+                            if source_response_before_model is not None:
+                                requeue_promoted_media()
+                            self._recover_failed_model_turn(
+                                rt,
+                                payloads_before_model_request,
+                                initial_turn=initial_turn,
+                            )
+                            logger.warning(
+                                "主体连续性维护回合未提交检查点，"
+                                "待处理消息保留到下一次调度"
+                            )
+                            return Failure(
+                                "主体连续性维护未完成，待处理消息已保留"
+                            )
+                        # A non-tool answer cannot complete maintenance.  Its
+                        # immutable model-turn event was recorded above, but it
+                        # must not enter the rolling projection or consume the
+                        # pending user turn.  Retry from the exact pre-attempt
+                        # payloads with the same control envelope.
+                        self._restore_payloads(
+                            source_response_before_model,
+                            recovery_payloads_before_send,
+                        )
+                        self._strip_suffix_context(source_response_before_model)
+                        rt.response = source_response_before_model
+                        self._register_chatter_live_context(rt.response)
+                        self._transition(
+                            rt,
+                            _Phase.MODEL_TURN,
+                            "subject context checkpoint still required",
+                        )
+                        await self._save_rolling_context_snapshot(rt.response)
+                        return Success("subject context maintenance retry scheduled")
+
                     response_text = str(response_msg or "").strip()
                     is_suspend_echo = bool(response_text) and (
                         _SUSPEND_TEXT in response_text
@@ -6690,6 +6930,33 @@ class LifeChatter(BaseChatter):
                     )
 
                     if (
+                        compression_turn_required
+                        and not self._is_context_stewardship_call(call_name)
+                    ):
+                        await flush_parallel_calls()
+                        action_id = str(getattr(call, "id", "") or "")
+                        llm_response.add_payload(
+                            LLMPayload(
+                                ROLE.TOOL_RESULT,
+                                ToolResult(
+                                    value=(
+                                        "当前是主体连续性维护回合；普通表达和其他动作"
+                                        "均未执行。请先用 read_context_group 阅读需要的"
+                                        "精确旧组，或调用 "
+                                        "author_self_continuity_checkpoint 亲自写下检查点。"
+                                    ),
+                                    call_id=action_id,
+                                    name=call_name,
+                                ),
+                            )
+                        )
+                        activity_outcomes[action_id] = {
+                            "success": False,
+                            "technical_outcome": "context_stewardship_required",
+                        }
+                        continue
+
+                    if (
                         minecraft_result_before_visible_reply
                         and self._is_visible_reply_action(str(call_name or ""))
                     ):
@@ -7016,6 +7283,62 @@ class LifeChatter(BaseChatter):
                     activity_ids=activity_ids,
                     outcomes=activity_outcomes,
                 )
+
+                if compression_turn_required:
+                    checkpoint_result = self._maybe_compact_runtime_context(
+                        llm_response
+                    )
+                    checkpoint_installed = bool(
+                        checkpoint_result is not None
+                        and getattr(checkpoint_result, "triggered", False)
+                    )
+                    if checkpoint_installed:
+                        # Context maintenance does not spend the user's normal
+                        # expression rounds.  Re-run the still-pending initial
+                        # turn against the newly bounded, subject-authored
+                        # rolling context; only that exact-delivery turn may
+                        # flush the unread batch or advance its perception.
+                        self._append_follow_up_user_instruction(
+                            llm_response,
+                            _SUBJECT_CHECKPOINT_RESUME_TEXT,
+                        )
+                        rt.follow_up_rounds = 0
+                        self._transition(
+                            rt,
+                            _Phase.MODEL_TURN,
+                            "subject context checkpoint installed",
+                        )
+                        await self._save_rolling_context_snapshot(llm_response)
+                        return Success("subject context checkpoint installed")
+
+                    rt.follow_up_rounds += 1
+                    if rt.follow_up_rounds >= max_rounds:
+                        # This branch really ends the maintenance attempt, so a
+                        # TOOL_RESULT tail needs a closing assistant frame.
+                        # Continuing rounds deliberately keep TOOL_RESULT as
+                        # the causal boundary for the next assistant response.
+                        if self._has_tool_result_tail(llm_response):
+                            llm_response.add_payload(
+                                LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT))
+                            )
+                        self._transition(
+                            rt,
+                            _Phase.WAIT_USER,
+                            "subject context maintenance round limit reached",
+                        )
+                        await self._save_rolling_context_snapshot(llm_response)
+                        logger.warning(
+                            "主体连续性维护达到有界轮数，未执行普通动作；"
+                            "待处理消息仍保留"
+                        )
+                        return Wait()
+                    self._transition(
+                        rt,
+                        _Phase.MODEL_TURN,
+                        "subject context checkpoint still required",
+                    )
+                    await self._save_rolling_context_snapshot(llm_response)
+                    return Success("subject context maintenance continued")
 
                 if terminal_tool_failure:
                     if service is not None and autonomy_occurrences:

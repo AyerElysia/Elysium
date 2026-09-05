@@ -98,7 +98,7 @@ main.py
 | `config/mcp.toml` | MCP 服务配置 |
 | `config/plugins/life_engine/config.toml` | Life Engine、心跳、Chatter、记忆及场景能力 |
 | `config/plugins/feishu_adapter/config.toml` | 飞书应用、连接和消息行为 |
-| `config/plugins/tts_voice_plugin/config.toml` | 当前本地消息 TTS Service；`backend` 在 GPT-SoVITS `api_v2` 与 IndexTTS2.5/vLLM-Omni 之间显式选择。2026-08-28 本机 live 配置是前者 |
+| `config/plugins/tts_voice_plugin/config.toml` | 当前本地消息 TTS Service；`backend` 在 GPT-SoVITS `api_v2`、IndexTTS2.5/vLLM-Omni 与 Breeze TTS 2 之间显式选择。当前本机 live 配置仍是 GPT-SoVITS |
 | `data/life_engine_workspace/SOUL.md` | 主体灵魂文件；Life Chatter 表达的硬前提 |
 | `logs/` | 运行日志 |
 | `data/` | SQLite、记忆、事件和运行数据 |
@@ -608,8 +608,8 @@ retry_failed = true
 语音链路的通用实现和协议要求为：
 
 - `tasks.voice` 必须指向兼容当前音频输入合同的音频理解或 ASR 模型。飞书入站 Opus 会先转为 16 kHz 单声道 WAV；`MediaManager` 可先尝试原生音频理解，失败后回退 ASR。
-- 当前消息 TTS 由 `tts_voice_plugin:service:tts` 通过本机 `config/plugins/tts_voice_plugin/config.toml` 显式选择 IndexTTS2.5/vLLM-Omni `/v1/audio/speech` 或 GPT-SoVITS `api_v2` `/tts`。`models.toml` 没有也不需要 `tasks.tts`；Life Chatter 的 `life_send_voice(text=...)` 直接消费 Service，绝不回退旧 `model.toml`、MiMo speech client 或其他模型任务。
-- 两个后端只有一个稳定 Service 接口，但切分 owner 不同：展示正文先派生不写回消息/trajectory 的可发音投影；vLLM-Omni 的长表达由 Service 以默认 24 单位上限做有界运输切分，最多并发 2 段、硬上限 4，再按原序拼成一条语音；GPT-SoVITS 的完整投影只发出一次 `/tts`，由部署配置的原生 `text_split_method` 切分，禁止 Elysium 二次拆句。GPT-SoVITS 的切分、速度、seed、参考音频与权重必须作为整体试听，日志只记录完整表达的时长与无正文语速指标。内部片段不形成多次表达，也不分段外发。
+- 当前消息 TTS 由 `tts_voice_plugin:service:tts` 通过本机 `config/plugins/tts_voice_plugin/config.toml` 显式选择 IndexTTS2.5/vLLM-Omni JSON `/v1/audio/speech`、GPT-SoVITS `api_v2` `/tts` 或 Breeze TTS 2 multipart `/v1/audio/speech`。`models.toml` 没有也不需要 `tasks.tts`；Life Chatter 的 `life_send_voice(text=...)` 直接消费 Service，绝不回退旧 `model.toml`、MiMo speech client 或其他模型任务。
+- 三个后端只有一个稳定 Service 接口，但切分 owner 不同：展示正文先派生不写回消息/trajectory 的可发音投影；vLLM-Omni 的长表达由 Service 以默认 24 单位上限做有界运输切分，最多并发 2 段、硬上限 4；Breeze 使用同一有界切分但因服务单并发而串行，返回 24 kHz s16le PCM，严格校验并封装 WAV 后再按原序拼接；GPT-SoVITS 的完整投影只发出一次 `/tts`，由部署配置的原生 `text_split_method` 切分，禁止 Elysium 二次拆句。内部片段不形成多次表达，也不分段外发。
 - `[tts].idle_shutdown_seconds` 默认 1800 秒：只对插件通过 `start_command` 创建的后端进程组生效。最后一条完整表达结束并持续闲置到期后释放模型；下一次语音自动按需启动。设为 0 可保持常驻。外部手工服务、正在执行的长表达和 replacement process 不受旧计时影响；不要用定时 kill、端口猜测或 vLLM sleep endpoint 代替 owner 校验。
 - WSL 上的 GPT-SoVITS 使用仓库脚本 `scripts/tts/start_gpt_sovits_hiely.sh`。它默认固定人工批准的 e25/e80，并在改变 `latest/` 链接或启动 `api_v2` 前校验两份 SHA-256；自定义权重必须成对提供 checkpoint 与摘要，不再回退“最新 epoch”。脚本保持为进程组 owner 并监督 API 子进程，禁止改回会让 relay 与真实监听进程脱钩的裸 `exec`。`legacy_owned_startup_weights_ready=true` 只可用于该脚本确实已加载 `default` 权重对的本机配置；外部端口永不信任该声明。
 - `[[tts_styles]]` 中 GPT/SoVITS 的路径与 `gpt_weights_sha256` / `sovits_weights_sha256` 是同一不可拆分部署合同。Service 在任何权重切换或合成请求前校验完整权重对，文件 identity 改变会使摘要缓存失效；缺摘要、摘要不匹配或校验中被替换都 fail closed。
@@ -623,7 +623,7 @@ retry_failed = true
 PYTHONPATH=. .venv/bin/python scripts/verify_local_tts.py
 ```
 
-具体 Provider 地址、served model name、音色资产路径和插件启停状态属于部署环境配置，不写入公共文档。2026-08-28 本机 live 后端是 GPT-SoVITS v2ProPlus `api_v2`，不是 IndexTTS2.5。IndexTTS 仍是可配置合同；其 vLLM-Omni 启动命令与当前 CLI 不兼容，修复并验收前不得再写成“当前模型家族就是 IndexTTS”。禁止把主体语音发到 AI-Hobbyist 公共推理站；其 `GPT-SoVITS-Inference` fork 与本机 `api_v2` 合同相同，不能当作另一种推理引擎来修缺失权重。
+具体 Provider 地址、served model name、音色资产路径和插件启停状态属于部署环境配置，不写入公共文档。当前本机 live 后端是 GPT-SoVITS v2ProPlus `api_v2`，不是 IndexTTS2.5 或 Breeze。IndexTTS 与 Breeze 都是可配置合同；可选服务已经运行也不会让 Service 自动改后端。Breeze 配置必须给出可信风格指令、逐字准确参考稿和成对参考音频，返回协议不匹配时整条失败；其当前研究许可为非商业用途。禁止把主体语音发到 AI-Hobbyist 公共推理站；其 `GPT-SoVITS-Inference` fork 与本机 `api_v2` 合同相同，不能当作另一种推理引擎来修缺失权重。
 
 ---
 
@@ -1487,7 +1487,8 @@ config/
 - [x] 当前 schema 配置模板与模型环境变量密钥注入
 - [ ] 模型 Provider 兼容性矩阵
 - [x] ASR 协议接入、Opus/WAV 转码和飞书端到端验收
-- [ ] IndexTTS2.5/vLLM-Omni 本地部署、模型/声音 revision、参考音频或命名音色、并发 1/2/4、Service 合同和独立语音发送验收；当前本机 live 后端已回到 GPT-SoVITS `api_v2`
+- [ ] IndexTTS2.5/vLLM-Omni 本地部署、模型/声音 revision、参考音频或命名音色、并发 1/2/4、Service 合同和独立语音发送验收；当前本机 live 后端保持 GPT-SoVITS `api_v2`
+- [ ] Breeze TTS 2 `/health`、multipart 流式 PCM、可信 instruction、参考音频/逐字稿、单并发 409、总 deadline、WAV 封装、模型许可与真实平台发送验收；未显式切换时不得加载或替代 GPT
 - [x] QQ/NapCat 与飞书私聊文本、图片查看真实端到端验收
 - [x] 飞书图片保存、图片发送、语音合成发送和语音接收识别验收
 - [ ] 飞书群聊、普通文件和视频验收

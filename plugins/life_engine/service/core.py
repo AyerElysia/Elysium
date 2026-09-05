@@ -277,6 +277,8 @@ from .subconscious_context import (
     SubconsciousSummary,
 )
 from .heartbeat_rolling import (
+    copy_rolling_payloads,
+    ensure_heartbeat_user_turn,
     estimate_payload_chars,
     format_new_events_text,
     iter_selected_events,
@@ -292,11 +294,14 @@ from ..core.context_stewardship import (
     LiveContextWindow,
     apply_pending_subject_checkpoint,
     archive_target_for_runtime,
+    consume_subject_context_recovery_marker,
     ensure_compression_required_appended,
     has_compression_required_payload,
-    install_fail_closed_context_hook,
+    install_subject_context_recovery_hook,
+    is_subject_window_overflow_error,
     payloads_require_compression,
     register_live_context,
+    reset_subject_context_recovery_marker,
     unregister_live_context,
 )
 from .world_projection import (
@@ -9506,6 +9511,71 @@ class LifeEngineService(BaseService):
         )
         return max(1, max_groups), max(256, max_bytes)
 
+    def _install_heartbeat_context_recovery_hook(self, request: Any) -> None:
+        """Allow one attempt-local send projection; durable rolling stays intact."""
+
+        max_groups, max_bytes = self._heartbeat_compaction_list_limits()
+        install_subject_context_recovery_hook(
+            request,
+            max_groups=max_groups,
+            max_bytes=max_bytes,
+        )
+
+    def _apply_heartbeat_recovery_envelope(self, response: Any) -> None:
+        """Keep the compression list on the untrimmed chain after a recovery send."""
+
+        if not consume_subject_context_recovery_marker(response):
+            return
+        payloads = getattr(response, "payloads", None)
+        if not isinstance(payloads, list):
+            return
+        max_groups, max_bytes = self._heartbeat_compaction_list_limits()
+        response.payloads = ensure_compression_required_appended(
+            [payload for payload in payloads if isinstance(payload, LLMPayload)],
+            estimate=estimate_payload_chars,
+            trigger_chars=self._heartbeat_compaction_trigger_chars(),
+            max_groups=max_groups,
+            max_bytes=max_bytes,
+            force=True,
+        )
+        self._register_heartbeat_live_context(list(response.payloads))
+
+    async def _heartbeat_unresolved_window_overflow(
+        self,
+        baseline_rolling: list[LLMPayload],
+        *,
+        workspace: str,
+    ) -> HeartbeatModelResult:
+        """Skip this beat without utility-retrying the same overflowing payloads."""
+
+        max_groups, max_bytes = self._heartbeat_compaction_list_limits()
+        persist_payloads = ensure_compression_required_appended(
+            copy_rolling_payloads(baseline_rolling),
+            estimate=estimate_payload_chars,
+            trigger_chars=self._heartbeat_compaction_trigger_chars(),
+            max_groups=max_groups,
+            max_bytes=max_bytes,
+            force=True,
+        )
+        try:
+            await save_heartbeat_rolling(
+                persist_payloads,
+                service=self,
+                workspace_path=workspace,
+            )
+        except Exception as exc:  # noqa: BLE001 - overflow skip must not raise
+            logger.warning(
+                "心跳窗口溢出后写入压缩清单失败: "
+                f"error_type={type(exc).__name__}"
+            )
+        unregister_live_context(HEARTBEAT_RUNTIME_KEY)
+        return HeartbeatModelResult(
+            "",
+            None,
+            compression_unresolved=True,
+            rolling_payloads=tuple(persist_payloads),
+        )
+
     def _register_heartbeat_live_context(self, payloads: list[Any]) -> None:
         typed = [payload for payload in payloads if isinstance(payload, LLMPayload)]
         namespace, subdir = archive_target_for_runtime(HEARTBEAT_RUNTIME_KEY)
@@ -10199,7 +10269,10 @@ class LifeEngineService(BaseService):
     ) -> tuple[str, str]:
         """Read the sealed delivery identity without retaining prompt content."""
 
-        first_line = str(wake_context or "").splitlines()[0].strip()
+        lines = str(wake_context or "").splitlines()
+        if not lines:
+            return "", ""
+        first_line = lines[0].strip()
         prefix = '<subconscious_activity_projection delivery_id="'
         suffix = '">'
         if not first_line.startswith(prefix) or not first_line.endswith(suffix):
@@ -10296,7 +10369,11 @@ class LifeEngineService(BaseService):
         world_perception: PreparedPerception | None = None,
         heartbeat_deadline: float | None = None,
     ) -> HeartbeatModelResult:
-        """调用 life 任务模型生成内部报文；请求失败必须向上抛出。"""
+        """调用 life 任务模型生成内部报文。
+
+        普通请求失败仍向上抛出。硬窗口溢出不是成功路径，但也不得把同一份
+        超窗载荷丢给 utility 空转；该情况本拍以压缩未完成返回。
+        """
         del world_perception
         cfg = self._cfg()
         configured_timeout = float(
@@ -10312,7 +10389,7 @@ class LifeEngineService(BaseService):
             model_set=model_set,
             request_name="life_engine_heartbeat",
         )
-        install_fail_closed_context_hook(request)
+        self._install_heartbeat_context_recovery_hook(request)
 
         system_prompt = await self._build_heartbeat_system_prompt()
         if system_prompt is None:
@@ -10342,10 +10419,11 @@ class LifeEngineService(BaseService):
                 f"error_type={type(exc).__name__}"
             )
             baseline_rolling = []
-        rolling = list(baseline_rolling)
+        rolling = copy_rolling_payloads(baseline_rolling)
         wake_text = str(wake_context or "")
         if wake_text.strip():
             rolling.append(LLMPayload(ROLE.USER, Text(wake_text)))
+        rolling = ensure_heartbeat_user_turn(rolling)
         max_groups, max_bytes = self._heartbeat_compaction_list_limits()
         rolling = ensure_compression_required_appended(
             rolling,
@@ -10383,11 +10461,21 @@ class LifeEngineService(BaseService):
                 per_call_timeout=timeout_seconds,
             )
 
+        reset_subject_context_recovery_marker(request)
         try:
             response = await _send_heartbeat_request()
         except HeartbeatBudgetExhausted:
             raise
         except Exception as e:
+            if is_subject_window_overflow_error(e):
+                logger.warning(
+                    "心跳滚动上下文超过模型窗口，本拍改为压缩维护，"
+                    f"不把同一份超窗载荷降级到 utility: {e}"
+                )
+                return await self._heartbeat_unresolved_window_overflow(
+                    baseline_rolling,
+                    workspace=workspace,
+                )
             # 主模型失败，尝试轻量模型降级（utils task 通常路由到更快的 provider）
             if task_name != "utility":
                 try:
@@ -10399,7 +10487,7 @@ class LifeEngineService(BaseService):
                         model_set=fallback_model_set,
                         request_name="life_engine_heartbeat_fallback",
                     )
-                    install_fail_closed_context_hook(fallback_request)
+                    self._install_heartbeat_context_recovery_hook(fallback_request)
                     # 复制 payloads 到 fallback request
                     for payload in request.payloads:
                         fallback_request.add_payload(payload)
@@ -10419,12 +10507,22 @@ class LifeEngineService(BaseService):
                 except HeartbeatBudgetExhausted:
                     raise
                 except Exception as fallback_exc:
+                    if is_subject_window_overflow_error(fallback_exc):
+                        logger.warning(
+                            "心跳 utility 降级仍超过模型窗口，本拍改为压缩维护: "
+                            f"{fallback_exc}"
+                        )
+                        return await self._heartbeat_unresolved_window_overflow(
+                            baseline_rolling,
+                            workspace=workspace,
+                        )
                     logger.error(f"Heartbeat fallback also failed: {fallback_exc}")
                     raise e from fallback_exc
             else:
                 logger.error(f"Heartbeat request failed after all retries: {e}")
                 raise
 
+        self._apply_heartbeat_recovery_envelope(response)
         max_rounds = max(1, int(cfg.settings.max_rounds_per_heartbeat))
         last_text = ""
         final_response_observed = False
@@ -10602,6 +10700,8 @@ class LifeEngineService(BaseService):
                     marker=subconscious_delivery_marker,
                 )
 
+            reset_subject_context_recovery_marker(current_response)
+
             async def _send_followup_request() -> Any:
                 from src.kernel.llm.exceptions import LLMModelsCoolingDownError
 
@@ -10645,6 +10745,7 @@ class LifeEngineService(BaseService):
                         stage="followup_backoff",
                     )
                     response = await _send_followup_request()
+                self._apply_heartbeat_recovery_envelope(response)
                 await self._commit_heartbeat_memory_deliveries(
                     response,
                     pending_memory_deliveries,
@@ -10683,10 +10784,18 @@ class LifeEngineService(BaseService):
                     pending_memory_deliveries
                 )
                 raise
-            except Exception:
+            except Exception as followup_exc:
                 self._discard_pending_heartbeat_memory_deliveries(
                     pending_memory_deliveries
                 )
+                if is_subject_window_overflow_error(followup_exc):
+                    logger.warning(
+                        "心跳续轮滚动上下文超过模型窗口，本拍改为压缩维护: "
+                        f"{followup_exc}"
+                    )
+                    stop_reason = "window_overflow"
+                    stop_stage = "followup_request"
+                    break
                 raise
 
         if stop_reason:
@@ -10763,6 +10872,8 @@ class LifeEngineService(BaseService):
             trigger_chars=self._heartbeat_compaction_trigger_chars(),
         )
         compression_unresolved = still_requires_compression and not checkpoint_installed
+        if stop_reason == "window_overflow":
+            compression_unresolved = True
         persist_payloads = final_payloads
         if compression_unresolved:
             persist_payloads = list(baseline_rolling)
@@ -10782,6 +10893,8 @@ class LifeEngineService(BaseService):
                 "心跳压缩回合未完成，本拍不把新经历写入滚动链: "
                 f"#{self._state.heartbeat_count}"
             )
+        elif not wake_text.strip() and not checkpoint_installed:
+            persist_payloads = list(baseline_rolling)
         try:
             await save_heartbeat_rolling(
                 persist_payloads,

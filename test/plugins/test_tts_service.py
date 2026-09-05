@@ -56,10 +56,19 @@ class _FakeAudioContent:
 
 
 class _FakeHTTPResponse:
-    def __init__(self, body: bytes, status: int = 200) -> None:
+    def __init__(
+        self,
+        body: bytes,
+        status: int = 200,
+        *,
+        headers: dict[str, str] | None = None,
+        json_body: dict[str, object] | None = None,
+    ) -> None:
         self.status = status
         self._body = body
         self.content = _FakeAudioContent(body)
+        self.headers = headers or {}
+        self._json_body = json_body
 
     async def __aenter__(self) -> "_FakeHTTPResponse":
         return self
@@ -72,6 +81,11 @@ class _FakeHTTPResponse:
 
     async def text(self) -> str:
         return self._body.decode("utf-8", errors="replace")
+
+    async def json(self, **_kwargs: object) -> dict[str, object]:
+        if self._json_body is None:
+            raise ValueError("no JSON body configured")
+        return self._json_body
 
 
 class _FakeClientSession:
@@ -111,6 +125,9 @@ def test_long_text_config_defaults_and_bounds() -> None:
     assert config.tts.legacy_owned_startup_weights_ready is False
     assert config.tts.sentence_pause_ms == 320
     assert config.tts.paragraph_pause_ms == 520
+    assert config.tts_styles[0].breeze_cfg_scale == 3.8
+    assert config.tts_styles[0].breeze_seed == -1
+    assert config.tts_styles[0].breeze_instruction
 
     with pytest.raises(ValueError):
         TTSVoiceConfig.model_validate({"tts": {"segment_max_units": 15}})
@@ -120,6 +137,10 @@ def test_long_text_config_defaults_and_bounds() -> None:
         TTSVoiceConfig.model_validate({"tts": {"segment_concurrency": 5}})
     with pytest.raises(ValueError):
         TTSVoiceConfig.model_validate({"tts": {"backend": "guessed"}})
+    assert (
+        TTSVoiceConfig.model_validate({"tts": {"backend": "breeze_tts2"}}).tts.backend
+        == "breeze_tts2"
+    )
     with pytest.raises(ValueError):
         TTSVoiceConfig.model_validate({"tts": {"idle_shutdown_seconds": -0.1}})
     with pytest.raises(ValueError):
@@ -128,6 +149,10 @@ def test_long_text_config_defaults_and_bounds() -> None:
         TTSVoiceConfig.model_validate({"tts_advanced": {"seed": -2}})
     with pytest.raises(ValueError):
         TTSVoiceConfig.model_validate({"tts_advanced": {"sample_steps": 0}})
+    with pytest.raises(ValueError):
+        TTSVoiceConfig.model_validate(
+            {"tts_styles": [{"style_name": "default", "breeze_cfg_scale": 5.1}]}
+        )
 
 
 def test_tts_spoken_projection_removes_decorative_pause_artifacts(
@@ -355,6 +380,308 @@ async def test_vllm_omni_call_uses_speech_endpoint_and_content_free_transport(
             "headers": {"Content-Type": "application/json"},
         }
     ]
+
+
+async def test_breeze_health_requires_ready_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"RIFF-reference")
+    config = TTSVoiceConfig()
+    config.tts.backend = "breeze_tts2"
+    config.tts.server = "http://127.0.0.1:7862"
+    config.tts_styles[0].refer_wav_path = str(reference)
+    service = TTSService(SimpleNamespace(config=config))  # type: ignore[arg-type]
+    calls: list[dict[str, object]] = []
+
+    class HealthSession:
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        def get(self, url: str, **kwargs: object) -> _FakeHTTPResponse:
+            calls.append({"url": url, **kwargs})
+            return _FakeHTTPResponse(
+                b'{"status":"ok","sample_rate":24000}',
+                headers={"Content-Type": "application/json"},
+                json_body={"status": "ok", "sample_rate": 24_000},
+            )
+
+    monkeypatch.setattr(
+        tts_service_module.aiohttp,
+        "ClientSession",
+        lambda **_kwargs: HealthSession(),
+    )
+
+    assert await service._is_server_alive(config.tts.server) is True
+    assert calls == [
+        {"url": "http://127.0.0.1:7862/health", "headers": {}}
+    ]
+
+
+def test_breeze_fields_bind_trusted_style_and_reproducible_seed(
+    tmp_path: Path,
+) -> None:
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"RIFF-reference")
+    config = TTSVoiceConfig()
+    config.tts.backend = "breeze_tts2"
+    config.tts_styles[0].refer_wav_path = str(reference)
+    config.tts_styles[0].prompt_text = "逐字准确的参考文本。"
+    config.tts_styles[0].breeze_instruction = "可信的自然对话指令。"
+    config.tts_styles[0].breeze_cfg_scale = 3.8
+    config.tts_styles[0].breeze_seed = -1
+    service = TTSService(SimpleNamespace(config=config))  # type: ignore[arg-type]
+
+    first = service._build_breeze_tts2_fields(
+        server_config=service.tts_styles["default"],
+        text="这是正文。",
+    )
+    second = service._build_breeze_tts2_fields(
+        server_config=service.tts_styles["default"],
+        text="这是正文。",
+    )
+
+    assert first == second
+    assert first["instruction"] == "可信的自然对话指令。"
+    assert first["ref_text"] == "逐字准确的参考文本。"
+    assert first["cfg_scale"] == "3.8"
+    assert 0 <= int(first["seed"]) <= 2_147_483_647
+
+
+async def test_breeze_call_uses_multipart_and_wraps_streamed_pcm_as_wav(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"RIFF-reference")
+    config = TTSVoiceConfig()
+    config.tts.backend = "breeze_tts2"
+    config.tts.server = "http://127.0.0.1:7862"
+    config.tts_styles[0].refer_wav_path = str(reference)
+    config.tts_styles[0].prompt_text = "逐字准确的参考文本。"
+    config.tts_styles[0].breeze_instruction = "保持音色，自然清晰。"
+    config.tts_styles[0].breeze_cfg_scale = 3.8
+    config.tts_styles[0].breeze_seed = 20260904
+    service = TTSService(SimpleNamespace(config=config))  # type: ignore[arg-type]
+    service._ensure_server_alive = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    pcm = b"\x00\x00" * 2_400
+    calls: list[dict[str, object]] = []
+
+    class BreezeSession:
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        def post(self, url: str, **kwargs: object) -> _FakeHTTPResponse:
+            calls.append({"url": url, **kwargs})
+            return _FakeHTTPResponse(
+                pcm,
+                headers={
+                    "Content-Type": "audio/pcm",
+                    "X-Sample-Rate": "24000",
+                    "X-Sample-Format": "s16le",
+                },
+            )
+
+    monkeypatch.setattr(
+        tts_service_module.aiohttp,
+        "ClientSession",
+        lambda **_kwargs: BreezeSession(),
+    )
+
+    result = await service._call_tts_api(
+        service.tts_styles["default"],
+        "一段测试。",
+        "zh",
+        refer_wav_path=str(reference),
+        reference_audio_bytes=reference.read_bytes(),
+        segment_index=1,
+        segment_count=1,
+    )
+
+    assert result is not None
+    with wave.open(io.BytesIO(result), "rb") as audio:
+        assert audio.getframerate() == 24_000
+        assert audio.getnchannels() == 1
+        assert audio.getsampwidth() == 2
+        assert audio.getnframes() == 2_400
+    assert len(calls) == 1
+    assert calls[0]["url"] == "http://127.0.0.1:7862/v1/audio/speech"
+    form = calls[0]["data"]
+    values = {field[0]["name"]: field[2] for field in form._fields}  # type: ignore[attr-defined]
+    assert values["text"] == "一段测试。"
+    assert values["instruction"] == "保持音色，自然清晰。"
+    assert values["cfg_scale"] == "3.8"
+    assert values["ref_text"] == "逐字准确的参考文本。"
+    assert values["seed"] == "20260904"
+    assert values["ref_audio"] == reference.read_bytes()
+    service._ensure_server_alive.assert_awaited_once_with(config.tts.server)
+
+
+async def test_breeze_invalid_pcm_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"RIFF-reference")
+    config = TTSVoiceConfig()
+    config.tts.backend = "breeze_tts2"
+    config.tts_styles[0].refer_wav_path = str(reference)
+    config.tts_styles[0].prompt_text = "参考文本。"
+    service = TTSService(SimpleNamespace(config=config))  # type: ignore[arg-type]
+    service._ensure_server_alive = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+    class InvalidPCMSession:
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        def post(self, _url: str, **_kwargs: object) -> _FakeHTTPResponse:
+            return _FakeHTTPResponse(
+                b"odd",
+                headers={
+                    "Content-Type": "audio/pcm",
+                    "X-Sample-Rate": "24000",
+                    "X-Sample-Format": "s16le",
+                },
+            )
+
+    monkeypatch.setattr(
+        tts_service_module.aiohttp,
+        "ClientSession",
+        lambda **_kwargs: InvalidPCMSession(),
+    )
+
+    assert (
+        await service._call_tts_api(
+            service.tts_styles["default"],
+            "不能交付半截音频。",
+            "zh",
+            refer_wav_path=str(reference),
+            reference_audio_bytes=reference.read_bytes(),
+        )
+        is None
+    )
+
+
+async def test_breeze_busy_response_retries_within_one_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"RIFF-reference")
+    config = TTSVoiceConfig()
+    config.tts.backend = "breeze_tts2"
+    config.tts.server = "http://127.0.0.1:7862"
+    config.tts.timeout = 10
+    config.tts_styles[0].refer_wav_path = str(reference)
+    config.tts_styles[0].prompt_text = "参考文本。"
+    service = TTSService(SimpleNamespace(config=config))  # type: ignore[arg-type]
+    service._ensure_server_alive = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    responses = [
+        _FakeHTTPResponse(b"busy", status=409),
+        _FakeHTTPResponse(
+            b"\x00\x00" * 2_400,
+            headers={
+                "Content-Type": "audio/pcm",
+                "X-Sample-Rate": "24000",
+                "X-Sample-Format": "s16le",
+            },
+        ),
+    ]
+    calls: list[dict[str, object]] = []
+
+    class BusyThenReadySession:
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        def post(self, url: str, **kwargs: object) -> _FakeHTTPResponse:
+            calls.append({"url": url, **kwargs})
+            return responses.pop(0)
+
+    sleep = AsyncMock()
+    monkeypatch.setattr(tts_service_module.asyncio, "sleep", sleep)
+    monkeypatch.setattr(
+        tts_service_module.aiohttp,
+        "ClientSession",
+        lambda **_kwargs: BusyThenReadySession(),
+    )
+
+    result = await service._call_tts_api(
+        service.tts_styles["default"],
+        "繁忙后继续。",
+        "zh",
+        refer_wav_path=str(reference),
+        reference_audio_bytes=reference.read_bytes(),
+    )
+
+    assert result is not None
+    assert len(calls) == 2
+    assert {call["url"] for call in calls} == {
+        "http://127.0.0.1:7862/v1/audio/speech"
+    }
+    sleep.assert_awaited_once()
+
+
+async def test_breeze_long_expression_is_serial_and_reads_reference_once(
+    tmp_path: Path,
+) -> None:
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"RIFF-reference")
+    config = TTSVoiceConfig()
+    config.tts.backend = "breeze_tts2"
+    config.tts.segment_max_units = 16
+    config.tts.segment_min_units = 4
+    config.tts_styles[0].refer_wav_path = str(reference)
+    config.tts_styles[0].prompt_text = "参考文本。"
+    config.tts_advanced.media_type = "wav"
+    service = TTSService(SimpleNamespace(config=config))  # type: ignore[arg-type]
+    service._ensure_server_alive = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    active = 0
+    maximum_active = 0
+    references: list[bytes] = []
+    joined: list[bytes] = []
+
+    async def synthesize(**kwargs: object) -> bytes:
+        nonlocal active, maximum_active
+        assert kwargs["_server_ready"] is True
+        active += 1
+        maximum_active = max(maximum_active, active)
+        await asyncio.sleep(0)
+        references.append(kwargs["reference_audio_bytes"])  # type: ignore[arg-type]
+        active -= 1
+        return _silent_wav()
+
+    def join_in_original_order(
+        audio_segments: list[bytes],
+        _segments: list[object],
+    ) -> bytes:
+        joined.extend(audio_segments)
+        return _silent_wav()
+
+    service._call_tts_api = synthesize  # type: ignore[method-assign]
+    service._join_wav_segments = join_in_original_order  # type: ignore[method-assign]
+
+    result = await service.generate_voice(
+        "第一句话会合成。第二句话继续。第三句话最后抵达。"
+    )
+
+    assert result
+    assert len(joined) >= 2
+    assert maximum_active == 1
+    assert references == [reference.read_bytes()] * len(joined)
+    service._ensure_server_alive.assert_awaited_once()
 
 
 async def test_legacy_expression_uses_native_cut_once(

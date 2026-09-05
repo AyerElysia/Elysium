@@ -1,8 +1,9 @@
 # TTS 语音合成
 
 > 文档状态：当前生产边界。
-> 当前消息 TTS Service 同时支持 **IndexTTS2.5 + vLLM-Omni** 与 **GPT-SoVITS api_v2**，由部署配置显式选择。
+> 当前消息 TTS Service 同时支持 **IndexTTS2.5 + vLLM-Omni**、**GPT-SoVITS api_v2** 与 **Breeze TTS 2**，由部署配置显式选择。
 > 本机 2026-08-28 的 ignored live 配置是 `legacy_compat`：RVC-Boss `api_v2` `/tts`，v2ProPlus 微调权重，端口 `9880`。IndexTTS2.5 + vLLM-Omni 仍是代码合同，但本机启动命令已与当前 CLI 不兼容，不得再写成“当前生产就是 IndexTTS”。
+> Breeze 当前只作为自托管可选 Provider 接入；本机生产选择仍是 GPT-SoVITS，不因 Breeze 服务在 `7862` 存活而自动切换。
 > `config/models.toml` 不再存在 `tasks.tts`；MiMo TTS 也不属于当前消息语音链。
 > 不得把主体语音或参考音频发到 `tts.ai-hobbyist.org` 一类公共推理平台。AI-Hobbyist `GPT-SoVITS-Inference` 与本机正在使用的 RVC-Boss `api_v2` 是同一套 `/tts` + `/set_*_weights` 合同，换 fork 不能修复缺失权重或失败后继续合成。
 
@@ -16,7 +17,7 @@ TTS 只把爱莉已经决定表达的文字变成声音。它不替她决定说�
 - **直播 TTS**：直播运行时拥有独立的有界 HTTP 客户端、切句、内容寻址音频与舞台播放回执，可配置本地端点，但不复用聊天动作的发送语义；
 - **Voice Live**：持续听说、停顿与打断的实时意识实例，不是“聊天文本再接一次 TTS”。
 
-这些链可以使用本地模型，但场景责任不同。当前普通消息共享 `tts_voice_plugin:service:tts`；该 Service 以一个稳定接口封装 vLLM-Omni 与 GPT-SoVITS，具体后端属于本机部署选择。直播仍由自己的客户端与配置负责，不能把直播播放成功当成消息平台发送成功。
+这些链可以使用本地模型，但场景责任不同。当前普通消息共享 `tts_voice_plugin:service:tts`；该 Service 以一个稳定接口封装 vLLM-Omni、GPT-SoVITS 与 Breeze，具体后端属于本机部署选择。直播仍由自己的客户端与配置负责，不能把直播播放成功当成消息平台发送成功。
 
 ## 2. 当前消息表达链
 
@@ -27,8 +28,10 @@ TTS 只把爱莉已经决定表达的文字变成声音。它不替她决定说�
   → 可发音投影（非权威，不写回展示正文）
   ├─ vLLM-Omni：有界运输切分 → /v1/audio/speech
   │              → 按原序号归位 → PCM 拼接
+  ├─ Breeze TTS 2：有界运输切分 → multipart /v1/audio/speech
+  │                 → 24 kHz s16le PCM 校验并封装 WAV
   └─ GPT-SoVITS：完整表达一次 /tts
-                 → 配置的后端原生 text_split_method
+                   → 配置的后端原生 text_split_method
   → 一次最终编码
   → Base64 音频
   → QQ / 飞书等平台发送
@@ -49,12 +52,12 @@ TTS 只把爱莉已经决定表达的文字变成声音。它不替她决定说�
 
 ### 2.1 长文本是一个表达，不是多次表达
 
-不同后端必须只有一个切分 owner。vLLM-Omni transport 没有等价的原生整段切分回执，因此 Service 可按段落、句号、问号、感叹号、分号、冒号、逗号的优先级拆成有界片段；没有自然边界且单段仍超限时，才使用稳定的技术硬边界。GPT-SoVITS `api_v2` 已原生支持 `text_split_method`，Service 必须把完整表达一次性交给 `/tts`，禁止外层切分后再用 `cut5` 二次切分。
+不同后端必须只有一个切分 owner。vLLM-Omni 与 Breeze transport 没有等价的原生整段切分回执，因此 Service 可按段落、句号、问号、感叹号、分号、冒号、逗号的优先级拆成有界片段；没有自然边界且单段仍超限时，才使用稳定的技术硬边界。Breeze 服务为单并发，片段必须串行；vLLM-Omni 可在硬上限内并发。GPT-SoVITS `api_v2` 已原生支持 `text_split_method`，Service 必须把完整表达一次性交给 `/tts`，禁止外层切分后再用 `cut5` 二次切分。
 
 这个拆分只属于音频合成运输层：
 
 - 上游仍只产生一次 `life_send_voice`，正文、思考和 trajectory 不被拆成多条；
-- vLLM-Omni 模式允许片段有界并发，由两阶段运行时批处理；GPT-SoVITS 每条表达只有一个请求和一次权重组合切换；
+- vLLM-Omni 模式允许片段有界并发，由两阶段运行时批处理；Breeze 片段按表达锁串行并复用同一份参考音频；GPT-SoVITS 每条表达只有一个请求和一次权重组合切换；
 - 后端完成顺序不得改变表达顺序，结果按稳定片段序号归位后才能拼接；
 - 每段先取得 WAV，按原有边界加入可配置静音，再拼为连续 PCM；空间效果只对完整音频应用一次，平台格式也只编码一次；
 - 只有全部片段成功后才返回一个 Base64 音频并发送一条平台消息；任一段失败、解码失败、采样率不一致或最终编码失败，整条表达都失败；
@@ -73,6 +76,8 @@ GPT-SoVITS 的 `text_split_method`、`speed_factor`、`seed`、参考音频与�
 
 IndexTTS2.5 的标准 vLLM-Omni 配置不是即时音频分块流式：Stage 0 先完成当前片段的语义序列，Stage 1 再产生音频。因此项目把加速边界放在“句段级有界并行”，而不是把半段音频提前冒充一条已经完成的表达。默认并发为 2，硬上限为 4；生产值必须依据端到端延迟、RTF、显存峰值与段间韵律一致性实测，不能仅凭吞吐提高就扩大。
 
+Breeze 的 `/v1/audio/speech` 接收可信 `instruction`、`cfg_scale`、`seed` 与成对的 `ref_audio/ref_text`，返回 24 kHz、单声道、s16le 流式 PCM。消息 TTS 仍须收到完整片段、核对响应媒体类型/采样格式/采样率并封装为 WAV 后才可进入原子拼接与平台发送，首包到达不等于整条表达已经说出口。`instruction` 只能来自部署风格配置，不能由用户正文覆盖；`seed=-1` 时由风格键与发音投影稳定派生，便于重现后训练样本。当前研究基线 `cfg_scale=3.8` 只是一组可配置起点，最终音色仍需按参考资产和真实平台链试听。
+
 ## 3. 本地服务与生命周期
 
 部署配置位于被 Git 忽略的 `config/plugins/tts_voice_plugin/config.toml`。本机当前 live 配置明确：
@@ -86,6 +91,8 @@ IndexTTS2.5 的标准 vLLM-Omni 配置不是即时音频分块流式：Stage 0 �
 
 若要把消息 TTS 切回 IndexTTS2.5 + vLLM-Omni，必须先让本机启动命令与当前 vLLM-Omni CLI 对齐，再用 ignored 配置把 `backend` 改成 `vllm_omni`，并完成真实合成验收。代码支持该协议，不等于它正在服务。
 
+若要试用 Breeze，使用 ignored 配置显式设置 `backend = "breeze_tts2"`、服务地址与独立启动命令，并为每个风格配置逐字准确的 `prompt_text`、`breeze_instruction`、`breeze_cfg_scale` 和 `breeze_seed`。健康检查必须返回 `status=ok` 与正采样率；合成端点繁忙时 Service 只在单次请求总 deadline 内等待，错误响应、空流、奇数字节 PCM 或协议头不匹配均整条失败。Breeze 模型只能按真实语音请求启动，闲置释放沿用同一进程所有权合同，不得因 Elysium 启动而常驻。当前模型及自托管输出受 BreezeBlue Research and Non-Commercial License 约束，部署前必须核对用途。
+
 `legacy_compat` 在调用任何 `/set_*_weights` 或 `/tts` 前必须先验证完整 GPT/SoVITS 权重合同：路径存在、配置了 SHA-256、实际摘要匹配，且校验期间文件 identity 未变化。摘要按 symlink-aware identity 在进程内缓存，权重被替换后自动失效并重新校验。任一检查失败时整条表达显式失败，禁止用进程内残留的另一套 epoch 继续合成，也禁止把空摘要解释成“信任当前后端”。
 
 `legacy_owned_startup_weights_ready` 是部署者对**插件自有启动进程**的显式声明：`start_command` 已经加载 `default` 配置指向的同一权重对。只有刚启动、仍由当前 Service 持有、文件 identity 也一致的进程可跳过第一次重复切换；同一自有进程之后只复用已经确认的 identity。端口上预先存在的外部服务永不消费该声明，仍逐次调用权重端点以避免缓存掩盖重启或陌生模型。
@@ -94,7 +101,7 @@ TTS 后端只在真正请求语音且端口未就绪时按配置启动。插件�
 
 闲置关闭使用完整进程退出，而不是依赖当前 IndexTTS2.5 Stage 1 未启用的 vLLM sleep mode。代价是下一次语音承担冷启动；本机 `startup_timeout` 必须覆盖实测最慢冷启动。长合成正在执行、计时已被新活动取消、进程已被替换或服务并非插件所有时，旧计时一律 no-op。
 
-仓库中的 Service 对 `legacy_compat` 与 `vllm_omni` 都提供显式协议合同。`legacy_compat` 每条完整表达只调用一次 `/tts`，由后端原生切分并最多切换一次 GPT/SoVITS 权重组合；`vllm_omni` 不调用权重切换端点，不发送本地文件路径，而是使用 `model/input/response_format/speed/ref_audio/extra_params`。参考音频在一条表达内只编码一次，各片段共享同一不可变 data URL；配置命名音色后可避免重复上传。后端身份以协议健康、模型/权重 revision 和输出验证为准。
+仓库中的 Service 对 `legacy_compat`、`vllm_omni` 与 `breeze_tts2` 都提供显式协议合同。`legacy_compat` 每条完整表达只调用一次 `/tts`，由后端原生切分并最多切换一次 GPT/SoVITS 权重组合；`vllm_omni` 不调用权重切换端点，不发送本地文件路径，而是使用 `model/input/response_format/speed/ref_audio/extra_params`。Breeze 使用 multipart 字节上传，不向服务发送调用端本地路径，参考音频在一条表达内只读取一次，各串行片段共享同一不可变字节快照。后端身份以协议健康、模型/权重 revision 和输出验证为准。
 
 官方 IndexTTS2.5 recipe 使用两阶段部署：Stage 0 为 AR talker，Stage 1 为 EnhancedCodec + S2Mel CFM/DiT + BigVGAN，输出 22.05 kHz mono WAV。Stage 0 使用 vLLM sampling，而不是上游默认 `num_beams=3`；因此迁移验收比较音色、发音、速度、韵律与稳定性，不要求逐样本波形一致。
 
@@ -150,5 +157,8 @@ TTS 工程证据应记录模型/声音 revision、输入文本 hash、输出音�
 19. 外部服务不复用进程内权重缓存；自有服务只复用绑定到同一进程与同一文件 identity 的确认状态。
 20. 日志分别记录权重合同校验、server wait、weight、synthesis 与 total 毫秒数，不含正文；QQ 默认原样发送 TTS 音频，只有显式启用旧实验投影时才记录其算法、字节数和耗时。
 21. WSL 监督启动器退出后，精确 API 子进程、监听端口和 GPU 资源均必须消失；只看到父句柄退出不算关闭成功。
+22. Breeze 使用 `/health` 与 multipart `/v1/audio/speech`；可信指令不取自用户正文，参考音频与逐字稿成对提交，不发送本地路径。
+23. Breeze 的 Content-Type、采样率、s16le 与 PCM 字节边界全部验证后才封装 WAV；409 仅在同一总 deadline 内重试，任一片段失败不返回部分表达。
+24. 本机 live 配置继续保持 `legacy_compat`；可选 Breeze 服务存活、测试通过或模型已加载都不得触发自动切换。
 
 部署步骤见[部署、配置、测试与使用说明](../operations/deployment_and_usage.md)。

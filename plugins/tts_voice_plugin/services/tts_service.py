@@ -1,8 +1,8 @@
 """本地消息 TTS 核心服务。
 
 封装风格管理、文本清洗、HTTP 后端调用和空间音效处理。后端由部署配置在
-GPT-SoVITS ``api_v2`` 与 IndexTTS2.5 + vLLM-Omni 之间显式选择，不得从 URL
-猜测，也不得把未绑定的云端 TTS 冒充成本机意识声音。
+GPT-SoVITS ``api_v2``、IndexTTS2.5 + vLLM-Omni 与 Breeze TTS 2 之间显式
+选择，不得从 URL 猜测，也不得把未绑定的云端 TTS 冒充成本机意识声音。
 """
 
 from __future__ import annotations
@@ -72,9 +72,9 @@ class TTSService(BaseService):
 
     service_name: str = "tts"
     service_description: str = (
-        "本地消息语音合成服务（GPT-SoVITS api_v2 / IndexTTS2.5 vLLM-Omni）"
+        "本地消息语音合成服务（GPT-SoVITS / IndexTTS2.5 / Breeze TTS 2）"
     )
-    version: str = "4.0.0"
+    version: str = "4.1.0"
 
     def __init__(self, plugin: "BasePlugin") -> None:
         """初始化 TTS 服务。
@@ -353,6 +353,9 @@ class TTSService(BaseService):
                 ),
                 "speed_factor": style_cfg.speed_factor,
                 "text_language": style_cfg.text_language or "auto",
+                "breeze_instruction": style_cfg.breeze_instruction,
+                "breeze_cfg_scale": style_cfg.breeze_cfg_scale,
+                "breeze_seed": style_cfg.breeze_seed,
             }
         return styles
 
@@ -417,6 +420,12 @@ class TTSService(BaseService):
         with open(path, "rb") as audio_file:
             encoded = base64.b64encode(audio_file.read()).decode("ascii")
         return f"data:{mime_type};base64,{encoded}"
+
+    @staticmethod
+    def _read_reference_audio(path: str) -> bytes:
+        """Read one immutable reference artifact outside the event loop."""
+        with open(path, "rb") as audio_file:
+            return audio_file.read()
 
     def _resolve_aux_ref_paths(self, aux_paths: list[str] | None) -> list[str]:
         """筛选出真实存在的辅助参考音频路径。
@@ -1127,23 +1136,30 @@ class TTSService(BaseService):
     async def _is_server_alive(self, base_url: str) -> bool:
         """快速探测 TTS 服务是否存活。"""
         normalized_base = base_url.rstrip("/")
-        health_url = (
-            f"{normalized_base}/v1/models"
-            if self._backend_name() == "vllm_omni"
-            else normalized_base
-        )
+        backend = self._backend_name()
+        if backend == "vllm_omni":
+            health_url = f"{normalized_base}/v1/models"
+        elif backend == "breeze_tts2":
+            health_url = f"{normalized_base}/health"
+        else:
+            health_url = normalized_base
         try:
-            headers = (
-                self._vllm_request_headers()
-                if self._backend_name() == "vllm_omni"
-                else {}
-            )
+            headers = self._vllm_request_headers() if backend == "vllm_omni" else {}
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=5)
             ) as session:
                 async with session.get(health_url, headers=headers) as resp:
-                    if self._backend_name() == "vllm_omni":
+                    if backend == "vllm_omni":
                         return resp.status == 200
+                    if backend == "breeze_tts2":
+                        if resp.status != 200:
+                            return False
+                        payload = await resp.json(content_type=None)
+                        try:
+                            sample_rate = int(payload.get("sample_rate", 0))
+                        except (TypeError, ValueError):
+                            return False
+                        return payload.get("status") == "ok" and sample_rate > 0
                     # 历史后端没有统一 health path；任何非 5xx 响应都说明在监听。
                     return resp.status < 500
         except Exception:
@@ -1245,6 +1261,13 @@ class TTSService(BaseService):
         """Dispatch one bounded transport segment to the configured backend."""
         if self._backend_name() == "vllm_omni":
             return await self._call_vllm_omni_api(
+                server_config,
+                text,
+                text_language,
+                **kwargs,
+            )
+        if self._backend_name() == "breeze_tts2":
+            return await self._call_breeze_tts2_api(
                 server_config,
                 text,
                 text_language,
@@ -1367,6 +1390,223 @@ class TTSService(BaseService):
         except Exception as exc:
             logger.error(
                 "vLLM-Omni TTS 调用异常: "
+                f"error_type={type(exc).__name__}"
+            )
+            return None
+
+    @staticmethod
+    def _stable_breeze_seed(
+        *,
+        style_name: str,
+        text: str,
+        configured_seed: int,
+    ) -> int:
+        """Resolve one reproducible Breeze seed without logging private text."""
+        if configured_seed >= 0:
+            return configured_seed
+        digest = hashlib.blake2s(
+            f"{style_name}\0{text}".encode(),
+            digest_size=4,
+        ).digest()
+        return int.from_bytes(digest, "little") & 0x7FFFFFFF
+
+    def _build_breeze_tts2_fields(
+        self,
+        *,
+        server_config: dict[str, Any],
+        text: str,
+    ) -> dict[str, str]:
+        """Build trusted multipart fields for one Breeze transport segment."""
+        instruction = str(server_config.get("breeze_instruction") or "").strip()
+        ref_text = str(server_config.get("prompt_text") or "").strip()
+        style_name = str(server_config.get("style_name") or "default").strip()
+        try:
+            cfg_scale = float(server_config.get("breeze_cfg_scale", 3.8))
+            configured_seed = int(server_config.get("breeze_seed", -1))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid Breeze style parameters") from exc
+        if not instruction:
+            raise ValueError("Breeze instruction must not be empty")
+        if not ref_text:
+            raise ValueError("Breeze reference transcript must not be empty")
+        if not math.isfinite(cfg_scale) or not 0.0 < cfg_scale <= 5.0:
+            raise ValueError("Breeze cfg_scale is outside the supported range")
+        seed = self._stable_breeze_seed(
+            style_name=style_name,
+            text=text,
+            configured_seed=configured_seed,
+        )
+        return {
+            "text": text,
+            "instruction": instruction,
+            "cfg_scale": format(cfg_scale, ".12g"),
+            "ref_text": ref_text,
+            "seed": str(seed),
+        }
+
+    @staticmethod
+    def _breeze_pcm16_to_wav(pcm: bytes, sample_rate: int) -> bytes:
+        """Validate Breeze PCM and wrap it as a mono PCM16 WAV artifact."""
+        if sample_rate <= 0:
+            raise ValueError("Breeze sample rate must be positive")
+        if not pcm or len(pcm) % 2:
+            raise ValueError("Breeze returned invalid s16le PCM")
+        samples = np.frombuffer(pcm, dtype="<i2")
+        with io.BytesIO() as output:
+            sf.write(output, samples, sample_rate, format="WAV", subtype="PCM_16")
+            return output.getvalue()
+
+    async def _call_breeze_tts2_api(
+        self,
+        server_config: dict[str, Any],
+        text: str,
+        text_language: str,
+        **kwargs: Any,
+    ) -> bytes | None:
+        """Call the self-hosted Breeze TTS 2 multipart streaming endpoint."""
+        del text_language  # Breeze infers language from text and its trusted direction.
+        base_url = str(server_config["url"]).rstrip("/")
+        if not kwargs.get("_server_ready") and not await self._ensure_server_alive(
+            base_url
+        ):
+            return None
+
+        ref_wav_path = str(kwargs.get("refer_wav_path") or "").strip()
+        if not ref_wav_path or not self._validate_main_ref_duration(ref_wav_path):
+            logger.error("Breeze TTS 2 调用失败：当前风格缺少有效参考音频")
+            return None
+        reference_audio = kwargs.get("reference_audio_bytes")
+        if reference_audio is None:
+            try:
+                reference_audio = await asyncio.to_thread(
+                    self._read_reference_audio,
+                    ref_wav_path,
+                )
+            except asyncio.CancelledError:
+                raise
+            except OSError as exc:
+                logger.error(
+                    "读取 Breeze 参考音频失败: "
+                    f"error_type={type(exc).__name__}"
+                )
+                return None
+        if not isinstance(reference_audio, bytes) or not reference_audio:
+            logger.error("Breeze TTS 2 调用失败：参考音频为空")
+            return None
+
+        try:
+            fields = self._build_breeze_tts2_fields(
+                server_config=server_config,
+                text=text,
+            )
+        except ValueError as exc:
+            logger.error(
+                "Breeze TTS 2 请求配置无效: "
+                f"error_type={type(exc).__name__}"
+            )
+            return None
+
+        filename = os.path.basename(ref_wav_path) or "reference.wav"
+        content_type = mimetypes.guess_type(filename)[0] or "audio/wav"
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + float(self.timeout)
+        started_at = loop.time()
+        busy_retries = 0
+
+        def build_form() -> aiohttp.FormData:
+            form = aiohttp.FormData()
+            for key, value in fields.items():
+                form.add_field(key, value)
+            form.add_field(
+                "ref_audio",
+                reference_audio,
+                filename=filename,
+                content_type=content_type,
+            )
+            return form
+
+        async def receive_audio(session: aiohttp.ClientSession) -> bytes | None:
+            nonlocal busy_retries
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0.0:
+                    raise TimeoutError
+                async with session.post(
+                    f"{base_url}/v1/audio/speech",
+                    data=build_form(),
+                    timeout=aiohttp.ClientTimeout(total=remaining),
+                ) as response:
+                    if response.status == 409:
+                        await response.read()
+                        busy_retries += 1
+                    elif response.status != 200:
+                        error_body = await response.read()
+                        logger.error(
+                            "Breeze TTS 2 请求失败: "
+                            f"status={response.status}, response_bytes={len(error_body)}"
+                        )
+                        return None
+                    else:
+                        response_type = str(
+                            response.headers.get("Content-Type", "")
+                        ).lower()
+                        sample_format = str(
+                            response.headers.get("X-Sample-Format", "")
+                        ).lower()
+                        try:
+                            sample_rate = int(response.headers["X-Sample-Rate"])
+                        except (KeyError, TypeError, ValueError):
+                            logger.error("Breeze TTS 2 响应缺少有效采样率")
+                            return None
+                        if not response_type.startswith("audio/pcm"):
+                            logger.error("Breeze TTS 2 响应媒体类型无效")
+                            return None
+                        if sample_format != "s16le":
+                            logger.error("Breeze TTS 2 响应采样格式无效")
+                            return None
+                        first_audio_at: float | None = None
+                        pcm = bytearray()
+                        async for chunk in response.content.iter_chunked(64 * 1024):
+                            if not chunk:
+                                continue
+                            if first_audio_at is None:
+                                first_audio_at = loop.time()
+                            pcm.extend(chunk)
+                        try:
+                            wav = self._breeze_pcm16_to_wav(bytes(pcm), sample_rate)
+                        except ValueError as exc:
+                            logger.error(
+                                "Breeze TTS 2 返回无效 PCM: "
+                                f"error_type={type(exc).__name__}"
+                            )
+                            return None
+                        completed_at = loop.time()
+                        logger.info(
+                            "Breeze TTS 2 调用完成: "
+                            f"segment={kwargs.get('segment_index', 1)}/"
+                            f"{kwargs.get('segment_count', 1)}, "
+                            f"first_audio_ms={round(((first_audio_at or completed_at) - started_at) * 1000)}, "
+                            f"total_ms={round((completed_at - started_at) * 1000)}, "
+                            f"busy_retries={busy_retries}, pcm_bytes={len(pcm)}"
+                        )
+                        return wav
+                await asyncio.sleep(min(0.5, max(0.0, deadline - loop.time())))
+
+        try:
+            shared_session = kwargs.get("_http_session")
+            if shared_session is not None:
+                return await receive_audio(shared_session)
+            timeout = aiohttp.ClientTimeout(total=float(self.timeout))
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                return await receive_audio(session)
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            logger.error("Breeze TTS 2 请求超时")
+            return None
+        except Exception as exc:
+            logger.error(
+                "Breeze TTS 2 调用异常: "
                 f"error_type={type(exc).__name__}"
             )
             return None
@@ -1904,6 +2144,23 @@ class TTSService(BaseService):
                     f"error_type={type(exc).__name__}"
                 )
                 return None
+        elif backend == "breeze_tts2":
+            ref_wav_path = str(server_config.get("refer_wav_path") or "").strip()
+            if not ref_wav_path or not self._validate_main_ref_duration(ref_wav_path):
+                return None
+            try:
+                call_kwargs["reference_audio_bytes"] = await asyncio.to_thread(
+                    self._read_reference_audio,
+                    ref_wav_path,
+                )
+            except asyncio.CancelledError:
+                raise
+            except OSError as exc:
+                logger.error(
+                    "读取 Breeze 参考音频失败: "
+                    f"error_type={type(exc).__name__}"
+                )
+                return None
 
         # One lock covers the complete outward expression. vLLM-Omni may batch
         # its internal transport segments, but two visible expressions never mix.
@@ -2002,12 +2259,16 @@ class TTSService(BaseService):
                     )
                 return results
 
-            if backend == "vllm_omni":
+            if backend in {"vllm_omni", "breeze_tts2"}:
                 base_url = str(server_config["url"]).rstrip("/")
                 if not await self._ensure_server_alive(base_url):
                     return None
                 connector = aiohttp.TCPConnector(
-                    limit=max(1, int(self._config.tts.segment_concurrency))
+                    limit=(
+                        max(1, int(self._config.tts.segment_concurrency))
+                        if backend == "vllm_omni"
+                        else 1
+                    )
                 )
                 timeout = aiohttp.ClientTimeout(total=self.timeout)
                 async with aiohttp.ClientSession(

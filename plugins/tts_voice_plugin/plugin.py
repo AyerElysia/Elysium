@@ -24,9 +24,9 @@ class TTSVoicePlugin(BasePlugin):
 
     plugin_name: str = "tts_voice_plugin"
     plugin_description: str = (
-        "本地消息文本转语音插件；支持 GPT-SoVITS api_v2 与 IndexTTS2.5 + vLLM-Omni"
+        "本地消息文本转语音插件；支持 GPT-SoVITS、IndexTTS2.5 与 Breeze TTS 2"
     )
-    plugin_version: str = "3.3.0"
+    plugin_version: str = "3.4.0"
 
     configs = [TTSVoiceConfig]
 

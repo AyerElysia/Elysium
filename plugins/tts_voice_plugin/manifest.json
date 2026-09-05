@@ -1,7 +1,7 @@
 {
   "name": "tts_voice_plugin",
-  "version": "3.3.0",
-  "description": "本地消息文本转语音插件；支持 GPT-SoVITS api_v2 与 IndexTTS2.5 + vLLM-Omni",
+  "version": "3.4.0",
+  "description": "本地消息文本转语音插件；支持 GPT-SoVITS、IndexTTS2.5 与 Breeze TTS 2",
   "author": "Elysium",
   "license": "AGPL-v3.0",
   "dependencies": {
