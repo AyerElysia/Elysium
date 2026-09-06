@@ -104,7 +104,7 @@ final class CommandLedger {
         }
     }
 
-    private static String fingerprint(JsonObject command) {
+    static String fingerprint(JsonObject command) {
         String canonical = GSON.toJson(canonicalize(command));
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");

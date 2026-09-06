@@ -10,6 +10,7 @@ import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.BiConsumer;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.util.Mth;
@@ -27,6 +28,7 @@ final class ControlExecutor {
             "observation.wait",
             "player.respawn");
     private static final Set<String> BARITONE_OPERATIONS = Set.of(
+            "task.start", "task.status", "task.cancel",
             "navigation.follow",
             "navigation.goto",
             "navigation.stop",
@@ -34,11 +36,25 @@ final class ControlExecutor {
 
     private final Minecraft client;
     private final Map<KeyMapping, Integer> pulseReleases = new IdentityHashMap<>();
+    private final NativeTaskEngine tasks;
+    private BiConsumer<String, JsonObject> eventPublisher;
 
     /** Bind control execution to the singleton Minecraft client. */
     ControlExecutor(Minecraft client) {
         this.client = client;
+        tasks = new NativeTaskEngine(new NativeTaskBackend(client), (kind, payload) -> {
+            if (eventPublisher == null) {
+                throw new IllegalStateException("body event publisher is not connected");
+            }
+            eventPublisher.accept(kind, payload);
+        });
     }
+
+    void setEventPublisher(BiConsumer<String, JsonObject> publisher) {
+        eventPublisher = publisher;
+    }
+
+    JsonObject taskSnapshot() { return tasks.snapshot(); }
 
     /** Return every operation implemented by this bridge build. */
     Set<String> operations() {
@@ -56,11 +72,20 @@ final class ControlExecutor {
 
     /** Execute one validated operation and return dispatch facts. */
     JsonObject execute(String operation, JsonObject parameters) {
+        if (tasks.ownsBody() && !Set.of("task.start", "task.status", "task.cancel",
+                "chat.send", "observation.wait", "control.release_all", "navigation.stop")
+                .contains(operation)) {
+            throw new IllegalStateException("body gate is occupied by a high-level task");
+        }
         return switch (operation) {
+            case "task.start" -> tasks.start(parameters);
+            case "task.status" -> tasks.status(parameters);
+            case "task.cancel" -> tasks.cancel(parameters, parameters.has("reason")
+                    ? OperationContracts.requiredString(parameters, "reason") : "controller cancelled");
             case "movement.input" -> nativeInput(parameters);
             case "navigation.goto" -> navigationGoto(parameters);
             case "navigation.follow" -> navigationFollow(parameters);
-            case "navigation.stop" -> navigationStop();
+            case "navigation.stop" -> interrupt("navigation.stop");
             case "world.mine" -> mine(parameters);
             case "interaction.attack" -> pulse("attack");
             case "interaction.use" -> pulse("use");
@@ -69,7 +94,7 @@ final class ControlExecutor {
             case "observation.wait" -> waitForObservation();
             case "chat.send" -> sendChat(OperationContracts.requiredString(parameters, "message"));
             case "player.respawn" -> respawn();
-            case "control.release_all" -> releaseAll("command");
+            case "control.release_all" -> interrupt("command");
             default -> throw new IllegalArgumentException("Unsupported operation: " + operation);
         };
     }
@@ -84,11 +109,13 @@ final class ControlExecutor {
             }
             return false;
         });
+        tasks.tick();
     }
 
     /** Release all bridge-managed controls and stop Baritone pathing. */
     JsonObject interrupt(String reason) {
         JsonObject facts = releaseAll(reason);
+        tasks.stop(reason);
         try {
             executeBaritoneCommand("stop");
             facts.addProperty("baritone_stop_dispatched", true);
