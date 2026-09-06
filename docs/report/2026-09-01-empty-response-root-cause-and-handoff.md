@@ -26,7 +26,7 @@
 - `memory_witness` 行 `metadata={"witness_state_mirror": true}`，**无任何现行代码写入**，是 8-12 迁移遗留的孤儿镜像。
 - **真实游标**在 `memory.db` 的 `memory_witness_state.last_sequence`：实测每轮恰好 +40，
   `last_error=''`，真实落后约 6.3 万条，吞吐 480/h vs 产生 74/h，**正在收敛**。
-- ⇒ 据此提出的"停掉 memory_witness"方案**已撤销**，那会停掉一个自愈中的健康功能。
+- ⇒ 当日空响应与 witness 积压无关，因此**不能**把停掉 memory_witness 当作空响应的修复。2026-09-06 因 oversized occurrence 窗口无法规划，操作者退役了该 worker；见 [记忆见证意识退役_2026-09-06](./记忆见证意识退役_2026-09-06.md)。空响应诊断不变。
 
 ### 推翻二：「event_bus 超时导致空响应」
 - 我把 `message_collector` 的 facts/context 后台化后，event_bus 超时

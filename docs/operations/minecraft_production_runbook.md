@@ -1,14 +1,40 @@
 # Minecraft 生产运行手册
 
+## 独立插件启用与配置迁移
+
+Minecraft 现在由 `plugins/minecraft` 独立插件持有，配置为
+`config/plugins/minecraft/config.toml` 的 `[settings]`；life_engine 只作为共享意识与经历基底。
+插件加载本身不启动游戏。旧部署先执行（均从仓库根目录运行）：
+
+```bash
+uv run --frozen --no-sync python -m plugins.minecraft.config_migration
+uv run --frozen --no-sync python -m plugins.minecraft.config_migration --apply
+```
+
+第一条只读检查；第二条先备份原文件为
+`config/plugins/life_engine/config.toml.minecraft-migration.bak`（0600），
+将 `[minecraft]` 原值迁为新文件 `[settings]`，旧
+`history_retrieval.minecraft_max_result_bytes` 迁为 `settings.evidence_max_result_bytes`。
+其他配置逐值校验不变；已有不同的新配置或不同备份会明确报冲突，不能覆盖。
+重复执行已完成的迁移无副作用。迁移不改端口、账号、令牌路径、主体文件或历史记录。
+
+回滚需先由用户手动停止 Elysium：保留当前新旧配置以便审计，切回相匹配的旧代码后，
+从上述备份逐字节恢复旧 life_engine 配置，并将独立插件配置留档。若迁移后其他配置已被
+编辑，不要用备份覆盖那些新改动，应核对并仅恢复游戏配置段。历史账本无需回滚。
+
+最后由用户手动重启完整 Elysium；本次结构升级不要只热重载 life_engine，以免游戏会话
+仍引用旧的共享服务。验收插件列表应出现 `minecraft`，正式工具完整签名为
+`minecraft:tool:nucleus_minecraft`，控制台仍使用原 `/console/api/v1/minecraft` 路径。
+
 ## 当前支持范围
 
 生产默认身体是 `bot`：一个由 Elysium 会话独占生命周期的 Mineflayer 玩家加入用户已经打开的局域网世界。它拥有独立游戏身份、结构化观察、游戏聊天、高层任务、终态事件和哈希证据链，不占用用户的窗口、键鼠或视角，适合“爱莉和我一起玩”。
 
 `biomimetic` 是可选实验身体，使用 DXcam 与 Windows 原生输入。它依赖唯一的前台 Minecraft 窗口，不能与人同时争用同一桌面的键鼠，也不能在旧 sidecar 仍运行时启动新实例。只有明确进行仿生实验时才应显式选择它；普通陪玩保持 `default_body = "bot"`。
 
-`agent` 是可见的 NeoForge 1.21.1 客户端路线：Elysium Bridge 0.2.1 主动连接 WSL，Baritone 提供导航，并能把自己的第一人称画面直接交给多模态模型。需要“爱莉自己的眼睛”或 OBS 捕获她的视角时显式选择 `agent`；它不是共享桌面上陪玩场景的默认值。
+`agent` 是可见的 NeoForge 1.21.1 客户端路线：共享世界使用 Elysium Bridge 0.3.0 主动连接 WSL，Baritone 提供导航，并能把自己的第一人称画面直接交给多模态模型。需要“爱莉自己的眼睛”或 OBS 捕获她的视角时显式选择 `agent`；它不是共享桌面上陪玩场景的默认值。
 
-## 固定环境
+## 旧独占单人模式的固定环境（非共享 native profile）
 
 - Minecraft：1.21.1
 - NeoForge：21.1.219
@@ -22,7 +48,22 @@
 
 版本、文件名和摘要属于同一部署契约。只替换 JAR 而不更新锁文件、配置、测试和真实验收会被启动前检查拒绝。
 
-## 首次部署或升级
+## 新共享 native agent profile
+
+共享 `agent` 使用隔离的 `G:\Game\Minecraft\ElysiaClient`，不得复用人类游戏目录或
+账号。对应启动脚本为该目录内的 `LaunchElysia.bat`，默认认证监听
+`ws://127.0.0.1:18768/elysium`，令牌文件位于该 profile 的 `config/elysium_bridge.json`。
+`agent_expected_bridge_version = "0.3.0"`，JAR 为 `elysium_bridge-0.3.0.jar`，
+本次构建 SHA-256 为 `02765CCD262ADAE3DA2D6EE9AC2323E5B151F20773FF3687D3C73D5DD108AEFE`。
+这些设置与旧单人模式的 0.2.1 锁文件不能混用。
+
+预检核对独立 game directory、用户名、offline UUID、完整启动参数、JAR 摘要和令牌
+路径；连接 hello 再核对同一账号与目录。共享 agent 只接受原生 render-target 帧，
+不以人类窗口截图降级。已有旧配置迁移会保留其原值，因此必须另行核对旧 18765
+监听和人类目录 token 路径；不要把配置搬家当成完成了 native 环境升级。
+当前 profile 的真实联机、聊天、视觉和持续任务仍须现场验收。
+
+## 旧独占单人模式部署脚本（非共享 profile 升级入口）
 
 所有脚本都会校验精确的托管目录。游戏正在运行时，它们会拒绝修改模组，不会自行关闭游戏。
 
@@ -51,10 +92,10 @@
 
    脚本只接受托管的 PCL 启动脚本，并保留 `.pre-elysium-quickplay.bak` 备份。最终参数必须包含 `--quickPlaySingleplayer "Elysian Realm"`。
 
-4. 在 `config/plugins/life_engine/config.toml` 中启用：
+4. 在 `config/plugins/minecraft/config.toml` 中启用：
 
    ```toml
-   [minecraft]
+   [settings]
    enabled = true
    default_body = "bot"
    world_name = "Elysian Realm"
@@ -64,6 +105,7 @@
    require_quick_play = true
    expected_bridge_version = "0.2.1"
    shared_world_enabled = true
+   offline_username = "AyerElysia"
    agent_shared_username = "Elysia"
    consciousness_enabled = true
    consciousness_task_name = "agent"
@@ -86,7 +128,7 @@
 
 ## 专属 Minecraft 意识、共享世界与原生视觉
 
-- `shared_world_enabled = true`（默认）时，agent 身体不再进入本地单人世界，而是通过自动生成的 `LaunchElysiaShared.bat` 以 `--quickPlayMultiplayer "<WSL网关>:<bot_server_port>"` 直连人类玩家开放的局域网世界；游戏内用户名为 `agent_shared_username`（默认 `Elysia`，必须与人类玩家区分）。
+- `shared_world_enabled = true`（默认）时，agent 使用预先准备并验证的独立 profile 启动脚本，以 `--quickPlayMultiplayer "127.0.0.1:<bot_server_port>"` 连接 Windows 本地共享世界（显式远程 host 按配置）；不再克隆人类 PCL 脚本生成 `LaunchElysiaShared.bat`。游戏用户名为 `agent_shared_username`，必须与人类玩家区分。
 - 该模式下 preflight 跳过单人世界与 `--quickPlaySingleplayer` 校验（改为共享世界语义）。
 - 身体完成预检和 playable 判定后，session 启动独立 `minecraft` 意识实例。它不是核心 heartbeat 的“加速模式”：核心 heartbeat 始终保持原周期和原载荷，专属实例拥有自己的串行模型轮次、Presence、phase、失败退避、session 上限与停止信号。
 - 她拥有自己的客户端窗口，即她自己的眼睛：每个专属意识轮次调用 `session.grab_vision_frame_bytes()` 截取第一人称 JPEG，并作为原生 `Image` part 直接进入多模态请求，不做文字转述。无窗口可截时（如 bot 身体）保留结构化观察并显式没有像素；不会伪造画面。
@@ -107,7 +149,7 @@ bot 身体用于和人一起玩同一个世界：人类用自己的客户端进�
    npm ci
    ```
 
-2. 在 `config/plugins/life_engine/config.toml` 的 `[minecraft]` 段配置目标世界：
+2. 在 `config/plugins/minecraft/config.toml` 的 `[settings]` 段配置目标世界：
 
    ```toml
    bot_server_host = "auto"
@@ -144,7 +186,7 @@ bot 观察 facts 与 `StateCollector` 结构对齐（world/player/players/entiti
 
 ## 启动与就绪语义
 
-`nucleus_minecraft` 只有在 `minecraft.enabled=true` 时暴露。Minecraft session 由 `LifeEngineService` 独立持有，不依赖 Learning 是否启用。
+`nucleus_minecraft` 只有在独立插件的 `settings.enabled=true` 时暴露。Minecraft session 由 `MinecraftService` 独立持有，不依赖 Learning 是否启用；LifeEngineService 不再持有游戏会话。
 
 `start` 成功必须同时满足：
 
@@ -202,6 +244,7 @@ PYTHONPATH=. uv run --frozen --no-sync python \
 - 高层任务长期无终态：BodyGate 在默认 180 秒技术截止触发取消并记录 `timed_out` 失败；不得把超时写成完成，也不得在旧任务仍占有身体时并发启动第二个任务。
 - 模组崩溃：以 crash report 的首个业务栈为准，只隔离有直接证据的模组，并保留可恢复副本。不要批量禁用模组。
 - `Minecraft subject projection byte count does not match its text`：这表示身体尚未启动，主体投影的正文与元数据不再逐字节一致。消费端必须保留快照原始 UTF-8（包括渲染器固定写入的末尾换行），再校验 `delivered_bytes` 与 `projection_sha256`；不得对正文 `strip()` 后比较，也不得跳过该 fail-closed 门。修复后需要用户手动重启 Elysium，再重新执行 `start`。
+- `Minecraft subject context binding failed: projection manifest profile is incompatible`：先只读检查选定 `runtime_states` 中 `router_context_projection.version` 的 MC 版本键及 `budget.max_bytes`。2026-09-06 真实启动发现旧键未隔离预算，16 KiB 缓存阻断了 8 KiB 配置。修复后的新键为 `minecraft.bytes-8192.v1-<digest>`，旧键保持原样；兼容的旧快照经过完整校验后无损采用，不兼容预算通过既有生成链另建版本。不要删除旧版本、篡改 manifest 或关闭身份校验。加载修复仍由用户手动重启 Elysium。
 - life_chatter 后缀突然变大：检查 World 中 `domain=minecraft/predicate=embodied_trace` 的 value schema。新记录必须是 8 KiB 内的 `minecraft.embodied_trace_projection.v1`；若看到完整 `payload.context`、`transient_world_perception` 或 `recent_subconscious_context`，这是旧递归投影或新的边界违约证据。不要删除或重写历史数据库；保留原文并交由 World owner 做有来源隔离、分页或 superseding projection。
 
 2026-08-04 的真实启动发现 `InventoryProfilesNext 2.2.5`/`libIPN 6.6.3` 在渲染阶段自身空指针崩溃。已验证构建可用以下脚本做精确、可恢复隔离：
