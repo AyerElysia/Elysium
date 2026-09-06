@@ -9,12 +9,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from plugins.life_engine.minecraft.embodiment_contracts import (
+from plugins.minecraft.embodiment_contracts import (
     EmbodiedIntent,
     PerceptionReference,
 )
-from plugins.life_engine.minecraft.embodiment_trace import EmbodimentTrace
-from plugins.life_engine.minecraft.trace_projection import (
+from plugins.minecraft.embodiment_trace import EmbodimentTrace
+from plugins.minecraft.trace_projection import (
     WORLD_TRACE_RECEIPT_MAX_BYTES,
     TraceProjectionError,
     build_world_trace_receipt,

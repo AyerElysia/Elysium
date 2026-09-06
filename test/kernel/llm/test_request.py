@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from collections.abc import AsyncIterator
+from datetime import datetime
 from typing import Any
 
 import pytest
@@ -691,6 +692,12 @@ class TestLLMRequestSend:
             == hashlib.sha256(suffix.encode("utf-8")).hexdigest()
         )
         assert suffix not in repr(receipt)
+        assert response.final_request_id
+        assert response.final_attempt_id
+        assert datetime.fromisoformat(response.final_completed_at).tzinfo is not None
+        completed_at = response.final_completed_at
+        await response
+        assert response.final_completed_at == completed_at
 
     async def test_send_reports_registered_context_trim_fail_closed(
         self,
@@ -774,6 +781,14 @@ class TestLLMRequestSend:
         monkeypatch,
     ) -> None:
         delivery_id = "delivery-final-attempt"
+        generated_ids: list[tuple[str, str]] = []
+
+        def new_id(prefix: str) -> str:
+            value = f"{prefix}_{len(generated_ids)}"
+            generated_ids.append((prefix, value))
+            return value
+
+        monkeypatch.setattr("src.kernel.llm.request.new_trajectory_id", new_id)
         suffix = f"<delivery>{delivery_id}</delivery>\n" + ("x" * 500)
         first = {**mock_model_set[0], "max_retry": 0, "context_tokens": 900}
         second = {**mock_model_set[1], "max_retry": 0, "context_tokens": 120}
@@ -803,6 +818,9 @@ class TestLLMRequestSend:
         receipt = response.effective_context_receipt(delivery_id)
 
         assert response.message == "ok"
+        assert response.final_request_id == [v for p, v in generated_ids if p == "req"][-1]
+        assert response.final_attempt_id == [v for p, v in generated_ids if p == "attempt"][-1]
+        assert len([v for p, v in generated_ids if p == "attempt"]) == 2
         assert receipt is not None
         assert receipt.exact_present is False
         assert receipt.effective_utf8_bytes is not None

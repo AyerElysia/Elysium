@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from plugins.life_engine.core.chatter import LifeChatter
+from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.initiative.contracts import (
     InitiativeOutreachCommand,
     InitiativeOutreachDeliveryReceipt,
@@ -62,7 +63,10 @@ def _view() -> InitiativeSeedView:
 
 def test_heartbeat_nucleus_pool_exposes_only_unified_proactive_tools() -> None:
     service = LifeEngineService.__new__(LifeEngineService)
-    names = {tool.tool_name for tool in service._get_nucleus_tools()}
+    names = {
+        getattr(tool, "tool_name", None) or getattr(tool, "action_name", "")
+        for tool in service._get_nucleus_tools()
+    }
     assert {
         "nucleus_proactive_query",
         "nucleus_proactive_command",
@@ -561,6 +565,7 @@ async def test_outreach_wake_failure_preserves_durable_inbox_before_volatile_wak
 @pytest.mark.asyncio
 async def test_surface_reencounter_queues_bounded_subject_projection_without_action_rule() -> None:
     service = LifeEngineService.__new__(LifeEngineService)
+    service.plugin = SimpleNamespace(config=LifeEngineConfig())
     service._state = LifeEngineState()
     queued = []
     receipts: list[dict[str, object]] = []
@@ -638,6 +643,7 @@ def test_large_seed_content_is_exactly_resumable_and_utf8_bounded() -> None:
 @pytest.mark.asyncio
 async def test_existing_durable_reencounter_repairs_receipt_without_requeue() -> None:
     service = LifeEngineService.__new__(LifeEngineService)
+    service.plugin = SimpleNamespace(config=LifeEngineConfig())
     service._state = LifeEngineState()
     receipts: list[dict[str, object]] = []
 

@@ -756,7 +756,7 @@ async def test_context_checkpoint_install_resumes_with_user_control_frame(
         )
         return True, True
 
-    def fake_install_checkpoint(target):
+    async def fake_install_checkpoint(target):
         target.payloads = [
             LLMPayload(ROLE.USER, Text("仍待处理的当前消息")),
             LLMPayload(ROLE.ASSISTANT, Text("主体亲自写下的连续性检查点")),
@@ -996,6 +996,7 @@ def test_life_chatter_snapshot_compaction_keeps_payload_when_over_budget() -> No
 async def test_life_chatter_snapshot_save_failure_does_not_mutate_runtime(
     tmp_path, monkeypatch, failure_stage
 ) -> None:
+    LifeChatter.reset_global_runtime()
     config = LifeEngineConfig()
     config.settings.workspace_path = str(tmp_path)
     config.chatter.rolling_context_snapshot_char_budget = 1_000
@@ -1013,23 +1014,25 @@ async def test_life_chatter_snapshot_save_failure_does_not_mutate_runtime(
     original_contents = [payload.content for payload in original_payloads]
 
     compactable_response = SimpleNamespace(payloads=list(payloads))
-    result = chatter._maybe_compact_runtime_context(compactable_response)
-    assert result.triggered is False
+    result = await chatter._maybe_compact_runtime_context(compactable_response)
+    assert result is None
     assert compactable_response.payloads == payloads
 
     if failure_stage == "mkdir":
         monkeypatch.setattr(Path, "mkdir", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("mkdir")))
     elif failure_stage == "write":
-        monkeypatch.setattr(Path, "write_text", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("write")))
+        monkeypatch.setattr(Path, "open", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("write")))
     else:
         monkeypatch.setattr(chatter_module.os, "replace", lambda *_args: (_ for _ in ()).throw(OSError("replace")))
 
-    await chatter._save_rolling_context_snapshot(response)
+    with pytest.raises(RuntimeError, match="RollingContextSnapshotSaveFailed"):
+        await chatter._save_rolling_context_snapshot(response)
 
     assert response.payloads is original_list
     assert response.payloads == original_payloads
     assert all(actual is expected for actual, expected in zip(response.payloads, original_payloads, strict=True))
     assert all(payload.content is content for payload, content in zip(response.payloads, original_contents, strict=True))
+    LifeChatter.reset_global_runtime()
 
 
 async def test_life_chatter_global_runtime_is_reused(monkeypatch) -> None:
@@ -1244,7 +1247,7 @@ async def _drive_router_false_case(
     monkeypatch.setattr(chatter, "_build_dynamic_context_text", no_dynamic_context)
     monkeypatch.setattr(chatter, "flush_unreads", flush_unreads)
     monkeypatch.setattr(chatter, "_await_model_turn", immediate_model_turn)
-    monkeypatch.setattr(chatter, "_maybe_compact_runtime_context", lambda _response: None)
+    monkeypatch.setattr(chatter, "_maybe_compact_runtime_context", _skip_snapshot_save)
     monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", _skip_snapshot_save)
     monkeypatch.setattr(
         "src.kernel.concurrency.get_watchdog",
@@ -2843,7 +2846,7 @@ async def test_initiative_outreach_claims_before_send_and_commits_exact_terminal
 
     monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
     monkeypatch.setattr(chatter, "run_tool_call", fake_run_tool_call)
-    monkeypatch.setattr(chatter, "_maybe_compact_runtime_context", lambda _response: None)
+    monkeypatch.setattr(chatter, "_maybe_compact_runtime_context", _skip_snapshot_save)
     monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", _skip_snapshot_save)
     monkeypatch.setattr(
         "src.kernel.concurrency.get_watchdog",
@@ -2925,7 +2928,7 @@ async def test_life_chatter_delivery_unknown_ends_turn_without_retry(
 
     monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
     monkeypatch.setattr(chatter, "run_tool_call", fake_run_tool_call)
-    monkeypatch.setattr(chatter, "_maybe_compact_runtime_context", lambda _response: None)
+    monkeypatch.setattr(chatter, "_maybe_compact_runtime_context", _skip_snapshot_save)
     monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", _skip_snapshot_save)
     monkeypatch.setattr(
         "src.kernel.concurrency.get_watchdog",
@@ -3015,7 +3018,7 @@ async def test_life_chatter_terminal_platform_failure_ends_turn(
 
     monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
     monkeypatch.setattr(chatter, "run_tool_call", fake_run_tool_call)
-    monkeypatch.setattr(chatter, "_maybe_compact_runtime_context", lambda _response: None)
+    monkeypatch.setattr(chatter, "_maybe_compact_runtime_context", _skip_snapshot_save)
     monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", _skip_snapshot_save)
     monkeypatch.setattr(
         "src.kernel.concurrency.get_watchdog",

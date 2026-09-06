@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-import plugins.life_engine.minecraft.win_bridge as win_bridge_module
-from plugins.life_engine.minecraft.win_bridge import WinBridge, WindowsBridgeError
+import plugins.minecraft.win_bridge as win_bridge_module
+from plugins.minecraft.win_bridge import WinBridge, WindowsBridgeError
 
 
 def test_existing_wsl_interop_needs_no_registration(

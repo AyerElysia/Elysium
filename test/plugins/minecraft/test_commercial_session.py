@@ -9,13 +9,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-import plugins.life_engine.minecraft.session as session_module
-from plugins.life_engine.minecraft.consciousness import (
+import plugins.minecraft.session as session_module
+from plugins.minecraft.consciousness import (
     MinecraftConsciousnessDecision,
     MinecraftConsciousnessTurnContext,
     MinecraftTaskDirective,
 )
-from plugins.life_engine.minecraft.embodiment_contracts import (
+from plugins.minecraft.embodiment_contracts import (
     ActionCommand,
     ActionReceipt,
     EmbodiedIntent,
@@ -25,9 +25,9 @@ from plugins.life_engine.minecraft.embodiment_contracts import (
     WorldObservation,
     utc_now,
 )
-from plugins.life_engine.minecraft.launcher import LaunchResult, MCConfig
-from plugins.life_engine.minecraft.session import MinecraftSession
-from plugins.life_engine.minecraft.trace_projection import (
+from plugins.minecraft.launcher import LaunchResult, MCConfig
+from plugins.minecraft.session import MinecraftSession
+from plugins.minecraft.trace_projection import (
     WORLD_TRACE_RECEIPT_MAX_BYTES,
     world_trace_receipt_size,
 )
@@ -45,6 +45,7 @@ _RECENT_CONTEXT_REQUEST = {
 def _body_only_config(**kwargs: Any) -> MCConfig:
     """Keep legacy body tests separate from the new scene-runtime contract."""
 
+    kwargs.setdefault("shared_world_enabled", False)
     return MCConfig(consciousness_enabled=False, **kwargs)
 
 
@@ -516,6 +517,7 @@ async def test_dedicated_consciousness_runs_observe_decide_act_without_chat(
     config = MCConfig(
         mc_home=tmp_path,
         bridge_ready_timeout_seconds=1,
+        shared_world_enabled=False,
         consciousness_retry_base_seconds=0.01,
         consciousness_retry_max_seconds=0.02,
     )
@@ -615,6 +617,7 @@ async def test_pushed_chat_is_durable_then_wakes_dedicated_task_consciousness(
     config = MCConfig(
         mc_home=tmp_path,
         bridge_ready_timeout_seconds=1,
+        shared_world_enabled=False,
         consciousness_retry_base_seconds=0.01,
         consciousness_retry_max_seconds=0.02,
     )
@@ -690,7 +693,7 @@ async def test_subject_binding_failure_happens_before_body_launch(
     launcher = _CountingLauncher()
     session = MinecraftSession(
         workspace=tmp_path,
-        mc_config=MCConfig(mc_home=tmp_path),
+        mc_config=MCConfig(mc_home=tmp_path, shared_world_enabled=False),
         consciousness_registry=ConsciousnessRegistry(),
     )
     session._launcher = launcher

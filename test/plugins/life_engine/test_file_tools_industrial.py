@@ -126,7 +126,10 @@ async def test_write_standing_prompt_commits_selected_store_before_disk(
     )
     (tmp_path / "SOUL.md").write_text("original\n", encoding="utf-8")
 
-    ok, payload = await LifeEngineWriteFileTool(plugin=plugin).execute(
+    tool = LifeEngineWriteFileTool(plugin=plugin)
+    tool._life_source_instance_id = "consciousness-file-industrial"
+    tool._life_source_occurrence_id = "activity:standing-prompt-write"
+    ok, payload = await tool.execute(
         "SOUL.md",
         "next-turn\n",
         reason="prompt must follow the write",
@@ -137,6 +140,8 @@ async def test_write_standing_prompt_commits_selected_store_before_disk(
     assert len(commits) == 1
     assert commits[0]["workspace_relative_path"] == "SOUL.md"
     assert commits[0]["content_bytes"] == b"next-turn\n"
+    assert commits[0]["semantic_actor_id"] == "consciousness-file-industrial"
+    assert commits[0]["semantic_source_id"] == "activity:standing-prompt-write"
     assert (tmp_path / "SOUL.md").read_text(encoding="utf-8") == "next-turn\n"
 
 
@@ -215,7 +220,10 @@ def test_file_tools_are_visible_to_chatter() -> None:
 
 
 def test_heartbeat_and_chat_manifests_include_apply_patch() -> None:
-    names = {cls.tool_name for cls in heartbeat_tool_classes()}
+    names = {
+        getattr(cls, "tool_name", None) or getattr(cls, "action_name", "")
+        for cls in heartbeat_tool_classes()
+    }
     assert "nucleus_apply_patch" in names
     assert "nucleus_glob_file" in names
     chat = set(get_tool_manifest("chat"))

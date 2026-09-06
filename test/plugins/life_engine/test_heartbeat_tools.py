@@ -12,6 +12,10 @@ from plugins.life_engine.learning.learn_tool import (
     NucleusLearnTool,
     learn_call_counts_as_activity,
     normalize_learn_action,
+    read_learning_skill,
+)
+from plugins.life_engine.learning.opportunity_capability import (
+    LearningOpportunityCapability,
 )
 from plugins.life_engine.learning.tools import (
     LEARNING_TOOLS,
@@ -168,6 +172,19 @@ async def test_unknown_heartbeat_tool_fails_closed() -> None:
     assert "未知工具" in str(result)
 
 
+async def test_heartbeat_blocks_non_stewardship_tools_during_compression() -> None:
+    service = LifeEngineService.__new__(LifeEngineService)
+    result, ok = await service._run_heartbeat_tool_call_execution(
+        "nucleus_search_memory",
+        {"query": "anything"},
+        ToolRegistry(),
+        compression_turn_required=True,
+    )
+    assert ok is False
+    assert "author_self_continuity_checkpoint" in str(result)
+    assert "read_context_group" in str(result)
+
+
 def test_heartbeat_tool_prefix_resolves_resident_schema() -> None:
     service = LifeEngineService.__new__(LifeEngineService)
     service.plugin = SimpleNamespace()
@@ -189,28 +206,23 @@ def test_heartbeat_tool_prefix_resolves_resident_schema() -> None:
     assert bare is prefixed
 
 
-async def test_help_reads_packaged_skill_and_seeds_workspace(tmp_path) -> None:
+async def test_help_without_service_fails_and_never_seeds_workspace(tmp_path) -> None:
     tool = NucleusLearnTool(plugin=_plugin(tmp_path))
     dest = tmp_path / LEARNING_SKILL_RELATIVE
     assert not dest.exists()
-    ok, payload = await tool.execute(action="help")
-    assert ok is True
-    assert isinstance(payload, dict)
-    assert "nucleus_learn" in str(payload.get("content") or "")
-    assert dest.is_file()
-    assert payload.get("skill") == "learning"
-    assert "第一人称自我叙事" in str(payload.get("content") or "")
+    ok, result = await tool.execute(action="help")
+    assert ok is False
+    assert "LearningCapabilityUnavailable" in str(result)
+    assert not dest.exists()
 
 
 async def test_help_does_not_overwrite_existing_workspace_skill(tmp_path) -> None:
     dest = tmp_path / LEARNING_SKILL_RELATIVE
     dest.parent.mkdir(parents=True)
     dest.write_text("EXISTING_CUSTOM_SKILL\n", encoding="utf-8")
-    tool = NucleusLearnTool(plugin=_plugin(tmp_path))
-    ok, payload = await tool.execute(action="help")
-    assert ok is True
-    assert isinstance(payload, dict)
+    payload = read_learning_skill(_plugin(tmp_path))
     assert "EXISTING_CUSTOM_SKILL" in str(payload.get("content") or "")
+    assert payload["seeded"] is False
     assert dest.read_text(encoding="utf-8") == "EXISTING_CUSTOM_SKILL\n"
 
 
@@ -228,8 +240,22 @@ async def test_learn_delegates_list_and_legacy_review_name(
         captured.append(("review", dict(kwargs)))
         return True, {"action": "subject_review_status"}
 
+    async def bind_capability(
+        _cls: type[LearningOpportunityCapability],
+        _tool: Any,
+        *,
+        require_writable: bool = False,
+    ) -> SimpleNamespace:
+        del require_writable
+        return SimpleNamespace(opportunity_runtime=None)
+
     monkeypatch.setattr(LifeListInsightsTool, "execute", list_execute)
     monkeypatch.setattr(LifeReviewSubjectDocumentTool, "execute", review_execute)
+    monkeypatch.setattr(
+        LearningOpportunityCapability,
+        "bind",
+        classmethod(bind_capability),
+    )
     tool = NucleusLearnTool(plugin=_plugin(tmp_path))
 
     ok, listed = await tool.execute(action="list_insights", arguments={"limit": 4})
@@ -248,7 +274,23 @@ async def test_learn_delegates_list_and_legacy_review_name(
     assert captured[1][1]["target_path"] == "SOUL.md"
 
 
-async def test_unknown_learn_operation_is_explicit() -> None:
+async def test_unknown_learn_operation_is_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def bind_capability(
+        _cls: type[LearningOpportunityCapability],
+        _tool: Any,
+        *,
+        require_writable: bool = False,
+    ) -> SimpleNamespace:
+        del require_writable
+        return SimpleNamespace(opportunity_runtime=None)
+
+    monkeypatch.setattr(
+        LearningOpportunityCapability,
+        "bind",
+        classmethod(bind_capability),
+    )
     tool = NucleusLearnTool(plugin=_plugin("/tmp/unused"))
     ok, result = await tool.execute(action="invented_operation")
     assert ok is False

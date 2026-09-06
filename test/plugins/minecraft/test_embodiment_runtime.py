@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from plugins.life_engine.minecraft.embodiment_contracts import (
+from plugins.minecraft.embodiment_contracts import (
     ActionCommand,
     ActionReceipt,
     EmbodiedIntent,
@@ -17,12 +17,12 @@ from plugins.life_engine.minecraft.embodiment_contracts import (
     WorldObservation,
     utc_now,
 )
-from plugins.life_engine.minecraft.embodiment_runtime import (
+from plugins.minecraft.embodiment_runtime import (
     BodySelectionError,
     EmbodimentRuntime,
     EvidenceReferenceError,
 )
-from plugins.life_engine.minecraft.embodiment_trace import (
+from plugins.minecraft.embodiment_trace import (
     EmbodimentTrace,
     TraceIntegrityError,
 )

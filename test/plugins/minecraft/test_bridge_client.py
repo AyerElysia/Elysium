@@ -13,13 +13,13 @@ import pytest
 from websockets.asyncio.client import connect
 from websockets.asyncio.server import ServerConnection, serve
 
-from plugins.life_engine.minecraft.bridge_client import (
+from plugins.minecraft.bridge_client import (
     BRIDGE_PROTOCOL,
     BridgeConfig,
     BridgeProtocolError,
     MinecraftBridgeClient,
 )
-from plugins.life_engine.minecraft.embodiment_contracts import (
+from plugins.minecraft.embodiment_contracts import (
     ActionCommand,
     utc_now,
 )

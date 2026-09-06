@@ -6,9 +6,11 @@ import io
 from types import SimpleNamespace
 
 from PIL import Image as PILImage
+import pytest
+from unittest.mock import AsyncMock
 
-from plugins.life_engine.minecraft.capture import Frame
-from plugins.life_engine.minecraft.session import MinecraftSession
+from plugins.minecraft.capture import Frame
+from plugins.minecraft.session import MinecraftSession
 from plugins.life_engine.service.core import LifeEngineService
 
 
@@ -33,10 +35,33 @@ def _bare_session(active: bool, frame: Frame | None) -> MinecraftSession:
     session._state = SimpleNamespace(active=active, body_name="agent")
     session._runtime = object() if active else None
     session._capture = _CaptureStub(frame)
+    session._bridge_client = None
+    session._config = SimpleNamespace(shared_world_enabled=False)
     return session
 
 
 class TestVisionFrameBytes:
+    async def test_shared_native_vision_never_calls_desktop_capture(self) -> None:
+        image = PILImage.new("RGB", (32, 16))
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        session = _bare_session(active=True, frame=None)
+        session._config.shared_world_enabled = True
+        session._bridge_client = SimpleNamespace(
+            capabilities=("vision.capture",), capture_frame=AsyncMock(return_value=buffer.getvalue()),
+        )
+        session._capture = SimpleNamespace(
+            grab_consciousness_frame=AsyncMock(side_effect=AssertionError("human window queried")),
+        )
+        assert (await session.grab_vision_frame_bytes()).startswith(b"\xff\xd8")
+        session._capture.grab_consciousness_frame.assert_not_awaited()
+
+    async def test_shared_native_vision_without_own_frame_fails_explicitly(self) -> None:
+        session = _bare_session(active=True, frame=None)
+        session._config.shared_world_enabled = True
+        with pytest.raises(RuntimeError, match="authenticated render-target"):
+            await session.grab_vision_frame_bytes()
+
     async def test_active_session_returns_jpeg_bytes(self) -> None:
         image = PILImage.open(io.BytesIO(_jpeg_bytes()))
         frame = Frame(image=image, width=image.width, height=image.height)

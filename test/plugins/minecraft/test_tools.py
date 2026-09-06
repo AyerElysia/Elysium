@@ -7,7 +7,7 @@ import json
 from types import SimpleNamespace
 from typing import Any
 
-from plugins.life_engine.minecraft.tools import LifeEngineMinecraftTool
+from plugins.minecraft.tools import MinecraftTool
 from src.core.managers.tool_manager.tool_use import ToolUse
 from src.core.utils.llm_tool_call import exec_llm_usable
 
@@ -29,7 +29,7 @@ class _Session:
         return {"success": True, "observation": {"sequence": len(self.calls)}}
 
 
-def _bind_turn(tool: LifeEngineMinecraftTool, turn_key: str) -> None:
+def _bind_turn(tool: MinecraftTool, turn_key: str) -> None:
     tool._bind_runtime_context(
         stream_id="feishu.private.mc",
         message=SimpleNamespace(
@@ -45,11 +45,11 @@ async def test_tool_consumes_service_owned_session_without_learning_scheduler() 
     session = _Session()
     plugin = SimpleNamespace(
         service=SimpleNamespace(
-            minecraft_session=session,
+            session=session,
             _learning_scheduler=None,
         )
     )
-    tool = LifeEngineMinecraftTool(plugin=plugin)
+    tool = MinecraftTool(plugin=plugin)
 
     success, payload = await tool.execute(action="preflight", body_name="agent")
     result = json.loads(payload)
@@ -64,8 +64,8 @@ async def test_tool_reports_disabled_session_without_private_scheduler_fallback(
 ):
     """Missing public session ownership is a diagnosable disabled state."""
 
-    plugin = SimpleNamespace(service=SimpleNamespace(minecraft_session=None))
-    tool = LifeEngineMinecraftTool(plugin=plugin)
+    plugin = SimpleNamespace(service=SimpleNamespace(session=None))
+    tool = MinecraftTool(plugin=plugin)
 
     success, payload = await tool.execute(action="status")
     result = json.loads(payload)
@@ -78,8 +78,8 @@ async def test_status_query_succeeds_when_body_is_inactive() -> None:
     """Inactive is valid status data rather than a tool execution failure."""
 
     session = _Session()
-    plugin = SimpleNamespace(service=SimpleNamespace(minecraft_session=session))
-    tool = LifeEngineMinecraftTool(plugin=plugin)
+    plugin = SimpleNamespace(service=SimpleNamespace(session=session))
+    tool = MinecraftTool(plugin=plugin)
 
     success, payload = await tool.execute(action="status")
 
@@ -98,9 +98,9 @@ async def test_same_turn_semantic_operation_is_replayed_without_reexecution() ->
     """Late chatter follow-ups must not execute the same embodied operation twice."""
 
     session = _Session()
-    plugin = SimpleNamespace(service=SimpleNamespace(minecraft_session=session))
-    first_tool = LifeEngineMinecraftTool(plugin=plugin)
-    replay_tool = LifeEngineMinecraftTool(plugin=plugin)
+    plugin = SimpleNamespace(service=SimpleNamespace(session=session))
+    first_tool = MinecraftTool(plugin=plugin)
+    replay_tool = MinecraftTool(plugin=plugin)
     _bind_turn(first_tool, "stable-unread-turn")
     _bind_turn(replay_tool, "stable-unread-turn")
 
@@ -110,7 +110,7 @@ async def test_same_turn_semantic_operation_is_replayed_without_reexecution() ->
     assert replay == first
     assert session.calls == [("look", {})]
 
-    next_turn_tool = LifeEngineMinecraftTool(plugin=plugin)
+    next_turn_tool = MinecraftTool(plugin=plugin)
     _bind_turn(next_turn_tool, "next-unread-turn")
     await next_turn_tool.execute(action="look")
     assert session.calls == [("look", {}), ("look", {})]
@@ -130,9 +130,9 @@ async def test_concurrent_same_turn_operation_shares_one_execution() -> None:
             return {"success": True, "observation": {"sequence": 7}}
 
     session = BlockingSession()
-    plugin = SimpleNamespace(service=SimpleNamespace(minecraft_session=session))
-    first_tool = LifeEngineMinecraftTool(plugin=plugin)
-    replay_tool = LifeEngineMinecraftTool(plugin=plugin)
+    plugin = SimpleNamespace(service=SimpleNamespace(session=session))
+    first_tool = MinecraftTool(plugin=plugin)
+    replay_tool = MinecraftTool(plugin=plugin)
     _bind_turn(first_tool, "concurrent-unread-turn")
     _bind_turn(replay_tool, "concurrent-unread-turn")
 
@@ -153,10 +153,10 @@ async def test_tool_use_injects_the_owning_plugin_without_public_plugin_argument
     """The production ToolUse path must resolve the service-owned MC session."""
 
     session = _Session()
-    plugin = SimpleNamespace(service=SimpleNamespace(minecraft_session=session))
+    plugin = SimpleNamespace(service=SimpleNamespace(session=session))
     registry = SimpleNamespace(
         get=lambda signature: (
-            LifeEngineMinecraftTool
+            MinecraftTool
             if signature == "life_engine:tool:nucleus_minecraft"
             else None
         )
@@ -185,10 +185,10 @@ async def test_llm_runtime_injects_the_owning_plugin_without_public_plugin_argum
     """The actual chatter execution path constructs the tool with its owner."""
 
     session = _Session()
-    plugin = SimpleNamespace(service=SimpleNamespace(minecraft_session=session))
+    plugin = SimpleNamespace(service=SimpleNamespace(session=session))
 
     success, result = await exec_llm_usable(
-        LifeEngineMinecraftTool,
+        MinecraftTool,
         plugin=plugin,
         kwargs={"action": "preflight", "body_name": "agent"},
     )

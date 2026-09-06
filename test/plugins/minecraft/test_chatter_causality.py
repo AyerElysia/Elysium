@@ -3,6 +3,20 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+import pytest
+from plugins.minecraft.service import MINECRAFT_EXTENSION
+from plugins.life_engine.service.scene_extensions import (
+    register_scene_extension, unregister_scene_extension,
+)
+
+
+@pytest.fixture(autouse=True)
+def minecraft_extension():
+    owner = object()
+    register_scene_extension(owner, MINECRAFT_EXTENSION)
+    yield
+    unregister_scene_extension(owner)
+
 
 from plugins.life_engine.core.chatter import (
     LifeChatter,
@@ -89,7 +103,7 @@ async def test_minecraft_receipt_precedes_same_turn_visible_promise(
     monkeypatch.setattr(
         chatter,
         "_maybe_compact_runtime_context",
-        lambda _response: None,
+        _skip_snapshot_save,
     )
     monkeypatch.setattr(
         chatter,
@@ -119,7 +133,7 @@ async def test_minecraft_receipt_precedes_same_turn_visible_promise(
     assert isinstance(result, Success)
     assert executed == ["tool-nucleus_minecraft"]
     assert "未发送" in str(deferred.value)
-    assert "Minecraft" in str(deferred.value)
+    assert "场景工具回执" in str(deferred.value)
     assert runtime.phase == _Phase.FOLLOW_UP
     assert runtime.sent_visible_reply is False
     assert runtime.must_reply is True

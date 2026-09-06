@@ -262,7 +262,7 @@ async def test_grep_finds_ledger_event_after_runtime_history_is_cleared(
     config.settings.enabled = True
     config.settings.workspace_path = str(tmp_path)
     service = LifeEngineService(SimpleNamespace(config=config))
-    event = service._event_builder.build_dfc_message_event(
+    event = service._event_builder.build_direct_message_event(
         "账本里还有这条",
         stream_id="s-ledger",
     )
@@ -368,7 +368,9 @@ async def test_grep_thought_alias_and_scan_truncated_page(
     config.settings.workspace_path = str(tmp_path)
     service = LifeEngineService(SimpleNamespace(config=config))
     events = [
-        service._event_builder.build_dfc_message_event(f"事件{index}", stream_id="s1")
+        service._event_builder.build_direct_message_event(
+            f"事件{index}", stream_id="s1"
+        )
         for index in range(6)
     ]
     await service._publish_raw_events(events)

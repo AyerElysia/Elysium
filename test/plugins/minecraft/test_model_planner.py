@@ -10,19 +10,19 @@ from typing import Any
 
 import pytest
 
-from plugins.life_engine.minecraft import model_planner as model_planner_module
-from plugins.life_engine.minecraft.embodiment_contracts import (
+from plugins.minecraft import model_planner as model_planner_module
+from plugins.minecraft.embodiment_contracts import (
     EmbodiedIntent,
     PerceptionReference,
     WorldObservation,
     utc_now,
 )
-from plugins.life_engine.minecraft.model_planner import (
+from plugins.minecraft.model_planner import (
     ElysiumModelDecisionSource,
     JsonIntentPlanner,
     PlannerOutputError,
 )
-from plugins.life_engine.minecraft.session import MinecraftSession, SessionState
+from plugins.minecraft.session import MinecraftSession, SessionState
 from src.kernel.llm import EffectiveContextReceipt, Text
 
 

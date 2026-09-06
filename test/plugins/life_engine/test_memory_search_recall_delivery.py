@@ -501,7 +501,8 @@ async def test_heartbeat_binds_stable_source_time_to_search_tool() -> None:
             return True, {"captured": True}
 
     registry = SimpleNamespace(get=lambda name: _CaptureTool if name else None)
-    service = SimpleNamespace(plugin=SimpleNamespace())
+    service = LifeEngineService.__new__(LifeEngineService)
+    service.plugin = SimpleNamespace()
     result, success = await LifeEngineService._run_heartbeat_tool_call_execution(
         service,
         "capture_memory_source",

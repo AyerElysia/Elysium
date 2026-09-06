@@ -54,8 +54,8 @@ class _Catalog:
     async def minecraft_status(self) -> dict:
         return {"kind": "minecraft_status", "available": True, "active": False}
 
-    async def minecraft_preflight(self) -> dict:
-        return {"kind": "minecraft_preflight", "result": {"success": True}}
+    async def minecraft_preflight(self, *, body_name="bot") -> dict:
+        return {"kind": "minecraft_preflight", "body_name": body_name, "result": {"success": True}}
 
     async def minecraft_start(self, **kwargs) -> dict:
         return {"kind": "minecraft_start", "goal": kwargs.get("goal", "")}

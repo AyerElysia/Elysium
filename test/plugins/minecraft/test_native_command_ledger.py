@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 INTEGRATION_ROOT = (
-    Path(__file__).resolve().parents[4] / "integrations" / "windows_native_body"
+    Path(__file__).resolve().parents[3] / "integrations" / "windows_native_body"
 )
 sys.path.insert(0, str(INTEGRATION_ROOT))
 

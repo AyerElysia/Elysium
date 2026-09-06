@@ -13,8 +13,8 @@ from typing import Any
 import pytest
 from PIL import Image as PILImage
 
-import plugins.life_engine.minecraft.consciousness as consciousness_module
-from plugins.life_engine.minecraft.consciousness import (
+import plugins.minecraft.consciousness as consciousness_module
+from plugins.minecraft.consciousness import (
     ElysiumMinecraftDecisionSource,
     MinecraftConsciousnessDecision,
     MinecraftConsciousnessOutputError,
@@ -26,7 +26,7 @@ from plugins.life_engine.minecraft.consciousness import (
     MinecraftTaskDirective,
     build_observation_projection,
 )
-from plugins.life_engine.minecraft.embodiment_contracts import (
+from plugins.minecraft.embodiment_contracts import (
     WorldObservation,
     utc_now,
 )

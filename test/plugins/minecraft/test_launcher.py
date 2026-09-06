@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from plugins.life_engine.minecraft.launcher import MCConfig, MinecraftLauncher
+from plugins.minecraft.launcher import MCConfig, MinecraftLauncher
 
 
 class _ExistingWindowBridge:
@@ -48,7 +48,7 @@ class _TestableLauncher(MinecraftLauncher):
 async def test_launcher_reuses_exact_existing_client(tmp_path: Path) -> None:
     """Starting a session must not create a competing second game client."""
 
-    launcher = MinecraftLauncher(MCConfig(mc_home=tmp_path))
+    launcher = MinecraftLauncher(MCConfig(mc_home=tmp_path, shared_world_enabled=False))
     launcher._bridge = _ExistingWindowBridge()
 
     result = await launcher.launch()
@@ -88,7 +88,7 @@ async def test_installation_requires_exact_quick_play_world(tmp_path: Path) -> N
         '--quickPlaySingleplayer "Other World"',
         encoding="utf-8",
     )
-    launcher = _TestableLauncher(MCConfig(mc_home=tmp_path), script)
+    launcher = _TestableLauncher(MCConfig(mc_home=tmp_path, shared_world_enabled=False), script)
 
     wrong = await launcher.check_installation()
     script.write_text(
@@ -124,6 +124,7 @@ async def test_installation_requires_one_hash_pinned_bridge_and_baritone(
     )
     config = MCConfig(
         mc_home=tmp_path,
+        shared_world_enabled=False,
         expected_bridge_sha256=hashlib.sha256(bridge.read_bytes()).hexdigest(),
         expected_baritone_sha256=hashlib.sha256(baritone.read_bytes()).hexdigest(),
     )
@@ -145,8 +146,8 @@ def test_game_turn_interval_must_be_positive(tmp_path: Path) -> None:
         MCConfig(mc_home=tmp_path, game_turn_interval_seconds=0)
 
 
-def test_prepare_shared_world_bat_points_at_lan_world(tmp_path: Path) -> None:
-    """Shared mode rewrites quick play and the username for her own window."""
+def test_legacy_shared_profile_clone_is_disabled(tmp_path: Path) -> None:
+    """Changing only username can leak human identity and must never prepare a client."""
 
     script = tmp_path / "LaunchElysia.bat"
     script.write_text(
@@ -164,10 +165,6 @@ def test_prepare_shared_world_bat_points_at_lan_world(tmp_path: Path) -> None:
     launcher = MinecraftLauncher(config)
     launcher._wsl_mount_path = lambda _path: script  # test-local mount mapping
 
-    shared = launcher.prepare_shared_world_bat()
-
-    assert str(shared).endswith("LaunchElysiaShared.bat")
-    content = (tmp_path / "LaunchElysiaShared.bat").read_text(encoding="utf-8")
-    assert '--quickPlayMultiplayer "127.0.0.1:25565"' in content
-    assert "--username Elysia" in content
-    assert "--quickPlaySingleplayer" not in content
+    with pytest.raises(RuntimeError, match="cloning the human launch script is disabled"):
+        launcher.prepare_shared_world_bat()
+    assert not (tmp_path / "LaunchElysiaShared.bat").exists()

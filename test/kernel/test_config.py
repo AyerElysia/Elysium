@@ -304,6 +304,49 @@ option2 = 100
             }
         }
 
+    def test_duplicate_toml_section_names_fail_closed(self) -> None:
+        """Two fields mapping to the same TOML table must not write invalid TOML."""
+
+        class DuplicateSectionConfig(ConfigBase):
+            @config_section("learning")
+            class LearningSection(SectionBase):
+                enabled: bool = Field(default=True)
+
+            @config_section("learning")
+            class OpportunitySection(SectionBase):
+                enabled: bool = Field(default=False)
+
+            learning: LearningSection = Field(default_factory=LearningSection)
+            opportunity: OpportunitySection = Field(default_factory=OpportunitySection)
+
+        with pytest.raises(ValueError, match=r"Cannot declare \('learning',\) twice"):
+            DuplicateSectionConfig.default()
+
+    def test_auto_update_recovers_empty_constrained_string(self) -> None:
+        """Empty strings that fail Field constraints must fall back to the default."""
+
+        class TaskConfig(ConfigBase):
+            @config_section("learning")
+            class LearningSection(SectionBase):
+                model_task_name: str = Field(default="learning", min_length=1)
+
+            learning: LearningSection = Field(default_factory=LearningSection)
+
+        temp_dir = tempfile.mkdtemp()
+        try:
+            config_file = Path(temp_dir) / "config.toml"
+            config_file.write_text(
+                '[learning]\nmodel_task_name = ""\n',
+                encoding="utf-8",
+            )
+            cfg = TaskConfig.load(config_file, auto_update=True)
+            assert cfg.learning.model_task_name == "learning"
+            assert 'model_task_name = "learning"' in config_file.read_text(
+                encoding="utf-8"
+            )
+        finally:
+            shutil.rmtree(temp_dir)
+
     def test_configbase_default_with_required_fields(self) -> None:
         """测试存在必填字段时仍可生成默认配置（使用占位值）。"""
 

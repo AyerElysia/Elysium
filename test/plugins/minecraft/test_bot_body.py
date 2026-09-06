@@ -11,20 +11,20 @@ from typing import Any
 
 import pytest
 
-from plugins.life_engine.minecraft.bot_launcher import MinecraftBotLauncher
-from plugins.life_engine.minecraft.bridge_client import (
+from plugins.minecraft.bot_launcher import MinecraftBotLauncher
+from plugins.minecraft.bridge_client import (
     BridgeConfig,
     MinecraftBridgeClient,
 )
-from plugins.life_engine.minecraft.embodiment_contracts import (
+from plugins.minecraft.embodiment_contracts import (
     ActionCommand,
     ActionReceipt,
     WorldObservation,
     utc_now,
 )
-from plugins.life_engine.minecraft.launcher import MCConfig
-from plugins.life_engine.minecraft.session import MinecraftSession
-from plugins.life_engine.minecraft.tools import LifeEngineMinecraftTool
+from plugins.minecraft.launcher import MCConfig
+from plugins.minecraft.session import MinecraftSession
+from plugins.minecraft.tools import MinecraftTool
 
 
 def _body_only_config(**kwargs: Any) -> MCConfig:
@@ -228,7 +228,7 @@ def test_bot_profile_contract() -> None:
 def test_tool_schema_exposes_bot_as_same_world_body() -> None:
     """The formal tool contract lets the model select the shared-world body."""
 
-    body_schema = LifeEngineMinecraftTool.parameters["properties"]["body_name"]
+    body_schema = MinecraftTool.parameters["properties"]["body_name"]
     assert body_schema["enum"] == ["agent", "bot", "biomimetic"]
 
 
