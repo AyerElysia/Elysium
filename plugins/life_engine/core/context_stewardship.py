@@ -76,6 +76,17 @@ ARCHIVE_NAMESPACE = "life_chatter.context_archive"
 HEARTBEAT_ARCHIVE_NAMESPACE = "life_heartbeat.context_archive"
 CHATTER_RUNTIME_KEY = "life_chatter"
 HEARTBEAT_RUNTIME_KEY = "life_heartbeat"
+HEARTBEAT_CHECKPOINT_FEEDBACK_TEXT = (
+    "<context_checkpoint_feedback technical_only=\"true\">\n"
+    "本轮没有工具调用，当前压缩维护尚未完成。"
+    "普通独白不能完成上下文容量维护；已耐久保存的滚动链仍保留，"
+    "本拍待处理经历尚未消费。请根据压缩清单选择释放边界，"
+    "调用 author_self_continuity_checkpoint 并亲自书写 "
+    "continuity_text；需要原文时可先 read_context_group。"
+    "系统不会代写、挑选或删除记忆。若本拍预算内仍未完成，"
+    "维护会保留为未完成，普通安静结束不视为压缩成功。\n"
+    "</context_checkpoint_feedback>"
+)
 CHATTER_ARCHIVE_SUBDIR = "context_archive"
 HEARTBEAT_ARCHIVE_SUBDIR = "heartbeat_context_archive"
 ARCHIVE_MAX_BYTES = 12 * 1024 * 1024
@@ -437,6 +448,20 @@ def is_compression_required_part(part: object) -> bool:
     return _compression_required_part_data(part) is not None
 
 
+def is_context_stewardship_tool_name(call_name: str) -> bool:
+    """Allow only exact-group reads and the subject checkpoint in a compact turn."""
+
+    normalized = str(call_name or "").strip().lower()
+    if normalized.startswith("action-"):
+        normalized = normalized[7:]
+    elif normalized.startswith("tool-"):
+        normalized = normalized[5:]
+    return normalized in {
+        "author_self_continuity_checkpoint",
+        "read_context_group",
+    }
+
+
 def checkpoint_data(payload: LLMPayload) -> dict[str, Any] | None:
     if getattr(payload, "role", None) != ROLE.ASSISTANT:
         return None
@@ -726,8 +751,9 @@ def strip_compression_maintenance_transport(
     Everything after the control is produced while the surface is in its
     maintenance-only mode.  Assistant/tool-result frames there are transport
     for exact-group reads and checkpoint submission, not subject continuity.
-    Real USER frames that arrived during maintenance are preserved verbatim;
-    pinned payloads are preserved as well.  Authoritative activity trajectories
+    Real USER content arriving during maintenance is preserved verbatim; only
+    the exact infrastructure feedback Text part is removed after completion.
+    Pinned payloads are preserved as well. Authoritative activity trajectories
     are not touched by this derived-context helper.
     """
 
@@ -747,11 +773,24 @@ def strip_compression_maintenance_transport(
     semantic_prefix = strip_compression_required_payloads(
         typed[: control_index + 1]
     )
-    preserved_suffix = [
-        payload
-        for payload in typed[control_index + 1 :]
-        if payload.role in {ROLE.SYSTEM, ROLE.TOOL, ROLE.USER}
-    ]
+    preserved_suffix: list[LLMPayload] = []
+    for payload in typed[control_index + 1 :]:
+        if payload.role in {ROLE.SYSTEM, ROLE.TOOL}:
+            preserved_suffix.append(payload)
+        elif payload.role == ROLE.USER:
+            content = list(payload.content or [])
+            retained = [
+                part for part in content
+                if not (
+                    isinstance(part, Text)
+                    and part.text == HEARTBEAT_CHECKPOINT_FEEDBACK_TEXT
+                )
+            ]
+            if retained:
+                preserved_suffix.append(
+                    payload if len(retained) == len(content)
+                    else LLMPayload(ROLE.USER, retained)
+                )
     return [*semantic_prefix, *preserved_suffix]
 
 
@@ -1247,6 +1286,35 @@ def reset_pending_subject_checkpoint(
         _PENDING_CHECKPOINTS.pop(key, None)
 
 
+def get_pending_subject_checkpoint(
+    actor_consciousness_instance_id: str,
+    *,
+    runtime_key: str = CHATTER_RUNTIME_KEY,
+) -> SubjectCheckpointCommand | None:
+    """Read an immutable pending command without spending its commit intent."""
+
+    key = _pending_key(actor_consciousness_instance_id, runtime_key)
+    with _PENDING_LOCK:
+        return _PENDING_CHECKPOINTS.get(key)
+
+
+def acknowledge_subject_checkpoint(
+    command: SubjectCheckpointCommand,
+    *,
+    runtime_key: str = CHATTER_RUNTIME_KEY,
+) -> None:
+    """Remove only the exact command whose resulting snapshot was committed."""
+
+    key = _pending_key(command.actor_consciousness_instance_id, runtime_key)
+    with _PENDING_LOCK:
+        current = _PENDING_CHECKPOINTS.get(key)
+        if current is None:
+            return
+        if current.command_sha256 != command.command_sha256:
+            raise ContextStewardshipError("checkpoint commit intent changed")
+        _PENDING_CHECKPOINTS.pop(key, None)
+
+
 def apply_pending_subject_checkpoint(
     actor_consciousness_instance_id: str,
     payloads: Sequence[LLMPayload],
@@ -1270,18 +1338,13 @@ def apply_pending_subject_checkpoint(
             before_utf8_bytes=before,
             after_utf8_bytes=before,
         )
-    try:
-        prepared = prepare_subject_checkpoint(
-            typed,
-            command,
-            max_checkpoint_bytes=max_checkpoint_bytes,
-            archive_namespace=archive_namespace,
-        )
-    finally:
-        with _PENDING_LOCK:
-            current = _PENDING_CHECKPOINTS.get(key)
-            if current is not None and current.command_sha256 == command.command_sha256:
-                _PENDING_CHECKPOINTS.pop(key, None)
+    prepared = prepare_subject_checkpoint(
+        typed,
+        command,
+        max_checkpoint_bytes=max_checkpoint_bytes,
+        archive_namespace=archive_namespace,
+    )
+    acknowledge_subject_checkpoint(command, runtime_key=runtime_key)
     return ContextStewardshipResult(
         triggered=True,
         payloads=prepared.payloads,
@@ -1302,6 +1365,33 @@ def _archive_payload(record: ContextGroupRecord) -> dict[str, Any]:
         "utf8_bytes": record.utf8_bytes,
         "record": record.record,
     }
+
+
+def write_synced_context_file(path: Path, text: str) -> None:
+    """Atomically replace one context file and sync its bytes and directory.
+
+    Callers own the destination and create its parent first. An exception or
+    cancellation at this boundary must never be treated as a successful save.
+    This helper writes no semantic content of its own.
+    """
+
+    tmp = path.with_suffix(f".tmp-{os.getpid()}-{uuid.uuid4().hex}")
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 async def archive_context_groups(
@@ -1376,18 +1466,7 @@ async def archive_context_groups(
                     "content-addressed local context archive mismatch"
                 )
             continue
-        tmp = path.with_suffix(f".tmp-{os.getpid()}-{uuid.uuid4().hex}")
-        try:
-            await asyncio.to_thread(tmp.write_text, text, encoding="utf-8")
-            await asyncio.to_thread(os.replace, tmp, path)
-        finally:
-            try:
-                await asyncio.to_thread(tmp.unlink, missing_ok=True)
-            except OSError:
-                # A stranded temporary file does not weaken the immutable
-                # content-addressed destination.  A later maintenance pass may
-                # remove it without interpreting subject content.
-                pass
+        await asyncio.to_thread(write_synced_context_file, path, text)
 
 
 async def read_context_group_archive(
@@ -1456,6 +1535,56 @@ async def read_context_group_archive(
     if payload.get("utf8_bytes") != len(encoded):
         raise ContextStewardshipError("context group archive byte metadata mismatch")
     return payload
+
+
+async def verify_subject_checkpoint_archives(
+    payloads: Sequence[LLMPayload],
+    *,
+    actor_consciousness_instance_id: str,
+    service: Any | None,
+    workspace_path: str,
+    namespace: str = ARCHIVE_NAMESPACE,
+    local_subdir: str = CHATTER_ARCHIVE_SUBDIR,
+) -> None:
+    """Verify explicit checkpoint identity and exact refs without authoring text.
+
+    Only the selected surface's archive is consulted. This does not import
+    another instance's private rolling context or traverse semantic memories.
+    """
+
+    checked: set[str] = set()
+    for payload in payloads:
+        checkpoint = checkpoint_data(payload)
+        if checkpoint is None:
+            continue
+        archive = checkpoint.get("exact_archive")
+        refs = checkpoint.get("released_group_refs")
+        text = checkpoint.get("continuity_text")
+        if (
+            checkpoint.get("actor_consciousness_instance_id")
+            != actor_consciousness_instance_id
+            or not isinstance(archive, dict)
+            or archive.get("namespace") != namespace
+            or not isinstance(refs, list)
+            or not refs
+            or archive.get("state_keys") != refs
+            or not isinstance(text, str)
+            or checkpoint.get("continuity_text_sha256") != _sha256_text(text)
+        ):
+            raise ContextStewardshipError("checkpoint identity is invalid")
+        for ref in refs:
+            if not isinstance(ref, str):
+                raise ContextStewardshipError("checkpoint archive ref is invalid")
+            if ref in checked:
+                continue
+            await read_context_group_archive(
+                ref,
+                service=service,
+                workspace_path=workspace_path,
+                namespace=namespace,
+                local_subdir=local_subdir,
+            )
+            checked.add(ref)
 
 
 def _utf8_page(text: str, *, offset_bytes: int, max_bytes: int) -> tuple[str, int, bool]:
@@ -1900,6 +2029,10 @@ def mechanically_bound_payloads(
 
 
 __all__ = [
+    "acknowledge_subject_checkpoint",
+    "get_pending_subject_checkpoint",
+    "verify_subject_checkpoint_archives",
+    "write_synced_context_file",
     "ARCHIVE_NAMESPACE",
     "CHATTER_ARCHIVE_SUBDIR",
     "CHATTER_RUNTIME_KEY",
@@ -1914,6 +2047,7 @@ __all__ = [
     "HEARTBEAT_ARCHIVE_NAMESPACE",
     "HEARTBEAT_ARCHIVE_SUBDIR",
     "HEARTBEAT_RUNTIME_KEY",
+    "HEARTBEAT_CHECKPOINT_FEEDBACK_TEXT",
     "OMISSION_CLOSE",
     "OMISSION_OPEN",
     "PRESSURE_CLOSE",

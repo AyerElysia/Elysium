@@ -13,6 +13,7 @@ from ..memory.boundary_tools import MEMORY_BOUNDARY_TOOLS
 from ..memory.continuity_tools import CONTINUITY_REVIEW_TOOLS
 from ..memory.tools import MEMORY_TOOLS
 from ..proactive.tools import PROACTIVE_TOOLS
+from ..opportunity.tools import OPPORTUNITY_TOOLS
 from ..service import LifeEngineService
 from ..service.audit import (
     get_life_log_file,
@@ -110,14 +111,9 @@ class LifeEnginePlugin(BasePlugin):
             *LEARNING_TOOLS,
             *LEARN_TOOLS,
             *PROACTIVE_TOOLS,
+            *OPPORTUNITY_TOOLS,
             *MISSION_TOOLS,
         ]
-
-        minecraft_cfg = getattr(self.config, "minecraft", None)
-        if bool(getattr(minecraft_cfg, "enabled", False)):
-            from ..minecraft.tools import MINECRAFT_TOOLS
-
-            components.extend(MINECRAFT_TOOLS)
 
         # 启用 LifeChatter 时注册对话器及其专用 Action / Tool
         if isinstance(self.config, LifeEngineConfig) and getattr(

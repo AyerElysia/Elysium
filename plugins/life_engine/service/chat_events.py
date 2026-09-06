@@ -5,12 +5,40 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
 from src.core.models.message import Message, MessageType
 
-from .event_bus import LifeEvent, LifeEventChannel, LifeEventPriority
+from .event_builder import LifeEngineEvent
+from .event_bus import (
+    LifeEvent,
+    LifeEventChannel,
+    LifeEventPriority,
+    life_event_from_legacy,
+)
+
+
+def with_legacy_message_view(fact: LifeEvent, legacy: LifeEngineEvent) -> LifeEvent:
+    """One message occurrence with a compatibility view, never two events.
+
+    Runtime sequence and inferred current stream ownership do not belong to the
+    producer evidence. They can change on replay without changing the message.
+    """
+
+    view = dict(life_event_from_legacy(legacy).metadata)
+    for key in ("source_instance_id", "correlation_id", "content_ref"):
+        view.pop(key, None)
+    view.update(legacy_event_id=legacy.event_id, legacy_source=legacy.source)
+    return replace(
+        fact,
+        metadata={
+            **view,
+            **fact.metadata,
+        },
+    )
+
 
 _NOTICE_FACTS: dict[str, str] = {
     "friend_recall": "chat.message.recalled",
@@ -56,9 +84,12 @@ def build_chat_message_event(
         delivery_status=delivery_status,
     )
     message_id = str(message.message_id or "").strip()
+    if not message_id:
+        raise ValueError("chat occurrence requires a stable message_id")
     stable_identity = {
         "direction": direction,
-        "delivery_status": delivery_status,
+        # Keep the historical default identity; explicit confirmed is its alias.
+        "delivery_status": None if delivery_status in {None, "confirmed"} else delivery_status,
         "event_type": event_type,
         "provider": provider,
         "message_id": message_id,

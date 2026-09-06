@@ -214,13 +214,24 @@ class EventGroup:
         return self.protected
 
 
+@dataclass(frozen=True, slots=True)
+class HeartbeatConsumptionReceipt:
+    """Content-free result issued only after a heartbeat consumption commit."""
+
+    heartbeat_run_id: str
+    event_ids: tuple[str, ...]
+    cursor_before: int
+    cursor_after: int
+
+
 @dataclass(slots=True)
 class PreparedHeartbeatContext:
-    """Character-bounded context plus state to retain after this snapshot."""
+    """Prepared candidates; only ``consumption_receipt`` proves a commit."""
 
     content: str
     snapshot_high_water: int
     selected_event_ids: list[str]
+    # Compatibility name: these are candidates, never a delivery/commit receipt.
     acknowledged_event_ids: list[str]
     summary_event_ids: list[str]
     before_chars: int
@@ -236,6 +247,9 @@ class PreparedHeartbeatContext:
     delivery_marker: str = ""
     delivery_sha256: str = ""
     delivery_bytes: int = 0
+    consumption_receipt: HeartbeatConsumptionReceipt | None = field(
+        default=None, init=False,
+    )
 
     @property
     def summary(self) -> SubconsciousSummary:

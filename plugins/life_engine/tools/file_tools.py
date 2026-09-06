@@ -456,7 +456,7 @@ def _plugin_life_service(plugin: Any) -> Any:
 
 
 async def _commit_subject_authority_file_write(
-    plugin: Any,
+    tool: Any,
     target: Path,
     content: str,
     *,
@@ -466,6 +466,7 @@ async def _commit_subject_authority_file_write(
 ) -> tuple[bool, str | None]:
     """CAS-append SOUL/USER/MEMORY so the next prompt reads what she just wrote."""
 
+    plugin = tool.plugin
     subject_path = _subject_authority_path(plugin, target)
     if subject_path is None:
         return True, None
@@ -476,7 +477,21 @@ async def _commit_subject_authority_file_write(
         return True, None
     commit = getattr(service, "commit_subject_authority_file_write", None)
     if not callable(commit):
-        return True, None
+        return False, "SelectedSubjectCommitUnavailable"
+    scope = (getattr(getattr(tool, "trigger_message", None), "extra", {}) or {}).get(
+        "life_turn_scope", {}
+    )
+    scope = scope if isinstance(scope, dict) else {}
+    activities = scope.get("conscious_activity_ids", {})
+    activities = activities if isinstance(activities, dict) else {}
+    actor = str(getattr(tool, "_life_source_instance_id", "") or scope.get(
+        "consciousness_instance_id", ""
+    )).strip()
+    source = str(getattr(tool, "_life_source_occurrence_id", "") or activities.get(
+        str(getattr(tool, "_tool_call_id", "") or ""), ""
+    )).strip()
+    if not actor or not source:
+        return False, "SubjectFileWriteOriginRequired"
     try:
         await commit(
             workspace_relative_path=subject_path,
@@ -485,6 +500,9 @@ async def _commit_subject_authority_file_write(
             recorded_by="life_engine",
             recorded_source="nucleus_file_tool",
             encoding=encoding,
+            semantic_actor_id=actor,
+            semantic_source_id=source,
+            occurred_at=str(getattr(tool, "_life_source_occurred_at", "") or "") or None,
             reason=reason,
         )
     except Exception as exc:  # noqa: BLE001
@@ -494,6 +512,21 @@ async def _commit_subject_authority_file_write(
         )
         return False, f"写入主体固定提示词账本失败: {exc}"
     return True, None
+
+
+async def _read_selected_subject_file(plugin: Any, target: Path) -> Any | None:
+    """Read immutable selected bytes; missing authority never means stale disk."""
+
+    subject_path = _subject_authority_path(plugin, target)
+    if subject_path is None:
+        return None
+    service = _plugin_life_service(plugin)
+    if service is None or not bool(getattr(service, "_selectable_storage_enabled", False)):
+        return None
+    read = getattr(service, "read_subject_authority_file", None)
+    if not callable(read):
+        raise RuntimeError("SelectedSubjectReadUnavailable")
+    return await read(subject_path)
 
 
 def _guard_workspace_mutation(plugin: Any, path: str) -> tuple[bool, Any]:
@@ -671,20 +704,27 @@ class LifeEngineReadFileTool(BaseTool):
             return False, str(result)
 
         target = result
-        if not target.exists():
-            return False, f"文件不存在: {path}"
-        if not target.is_file():
-            return False, f"路径不是文件: {path}"
-
         try:
-            stat_before = target.stat()
-            raw_bytes = target.read_bytes()
-            stat_after = target.stat()
-            if (
-                stat_before.st_size != stat_after.st_size
-                or stat_before.st_mtime_ns != stat_after.st_mtime_ns
-            ):
-                return False, "file changed while the read page was prepared"
+            version = await _read_selected_subject_file(self.plugin, target)
+            if version is not None:
+                raw_bytes = version.content_bytes
+                source_size = len(raw_bytes)
+                source_mtime = 0
+            else:
+                if not target.exists():
+                    return False, f"文件不存在: {path}"
+                if not target.is_file():
+                    return False, f"路径不是文件: {path}"
+                stat_before = target.stat()
+                raw_bytes = await asyncio.to_thread(target.read_bytes)
+                stat_after = target.stat()
+                if (
+                    stat_before.st_size != stat_after.st_size
+                    or stat_before.st_mtime_ns != stat_after.st_mtime_ns
+                ):
+                    return False, "file changed while the read page was prepared"
+                source_size = stat_after.st_size
+                source_mtime = stat_after.st_mtime_ns
             raw_content = raw_bytes.decode(encoding)
             lines = raw_content.splitlines()
             total_lines = len(lines)
@@ -703,7 +743,6 @@ class LifeEngineReadFileTool(BaseTool):
                 for i, line in enumerate(selected_lines)
             )
 
-            stat = stat_after
             workspace = _get_workspace_read_only(self.plugin)
             normalized_path = str(target.relative_to(workspace))
             file_sha256 = hashlib.sha256(raw_bytes).hexdigest()
@@ -713,9 +752,11 @@ class LifeEngineReadFileTool(BaseTool):
                 "normalized_path": normalized_path,
                 "total_lines": total_lines,
                 "showing": f"{start_idx + 1}-{end_idx}",
-                "size_human": _format_size(stat.st_size),
-                "source_file_bytes": stat.st_size,
+                "size_human": _format_size(source_size),
+                "source_file_bytes": source_size,
                 "file_content_sha256": file_sha256,
+                **({"subject_version_id": version.version_id,
+                    "source_authority": "subject_document_store"} if version else {}),
             }
             if start_idx > 0:
                 base_payload["remaining_lines_before"] = start_idx
@@ -737,8 +778,9 @@ class LifeEngineReadFileTool(BaseTool):
                 },
                 frontier={
                     "path": normalized_path,
-                    "size": stat.st_size,
-                    "mtime_ns": stat.st_mtime_ns,
+                    "size": source_size,
+                    "mtime_ns": source_mtime,
+                    "subject_version_id": version.version_id if version else "",
                     "content_sha256": file_sha256,
                 },
                 base_payload=base_payload,
@@ -818,7 +860,7 @@ class LifeEngineWriteFileTool(BaseTool):
         before_content = _read_trace_before_content(target, encoding)
         occurrence_id = f"file-tool:{uuid4().hex}"
         committed, commit_error = await _commit_subject_authority_file_write(
-            self.plugin,
+            self,
             target,
             content,
             encoding=encoding,
@@ -925,13 +967,17 @@ class LifeEngineEditFileTool(BaseTool):
         reserved = _workspace_authority_mutation_path(self.plugin, target)
         if reserved is not None:
             return False, _workspace_authority_mutation_error(*reserved)
-        if not target.exists():
-            return False, f"文件不存在: {path}"
-        if not target.is_file():
-            return False, f"路径不是文件: {path}"
 
         try:
-            content = target.read_text(encoding=encoding)
+            version = await _read_selected_subject_file(self.plugin, target)
+            if version is not None:
+                content = version.content_bytes.decode(encoding)
+            else:
+                if not target.exists():
+                    return False, f"文件不存在: {path}"
+                if not target.is_file():
+                    return False, f"路径不是文件: {path}"
+                content = await asyncio.to_thread(target.read_text, encoding=encoding)
             search_text = old_text
             count = content.count(search_text)
             if count == 0:
@@ -973,7 +1019,7 @@ class LifeEngineEditFileTool(BaseTool):
                 return False, standing_error
             occurrence_id = f"file-tool:{uuid4().hex}"
             committed, commit_error = await _commit_subject_authority_file_write(
-                self.plugin,
+                self,
                 target,
                 new_content,
                 encoding=encoding,
@@ -1107,6 +1153,15 @@ class LifeEngineApplyPatchTool(BaseTool):
 
         files: dict[str, str | None] = {}
         for relative, target in resolved.items():
+            try:
+                version = await _read_selected_subject_file(self.plugin, target)
+                if version is not None:
+                    files[relative] = version.content_bytes.decode(encoding)
+                    continue
+            except UnicodeDecodeError as exc:
+                return False, f"文件编码错误: {exc}"
+            except Exception as exc:  # noqa: BLE001 - selected authority fails closed
+                return False, f"读取主体文件失败: {exc}"
             if target.exists() and not target.is_file():
                 return False, f"路径不是文件: {relative}"
             if target.exists():
@@ -1134,7 +1189,7 @@ class LifeEngineApplyPatchTool(BaseTool):
                 return False, standing_error
             occurrence_id = f"file-tool:{uuid4().hex}"
             committed, commit_error = await _commit_subject_authority_file_write(
-                self.plugin,
+                self,
                 resolved[item.path],
                 item.content or "",
                 encoding=encoding,

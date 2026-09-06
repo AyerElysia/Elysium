@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "capability_id": "life.todo_reminder",
+  "package_version": "1.0.0",
+  "removability": "subject_removable",
+  "provider_kind": "todo_reminder",
+  "manual": "CAPABILITY.md",
+  "default_skill": "DEFAULT_SKILL.md",
+  "operations": [
+    "nucleus_todo"
+  ],
+  "dependencies": [
+    "life.presence",
+    "life.timeline",
+    "life.todo_board"
+  ]
+}

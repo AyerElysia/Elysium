@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "capability_id": "life.inner_return",
+  "package_version": "1.0.0",
+  "removability": "subject_removable",
+  "provider_kind": "inner_return",
+  "manual": "CAPABILITY.md",
+  "default_skill": "DEFAULT_SKILL.md",
+  "operations": [
+    "nucleus_proactive_query",
+    "nucleus_proactive_command"
+  ],
+  "dependencies": [
+    "life.inner_dialogue_ledger",
+    "life.presence",
+    "life.proactive_actor_gate",
+    "life.timeline"
+  ]
+}

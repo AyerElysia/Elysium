@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import traceback
 from typing import Any, ClassVar
 
 from src.app.plugin_system.api.log_api import get_logger
@@ -13,6 +12,10 @@ from src.kernel.event import EventDecision
 from .audit import log_error
 
 logger = get_logger("life_engine", display="life_engine")
+
+
+class LifeEventCollectionFailed(RuntimeError):
+    """A transport notification did not durably enter the Life Event stream."""
 
 
 class LifeEngineMessageCollectorHandler(BaseEventHandler):
@@ -98,18 +101,17 @@ class LifeEngineMessageCollectorHandler(BaseEventHandler):
                 adapter_signature=str(params.get("adapter_signature") or ""),
             )
         except Exception as exc:  # noqa: BLE001
-            # 附带异常类型与 traceback，便于定位 "session already committed" 等
-            # 事务状态错误究竟发生在哪个阶段（事实提交/EventBus/World catch-up）。
-            tb_text = traceback.format_exc(limit=12)
+            # Database exceptions can contain private payloads and credentials.
+            # Surface a content-free failure, never an unearned SUCCESS receipt.
             logger.error(
-                f"life_engine 收集消息失败: {type(exc).__name__}: {exc}\n{tb_text}"
+                f"life_engine 收集消息失败: error_type={type(exc).__name__}"
             )
             log_error(
                 "message_collect_failed",
-                str(exc),
+                "Life Event collection failed",
                 event_name=event_name,
                 error_type=type(exc).__name__,
-                traceback=tb_text,
             )
+            raise LifeEventCollectionFailed(type(exc).__name__) from None
 
         return EventDecision.SUCCESS, params

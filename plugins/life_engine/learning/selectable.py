@@ -156,6 +156,8 @@ class SelectedLearningPersistence:
         store: LearningStorePort,
         *,
         writer_instance_id: str = "",
+        writable: bool = True,
+        write_disabled_reason: str = "",
     ) -> None:
         self.store = store
         self.writer_instance_id = (
@@ -171,6 +173,8 @@ class SelectedLearningPersistence:
         self._dirty: set[str] = set()
         self._initialized = False
         self._failed = False
+        self._writable = bool(writable)
+        self._write_disabled_reason = str(write_disabled_reason or "").strip()
         self._failure: LearningPersistenceFailure | None = None
         self._flush_lock = asyncio.Lock()
         self._last_flush_at = ""
@@ -185,11 +189,31 @@ class SelectedLearningPersistence:
         self.insight_store = insight_store
         self.skill_store = skill_store
 
+    @property
+    def writable(self) -> bool:
+        """Whether compatibility mutations may enter the in-memory projection."""
+
+        return self._writable and not self._failed
+
+    def require_writable(self) -> None:
+        """Reject a mutation before any selected projection object is changed."""
+
+        self._require_writable()
+
+    def quiesce(self, *, reason: str, error_type: str = "") -> None:
+        """Disable future mutations without flushing or touching the backend."""
+
+        self._writable = False
+        detail = str(reason or "").strip() or "selected projection is read-only"
+        error = str(error_type or "").strip()
+        self._write_disabled_reason = f"{detail}:{error}" if error else detail
+
     @contextmanager
     def mutation_context(
         self,
         context: LearningMutationContext,
     ) -> Iterator[None]:
+        self._require_writable()
         token: Token[LearningMutationContext] = _MUTATION_CONTEXT.set(context)
         try:
             yield
@@ -245,6 +269,9 @@ class SelectedLearningPersistence:
     def _require_writable(self) -> None:
         if not self._initialized:
             raise RuntimeError("selected learning persistence is not initialized")
+        if not self._writable:
+            reason = self._write_disabled_reason or "projector claim is not owned"
+            raise RuntimeError(f"SelectedLearningProjectionReadOnly:{reason}")
         if self._failed:
             raise RuntimeError(
                 "selected learning persistence failed closed; restart after diagnosis"
@@ -384,7 +411,7 @@ class SelectedLearningPersistence:
     async def close(self) -> None:
         """Flush selected learning state without closing the injected runtime."""
 
-        if self._initialized and not self._failed:
+        if self._initialized and self.writable:
             await self.flush()
 
     def health_snapshot(self) -> dict[str, Any]:
@@ -405,6 +432,8 @@ class SelectedLearningPersistence:
             "status": (
                 "failed"
                 if self._failed
+                else "read_only"
+                if not self._writable
                 else "healthy"
                 if self._initialized
                 else "initializing"
@@ -412,6 +441,8 @@ class SelectedLearningPersistence:
             "backend": "selected",
             "writer_instance_id": self.writer_instance_id,
             "initialized": self._initialized,
+            "writable": self.writable,
+            "write_disabled_reason": self._write_disabled_reason,
             "pending_events": len(self._pending_events),
             "dirty_projection_count": len(self._dirty),
             "last_flush_at": self._last_flush_at,
@@ -524,6 +555,57 @@ class SelectedInsightStore(InsightStore):
     def load(self) -> None:
         return
 
+    def _require_mutation(self) -> None:
+        self._persistence.require_writable()
+
+    def add_insight(self, *args: Any, **kwargs: Any) -> Any:
+        self._require_mutation()
+        return super().add_insight(*args, **kwargs)
+
+    def update_insight(self, *args: Any, **kwargs: Any) -> Any:
+        self._require_mutation()
+        return super().update_insight(*args, **kwargs)
+
+    def add_evidence(self, *args: Any, **kwargs: Any) -> Any:
+        self._require_mutation()
+        return super().add_evidence(*args, **kwargs)
+
+    def reinforce_insight(self, *args: Any, **kwargs: Any) -> Any:
+        self._require_mutation()
+        return super().reinforce_insight(*args, **kwargs)
+
+    def reconsider_insight(self, *args: Any, **kwargs: Any) -> Any:
+        self._require_mutation()
+        return super().reconsider_insight(*args, **kwargs)
+
+    def record_knowledge_version(self, *args: Any, **kwargs: Any) -> Any:
+        self._require_mutation()
+        return super().record_knowledge_version(*args, **kwargs)
+
+    def reconcile_knowledge_versions(self) -> int:
+        self._require_mutation()
+        return super().reconcile_knowledge_versions()
+
+    def transition_status(self, *args: Any, **kwargs: Any) -> Any:
+        self._require_mutation()
+        return super().transition_status(*args, **kwargs)
+
+    def accept_knowledge_candidate(self, *args: Any, **kwargs: Any) -> Any:
+        self._require_mutation()
+        return super().accept_knowledge_candidate(*args, **kwargs)
+
+    def decline_knowledge_candidate(self, *args: Any, **kwargs: Any) -> Any:
+        self._require_mutation()
+        return super().decline_knowledge_candidate(*args, **kwargs)
+
+    def add_validation_experiment(self, *args: Any, **kwargs: Any) -> Any:
+        self._require_mutation()
+        return super().add_validation_experiment(*args, **kwargs)
+
+    def complete_experiment(self, *args: Any, **kwargs: Any) -> Any:
+        self._require_mutation()
+        return super().complete_experiment(*args, **kwargs)
+
     def _ensure_dirs(self) -> None:
         return
 
@@ -551,6 +633,7 @@ class SelectedInsightStore(InsightStore):
         return dict(self._knowledge_manifest)
 
     def save_knowledge_manifest(self, manifest: dict[str, Any]) -> None:
+        self._require_mutation()
         self._knowledge_manifest = dict(manifest)
         self._persistence.mark_dirty(_INSIGHT_PROJECTION)
 
@@ -580,6 +663,7 @@ class SelectedInsightStore(InsightStore):
         promoted: bool,
         reason: str = "",
     ) -> KnowledgeVersion:
+        self._require_mutation()
         if str(version) in self._knowledge_versions_content:
             raise ValueError(f"KnowledgeVersionConflict:{version}")
         knowledge_version = KnowledgeVersion(
@@ -616,6 +700,7 @@ class SelectedInsightStore(InsightStore):
         return dict(self._state)
 
     def save_state(self, state: dict[str, Any]) -> None:
+        self._require_mutation()
         self._state = dict(state)
         self._persistence.mark_dirty(_INSIGHT_PROJECTION)
 
@@ -675,6 +760,41 @@ class SelectedSkillStore(SkillStore):
 
     def load(self) -> None:
         return
+
+    def _require_mutation(self) -> None:
+        self._persistence.require_writable()
+
+    def add_skill(self, *args: Any, **kwargs: Any) -> Any:
+        self._require_mutation()
+        return super().add_skill(*args, **kwargs)
+
+    def update_skill(self, *args: Any, **kwargs: Any) -> Any:
+        self._require_mutation()
+        return super().update_skill(*args, **kwargs)
+
+    def remove_skill(self, *args: Any, **kwargs: Any) -> Any:
+        self._require_mutation()
+        return super().remove_skill(*args, **kwargs)
+
+    def append_candidate(self, *args: Any, **kwargs: Any) -> Any:
+        self._require_mutation()
+        return super().append_candidate(*args, **kwargs)
+
+    def record_candidate_decision(self, *args: Any, **kwargs: Any) -> Any:
+        self._require_mutation()
+        return super().record_candidate_decision(*args, **kwargs)
+
+    def append_use_observation(self, *args: Any, **kwargs: Any) -> Any:
+        self._require_mutation()
+        return super().append_use_observation(*args, **kwargs)
+
+    def append_rejected_edit(self, *args: Any, **kwargs: Any) -> Any:
+        self._require_mutation()
+        return super().append_rejected_edit(*args, **kwargs)
+
+    def advance_maturity(self, *args: Any, **kwargs: Any) -> Any:
+        self._require_mutation()
+        return super().advance_maturity(*args, **kwargs)
 
     def _ensure_dirs(self) -> None:
         return
