@@ -178,6 +178,21 @@ async def create_llm_usable_execution(
             message=message,
             tool_call_id=str(tool_call_id or ""),
         )
+        extra = getattr(message, "extra", None) if message is not None else None
+        if not isinstance(extra, dict):
+            extra = {}
+        turn_scope = extra.get("life_turn_scope")
+        if not isinstance(turn_scope, dict):
+            turn_scope = {}
+        source_instance_id = str(
+            extra.get("source_instance_id")
+            or extra.get("consciousness_instance_id")
+            or turn_scope.get("source_instance_id")
+            or turn_scope.get("consciousness_instance_id")
+            or ""
+        ).strip()
+        if source_instance_id:
+            instance._life_source_instance_id = source_instance_id
         if stream_id:
             from src.core.managers.stream_manager import get_stream_manager
 

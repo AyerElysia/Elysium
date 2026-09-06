@@ -53,6 +53,9 @@ class LLMResponse:
     call_list: list[ToolCall] | None = None
     tool_call_compat: bool = False
     request_record_id: int | None = None
+    final_request_id: str = ""
+    final_attempt_id: str = ""
+    final_completed_at: str = ""
     effective_context_receipts: dict[str, EffectiveContextReceipt] | None = None
     _on_complete: Callable[["LLMResponse", BaseException | None], None] | None = None
     _context_delivery_expectations: dict[str, ContextDeliveryExpectation] | None = (

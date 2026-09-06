@@ -555,15 +555,22 @@ def _iter_sections(config_model: type[ConfigBase]) -> list[_SectionInfo]:
     非 ``SectionBase`` 子类的字段会被忽略。
     """
     sections: list[_SectionInfo] = []
+    owners: dict[str, str] = {}
     for field_name, model_field in config_model.model_fields.items():
         annotation = model_field.annotation
         section_model, is_list = _get_section_model_from_annotation(annotation)
         if section_model is not None:  # 跳过非 SectionBase 字段（如普通标量字段）
+            section_name = _get_section_name(section_model, field_name)
+            previous = owners.get(section_name)
+            if previous is not None:
+                raise ValueError(
+                    f"Cannot declare ({section_name!r},) twice "
+                    f"(fields {previous!r} and {field_name!r})"
+                )
+            owners[section_name] = field_name
             sections.append(
                 _SectionInfo(
-                    name=_get_section_name(
-                        section_model, field_name
-                    ),  # 优先使用装饰器注册名，回退字段名
+                    name=section_name,  # 优先使用装饰器注册名，回退字段名
                     model=section_model,
                     is_list=is_list,
                     default_factory=model_field.default_factory,  # 保留 factory 以便后续生成默认列表项
@@ -738,11 +745,16 @@ def _merge_section_fields(
         if key in raw_section:
             candidate = raw_section[key]
             try:
-                # 用 TypeAdapter 做严格类型校验，校验通过则直接使用用户值
-                section_out[key] = TypeAdapter(annotation).validate_python(candidate)
+                # Field 约束（min_length、ge 等）必须一起校验。
+                # 只跑 TypeAdapter(annotation) 会把 "" 当成合法 str，随后整模校验失败。
+                section_out[key] = _validate_merged_field(
+                    section_model,
+                    key,
+                    candidate,
+                )
                 continue
             except Exception:
-                pass  # 校验失败：用户值类型不符，回落到下方的默认值/占位值逻辑
+                pass  # 校验失败：用户值类型或约束不符，回落到下方的默认值/占位值逻辑
 
         if default_value is not None:
             section_out[key] = default_value  # 使用模型默认值
@@ -760,6 +772,23 @@ def _merge_section_fields(
             section_out[key] = _merge_section_fields(extra_section_model, raw_extra)
 
     return section_out
+
+
+def _validate_merged_field(
+    section_model: type[SectionBase],
+    key: str,
+    candidate: Any,
+) -> Any:
+    """Validate one merged field, including Field constraints."""
+
+    try:
+        baseline = section_model().model_dump()
+    except Exception:
+        return TypeAdapter(section_model.model_fields[key].annotation).validate_python(
+            candidate
+        )
+    baseline[key] = candidate
+    return getattr(section_model.model_validate(baseline), key)
 
 
 def _placeholder_for_type(annotation: Any) -> Any:
