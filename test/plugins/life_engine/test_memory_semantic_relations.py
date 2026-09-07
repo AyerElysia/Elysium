@@ -8,7 +8,11 @@ from typing import Any
 import pytest
 
 from plugins.life_engine.memory import tools as memory_tools
-from plugins.life_engine.memory.living import SemanticRelation
+from plugins.life_engine.memory.living import (
+    SemanticRelation,
+    normalize_semantic_relation,
+    validate_semantic_relation_parent,
+)
 from plugins.life_engine.memory.tools import (
     LEGACY_RELATION_MUTATION_RETIRED,
     MEMORY_TOOLS,
@@ -46,18 +50,69 @@ class _MemoryService:
     async def list_memory_semantic_relations(
         self,
         entity_ref: str,
+        *,
+        current_only: bool = False,
     ) -> list[SemanticRelation]:
         self.read_order.append("semantic")
+        parents = {
+            row.parent_relation_id for row in self.semantic_relations
+            if row.parent_relation_id is not None
+        }
         return [
             relation
             for relation in self.semantic_relations
             if entity_ref in {relation.source_ref, relation.target_ref}
+            and (
+                not current_only
+                or (relation.relation_id not in parents and relation.operation != "withdraw")
+            )
         ]
+
+    async def get_memory_semantic_relation(
+        self, relation_id: str,
+    ) -> SemanticRelation | None:
+        return next(
+            (row for row in self.semantic_relations if row.relation_id == relation_id),
+            None,
+        )
+
+    async def page_memory_semantic_relations(
+        self, entity_ref: str, *, current_only: bool = False, limit: int = 50,
+        offset: int = 0, expected_frontier_count: int | None = None,
+    ) -> Any:
+        if offset and expected_frontier_count is None:
+            raise ValueError("SemanticRelationPageFrontierRequired")
+        if expected_frontier_count is not None and expected_frontier_count != len(self.semantic_relations):
+            raise RuntimeError("SemanticRelationPageFrontierConflict")
+        rows = await self.list_memory_semantic_relations(entity_ref, current_only=current_only)
+        selected = tuple(rows[offset:offset + limit])
+        parents = {row.parent_relation_id for row in self.semantic_relations}
+        has_more = offset + len(selected) < len(rows)
+        return SimpleNamespace(
+            relations=selected, frontier_count=len(self.semantic_relations),
+            offset=offset, next_offset=offset + len(selected) if has_more else None,
+            has_more=has_more, matching_count=len(rows),
+            current_relation_ids=tuple(
+                row.relation_id for row in selected
+                if row.relation_id not in parents and row.operation != "withdraw"
+            ),
+        )
 
     async def record_memory_semantic_relation(
         self,
         relation: SemanticRelation,
     ) -> SemanticRelation:
+        relation = normalize_semantic_relation(relation)
+        if relation.parent_relation_id is not None:
+            parent = await self.get_memory_semantic_relation(relation.parent_relation_id)
+            if parent is None:
+                raise RuntimeError("SemanticRelationParentNotFound")
+            validate_semantic_relation_parent(relation, parent)
+            if any(
+                row.parent_relation_id == relation.parent_relation_id
+                for row in self.semantic_relations
+            ):
+                raise RuntimeError("SemanticRelationStaleParent")
         self.recorded.append(relation)
         self.semantic_relations.append(relation)
         return relation
@@ -161,6 +216,7 @@ async def test_unified_add_appends_only_semantic_history_with_runtime_identity(
     assert relation.stream_scope == "stream:chat-one"
     assert relation.recorded_at == "2026-08-12T01:02:03+00:00"
     assert relation.metadata == {
+        "protocol": "subject_relation_revision_v1",
         "source_occurrence_id": "turn:one",
         "source_occurrence_kind": "life_turn",
         "tool_call_id": "tool-call:relation-one",
@@ -249,6 +305,7 @@ async def test_view_reads_semantic_history_before_read_only_legacy_projection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     memory_service = _MemoryService()
+    _install_runtime(monkeypatch, memory_service)
     memory_service.semantic_relations.append(
         SemanticRelation(
             relation_id="relation:semantic",
@@ -298,6 +355,7 @@ async def test_legacy_only_relation_is_not_promoted_to_semantic_history(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     memory_service = _MemoryService()
+    _install_runtime(monkeypatch, memory_service)
 
     async def get_service(_self: Any) -> _MemoryService:
         return memory_service
@@ -329,11 +387,11 @@ async def test_destructive_relation_actions_are_retired_without_side_effects() -
     assert payload["mutated"] is False
 
 
-def test_relation_schema_exposes_only_append_and_view() -> None:
+def test_relation_schema_exposes_append_revision_withdrawal_and_view() -> None:
     schema = NucleusRelationsTool.to_schema()
     properties = schema["function"]["parameters"]["properties"]
     action = properties["action"]
-    assert action["enum"] == ["add", "view"]
+    assert action["enum"] == ["add", "revise", "withdraw", "view"]
     assert "forget" not in action["enum"]
     assert {
         "source_path",
@@ -343,6 +401,13 @@ def test_relation_schema_exposes_only_append_and_view() -> None:
         "file_path",
         "depth",
         "min_strength",
+        "source_ref",
+        "target_ref",
+        "entity_ref",
+        "root_relation_id",
+        "parent_relation_id",
+        "subject_strength",
+        "current_only",
     } <= properties.keys()
     assert MEMORY_TOOLS.count(NucleusRelationsTool) == 1
     assert NucleusRelationsTool.chatter_allow == [
