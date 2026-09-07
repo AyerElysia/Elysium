@@ -134,6 +134,13 @@ _SPECS = (
             "embedding_model",
             "embedding_updated_at",
             "legacy_fts_present",
+            "subject_document_id",
+            "subject_version_id",
+            "subject_document_revision",
+            "subject_binding_revision",
+            "subject_content_sha256",
+            "subject_projection_sha256",
+            "subject_projection_state",
         ),
         ("node_id",),
     ),
@@ -635,6 +642,8 @@ _BOOL_COLUMNS = {
     "force_delete",
 }
 _INT_COLUMNS = {
+    "subject_document_revision",
+    "subject_binding_revision",
     "version",
     "access_count",
     "index_revision",
@@ -885,11 +894,16 @@ def _transform_source_row(
             "node_id": node_id,
             "node_type": str(raw["node_type"]),
             "file_path": file_path,
-            "file_path_sha256": _sha256(file_path) if file_path is not None else None,
+            "file_path_sha256": (
+                _sha256(file_path) if file_path is not None and not bool(raw.get("is_deleted")) else None
+            ),
             "content_hash": (
                 str(raw["content_hash"]) if raw["content_hash"] is not None else None
             ),
-            "document_content": context.fts_content.get(node_id, ""),
+            "document_content": (
+                str(raw["document_content"]) if raw.get("document_content") is not None
+                else context.fts_content.get(node_id, "")
+            ),
             "title": str(raw.get("title") or ""),
             "activation_strength": float(raw.get("activation_strength") or 0.0),
             "access_count": int(raw.get("access_count") or 0),
@@ -931,6 +945,13 @@ def _transform_source_row(
                 else None
             ),
             "legacy_fts_present": node_id in context.fts_content,
+            "subject_document_id": str(raw["subject_document_id"]) if raw.get("subject_document_id") is not None else None,
+            "subject_version_id": str(raw["subject_version_id"]) if raw.get("subject_version_id") is not None else None,
+            "subject_document_revision": int(raw.get("subject_document_revision") or 0),
+            "subject_binding_revision": int(raw.get("subject_binding_revision") or 0),
+            "subject_content_sha256": str(raw["subject_content_sha256"]) if raw.get("subject_content_sha256") is not None else None,
+            "subject_projection_sha256": str(raw["subject_projection_sha256"]) if raw.get("subject_projection_sha256") is not None else None,
+            "subject_projection_state": str(raw.get("subject_projection_state") or ""),
         }
     if table == "memory_index_jobs":
         values = {

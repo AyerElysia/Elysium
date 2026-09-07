@@ -379,7 +379,7 @@ def event_to_dict(event: LifeEngineEvent) -> dict[str, Any]:
     Returns:
         可 JSON 序列化的字典
     """
-    return {
+    data = {
         "event_id": event.event_id,
         "event_type": event.event_type.value,
         "timestamp": event.timestamp,
@@ -410,6 +410,10 @@ def event_to_dict(event: LifeEngineEvent) -> dict[str, Any]:
         "content_ref": event.content_ref,
         "raw_content": event.raw_content,
     }
+    if event.redelivery_operation_id is not None:
+        data["redelivery_operation_id"] = event.redelivery_operation_id
+        data["redelivery_source_position"] = event.redelivery_source_position
+    return data
 
 
 def event_from_dict(
@@ -480,6 +484,8 @@ def event_from_dict(
         correlation_id=data.get("correlation_id"),
         content_ref=data.get("content_ref"),
         raw_content=data.get("raw_content"),
+        redelivery_operation_id=data.get("redelivery_operation_id"),
+        redelivery_source_position=data.get("redelivery_source_position"),
     )
 
 
@@ -624,7 +630,7 @@ class StatePersistence:
 
         Args:
             workspace_path: 工作空间路径
-            history_limit_func: 获取历史上限的函数
+            history_limit_func: 兼容调用参数；持久化恢复不按条数裁剪历史
             lock: 异步锁（可选，用于线程安全）
         """
         self._workspace_path = workspace_path
@@ -972,8 +978,11 @@ class StatePersistence:
             (_safe_int(event.sequence) for event in loaded_events),
             default=0,
         )
-        history_limit = max(0, _safe_int(self._history_limit_func()))
-        history_events = history_events[-history_limit:] if history_limit else []
+        # Restore every persisted raw event, including consumed members of
+        # causal groups that cross the cursor or the pending/history boundary.
+        # A count limit is not an acknowledgement and must never prune the
+        # restart snapshot. History reclamation belongs to the existing
+        # consumption-aware compaction owner, not persistence loading.
         summary_dict = _deduplicate_summary(persisted_summary).to_dict()
 
         async with self._get_lock():

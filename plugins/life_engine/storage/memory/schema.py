@@ -19,7 +19,7 @@ from src.kernel.storage.migration_runner import MySQLMigrationRunner, SchemaMigr
 from ..contracts import StorageBackendRuntime, StorageWriterRole
 from ..models import BackendKind
 
-MEMORY_SCHEMA_VERSION = 14
+MEMORY_SCHEMA_VERSION = 15
 MEMORY_IMMUTABILITY_SCHEMA_VERSION = 3
 
 # Database immutability follows the Memory Port contract, not a blanket
@@ -969,6 +969,54 @@ _WITNESS_RECONCILIATION_CHECKSUM = SchemaMigration(
     ),
 )
 
+def _managed_document_identity_ddl() -> tuple[str, ...]:
+    """Resume each MySQL DDL step without rewriting prior migration checksums."""
+    columns = (
+        ("subject_document_id", "VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NULL"),
+        ("subject_version_id", "VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NULL"),
+        ("subject_document_revision", "BIGINT UNSIGNED NOT NULL DEFAULT 0"),
+        ("subject_binding_revision", "BIGINT UNSIGNED NOT NULL DEFAULT 0"),
+        ("subject_content_sha256", "CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL"),
+        ("subject_projection_sha256", "CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL"),
+        ("subject_projection_state", "VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT ''"),
+    )
+    steps: list[str] = []
+    for column, definition in columns:
+        ddl = f"ALTER TABLE memory_nodes ADD COLUMN {column} {definition}".replace("'", "''")
+        steps.extend((
+            (
+                "SET @memory_identity_ddl = IF(EXISTS (SELECT 1 FROM information_schema.COLUMNS "
+                f"WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'memory_nodes' AND COLUMN_NAME = '{column}'), "
+                f"'SELECT 1', '{ddl}')"
+            ),
+            "PREPARE memory_identity_step FROM @memory_identity_ddl",
+            "EXECUTE memory_identity_step",
+            "DEALLOCATE PREPARE memory_identity_step",
+        ))
+    steps.extend((
+        (
+            "SET @memory_identity_ddl = IF(EXISTS (SELECT 1 FROM information_schema.STATISTICS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'memory_nodes' "
+            "AND INDEX_NAME = 'uq_memory_nodes_subject_document'), 'SELECT 1', "
+            "'CREATE UNIQUE INDEX uq_memory_nodes_subject_document ON memory_nodes(subject_document_id)')"
+        ),
+        "PREPARE memory_identity_step FROM @memory_identity_ddl",
+        "EXECUTE memory_identity_step",
+        "DEALLOCATE PREPARE memory_identity_step",
+        # A path hash is a current index claim, not the identity of a historical
+        # node. Keep all old paths, node IDs, chunks, and relation endpoints.
+        "UPDATE memory_nodes SET file_path_sha256 = NULL WHERE is_deleted = TRUE",
+    ))
+    return tuple(steps)
+
+
+_MANAGED_DOCUMENT_IDENTITY = SchemaMigration(
+    version=15,
+    name="life_memory_managed_document_identity_v1",
+    statements=_managed_document_identity_ddl(),
+)
+
+
 MEMORY_MIGRATIONS = (
     _DOCUMENT_INDEX,
     _EXPERIENCE,
@@ -984,6 +1032,7 @@ MEMORY_MIGRATIONS = (
     _WITNESS_PIPELINE,
     _WITNESS_RECONCILIATION_CURSOR,
     _WITNESS_RECONCILIATION_CHECKSUM,
+    _MANAGED_DOCUMENT_IDENTITY,
 )
 
 

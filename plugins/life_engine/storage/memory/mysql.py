@@ -72,6 +72,7 @@ from ...memory.indexing import (
     DocumentIdentityConflict,
     DocumentIndexResult,
     IndexJob,
+    assert_managed_source_revision,
     chunk_document,
 )
 from ...memory.lineage import MemoryCorrection
@@ -96,6 +97,7 @@ from ...memory.nodes import (
     NodeType,
     canonical_file_node_id,
     compute_content_hash,
+    generate_subject_file_node_id,
 )
 from ...memory.search import (
     DetailedSearchResult,
@@ -134,6 +136,8 @@ from ..contracts import StorageBackendRuntime
 from ..models import BackendKind, StorageAvailability
 from .contracts import (
     CanonicalDocumentMetadata,
+    ManagedDocumentIndexResult,
+    ManagedDocumentIndexSnapshot,
     MemoryStorageBundle,
     StableLedgerCursor,
     StableLedgerPage,
@@ -162,6 +166,13 @@ _MYSQL_MEMORY_READINESS_REQUIREMENTS: dict[
             "is_deleted",
             "embedding_content_hash",
             "legacy_fts_present",
+            "subject_document_id",
+            "subject_version_id",
+            "subject_document_revision",
+            "subject_binding_revision",
+            "subject_content_sha256",
+            "subject_projection_sha256",
+            "subject_projection_state",
         ),
         "memory_chunks": ("chunk_id", "node_id", "content_hash", "content"),
         "memory_index_jobs": (
@@ -396,6 +407,10 @@ _MYSQL_MEMORY_READINESS_INDEX_REQUIREMENTS: dict[
     dict[str, dict[str, tuple[int, tuple[str, ...]]]],
 ] = {
     "document_index": {
+        "memory_nodes": {
+            "uq_memory_nodes_file_path_hash": (0, ("file_path_sha256",)),
+            "uq_memory_nodes_subject_document": (0, ("subject_document_id",)),
+        },
         "memory_index_jobs": {
             "primary": (0, ("job_id", "index_revision")),
             "uq_memory_jobs_node_revision": (
@@ -1008,20 +1023,123 @@ class MySQLWorkspaceProjectionBindingStore(_MySQLPort):
 
 
 class MySQLDocumentIndexProjection(_MySQLPort):
+    async def _store_managed_source(
+        self, session: AsyncSession, node_id: str,
+        snapshot: ManagedDocumentIndexSnapshot, state: str,
+    ) -> None:
+        await session.execute(text(
+            "UPDATE memory_nodes SET subject_document_id = :document_id, "
+            "subject_version_id = :version_id, subject_document_revision = :revision, "
+            "subject_binding_revision = :binding_revision, subject_content_sha256 = :content_sha256, "
+            "subject_projection_sha256 = :projection_sha256, subject_projection_state = :state "
+            "WHERE node_id = :node_id"
+        ), {
+            "document_id": snapshot.document_id, "version_id": snapshot.version_id,
+            "revision": snapshot.document_revision, "binding_revision": snapshot.binding_revision,
+            "content_sha256": snapshot.content_sha256, "projection_sha256": snapshot.projection_sha256,
+            "state": state, "node_id": node_id,
+        })
+
+    async def _retire_managed_projection(
+        self, session: AsyncSession, node_id: str, *, state: str, now: float,
+    ) -> None:
+        row = (await session.execute(text(
+            "SELECT is_deleted FROM memory_nodes WHERE node_id = :node_id FOR UPDATE"
+        ), {"node_id": node_id})).mappings().one_or_none()
+        if row is None:
+            return
+        if not bool(row["is_deleted"]):
+            for chunk in await self._load_chunks(session, node_id):
+                await session.execute(text(
+                    "INSERT INTO memory_vector_tombstones "
+                    "(node_id, chunk_id, collection_name, created_at) "
+                    "VALUES (:node_id, :chunk_id, '', :now)"
+                ), {"node_id": node_id, "chunk_id": chunk.chunk_id, "now": now})
+        await session.execute(text(
+            "UPDATE memory_nodes SET index_revision = index_revision + IF(is_deleted, 0, 1), "
+            "is_deleted = TRUE, file_path_sha256 = NULL, embedding_synced = FALSE, "
+            "subject_projection_state = :state, updated_at = :now WHERE node_id = :node_id"
+        ), {"state": state, "now": now, "node_id": node_id})
+        await session.execute(text(
+            "UPDATE memory_index_jobs SET status = 'stale', updated_at = :now, "
+            "claim_token = '', error = 'ManagedProjectionRetired' WHERE node_id = :node_id "
+            "AND status IN ('pending', 'processing', 'failed')"
+        ), {"now": now, "node_id": node_id})
+
+    async def _retire_other_managed_path_owners(
+        self, session: AsyncSession, path: str, node_id: str, now: float,
+    ) -> None:
+        rows = (await session.execute(text(
+            "SELECT node_id, file_path, subject_document_id FROM memory_nodes "
+            "WHERE file_path_sha256 = :path_hash AND node_id <> :node_id FOR UPDATE"
+        ), {"path_hash": _sha256(path), "node_id": node_id})).mappings().all()
+        for row in rows:
+            if str(row["file_path"] or "") != path:
+                raise DocumentIdentityConflict("document path hash collision")
+            await self._retire_managed_projection(
+                session, str(row["node_id"]), now=now,
+                state="superseded" if row["subject_document_id"] else "legacy_retired",
+            )
+
+    async def project_managed_document(
+        self, snapshot: ManagedDocumentIndexSnapshot,
+    ) -> ManagedDocumentIndexResult:
+        """Project stable source identity under the caller-held subject namespace fence."""
+        snapshot.validate()
+        node_id = generate_subject_file_node_id(snapshot.document_id)
+        indexed = snapshot.content is not None and not snapshot.deleted
+
+        async def _operation(session: AsyncSession) -> ManagedDocumentIndexResult:
+            now = time.time()
+            existing = (await session.execute(text(
+                "SELECT * FROM memory_nodes WHERE node_id = :node_id FOR UPDATE"
+            ), {"node_id": node_id})).mappings().one_or_none()
+            replay = assert_managed_source_revision(existing, snapshot)
+            if indexed:
+                await self._upsert_in_session(
+                    session, snapshot.path, snapshot.content, snapshot.title, None,
+                    max_chars=DEFAULT_CHUNK_SIZE, overlap_chars=DEFAULT_CHUNK_OVERLAP,
+                    _managed_snapshot=snapshot,
+                )
+            else:
+                if existing is None:
+                    await session.execute(text(
+                        "INSERT INTO memory_nodes (node_id, node_type, file_path, "
+                        "file_path_sha256, document_content, title, created_at, updated_at, is_deleted) "
+                        "VALUES (:node_id, 'file', :path, NULL, '', :title, :now, :now, TRUE)"
+                    ), {"node_id": node_id, "path": snapshot.path, "title": snapshot.title, "now": now})
+                else:
+                    await self._retire_managed_projection(
+                        session, node_id, now=now,
+                        state="deleted" if snapshot.deleted else "unindexable",
+                    )
+                    await session.execute(text(
+                        "UPDATE memory_nodes SET file_path = :path WHERE node_id = :node_id"
+                    ), {"path": snapshot.path, "node_id": node_id})
+                await self._store_managed_source(
+                    session, node_id, snapshot, "deleted" if snapshot.deleted else "unindexable",
+                )
+                if not snapshot.deleted:
+                    await self._retire_other_managed_path_owners(session, snapshot.path, node_id, now)
+            return ManagedDocumentIndexResult(
+                node_id=node_id, document_id=snapshot.document_id, version_id=snapshot.version_id,
+                document_revision=snapshot.document_revision, indexed=indexed, idempotent_replay=replay,
+            )
+
+        return await self._write(_operation)
+
     async def get_document_metadata(
         self,
         path: str,
     ) -> CanonicalDocumentMetadata | None:
-        canonical_path, node_id = canonical_file_node_id(path)
+        canonical_path, _ = canonical_file_node_id(path)
         assert self.runtime.engine is not None
         async with self.runtime.engine.connect() as connection:
             row = (
                 (
                     await connection.execute(
                         text(
-                            """SELECT node_id, file_path, content_hash, title,
-                            source_mtime, index_revision, is_deleted, updated_at
-                            FROM memory_nodes
+                            """SELECT * FROM memory_nodes
                             WHERE file_path_sha256 = :path_hash
                             AND node_type = 'file'"""
                         ),
@@ -1034,14 +1152,13 @@ class MySQLDocumentIndexProjection(_MySQLPort):
         if row is None:
             return None
         if (
-            str(row["node_id"]) != node_id
-            or str(row["file_path"] or "") != canonical_path
+            str(row["file_path"] or "") != canonical_path
         ):
             raise DocumentIdentityConflict(
                 "document path hash belongs to another canonical path"
             )
         return CanonicalDocumentMetadata(
-            node_id=node_id,
+            node_id=str(row["node_id"]),
             file_path=canonical_path,
             content_hash=(
                 str(row["content_hash"])
@@ -1057,6 +1174,11 @@ class MySQLDocumentIndexProjection(_MySQLPort):
             index_revision=int(row["index_revision"] or 0),
             is_deleted=bool(row["is_deleted"]),
             updated_at=float(row["updated_at"] or 0.0),
+            subject_document_id=str(row.get("subject_document_id") or ""),
+            subject_version_id=str(row.get("subject_version_id") or ""),
+            subject_document_revision=int(row.get("subject_document_revision") or 0),
+            subject_binding_revision=int(row.get("subject_binding_revision") or 0),
+            subject_content_sha256=str(row.get("subject_content_sha256") or ""),
         )
 
     @staticmethod
@@ -1196,8 +1318,16 @@ class MySQLDocumentIndexProjection(_MySQLPort):
         *,
         max_chars: int,
         overlap_chars: int,
+        _managed_snapshot: ManagedDocumentIndexSnapshot | None = None,
     ) -> DocumentIndexResult:
-        canonical_path, node_id = canonical_file_node_id(path)
+        if _managed_snapshot is None:
+            canonical_path, node_id = canonical_file_node_id(path)
+        else:
+            _managed_snapshot.validate()
+            if path != _managed_snapshot.path or content != _managed_snapshot.content:
+                raise DocumentIdentityConflict("managed text does not match its exact source snapshot")
+            canonical_path = path
+            node_id = generate_subject_file_node_id(_managed_snapshot.document_id)
         path_hash = _sha256(canonical_path)
         now = time.time()
         body = str(content or "")
@@ -1236,9 +1366,17 @@ class MySQLDocumentIndexProjection(_MySQLPort):
             .mappings()
             .one_or_none()
         )
-        if path_owner is not None and str(path_owner["node_id"]) != node_id:
+        if _managed_snapshot is not None:
+            assert_managed_source_revision(existing, _managed_snapshot)
+            await self._retire_other_managed_path_owners(session, canonical_path, node_id, now)
+        elif existing is not None and (
+            existing.get("subject_document_id")
+            or existing.get("subject_projection_state") == "legacy_retired"
+        ):
+            raise DocumentIdentityConflict("managed/retired identity requires the stable source projection port")
+        elif path_owner is not None and str(path_owner["node_id"]) != node_id:
             raise DocumentIdentityConflict("document path belongs to another node")
-        if existing is not None and str(existing["file_path"] or "") != canonical_path:
+        if _managed_snapshot is None and existing is not None and str(existing["file_path"] or "") != canonical_path:
             raise DocumentIdentityConflict("document node ID belongs to another path")
 
         existing_chunks = (
@@ -1258,6 +1396,10 @@ class MySQLDocumentIndexProjection(_MySQLPort):
             and not bool(existing["legacy_fts_present"])
             and str(existing["title"] or "") == str(title or "")
             and existing_chunks == chunks
+            and (
+                _managed_snapshot is None
+                or str(existing.get("subject_projection_sha256") or "") == _managed_snapshot.projection_sha256
+            )
         )
         if projection_unchanged:
             observed_mtime_unchanged = bool(
@@ -1356,6 +1498,7 @@ class MySQLDocumentIndexProjection(_MySQLPort):
             updated = await session.execute(
                 text(
                     """UPDATE memory_nodes SET content_hash = :content_hash,
+                        file_path = :file_path, file_path_sha256 = :path_hash,
                         document_content = :content, title = :title,
                         updated_at = :now, source_mtime = :source_mtime,
                         embedding_synced = FALSE,
@@ -1375,6 +1518,8 @@ class MySQLDocumentIndexProjection(_MySQLPort):
                     "source_mtime": source_mtime,
                     "revision": revision,
                     "previous_revision": previous_revision,
+                    "file_path": canonical_path,
+                    "path_hash": path_hash,
                 },
             )
             if updated.rowcount != 1:
@@ -1382,6 +1527,8 @@ class MySQLDocumentIndexProjection(_MySQLPort):
                     "document projection revision changed concurrently"
                 )
 
+        if _managed_snapshot is not None:
+            await self._store_managed_source(session, node_id, _managed_snapshot, "active")
         previous_chunks = await self._load_chunks(session, node_id)
         for chunk in previous_chunks:
             await session.execute(
@@ -1467,7 +1614,7 @@ class MySQLDocumentIndexProjection(_MySQLPort):
                 (
                     await session.execute(
                         text(
-                            "SELECT file_path FROM memory_nodes "
+                            "SELECT file_path, subject_document_id, subject_projection_state FROM memory_nodes "
                             "WHERE node_id = :node_id FOR UPDATE"
                         ),
                         {"node_id": node_id},
@@ -1478,6 +1625,8 @@ class MySQLDocumentIndexProjection(_MySQLPort):
             )
             if row is None:
                 return False
+            if row.get("subject_document_id") or row.get("subject_projection_state") == "legacy_retired":
+                raise DocumentIdentityConflict("managed and retired legacy identities cannot be hard deleted")
             if str(row["file_path"] or "") != canonical_path:
                 raise DocumentIdentityConflict(
                     "document node ID belongs to another path"
@@ -1526,6 +1675,8 @@ class MySQLDocumentIndexProjection(_MySQLPort):
             )
             if old is None:
                 return False
+            if old.get("subject_document_id") or old.get("subject_projection_state") == "legacy_retired":
+                raise DocumentIdentityConflict("managed and retired legacy identities cannot be rekeyed")
             if str(old["file_path"] or "") != old_canonical:
                 raise DocumentIdentityConflict("source node path is inconsistent")
             target = (
@@ -1773,7 +1924,7 @@ class MySQLDocumentIndexProjection(_MySQLPort):
                 await connection.execute(
                     text(
                         "SELECT * FROM memory_nodes WHERE node_type = 'file' "
-                        "AND COALESCE(is_deleted, FALSE) = FALSE "
+                        "AND (COALESCE(is_deleted, FALSE) = FALSE OR subject_document_id IS NOT NULL) "
                         "ORDER BY file_path, node_id"
                     )
                 )
@@ -2364,6 +2515,7 @@ class MySQLDocumentIndexProjection(_MySQLPort):
 
         assert self.runtime.engine is not None
         payloads: list[tuple[IndexJob, DocumentChunk, str, str]] = []
+        source_metadata: dict[str, dict[str, Any]] = {}
         stale: list[_IndexJobIdentity] = []
         errors: dict[_IndexJobIdentity, str] = {}
         for _load_attempt in range(_MAX_WRITE_ATTEMPTS):
@@ -2388,6 +2540,23 @@ class MySQLDocumentIndexProjection(_MySQLPort):
                             stale.append(identity)
                             errors[identity] = "InvalidDocumentIdentity"
                             continue
+                        subject_id = str(node.get("subject_document_id") or "")
+                        if subject_id and (
+                            job.node_id != generate_subject_file_node_id(subject_id)
+                            or not node.get("subject_version_id")
+                            or int(node.get("subject_document_revision") or 0) <= 0
+                            or int(node.get("subject_binding_revision") or 0) <= 0
+                        ):
+                            stale.append(identity)
+                            errors[identity] = "InvalidDocumentIdentity"
+                            continue
+                        source_metadata[job.node_id] = {
+                            "document_id": subject_id,
+                            "version_id": str(node.get("subject_version_id") or ""),
+                            "document_revision": int(node.get("subject_document_revision") or 0),
+                            "binding_revision": int(node.get("subject_binding_revision") or 0),
+                            "content_sha256": str(node.get("subject_content_sha256") or ""),
+                        } if subject_id else {}
                         if (
                             str(node["node_type"]) != "file"
                             or str(node["content_hash"] or "") != job.content_hash
@@ -2440,6 +2609,7 @@ class MySQLDocumentIndexProjection(_MySQLPort):
                 stale.clear()
                 errors.clear()
                 payloads.clear()
+                source_metadata.clear()
 
         for identity in dict.fromkeys(stale):
             job = jobs_by_identity[identity]
@@ -2516,6 +2686,7 @@ class MySQLDocumentIndexProjection(_MySQLPort):
                         "document_hash": job.content_hash,
                         "index_revision": job.index_revision,
                         "embedding_model": model_name,
+                        **source_metadata.get(job.node_id, {}),
                         "embedding_dimension": dimension,
                         "chunk_index": chunk.chunk_index,
                     }
@@ -2795,11 +2966,12 @@ class MySQLDocumentIndexProjection(_MySQLPort):
                 (
                     await connection.execute(
                         text(
-                            """SELECT node_id,
-                            MAX(MATCH(title, content) AGAINST (:query IN NATURAL LANGUAGE MODE)) score
-                        FROM memory_chunks
-                        WHERE MATCH(title, content) AGAINST (:query IN NATURAL LANGUAGE MODE)
-                        GROUP BY node_id ORDER BY score DESC, node_id LIMIT :limit"""
+                            """SELECT c.node_id,
+                            MAX(MATCH(c.title, c.content) AGAINST (:query IN NATURAL LANGUAGE MODE)) score
+                        FROM memory_chunks c JOIN memory_nodes n ON n.node_id = c.node_id
+                        WHERE MATCH(c.title, c.content) AGAINST (:query IN NATURAL LANGUAGE MODE)
+                          AND n.node_type = 'file' AND COALESCE(n.is_deleted, FALSE) = FALSE
+                        GROUP BY c.node_id ORDER BY score DESC, c.node_id LIMIT :limit"""
                         ),
                         {"query": query_text, "limit": _safe_limit(top_k)},
                     )
@@ -2814,6 +2986,7 @@ class MySQLDocumentIndexProjection(_MySQLPort):
                             text(
                                 "SELECT node_id, 1.0 score FROM memory_nodes "
                                 "WHERE node_type = 'file' AND document_content LIKE :query "
+                                "AND COALESCE(is_deleted, FALSE) = FALSE "
                                 "ORDER BY updated_at DESC, node_id LIMIT :limit"
                             ),
                             {"query": f"%{query_text}%", "limit": _safe_limit(top_k)},
@@ -2845,6 +3018,7 @@ class MySQLDocumentIndexProjection(_MySQLPort):
                     await connection.execute(
                         text(
                             "SELECT node_id FROM memory_nodes WHERE node_type = 'file' "
+                            "AND COALESCE(is_deleted, FALSE) = FALSE "
                             f"AND node_id IN ({', '.join(marks)})"
                         ),
                         params,
@@ -2878,7 +3052,8 @@ class MySQLDocumentIndexProjection(_MySQLPort):
         async with self.runtime.engine.connect() as connection:
             content = await connection.scalar(
                 text(
-                    "SELECT document_content FROM memory_nodes WHERE node_id = :node_id"
+                    "SELECT CASE WHEN subject_document_id IS NOT NULL AND is_deleted = TRUE "
+                    "THEN '' ELSE document_content END FROM memory_nodes WHERE node_id = :node_id"
                 ),
                 {"node_id": node_id},
             )
@@ -2935,7 +3110,7 @@ class MySQLDocumentIndexProjection(_MySQLPort):
         results: list[SearchResult] = []
         for node_id in ordered:
             node = await self._load_node(node_id)
-            if node is None or not node.file_path:
+            if node is None or node.is_deleted or not node.file_path:
                 continue
             if suffixes and not any(
                 node.file_path.lower().endswith(item) for item in suffixes
@@ -2949,6 +3124,12 @@ class MySQLDocumentIndexProjection(_MySQLPort):
                     relevance=ranks[node_id],
                     source=sources[node_id],
                     score_kind="accessibility_rank_not_truth",
+                    node_id=node.node_id,
+                    document_id=node.subject_document_id,
+                    version_id=node.subject_version_id,
+                    document_revision=node.subject_document_revision,
+                    binding_revision=node.subject_binding_revision,
+                    content_sha256=node.subject_content_sha256,
                 )
             )
             if len(results) >= max(1, int(top_k)):
@@ -5509,6 +5690,12 @@ def _node_from_row(row: Any) -> MemoryNode:
         ),
         embedding_model=str(row.get("embedding_model") or ""),
         legacy_fts_present=bool(row.get("legacy_fts_present")),
+        subject_document_id=str(row.get("subject_document_id") or ""),
+        subject_version_id=str(row.get("subject_version_id") or ""),
+        subject_document_revision=int(row.get("subject_document_revision") or 0),
+        subject_binding_revision=int(row.get("subject_binding_revision") or 0),
+        subject_content_sha256=str(row.get("subject_content_sha256") or ""),
+        is_deleted=bool(row.get("is_deleted")),
     )
 
 
@@ -5603,6 +5790,7 @@ class MySQLLegacyGraphStore(_MySQLPort):
         self,
         node_ids: Sequence[str],
     ) -> dict[str, LineageNodeView]:
+        """Return exact historical IDs, including retired rows, never current path aliases."""
         identifiers = tuple(dict.fromkeys(str(node_id).strip() for node_id in node_ids))
         identifiers = tuple(node_id for node_id in identifiers if node_id)
         if not identifiers:
@@ -5619,11 +5807,12 @@ class MySQLLegacyGraphStore(_MySQLPort):
                 (
                     await connection.execute(
                         text(
-                            "SELECT node_id, file_path, title, "
+                            "SELECT node_id, file_path, title, is_deleted, "
+                            "subject_document_id, subject_version_id, subject_document_revision, "
+                            "subject_binding_revision, subject_content_sha256, "
                             "LEFT(COALESCE(document_content, ''), 500) AS snippet "
                             "FROM memory_nodes "
                             f"WHERE node_id IN ({', '.join(marks)}) "
-                            "AND COALESCE(is_deleted, FALSE) = FALSE"
                         ),
                         params,
                     )
@@ -5636,7 +5825,16 @@ class MySQLLegacyGraphStore(_MySQLPort):
                 node_id=str(row["node_id"]),
                 file_path=str(row["file_path"] or ""),
                 title=str(row["title"] or ""),
-                snippet=str(row["snippet"] or ""),
+                snippet=(
+                    "" if row.get("subject_document_id") and bool(row.get("is_deleted"))
+                    else str(row["snippet"] or "")
+                ),
+                subject_document_id=str(row.get("subject_document_id") or ""),
+                subject_version_id=str(row.get("subject_version_id") or ""),
+                subject_document_revision=int(row.get("subject_document_revision") or 0),
+                subject_binding_revision=int(row.get("subject_binding_revision") or 0),
+                subject_content_sha256=str(row.get("subject_content_sha256") or ""),
+                is_deleted=bool(row.get("is_deleted")),
             )
             for row in rows
             if row["file_path"]

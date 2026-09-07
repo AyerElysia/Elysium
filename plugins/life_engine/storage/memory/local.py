@@ -99,6 +99,7 @@ from ...memory.indexing import (
     enqueue_index_job,
     list_index_jobs,
     move_document_rows,
+    project_managed_document_rows,
     read_active_chunk_index_state,
     set_index_job_status,
     transaction,
@@ -193,6 +194,8 @@ from ..contracts import StorageBackendRuntime
 from ..models import BackendKind, StorageAvailability
 from .contracts import (
     CanonicalDocumentMetadata,
+    ManagedDocumentIndexResult,
+    ManagedDocumentIndexSnapshot,
     MemoryStorageBundle,
     StableLedgerCursor,
     StableLedgerPage,
@@ -574,21 +577,30 @@ class _LocalPort:
 
 
 class LocalDocumentIndexProjection(_LocalPort):
+    async def project_managed_document(
+        self,
+        snapshot: ManagedDocumentIndexSnapshot,
+    ) -> ManagedDocumentIndexResult:
+        async with self._write_scope():
+            return await run_db(project_managed_document_rows, self._db(), snapshot)
+
     async def get_document_metadata(
         self,
         path: str,
     ) -> CanonicalDocumentMetadata | None:
-        canonical_path, node_id = canonical_file_node_id(path)
+        canonical_path, _ = canonical_file_node_id(path)
 
         def _read(db: sqlite3.Connection) -> CanonicalDocumentMetadata | None:
-            row = db.execute(
-                """SELECT node_id, file_path, content_hash, title,
-                source_mtime, index_revision, is_deleted, updated_at
-                FROM memory_nodes WHERE node_id = ? AND node_type = 'file'""",
-                (node_id,),
-            ).fetchone()
-            if row is None:
+            rows = db.execute(
+                "SELECT * FROM memory_nodes WHERE file_path = ? "
+                "AND node_type = 'file' AND COALESCE(is_deleted, 0) = 0 ORDER BY node_id",
+                (canonical_path,),
+            ).fetchall()
+            if not rows:
                 return None
+            if len(rows) != 1:
+                raise DocumentIdentityConflict("multiple live nodes claim one document path")
+            row = rows[0]
             if str(row["file_path"] or "") != canonical_path:
                 raise DocumentIdentityConflict(
                     "document node ID belongs to another canonical path"
@@ -610,6 +622,11 @@ class LocalDocumentIndexProjection(_LocalPort):
                 index_revision=int(row["index_revision"] or 0),
                 is_deleted=bool(row["is_deleted"]),
                 updated_at=float(row["updated_at"] or 0.0),
+                subject_document_id=str(row["subject_document_id"] or ""),
+                subject_version_id=str(row["subject_version_id"] or ""),
+                subject_document_revision=int(row["subject_document_revision"] or 0),
+                subject_binding_revision=int(row["subject_binding_revision"] or 0),
+                subject_content_sha256=str(row["subject_content_sha256"] or ""),
             )
 
         return await run_db(_read, self._db())
@@ -686,7 +703,14 @@ class LocalDocumentIndexProjection(_LocalPort):
             return await run_db(enqueue_index_job, self._db(), node_id, content_hash)
 
     async def list_indexed_documents(self) -> list[MemoryNode]:
-        return await run_db(_list_active_file_nodes, self._db())
+        def _read() -> list[MemoryNode]:
+            return [row_to_node(row) for row in self._db().execute(
+                "SELECT * FROM memory_nodes WHERE node_type = 'file' "
+                "AND (COALESCE(is_deleted, 0) = 0 OR subject_document_id IS NOT NULL) "
+                "ORDER BY file_path, node_id"
+            ).fetchall()]
+
+        return await run_db(_read)
 
     async def mark_documents_deleted(self, node_ids: Sequence[str]) -> int:
         async with self._write_scope():

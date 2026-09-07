@@ -7,9 +7,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any, Optional
 
@@ -61,6 +62,104 @@ class MemoryNode:
     embedding_content_hash: str | None = None
     embedding_model: str = ""
     legacy_fts_present: bool = False
+    subject_document_id: str = ""
+    subject_version_id: str = ""
+    subject_document_revision: int = 0
+    subject_binding_revision: int = 0
+    subject_content_sha256: str = ""
+    is_deleted: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ManagedDocumentIndexSnapshot:
+    """A fenced, exact subject head projected into the rebuildable index.
+
+    The caller must hold the subject namespace fence until this projection
+    commits. ``content=None`` means the current bytes are not text-indexable;
+    it never authorizes changing or deleting the authoritative document.
+    """
+
+    document_id: str
+    version_id: str
+    path: str
+    document_revision: int
+    binding_revision: int
+    content_sha256: str
+    content: str | None
+    deleted: bool = False
+    title: str = ""
+
+    def validate(self) -> None:
+        """Reject incomplete source identity instead of inventing provenance."""
+        for value in (self.document_id, self.version_id):
+            if (
+                not isinstance(value, str)
+                or not value
+                or len(value) > 128
+                or not value.isascii()
+                or any(not (char.isalnum() or char in "_-.:@") for char in value)
+            ):
+                raise ValueError("ManagedDocumentSourceIdentityInvalid")
+        if (
+            not isinstance(self.path, str)
+            or not self.path
+            or len(self.path) > 2048
+            or "\\" in self.path
+            or any(part in {"", ".", ".."} for part in self.path.split("/"))
+            or ":" in self.path
+        ):
+            raise ValueError("ManagedDocumentPathInvalid")
+        if (
+            type(self.document_revision) is not int
+            or self.document_revision <= 0
+            or type(self.binding_revision) is not int
+            or self.binding_revision <= 0
+            or type(self.deleted) is not bool
+            or (self.content is not None and not isinstance(self.content, str))
+            or not isinstance(self.title, str)
+            or (self.deleted and self.content is not None)
+        ):
+            raise ValueError("ManagedDocumentProjectionStateInvalid")
+        if (
+            not isinstance(self.content_sha256, str)
+            or len(self.content_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in self.content_sha256)
+        ):
+            raise ValueError("ManagedDocumentContentHashInvalid")
+        if self.content is not None and not assess_indexed_document_path(self.path).eligible:
+            raise ValueError("ManagedDocumentTextPathNotIndexable")
+
+    @property
+    def projection_sha256(self) -> str:
+        """Pin text, title, and source metadata without persisting another body."""
+        self.validate()
+        body = asdict(self)
+        body["content"] = (
+            hashlib.sha256(self.content.encode("utf-8")).hexdigest()
+            if self.content is not None else None
+        )
+        encoded = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class ManagedDocumentIndexResult:
+    """Content-free receipt for a rebuildable managed-document projection."""
+
+    node_id: str
+    document_id: str
+    version_id: str
+    document_revision: int
+    indexed: bool
+    idempotent_replay: bool = False
+
+
+def generate_subject_file_node_id(document_id: str) -> str:
+    """Keep one node across renames without ever hashing its current path."""
+    value = str(document_id)
+    if not value or len(value) > 128 or not value.isascii():
+        raise ValueError("ManagedDocumentSourceIdentityInvalid")
+    return f"subject-file:{value}"
 
 
 # ============================================================
@@ -139,6 +238,12 @@ def row_to_node(row: sqlite3.Row) -> MemoryNode:
             if "legacy_fts_present" in columns
             else False
         ),
+        subject_document_id=str(row["subject_document_id"] or "") if "subject_document_id" in columns else "",
+        subject_version_id=str(row["subject_version_id"] or "") if "subject_version_id" in columns else "",
+        subject_document_revision=int(row["subject_document_revision"] or 0) if "subject_document_revision" in columns else 0,
+        subject_binding_revision=int(row["subject_binding_revision"] or 0) if "subject_binding_revision" in columns else 0,
+        subject_content_sha256=str(row["subject_content_sha256"] or "") if "subject_content_sha256" in columns else "",
+        is_deleted=bool(row["is_deleted"]) if "is_deleted" in columns else False,
     )
 
 
@@ -212,6 +317,8 @@ async def get_node_by_file_path(
     normalized_path = eligibility.path
 
     def _valid_file_row(row: sqlite3.Row) -> Optional[MemoryNode]:
+        if "is_deleted" in set(row.keys()) and bool(row["is_deleted"]):
+            return None
         if str(row["node_type"] or "file").lower() != NodeType.FILE.value:
             return None
         stored = assess_indexed_document_path(row["file_path"])

@@ -86,6 +86,29 @@ class LifeEngineEvent:
     content_ref: str | None = None
     raw_content: str | None = None
 
+    # Runtime delivery provenance, never a new source occurrence or tool call.
+    # The exact source row and recovery operation are retained in the private
+    # repair manifest; these fields keep later projections visibly historical.
+    redelivery_operation_id: str | None = None
+    redelivery_source_position: int | None = None
+
+    def __post_init__(self) -> None:
+        operation = self.redelivery_operation_id
+        position = self.redelivery_source_position
+        if operation is None and position is None:
+            return
+        if (
+            not isinstance(operation, str)
+            or not operation
+            or len(operation) > 128
+            or any(not (char.isascii() and (char.isalnum() or char in "_.:-"))
+                   for char in operation)
+            or isinstance(position, bool)
+            or not isinstance(position, int)
+            or position <= 0
+        ):
+            raise ValueError("HistoricalRedeliveryProvenanceInvalid")
+
 
 @dataclass(slots=True)
 class LifeEngineState:

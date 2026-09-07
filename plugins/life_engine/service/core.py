@@ -41,6 +41,7 @@ from src.core.models.message import Message, MessageType
 from src.kernel.concurrency import get_task_manager
 from src.kernel.llm import ROLE, LLMPayload, Text, ToolRegistry, ToolResult
 from src.kernel.llm.context_delivery import EffectiveContextReceipt
+from src.kernel.llm.exceptions import LLMContextError
 
 _STORAGE_RENEWAL_BACKOFF_BASE_SECONDS = 1.0
 _STORAGE_RENEWAL_BACKOFF_MAX_SECONDS = 30.0
@@ -282,8 +283,7 @@ from .heartbeat_rolling import (
     copy_rolling_payloads,
     ensure_heartbeat_user_turn,
     estimate_payload_chars,
-    format_new_events_text,
-    iter_selected_events,
+    format_visible_event,
     load_heartbeat_rolling,
     rolling_payloads_only,
     save_heartbeat_rolling,
@@ -305,8 +305,10 @@ from ..core.context_stewardship import (
     ensure_compression_required_appended,
     has_compression_required_payload,
     install_subject_context_recovery_hook,
+    is_compression_required_part,
     is_context_stewardship_tool_name,
     is_subject_window_overflow_error,
+    isolate_model_checkpoint_output,
     payloads_require_compression,
     register_live_context,
     reset_subject_context_recovery_marker,
@@ -564,14 +566,22 @@ async def _await_with_heartbeat_deadline(
     if remaining <= 0:
         raise HeartbeatBudgetExhausted(stage)
     timeout = remaining
-    deadline_limited = True
     if per_call_timeout is not None and per_call_timeout > 0:
         timeout = min(remaining, float(per_call_timeout))
-        deadline_limited = remaining <= float(per_call_timeout)
     try:
         return await asyncio.wait_for(factory(), timeout=timeout)
+    except HeartbeatBudgetExhausted:
+        # A nested deadline already identifies its content-free stop stage.
+        raise
     except asyncio.TimeoutError as exc:
-        if deadline_limited:
+        # An inner provider can raise TimeoutError before wait_for expires.
+        # Selecting the shared deadline as the tighter limit does not prove
+        # that deadline elapsed; preserve the original error and retry path
+        # while usable time remains, including its provider error cause.
+        if _heartbeat_remaining_seconds(
+            deadline,
+            reserve_seconds=reserve_seconds,
+        ) <= 0:
             raise HeartbeatBudgetExhausted(stage) from exc
         raise
 
@@ -2428,6 +2438,31 @@ class LifeEngineService(BaseService):
                 "must attach Memory to the LifeEngineService-owned runtime"
             )
 
+    async def _attach_selected_subject_store(self) -> None:
+        """Attach Memory's authority prerequisite without opening later domains.
+
+        Memory startup recovery needs the exact service-owned subject handle.
+        Runtime-state and singleton-domain attachment stays after Memory recovery
+        so a failed early start cannot checkpoint an as-yet-unloaded context.
+        Business startup only opens existing schema; it never migrates it.
+        """
+        if (
+            not self._selectable_storage_enabled
+            or self._subject_document_store is not None
+        ):
+            return
+        runtime = self.storage_runtime
+        if runtime is None or not runtime.enabled:
+            raise RuntimeError("SelectedSubjectStorageRuntimeNotStarted")
+        from ..storage.subject_factory import open_subject_document_store
+
+        subject_store = await open_subject_document_store(
+            runtime, initialize_schema=False
+        )
+        if subject_store is None:
+            raise RuntimeError("SelectedSubjectStorageNotStarted")
+        self._subject_document_store = subject_store
+
     async def _start_selected_storage(self) -> None:
         """Attach all selected life domains to the service-owned runtime."""
 
@@ -2445,7 +2480,6 @@ class LifeEngineService(BaseService):
             reconcile_proactive_decision_guards,
         )
         from ..storage.runtime_factory import open_runtime_state_store
-        from ..storage.subject_factory import open_subject_document_store
 
         await self._open_selected_storage_runtime()
         runtime = self.storage_runtime
@@ -2574,10 +2608,8 @@ class LifeEngineService(BaseService):
             runtime,
             initialize_schema=False,
         )
-        subject_store = await open_subject_document_store(
-            runtime,
-            initialize_schema=False,
-        )
+        await self._attach_selected_subject_store()
+        subject_store = self._subject_document_store
         runtime_state_store = await open_runtime_state_store(
             runtime,
             initialize_schema=False,
@@ -3632,8 +3664,9 @@ class LifeEngineService(BaseService):
         logical_path: str,
         version_id: str,
         max_tasks: int,
+        occurrence_id: str | None = None,
     ) -> dict[str, Any]:
-        """Verify one remote current head; never project selected data to files."""
+        """Resolve one exact operation; remote storage never writes local files."""
 
         store = self._subject_document_store
         if store is None:
@@ -3644,7 +3677,9 @@ class LifeEngineService(BaseService):
             projector = self._subject_workspace_projector
             if projector is None:
                 raise RuntimeError("SelectedSubjectProjectorNotStarted")
-            task = await store.get_projection_task(logical_path, version_id)
+            task = await store.get_projection_task(
+                logical_path, version_id, occurrence_id=occurrence_id,
+            )
             if task is None:
                 raise RuntimeError(
                     f"SubjectProjectionMissing: {logical_path}:{version_id}"
@@ -3654,46 +3689,88 @@ class LifeEngineService(BaseService):
                     "status": "confirmed_existing",
                     "logical_path": logical_path,
                     "version_id": version_id,
+                    "outbox_id": task.outbox_id,
+                    "head_event_id": task.head_event_id,
                 }
             if task.state == "failed":
                 await store.retry_projection(
                     task,
                     worker_id=projector.worker_id,
                 )
-            for _ in range(max(1, int(max_tasks))):
+            for _ in range(min(128, max(1, int(max_tasks)))):
                 result = await projector.project_one(logical_path=logical_path)
                 if result.status == "idle":
                     raise RuntimeError(
                         f"SubjectProjectionMissing: {logical_path}:{version_id}"
                     )
-                if result.status == "failed" and result.version_id == version_id:
+                exact_task = (
+                    result.outbox_id == task.outbox_id
+                    and result.head_event_id == task.head_event_id
+                )
+                if result.status == "failed" and exact_task:
+                    if occurrence_id:
+                        return {
+                            "status": "failed",
+                            "logical_path": result.logical_path,
+                            "version_id": result.version_id,
+                            "outbox_id": result.outbox_id,
+                            "head_event_id": result.head_event_id,
+                            "detail": result.detail,
+                        }
                     raise RuntimeError(
                         f"SubjectProjectionFailed: {logical_path}: {result.detail}"
                     )
-                if result.version_id == version_id and result.status in {
+                if exact_task and result.status in {
                     "projected",
                     "confirmed_existing",
                     "superseded",
+                    "deleted",
+                    "renamed",
                 }:
                     return {
                         "status": result.status,
                         "logical_path": result.logical_path,
                         "version_id": result.version_id,
+                        "outbox_id": result.outbox_id,
+                        "head_event_id": result.head_event_id,
                     }
             raise RuntimeError(f"SubjectProjectionBacklogExceeded: {logical_path}")
 
         del max_tasks
+        task = await store.get_projection_task(
+            logical_path, version_id, occurrence_id=occurrence_id,
+        )
+        if occurrence_id:
+            operation = await store.get_document_operation(occurrence_id)
+            version = await store.get_version(version_id)
+            if (
+                operation is None or task is None
+                or str(operation.result.get("version_id")) != version_id
+                or str(operation.result.get("logical_path")) != logical_path
+                or version.document_id != operation.document_id
+                or version.content_hash != task.content_hash
+                or hashlib.sha256(version.content_bytes).hexdigest() != task.content_hash
+            ):
+                raise RuntimeError("SubjectRemoteOperationReceiptMismatch")
+            if task.state != "confirmed":
+                raise RuntimeError("SubjectRemoteOperationNotConfirmed")
+            return {
+                "status": "remote_committed",
+                "logical_path": logical_path,
+                "version_id": version_id,
+                "outbox_id": task.outbox_id,
+                "head_event_id": task.head_event_id,
+            }
         head = await store.get_head(logical_path)
         if head is None or head.current_version_id != version_id:
             raise RuntimeError(
                 f"SubjectRemoteHeadMismatch: {logical_path}:{version_id}"
             )
         version = await store.get_version(version_id)
-        if version.logical_path != logical_path:
+        if version.document_id != head.document_id:
             raise RuntimeError(
                 f"SubjectRemoteVersionPathMismatch: {logical_path}:{version_id}"
             )
-        task = await store.get_projection_task(logical_path, version_id)
         if task is None or task.state != "confirmed":
             state = "missing" if task is None else task.state
             # MySQL 后端不运行 workspace projector：outbox 由 append 时直接
@@ -6110,6 +6187,46 @@ class LifeEngineService(BaseService):
         memory_service = self._memory_service
         if memory_service is None:
             return "记忆系统暂不可用"
+        selected = bool(
+            getattr(self, "_selectable_storage_enabled", False)
+            or getattr(memory_service, "_subject_document_store_required", False)
+            or getattr(memory_service, "_subject_document_store", None) is not None
+        )
+        workspace: Path | None = None
+        has_managed_reference = False
+
+        def source_reference(item: Any, *, primary: bool = False) -> str:
+            nonlocal has_managed_reference
+            prefix = "primary_" if primary else ""
+            document_id = str(getattr(item, prefix + "document_id", "") or "")
+            version_id = str(getattr(item, prefix + "version_id", "") or "")
+            node_id = str(getattr(item, prefix + "node_id", "") or "")
+            parts = []
+            if node_id:
+                parts.append(f"node_id={node_id}")
+            if document_id:
+                parts.append(f"document_id={document_id}")
+            if version_id:
+                parts.append(f"version_id={version_id}")
+            if document_id and version_id:
+                has_managed_reference = True
+                parts.append(f"file_ref=subject-file:{document_id}@{version_id}")
+            return " | ".join(parts)
+
+        def metadata_label(path: str, document_id: str) -> str:
+            nonlocal workspace
+            if document_id:
+                return "权威版本"
+            if workspace is None:
+                workspace = self._workspace_dir()
+            file_meta = get_file_metadata(workspace / path)
+            return f"{file_meta['ext']} | {file_meta['time_ago']} | {file_meta['size']}"
+
+        exact_read_hint = (
+            "\n受管文件请固定上方 file_ref 对应的版本：fetch_life_memory 同时传 "
+            "version_ids={路径: version_id}；也可用 nucleus_read_file（read_file）传 "
+            "document_id、version_id 精确续读，不要仅凭当前路径回取历史版本。"
+        )
 
         # 需要 SearchResult 列表：下面既要交给 build_memory_bundles，
         # 也要在降级路径里直接读 file_path/snippet。
@@ -6151,48 +6268,69 @@ class LifeEngineService(BaseService):
                 top_k=max(1, int(top_k)),
             )
         except Exception as exc:  # noqa: BLE001
+            if selected:
+                logger.warning(
+                    "[search_actor_memory] 受管记忆包待恢复: "
+                    f"error_type={type(exc).__name__}"
+                )
+                return (
+                    "记忆索引待恢复，本次未展示可能过期的摘要"
+                    f"（{type(exc).__name__}）；请恢复受管索引后重试。"
+                )
             logger.warning(
-                f"[search_actor_memory] 构建可追溯记忆包失败，将使用普通摘要: {exc}"
+                "[search_actor_memory] 构建可追溯记忆包失败，将使用普通摘要: "
+                f"error_type={type(exc).__name__}"
             )
             bundles = []
 
         if bundles:
-            workspace = self._workspace_dir()
             bundle_lines: list[str] = []
             for bundle in bundles[: max(1, int(top_k))]:
-                file_meta = get_file_metadata(workspace / bundle.primary_path)
-                meta_str = f"{file_meta['ext']} | {file_meta['time_ago']} | {file_meta['size']}"
+                primary_reference = source_reference(bundle, primary=True)
+                meta_str = metadata_label(
+                    bundle.primary_path,
+                    str(getattr(bundle, "primary_document_id", "") or ""),
+                )
 
                 evidence_lines: list[str] = []
                 for item in bundle.evidence[:4]:
                     label = (
                         "当前文件"
-                        if item.file_path == bundle.primary_path
+                        if item.file_path == bundle.primary_path and item.exists
                         else "历史证据"
                     )
                     if item.relation:
                         label += f"/{item.relation}"
                     exists_note = (
-                        "" if item.exists else "（当前路径不存在，仅作历史轨迹）"
+                        "" if item.exists
+                        else "（非当前绑定、不能按当前路径回取；仅作历史轨迹）"
                     )
+                    reference = source_reference(item)
                     snippet = _shorten_text(
                         " ".join((item.snippet or "").split()), max_length=160
                     )
                     evidence_lines.append(
                         f"  - {label}: {item.title or Path(item.file_path).name} "
                         f"[{item.file_path}]{exists_note}\n"
-                        f"    摘要：{snippet or '无摘要'}"
+                        + (f"    引用：{reference}\n" if reference else "")
+                        + f"    摘要：{snippet or '无摘要'}"
                     )
 
                 trace_lines: list[str] = []
                 for trace in bundle.history_trace[:4]:
+                    reference = source_reference(trace)
+                    exists_note = (
+                        "" if trace.exists
+                        else "（非当前绑定、不能按当前路径回取；仅作历史轨迹）"
+                    )
                     direction = "后来" if trace.direction == "later" else "早期"
                     reason = _shorten_text(
                         " ".join((trace.reason or "").split()), max_length=120
                     )
                     trace_lines.append(
-                        f"  - {direction}/{trace.relation}: [{trace.file_path}]"
+                        f"  - {direction}/{trace.relation}: [{trace.file_path}]{exists_note}"
                         + (f" - {reason}" if reason else "")
+                        + (f"\n    引用：{reference}" if reference else "")
                     )
 
                 correction_lines = [
@@ -6202,8 +6340,12 @@ class LifeEngineService(BaseService):
 
                 line_parts = [
                     f"- 主要文件：{bundle.primary_path} ({meta_str})",
-                    f"  当前理解：{_shorten_text(bundle.current_understanding, max_length=260)}",
                 ]
+                if primary_reference:
+                    line_parts.append(f"  引用：{primary_reference}")
+                line_parts.append(
+                    f"  当前理解：{_shorten_text(bundle.current_understanding, max_length=260)}"
+                )
                 if evidence_lines:
                     line_parts.append("  证据：\n" + "\n".join(evidence_lines))
                 if trace_lines:
@@ -6217,6 +6359,8 @@ class LifeEngineService(BaseService):
                 bundle_lines.append("\n".join(line_parts))
 
             footer = "\n\n提示：以上是可追溯记忆包；旧记忆作为历史证据保留，当前理解优先参考后续整理和显式修正。如需查看完整内容，可使用 fetch_life_memory 工具读取文件。"
+            if has_managed_reference:
+                footer += exact_read_hint
             final_result = "【可追溯记忆包】\n" + "\n\n".join(bundle_lines) + footer
 
             logger.info(
@@ -6226,7 +6370,6 @@ class LifeEngineService(BaseService):
             )
             return final_result
 
-        workspace = self._workspace_dir()
         direct_lines: list[str] = []
         associated_lines: list[str] = []
 
@@ -6235,15 +6378,16 @@ class LifeEngineService(BaseService):
             snippet = _shorten_text(
                 " ".join((result.snippet or "").split()), max_length=250
             )
-            file_meta = get_file_metadata(workspace / result.file_path)
-            meta_str = (
-                f"{file_meta['ext']} | {file_meta['time_ago']} | {file_meta['size']}"
+            reference = source_reference(result)
+            meta_str = metadata_label(
+                result.file_path, str(getattr(result, "document_id", "") or "")
             )
 
             line = (
                 f"- {title} [{result.file_path}] "
                 f"(相关度 {result.relevance:.2f} | {meta_str})\n"
-                f"  摘要：{snippet or '无摘要'}"
+                + (f"  引用：{reference}\n" if reference else "")
+                + f"  摘要：{snippet or '无摘要'}"
             )
 
             if result.source == "associated":
@@ -6278,6 +6422,8 @@ class LifeEngineService(BaseService):
             )
 
         footer = "\n\n💡 提示：以上仅为摘要。如需查看完整内容，可使用 fetch_life_memory 工具读取文件。"
+        if has_managed_reference:
+            footer += exact_read_hint
         final_result = "\n\n".join(parts) + footer
 
         logger.info(
@@ -8035,13 +8181,9 @@ class LifeEngineService(BaseService):
             snapshot_events,
             cursor=cursor,
             existing_summary=summary,
-        )
-        delta_events = iter_selected_events(
-            snapshot_events,
-            prepared.selected_event_ids,
+            event_renderer=format_visible_event,
         )
         prepared.world_perception = None
-        prepared.content = format_new_events_text(delta_events)
         try:
             from src.core.managers.stream_manager import get_stream_manager
 
@@ -8371,6 +8513,12 @@ class LifeEngineService(BaseService):
             tool_run_start_time = ""
 
         for event in sorted_events:
+            if event.redelivery_operation_id is not None:
+                _flush_tool_run()
+                historical = self._format_historical_chatter_event(event)
+                if historical:
+                    lines.append(historical)
+                continue
             # 工具操作折叠逻辑
             if event.event_type == EventType.TOOL_CALL:
                 if tool_run_count == 0:
@@ -8968,8 +9116,18 @@ class LifeEngineService(BaseService):
 
         return False
 
+    def _format_historical_chatter_event(self, event: LifeEngineEvent) -> str:
+        """Keep historical cross-instance tool observations payload-redacted."""
+        if event.event_type in {EventType.TOOL_CALL, EventType.TOOL_RESULT}:
+            return self._subconscious_context._render_event(
+                event, include_tool_payloads=False
+            )
+        return format_visible_event(event)
+
     def _format_salient_event(self, event: LifeEngineEvent) -> str:
         """把单条 salient event 渲染成一行摘要。"""
+        if event.redelivery_operation_id is not None:
+            return self._format_historical_chatter_event(event)
         time_display = _format_time_display(event.timestamp)
         event_type = event.event_type
         content = str(getattr(event, "content", "") or "")
@@ -9073,6 +9231,9 @@ class LifeEngineService(BaseService):
                 rendered.pop(0)
             body = "\n".join(rendered)
             if not body:
+                if merged[-1].redelivery_operation_id is not None:
+                    # A historical ref must remain complete or stay unseen.
+                    return "", cursor
                 # 极端情况下，单条仍超长 → 截断该单条
                 body = _shorten_text(
                     self._format_salient_event(merged[-1]), max_length=max_chars
@@ -9939,6 +10100,34 @@ class LifeEngineService(BaseService):
             request,
             max_groups=max_groups,
             max_bytes=max_bytes,
+        )
+
+    @staticmethod
+    def _protect_heartbeat_exact_projection(holder: Any, wake_text: str) -> None:
+        """Protect this beat's exact delivery and current technical controls.
+
+        Rebuild from the actual USER control parts before each send; assistant
+        quotations and controls from preceding turns do not accumulate.
+        """
+
+        manager = getattr(holder, "context_manager", None)
+        if manager is None or not hasattr(manager, "protected_exact_texts"):
+            raise LLMContextError("heartbeat context manager cannot protect exact delivery text")
+        controls = frozenset(
+            part.text
+            for payload in list(getattr(holder, "payloads", None) or [])
+            if isinstance(payload, LLMPayload) and payload.role == ROLE.USER
+            for part in payload.content
+            if isinstance(part, Text) and is_compression_required_part(part)
+        )
+        manager.protected_exact_texts = frozenset((wake_text, *controls))
+        manager.reprojectable_exact_texts = controls
+
+    @staticmethod
+    def _is_heartbeat_window_overflow_error(error: BaseException) -> bool:
+        return is_subject_window_overflow_error(error) or (
+            isinstance(error, LLMContextError)
+            and "protected exact delivery text" in str(error)
         )
 
     def _apply_heartbeat_recovery_envelope(self, response: Any) -> None:
@@ -10912,6 +11101,7 @@ class LifeEngineService(BaseService):
                 wake_text,
                 marker=subconscious_delivery_marker,
             )
+            self._protect_heartbeat_exact_projection(request, wake_text)
 
         # 心跳请求超时与心跳间隔解耦：慢模型（长 prompt 的推理模型）单次可达上百秒，
         # 沿用间隔值会把正常的慢响应当成超时反复重试。
@@ -10938,7 +11128,7 @@ class LifeEngineService(BaseService):
         except HeartbeatBudgetExhausted:
             raise
         except Exception as e:
-            if is_subject_window_overflow_error(e):
+            if self._is_heartbeat_window_overflow_error(e):
                 logger.warning(
                     "心跳滚动上下文超过模型窗口，本拍改为压缩维护，"
                     f"不把同一份超窗载荷降级到 utility: {e}"
@@ -10968,6 +11158,7 @@ class LifeEngineService(BaseService):
                             wake_text,
                             marker=subconscious_delivery_marker,
                         )
+                        self._protect_heartbeat_exact_projection(fallback_request, wake_text)
                     response = await _await_with_heartbeat_deadline(
                         lambda: fallback_request.send(stream=False),
                         deadline=heartbeat_deadline,
@@ -10978,7 +11169,7 @@ class LifeEngineService(BaseService):
                 except HeartbeatBudgetExhausted:
                     raise
                 except Exception as fallback_exc:
-                    if is_subject_window_overflow_error(fallback_exc):
+                    if self._is_heartbeat_window_overflow_error(fallback_exc):
                         logger.warning(
                             "心跳 utility 降级仍超过模型窗口，本拍改为压缩维护: "
                             f"{fallback_exc}"
@@ -11049,6 +11240,8 @@ class LifeEngineService(BaseService):
                     turn_index=turn_index,
                 )
             )
+            if isolate_model_checkpoint_output(response):
+                self._register_heartbeat_live_context(list(response.payloads))
             self._print_heartbeat_decision_panel(response, turn_index=turn_index)
 
             logger.debug(
@@ -11200,8 +11393,13 @@ class LifeEngineService(BaseService):
                     wake_text,
                     marker=subconscious_delivery_marker,
                 )
+                self._protect_heartbeat_exact_projection(current_response, wake_text)
 
             reset_subject_context_recovery_marker(current_response)
+            # A new attempt must earn its own exact receipt.  If preflight,
+            # retry, timeout, or cancellation prevents that attempt, an earlier
+            # response cannot authorize this heartbeat's consumption commit.
+            subconscious_receipt = None
 
             async def _send_followup_request() -> Any:
                 from src.kernel.llm.exceptions import LLMModelsCoolingDownError
@@ -11293,7 +11491,7 @@ class LifeEngineService(BaseService):
                 self._discard_pending_heartbeat_memory_deliveries(
                     pending_memory_deliveries
                 )
-                if is_subject_window_overflow_error(followup_exc):
+                if self._is_heartbeat_window_overflow_error(followup_exc):
                     logger.warning(
                         "心跳续轮滚动上下文超过模型窗口，本拍改为压缩维护: "
                         f"{followup_exc}"
@@ -11620,6 +11818,11 @@ class LifeEngineService(BaseService):
         self._start_storage_authority_renewal()
         await self._start_local_proactive_authority()
         await self._load_opportunity_runtime_mode()
+
+        # Subject authority is needed during Memory's own recovery. Do not move
+        # the later runtime-state/claim attach here: rollback before context
+        # hydration must not create a final checkpoint from empty startup state.
+        await self._attach_selected_subject_store()
 
         # 初始化集成管理器
         self._memory_integration = MemoryIntegration(self)
@@ -12790,11 +12993,12 @@ class LifeEngineService(BaseService):
                             f"at {self._state.last_heartbeat_at}: {wake_status}"
                         )
                     else:
-                        wake_status = (
-                            "本拍未完成，消费未确认"
-                            if prepared_round is None
-                            else "无新事件"
-                        )
+                        if prepared_round is None:
+                            wake_status = "本拍未完成，消费未确认"
+                        elif not getattr(prepared_round, "target_reached", True):
+                            wake_status = "待处理活动尚未完整投影，本拍未消费"
+                        else:
+                            wake_status = "无新事件"
                         logger.info(
                             f"life_engine heartbeat #{self._state.heartbeat_count} "
                             f"at {self._state.last_heartbeat_at}: {wake_status}"

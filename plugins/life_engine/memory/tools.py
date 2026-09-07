@@ -38,7 +38,72 @@ MEMORY_SEARCH_PROJECTION_VERSION = "memory-search-projection-v2"
 MEMORY_SEARCH_CORE_MAX_BYTES = 16 * 1024
 MEMORY_SEARCH_EXPRESSION_MAX_BYTES = 64 * 1024
 MEMORY_SEARCH_MAX_ITEM_EXCERPT_BYTES = 2 * 1024
+MEMORY_SEARCH_MAX_LINK_GROUP_BYTES = 2 * 1024
 LEGACY_RELATION_MUTATION_RETIRED = "LegacyRelationMutationRetired"
+_EXACT_DOCUMENT_FIELDS = (
+    "file_path", "node_id", "document_id", "version_id", "document_revision",
+    "binding_revision", "content_sha256", "file_ref",
+)
+
+
+def _exact_document_fields(value: Any) -> dict[str, Any]:
+    """Carry declared mechanical references, never reconstruct old path lineage."""
+    getter = value.get if isinstance(value, dict) else lambda key: getattr(value, key, None)
+    fields = {key: getter(key) for key in _EXACT_DOCUMENT_FIELDS}
+    return {
+        key: item for key, item in fields.items()
+        if item not in (None, "") and (
+            fields.get("document_id") or key not in {"document_revision", "binding_revision"}
+        )
+    }
+
+
+def _evidence_entity_ref(item: Any) -> str:
+    """Stable selected document identity, preserving legacy entity refs as-is."""
+    if item.kind == "document_evidence":
+        document_id = _exact_document_fields(item.metadata).get("document_id")
+        if document_id:
+            return f"subject-file:{document_id}"
+        return f"document:{item.record_id}"
+    return f"{item.kind}:{item.record_id}"
+
+
+def _bundle_primary_fields(bundle: MemoryBundle) -> dict[str, Any]:
+    fields = {"primary_path": bundle.primary_path}
+    for name in ("primary_node_id", "primary_document_id", "primary_version_id"):
+        value = getattr(bundle, name, "")
+        if value:
+            fields[name] = value
+    if fields.get("primary_document_id") and fields.get("primary_version_id"):
+        fields["primary_file_ref"] = (
+            f"subject-file:{fields['primary_document_id']}@{fields['primary_version_id']}"
+        )
+    return fields
+
+
+def _partition_projection_links(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Page large same-content link sets without dropping any exact reference.
+
+    Content hashes still deduplicate bytes. A content ref may recur on later
+    pages with explicitly numbered link groups; only its association metadata
+    is partitioned, with order and source semantics unchanged.
+    """
+    result = []
+    for record in records:
+        groups: list[list[dict[str, Any]]] = []
+        current: list[dict[str, Any]] = []
+        for link in record["links"]:
+            if current and len(_canonical_json_bytes([*current, link])) > MEMORY_SEARCH_MAX_LINK_GROUP_BYTES:
+                groups.append(current)
+                current = []
+            current.append(link)
+        groups.append(current)
+        for index, group in enumerate(groups):
+            split = {**record, "links": group}
+            if len(groups) > 1:
+                split.update({"link_group_index": index, "link_group_count": len(groups)})
+            result.append(split)
+    return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -451,17 +516,14 @@ class LifeEngineSearchMemoryTool(BaseTool):
             return ref
 
         for item in evidence_results:
-            entity_ref = (
-                f"document:{item.record_id}"
-                if item.kind == "document_evidence"
-                else f"{item.kind}:{item.record_id}"
-            )
+            entity_ref = _evidence_entity_ref(item)
             add_content(
                 item.content,
                 {
                     "link_type": "evidence",
                     "entity_ref": entity_ref,
                     "record_id": item.record_id,
+                    **_exact_document_fields(item.metadata),
                     "kind": item.kind,
                     "rank_score": round(float(item.rank_score), 6),
                     "confidence": item.confidence,
@@ -480,11 +542,10 @@ class LifeEngineSearchMemoryTool(BaseTool):
             )
 
         for bundle_index, bundle in enumerate(bundles):
+            primary = _bundle_primary_fields(bundle)
             bundle_id = (
                 "memory-bundle:"
-                + hashlib.sha256(
-                    f"{bundle_index}:{bundle.primary_path}".encode("utf-8")
-                ).hexdigest()
+                + _sha256_json({"ordinal": bundle_index, **primary})
             )
             if bundle.current_understanding:
                 add_content(
@@ -492,7 +553,7 @@ class LifeEngineSearchMemoryTool(BaseTool):
                     {
                         "link_type": "bundle_current",
                         "bundle_id": bundle_id,
-                        "primary_path": bundle.primary_path,
+                        **primary,
                     },
                 )
             for index, item in enumerate(bundle.evidence):
@@ -503,6 +564,8 @@ class LifeEngineSearchMemoryTool(BaseTool):
                         {
                             "link_type": "bundle_relation_reason",
                             "bundle_id": bundle_id,
+                            **primary,
+                            **_exact_document_fields(item),
                             "ordinal": index,
                             "file_path": item.file_path,
                         },
@@ -512,6 +575,8 @@ class LifeEngineSearchMemoryTool(BaseTool):
                     {
                         "link_type": "bundle_evidence",
                         "bundle_id": bundle_id,
+                        **primary,
+                        **_exact_document_fields(item),
                         "ordinal": index,
                         "file_path": item.file_path,
                         "title": item.title,
@@ -530,6 +595,8 @@ class LifeEngineSearchMemoryTool(BaseTool):
                         {
                             "link_type": "bundle_history_reason",
                             "bundle_id": bundle_id,
+                            **primary,
+                            **_exact_document_fields(item),
                             "ordinal": index,
                             "file_path": item.file_path,
                         },
@@ -539,6 +606,8 @@ class LifeEngineSearchMemoryTool(BaseTool):
                     {
                         "link_type": "bundle_history",
                         "bundle_id": bundle_id,
+                        **primary,
+                        **_exact_document_fields(item),
                         "ordinal": index,
                         "direction": item.direction,
                         "relation": item.relation,
@@ -554,6 +623,7 @@ class LifeEngineSearchMemoryTool(BaseTool):
                     {
                         "link_type": "bundle_correction",
                         "bundle_id": bundle_id,
+                        **primary,
                         "ordinal": index,
                         "topic": item.topic,
                         "source": item.source,
@@ -566,9 +636,10 @@ class LifeEngineSearchMemoryTool(BaseTool):
                     {
                         "link_type": "bundle_uncertainty",
                         "bundle_id": bundle_id,
+                        **primary,
                     },
                 )
-        return list(records.values())
+        return _partition_projection_links(list(records.values()))
 
     @staticmethod
     def _project_record(
@@ -584,6 +655,9 @@ class LifeEngineSearchMemoryTool(BaseTool):
             "delivery": delivery,
             "links": list(record["links"]),
         }
+        for key in ("link_group_index", "link_group_count"):
+            if key in record:
+                projected[key] = record[key]
         if delivery == "full":
             projected["content"] = record["content"]
             projected["delivered_content_bytes"] = int(record["original_bytes"])
@@ -645,6 +719,11 @@ class LifeEngineSearchMemoryTool(BaseTool):
                 )
                 if link.get("primary_path") and not bundle["primary_path"]:
                     bundle["primary_path"] = str(link["primary_path"])
+                for key in (
+                    "primary_node_id", "primary_document_id", "primary_version_id", "primary_file_ref"
+                ):
+                    if link.get(key):
+                        bundle[key] = link[key]
                 if kind == "bundle_current":
                     bundle["current_refs"].append(content_ref)
                 elif kind == "bundle_evidence":
@@ -1044,10 +1123,6 @@ class LifeEngineSearchMemoryTool(BaseTool):
                 evidence_kwargs["association_random_seed"] = retrieval_seed
             evidence_results = await evidence_search(normalized_query, **evidence_kwargs)
 
-            def _entity_ref(item: Any) -> str:
-                prefix = "document" if item.kind == "document_evidence" else item.kind
-                return f"{prefix}:{item.record_id}"
-
             records = self._projection_records(evidence_results, bundles)
             frontier_sha256 = _sha256_json(
                 [
@@ -1261,10 +1336,9 @@ class LifeEngineSearchMemoryTool(BaseTool):
                     original_bytes=original_bytes,
                 )
 
-            delivered_evidence = {
-                str(item["entity_ref"]): item
-                for item in final_payload["evidence_results"]
-            }
+            delivered_evidence: dict[str, list[dict[str, Any]]] = {}
+            for item in final_payload["evidence_results"]:
+                delivered_evidence.setdefault(str(item["entity_ref"]), []).append(item)
             if _memory_search_tool_result_bytes(final_payload) > budget:
                 return False, {"error": "memory search projection exceeded hard budget"}
 
@@ -1277,10 +1351,19 @@ class LifeEngineSearchMemoryTool(BaseTool):
                 delivered_refs: list[DeliveredMemorySearchRef] = []
                 seen_refs: set[str] = set()
                 for evidence_item in evidence_results:
-                    entity_ref = _entity_ref(evidence_item)
-                    projection = delivered_evidence.get(entity_ref)
-                    if projection is None or entity_ref in seen_refs:
+                    entity_ref = _evidence_entity_ref(evidence_item)
+                    projections = delivered_evidence.get(entity_ref)
+                    if not projections or entity_ref in seen_refs:
                         continue
+                    projection = projections[0]
+                    exact_versions = []
+                    for visible in projections:
+                        exact = _exact_document_fields(visible)
+                        if exact and exact not in exact_versions:
+                            exact_versions.append(exact)
+                    exact_metadata = exact_versions[0] if len(exact_versions) == 1 else {}
+                    if len(exact_versions) > 1:
+                        exact_metadata = {"subject_file_versions": exact_versions}
                     seen_refs.add(entity_ref)
                     delivered_refs.append(
                         DeliveredMemorySearchRef(
@@ -1288,6 +1371,7 @@ class LifeEngineSearchMemoryTool(BaseTool):
                             source=str(evidence_item.source or "memory_search"),
                             ordinal=len(delivered_refs),
                             metadata={
+                                **exact_metadata,
                                 "rank_score": float(evidence_item.rank_score),
                                 "rank_is_not_truth": True,
                                 "content_delivery": str(

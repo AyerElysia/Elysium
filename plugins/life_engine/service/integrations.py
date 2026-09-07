@@ -86,6 +86,15 @@ class MemoryIntegration:
                 raise RuntimeError(
                     "selectable Memory storage requires the Life Engine coherent runtime"
                 )
+            subject_store = (
+                getattr(self._service, "_subject_document_store", None)
+                if storage_enabled else None
+            )
+            if storage_enabled and subject_store is None:
+                raise RuntimeError(
+                    "SelectedSubjectStorageNotStarted: Memory recovery requires "
+                    "the LifeEngineService-owned subject authority"
+                )
             self._service._memory_service = LifeMemoryService(
                 workspace,
                 vector_backend_enabled=bool(
@@ -98,6 +107,8 @@ class MemoryIntegration:
                 index_worker_enabled=bool(getattr(index_config, "enabled", True)),
                 storage_runtime=storage_runtime,
                 selectable_storage_enabled=storage_enabled,
+                subject_document_store=subject_store,
+                subject_document_store_required=storage_enabled,
             )
             await self._service._memory_service.initialize()
             logger.info("life_engine 生命记忆服务已初始化")

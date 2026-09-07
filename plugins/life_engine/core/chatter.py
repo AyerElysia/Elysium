@@ -59,7 +59,6 @@ from src.kernel.storage import canonical_json_sha256
 
 from ..constants import LIFE_CHATTER_GLOBAL_CURSOR_KEY
 from ..inner_dialogue.protocol import INNER_RETURN_SENDER_ID
-from ..memory.prompting import analyze_memory_text, render_memory_prompt
 from ..service.activity_panel import (
     format_decision_panel,
     format_decision_tool_args,
@@ -105,6 +104,7 @@ from .context_stewardship import (
     is_compression_required_payload,
     is_context_stewardship_tool_name,
     is_subject_window_overflow_error,
+    isolate_model_checkpoint_output,
     prepare_subject_checkpoint,
     register_live_context,
     reset_pending_subject_checkpoint,
@@ -390,7 +390,8 @@ class _WorkflowRuntime:
     unread_history_merged_before_turn: bool = False
     media_seen: set[str] = field(default_factory=set)
     active_stream_id: str = ""
-    # must_reply: 路由判定需要回复；在 max_rounds 兜底时检查
+    # must_reply: 这批真实外部输入已接入表达层；循环内可提醒模型作出可追溯选择。
+    # max_rounds 仍无主体可见回复时 fail closed，禁止代写对外正文。
     must_reply: bool = False
     # sent_visible_reply: 本轮 loop 中是否已产生可见回复（跨 follow-up 轮累计）
     sent_visible_reply: bool = False
@@ -3685,12 +3686,46 @@ class LifeChatter(BaseChatter):
 
     # ── system prompt ────────────────────────────────────────
 
+    async def _refresh_subject_system_prompt(
+        self,
+        response: Any,
+        service: LifeEngineService | None,
+    ) -> None:
+        """Refresh only the owned SYSTEM prefix at a model-turn boundary.
+
+        The global request outlives file writes and chatter instances. Read the
+        selected authority again before every model/follow-up round, without
+        rebuilding its rolling history, tools or context-manager state. A read
+        failure or an ambiguous SYSTEM owner must never send the cached prefix.
+        """
+
+        self._assert_rolling_context_writable()
+        payloads = response.payloads
+        system_indices = [
+            index for index, payload in enumerate(payloads)
+            if payload.role == ROLE.SYSTEM
+        ]
+        if len(system_indices) != 1:
+            raise RuntimeError("SubjectSystemPromptOwnerMismatch")
+        index = system_indices[0]
+        previous = payloads[index]
+        if len(previous.content) != 1 or not isinstance(previous.content[0], Text):
+            raise RuntimeError("SubjectSystemPromptContentMismatch")
+
+        system_text = await self._build_chat_system_prompt(service, None)
+        if not system_text:
+            raise RuntimeError("SubjectSystemPromptAuthorityUnavailable")
+        if previous.content[0].text != system_text:
+            # Do not append: that would leave two conflicting authority views.
+            # The kernel context manager owns policies, not a second payload list.
+            payloads[index] = LLMPayload(ROLE.SYSTEM, Text(system_text))
+
     async def _build_chat_system_prompt(
         self,
         service: LifeEngineService | None,
         chat_stream: ChatStream | None = None,
     ) -> str:
-        """构建 100% 静态可缓存前缀提示词。"""
+        """从当前主体权威构建流无关前缀；源文件未变时保持稳定。"""
 
         # SOUL/USER/MEMORY 来自唯一绑定的权威源；EXISTENCE.md / TOOLS.md
         # 是工作区里的固定提示词，和日记一样由主体自己改。
@@ -3701,12 +3736,9 @@ class LifeChatter(BaseChatter):
             # 没有灵魂就不说话
             return ""
 
-        memory_text = ""
-        memory_raw = texts.get("MEMORY.md", "")
-        if memory_raw:
-            memory_data = analyze_memory_text(memory_raw)
-            if memory_data.raw_text:
-                memory_text = render_memory_prompt(memory_data, mode="chat")
+        # The current authority is not a ranked or section-limited projection.
+        # Keep the complete text, including custom sections and tail-only edits.
+        memory_text = texts.get("MEMORY.md", "")
         existence_text = self._load_workspace_markdown(service, "EXISTENCE.md")
         tools_text = self._load_workspace_markdown(service, "TOOLS.md")
 
@@ -5412,7 +5444,7 @@ class LifeChatter(BaseChatter):
 
     @staticmethod
     def _is_visible_reply_action(call_name: str) -> bool:
-        """判断是否为面向用户的可见回复动作（用于 must_reply 兜底判断）。"""
+        """判断是否为面向用户的可见回复动作（用于本轮是否已有主体可见表达）。"""
         normalized = str(call_name or "").strip().lower()
         return normalized in {
             _SEND_TEXT,
@@ -5705,12 +5737,12 @@ class LifeChatter(BaseChatter):
         decision: dict[str, Any],
         unread_msgs: list[Message],
     ) -> bool:
-        """路由层已判定要响应时，标记需要在 max_rounds 兜底前闭合可见回复。
+        """路由层已判定要响应时，标记这批外部输入已接入表达层。
 
         路由器只负责判断这批外部消息是否值得接入主对话。一旦它返回
         should_respond=true，后续主模型可以自由 think / 调用工具 / 多轮，
-        但如果一直到 max_rounds 都没产生可见回复，则发一条最小兜底，
-        避免对外界消息完全沉默。
+        并被提醒作出可追溯选择（发送或 pass_and_wait）。若一直到
+        max_rounds 仍没有主体可见回复，本轮 fail closed，禁止代写对外正文。
         """
 
         if not bool(decision.get("should_respond", False)):
@@ -5721,60 +5753,18 @@ class LifeChatter(BaseChatter):
         return cls._should_force_reply_for_unread_batch(unread_msgs)
 
     @staticmethod
-    def _build_must_reply_fallback_text(unread_msgs: list[Message]) -> str:
-        """模型在 max_rounds 内未产生可见回复时的最小兜底。
+    def _close_must_reply_without_subject_speech(rt: _WorkflowRuntime) -> None:
+        """max_rounds 仍无主体可见回复时 fail closed，禁止代写对外正文。"""
 
-        内容保持短确认，不替模型续写复杂表达，避免把主体性兜底变成规则化代答。
-        """
-        latest_text = ""
-        if unread_msgs:
-            latest = unread_msgs[-1]
-            latest_text = str(
-                getattr(latest, "processed_plain_text", None)
-                or getattr(latest, "content", "")
-                or ""
-            ).strip()
-
-        if latest_text and len(latest_text) <= 12:
-            return "在呢，我看到你啦。"
-        return "我看到你的消息了。"
-
-    async def _send_must_reply_fallback(
-        self,
-        chat_stream: ChatStream,
-        unread_msgs: list[Message],
-    ) -> bool:
-        from src.app.plugin_system.api.send_api import send_text
-
-        stream_id = str(
-            getattr(chat_stream, "stream_id", "")
-            or getattr(self, "stream_id", "")
-            or ""
-        ).strip()
-        if not stream_id:
-            return False
-
-        platform = (
-            str(
-                getattr(chat_stream, "platform", "")
-                or (getattr(unread_msgs[-1], "platform", "") if unread_msgs else "")
-                or ""
-            ).strip()
-            or None
+        if not rt.must_reply:
+            return
+        if rt.sent_visible_reply:
+            rt.must_reply = False
+            return
+        logger.warning(
+            "max_rounds 内未产生可见回复；禁止发送最小兜底，本轮以无对外表达收束"
         )
-        content = self._build_must_reply_fallback_text(unread_msgs)
-
-        try:
-            ok = await send_text(content, stream_id=stream_id, platform=platform)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"must_reply 兜底发送失败: {exc}", exc_info=True)
-            return False
-
-        if ok:
-            logger.warning(f"max_rounds 内未产生可见回复，已发送最小兜底: {content}")
-        else:
-            logger.warning("max_rounds 内未产生可见回复，最小兜底回复发送失败")
-        return bool(ok)
+        rt.must_reply = False
 
     @staticmethod
     def _ensure_unique_tool_call_ids(call_list: list[Any]) -> None:
@@ -6280,6 +6270,14 @@ class LifeChatter(BaseChatter):
 
             # ── MODEL_TURN / FOLLOW_UP ───────────────────
             if rt.phase in (_Phase.MODEL_TURN, _Phase.FOLLOW_UP):
+                try:
+                    await self._refresh_subject_system_prompt(rt.response, service)
+                except Exception as error:
+                    logger.error(
+                        "life_chatter subject authority refresh failed: "
+                        f"error_type={type(error).__name__}"
+                    )
+                    return Failure("life_chatter subject authority refresh failed", error)
                 initial_turn = rt.phase == _Phase.MODEL_TURN
                 # Keep the pre-delta state for failure rollback. The request may
                 # include newly fetched unread media, but a failed turn must not
@@ -6542,6 +6540,8 @@ class LifeChatter(BaseChatter):
                             await complete_active_initiative_outreach("failed")
                         return Failure(failure_message, error)
 
+                if isolate_model_checkpoint_output(rt.response):
+                    self._register_chatter_live_context(rt.response)
                 recovery_projection_used = consume_subject_context_recovery_marker(
                     rt.response
                 )
@@ -6738,11 +6738,7 @@ class LifeChatter(BaseChatter):
                             "life_chatter reached max rounds without a terminal choice"
                         )
                         await complete_active_initiative_outreach("failed")
-                        if rt.must_reply:
-                            await self._send_must_reply_fallback(
-                                chat_stream, rt.unreads
-                            )
-                            rt.must_reply = False
+                        self._close_must_reply_without_subject_speech(rt)
                         if self._has_tool_result_tail(llm_response):
                             llm_response.add_payload(
                                 LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT))
@@ -7531,9 +7527,7 @@ class LifeChatter(BaseChatter):
                         "life_chatter reached max rounds without a terminal choice"
                     )
                     await complete_active_initiative_outreach("failed")
-                    if rt.must_reply and not rt.sent_visible_reply:
-                        await self._send_must_reply_fallback(chat_stream, rt.unreads)
-                        rt.must_reply = False
+                    self._close_must_reply_without_subject_speech(rt)
                     if self._has_tool_result_tail(llm_response):
                         llm_response.add_payload(
                             LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT))

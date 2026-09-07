@@ -18,6 +18,7 @@ from src.kernel.storage import canonical_json_sha256
 
 from ..core.context_stewardship import write_synced_context_file
 from .event_builder import EventType, LifeEngineEvent
+from .historical_redelivery import format_historical_redelivery
 
 HEARTBEAT_ROLLING_NAMESPACE = "life_heartbeat.rolling_context"
 HEARTBEAT_ROLLING_STATE_KEY = "subconscious"
@@ -36,6 +37,12 @@ _VISIBLE_JSON_KEYS = (
 
 
 def format_visible_event(event: LifeEngineEvent) -> str:
+    """Render a declared projection, labelling explicit historical redelivery."""
+
+    return format_historical_redelivery(event, _format_visible_event_body(event))
+
+
+def _format_visible_event_body(event: LifeEngineEvent) -> str:
     """Render one life-domain event as first-person-readable text.
 
     Infrastructure protocol JSON is not copied into the rolling window.

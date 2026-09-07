@@ -30,6 +30,7 @@ from ..storage.subject_contracts import (
     SubjectDocumentHead,
     SubjectDocumentNotFound,
     SubjectDocumentVersion,
+    subject_authority_logical_path,
     subject_revision_from_contents,
 )
 from .boundary import (
@@ -1161,13 +1162,14 @@ class ContinuityReviewSession:
         contents: dict[Any, bytes] = {}
         for path in SUBJECT_AUTHORITY_PATHS:
             commit = snapshot.commits[path]
+            logical_path = subject_authority_logical_path(path)
             version = commit.version
             head = commit.head
             content = bytes(version.content_bytes)
             if not all(
                 (
-                    version.logical_path == path,
-                    head.logical_path == path,
+                    version.logical_path == logical_path,
+                    head.logical_path == logical_path,
                     head.current_version_id == version.version_id,
                     version.byte_length == len(content),
                     version.content_hash == _sha256_bytes(content),

@@ -138,6 +138,51 @@ class ContextGroupManifest:
     groups: tuple[ContextGroupRecord, ...]
 
 
+class ContextCheckpointManifestError(ContextStewardshipError):
+    """A rejected binding with content-free facts for subject-owned resubmission."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: str,
+        manifest: ContextGroupManifest,
+    ) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+        # Retain only the exact validated boundary's technical identifiers,
+        # never the supplied arguments or private group records.
+        self.source_manifest_sha256 = manifest.source_manifest_sha256
+        self.current_checkpoint_revision = manifest.current_checkpoint_revision
+
+    def retry_feedback(self) -> str:
+        """Report rejection, without correcting arguments or replaying a command."""
+
+        return json.dumps(
+            {
+                "schema": "elysium.context_checkpoint_retry.v1",
+                "technical_only": True,
+                "error_code": self.error_code,
+                "message": str(self),
+                "current_manifest": {
+                    "source_manifest_sha256": self.source_manifest_sha256,
+                    "current_checkpoint_revision": self.current_checkpoint_revision,
+                },
+                "subject_resubmission_required": True,
+                "instruction": (
+                    "Inspect the current context_compression_required list, correct "
+                    "the parameters yourself, and submit a new "
+                    "author_self_continuity_checkpoint call. No arguments have been "
+                    "corrected and no command has been replayed. The subject must "
+                    "author thought and continuity_text and choose the release "
+                    "boundary and retained groups."
+                ),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class SubjectCheckpointCommand:
     """The active subject's exact command; semantic fields remain open text."""
@@ -325,7 +370,12 @@ def _payload_record(payload: LLMPayload) -> dict[str, Any]:
     }
 
 
-def _group_record(group: Sequence[LLMPayload], ordinal: int) -> ContextGroupRecord:
+def _group_record(
+    group: Sequence[LLMPayload],
+    ordinal: int,
+    *,
+    closed_by_next_user: bool = False,
+) -> ContextGroupRecord:
     record = {
         "schema": GROUP_SCHEMA,
         "payloads": [_payload_record(payload) for payload in group],
@@ -337,7 +387,9 @@ def _group_record(group: Sequence[LLMPayload], ordinal: int) -> ContextGroupReco
         group_ref=f"ctxg_{digest}",
         utf8_bytes=len(encoded),
         payload_count=len(group),
-        open_tool_chain=_has_open_tool_chain(group),
+        open_tool_chain=_has_open_tool_chain(
+            group, closed_by_next_user=closed_by_next_user
+        ),
         legacy_transport_projection=any(
             is_legacy_summary_payload(payload) for payload in group
         ),
@@ -371,15 +423,69 @@ def build_conversation_groups(
     return groups
 
 
-def _has_open_tool_chain(group: Sequence[LLMPayload]) -> bool:
+def _has_open_tool_chain(
+    group: Sequence[LLMPayload],
+    *,
+    closed_by_next_user: bool = False,
+) -> bool:
+    """Keep incomplete/malformed batches open without rewriting their IDs.
+
+    Each assistant call batch must be followed by exactly its own result IDs.
+    A completed result tail is releasable only after a later semantic USER has
+    started another group. A live tail and callers without that boundary proof
+    remain conservative, even when every tool has returned.
+    """
     if not group:
         return False
-    last = group[-1]
-    if getattr(last, "role", None) == ROLE.TOOL_RESULT:
+    pending: set[str] = set()
+    previous_role: ROLE | None = None
+    for payload in group:
+        role = getattr(payload, "role", None)
+        parts = list(payload.content or [])
+        calls = [part for part in parts if isinstance(part, ToolCall)]
+        results = [part for part in parts if isinstance(part, ToolResult)]
+        if calls and role != ROLE.ASSISTANT:
+            return True
+        if results and role != ROLE.TOOL_RESULT:
+            return True
+        if role in {ROLE.SYSTEM, ROLE.TOOL}:
+            # Like kernel validation, schema/system payloads do not interrupt a
+            # conversation batch. The checks above still reject hidden tool
+            # calls/results carried under either pinned role.
+            continue
+        if role == ROLE.TOOL_RESULT:
+            if not pending or not results:
+                return True
+            for result in results:
+                call_id = result.call_id
+                if (
+                    not isinstance(call_id, str)
+                    or not call_id.strip()
+                    or call_id not in pending
+                ):
+                    return True
+                pending.remove(call_id)
+        else:
+            # A later assistant/USER must not supply an earlier batch's missing
+            # results. Matching IDs across the whole group would hide that gap.
+            if pending:
+                return True
+            if calls:
+                if previous_role not in {ROLE.USER, ROLE.TOOL_RESULT}:
+                    return True
+                for call in calls:
+                    call_id = call.id
+                    if (
+                        not isinstance(call_id, str)
+                        or not call_id.strip()
+                        or call_id in pending
+                    ):
+                        return True
+                    pending.add(call_id)
+        previous_role = role
+    if pending:
         return True
-    if getattr(last, "role", None) == ROLE.ASSISTANT:
-        return any(isinstance(part, ToolCall) for part in list(last.content or []))
-    return False
+    return not closed_by_next_user and previous_role == ROLE.TOOL_RESULT
 
 
 def is_legacy_summary_payload(payload: LLMPayload) -> bool:
@@ -417,9 +523,9 @@ def _strict_envelope_payload(
     suffix = "\n" + closing
     if not text.startswith(prefix) or not text.endswith(suffix):
         return None
-    if text.count(opening) != 1 or text.count(closing) != 1:
-        return None
     try:
+        # Tags inside JSON string values are subject-authored text, not extra
+        # framing. json.loads still rejects multiple outer envelopes or values.
         decoded = json.loads(text[len(prefix) : -len(suffix)])
     except (TypeError, ValueError):
         return None
@@ -490,6 +596,60 @@ def checkpoint_data(payload: LLMPayload) -> dict[str, Any] | None:
     )
 
 
+def quote_model_checkpoint_text(text: str) -> str:
+    """Keep model-authored bytes as ordinary speech, never checkpoint control.
+
+    Only the checkpoint action may install a control envelope. A model can
+    naturally imitate one in its answer (even with a valid digest), but its
+    answer is not an archive commit. The raw activity keeps the original text;
+    this reversible transport wrapper only disambiguates the prompt projection.
+    """
+
+    if checkpoint_data(LLMPayload(ROLE.ASSISTANT, [Text(text)])) is None:
+        return text
+    return (
+        '<model_output_not_checkpoint technical_only="true">\n'
+        + text
+        + "\n</model_output_not_checkpoint>"
+    )
+
+
+def isolate_model_checkpoint_output(response: Any) -> bool:
+    """Quote only this freshly completed model answer, before tool execution.
+
+    Do not scan/reclassify historical payloads: a real installed checkpoint is
+    still validated strictly. Preserve neighboring reasoning/tool parts and
+    avoid mutating objects shared with the previously committed snapshot.
+    """
+
+    message = str(getattr(response, "message", "") or "")
+    quoted = quote_model_checkpoint_text(message)
+    if quoted == message:
+        return False
+    payloads = list(getattr(response, "payloads", None) or [])
+    for payload_index in range(len(payloads) - 1, -1, -1):
+        payload = payloads[payload_index]
+        if getattr(payload, "role", None) != ROLE.ASSISTANT:
+            continue
+        parts = list(payload.content or [])
+        for part_index in range(len(parts) - 1, -1, -1):
+            part = parts[part_index]
+            if not isinstance(part, Text):
+                continue
+            if part.text == quoted:
+                return False
+            if part.text == message:
+                parts[part_index] = Text(quoted)
+                payloads[payload_index] = LLMPayload(payload.role, parts)
+                response.payloads = payloads
+                return True
+            break
+        break
+    raise ContextStewardshipError(
+        "checkpoint-shaped model output is missing from the completed response"
+    )
+
+
 def current_checkpoint_data(payloads: Sequence[LLMPayload]) -> dict[str, Any] | None:
     latest: dict[str, Any] | None = None
     latest_revision = -1
@@ -517,10 +677,15 @@ def build_group_manifest(
     semantic_payloads = strip_compression_required_payloads(payloads)
     _, tail = split_pinned_and_tail(semantic_payloads)
     groups = build_conversation_groups(tail)
+    # Remember the semantic boundary before excluding the in-flight latest
+    # group. Transport-only controls are already stripped and cannot close it.
+    group_count = len(groups)
     if exclude_latest_group and groups:
         groups = groups[:-1]
     records = tuple(
-        _group_record(group, ordinal)
+        _group_record(
+            group, ordinal, closed_by_next_user=ordinal < group_count
+        )
         for ordinal, group in enumerate(groups, start=1)
     )
     current = current_checkpoint_data(payloads)
@@ -959,6 +1124,48 @@ def install_subject_context_recovery_hook(
     if getattr(context_manager, "compression_hook", None) is not None:
         return
 
+    installed_protected: frozenset[str] | None = None
+    installed_reprojectable: frozenset[str] | None = None
+    owned_protected: frozenset[str] = frozenset()
+    owned_reprojectable: frozenset[str] = frozenset()
+
+    def protect_trusted_controls(parts: Sequence[Text]) -> None:
+        """Extend an explicit exact-delivery opt-in with this hook's controls.
+
+        Identity tracks only sets installed here.  A caller's reassignment is
+        authoritative, while repeated hook stages replace our transient texts
+        instead of accumulating controls from previous model attempts.
+        """
+        nonlocal installed_protected, installed_reprojectable
+        nonlocal owned_protected, owned_reprojectable
+        protected = getattr(context_manager, "protected_exact_texts", frozenset())
+        reprojectable = getattr(context_manager, "reprojectable_exact_texts", frozenset())
+        caller_protected = (
+            protected - owned_protected
+            if protected is installed_protected else protected
+        )
+        caller_reprojectable = (
+            reprojectable - owned_reprojectable
+            if reprojectable is installed_reprojectable else reprojectable
+        )
+        if not caller_protected:
+            # Never enable protection implicitly for default callers, and do
+            # not revive an opt-in explicitly cleared between attempts.
+            if protected is installed_protected and owned_protected:
+                context_manager.protected_exact_texts = frozenset(caller_protected)
+            if reprojectable is installed_reprojectable and owned_reprojectable:
+                context_manager.reprojectable_exact_texts = frozenset(caller_reprojectable)
+            installed_protected = installed_reprojectable = None
+            owned_protected = owned_reprojectable = frozenset()
+            return
+        control_texts = frozenset(part.text for part in parts)
+        installed_protected = frozenset(caller_protected) | control_texts
+        installed_reprojectable = frozenset(caller_reprojectable) | control_texts
+        owned_protected = control_texts - caller_protected
+        owned_reprojectable = control_texts - caller_reprojectable
+        context_manager.protected_exact_texts = installed_protected
+        context_manager.reprojectable_exact_texts = installed_reprojectable
+
     def compression_hook(
         dropped_groups: list[list[LLMPayload]],
         remaining_payloads: list[LLMPayload],
@@ -988,11 +1195,13 @@ def install_subject_context_recovery_hook(
                 "multiple compression maintenance controls are not allowed"
             )
         if has_compression_required_payload(remaining_payloads):
+            protect_trusted_controls(control_parts)
             # The durable control envelope is already the newest retained
             # group.  Returning no replacement lets the kernel omit old groups
             # for this attempt without inventing any semantic summary.
             return []
         if control_parts:
+            protect_trusted_controls(control_parts)
             # The existing control binds an earlier exact manifest.  If its
             # USER group fell outside this attempt's model window, project the
             # exact control part back into the attempt instead of generating a
@@ -1010,6 +1219,9 @@ def install_subject_context_recovery_hook(
                 "subject rolling context exceeds the model window and no "
                 "releasable closed context group is available"
             )
+        protect_trusted_controls([
+            part for part in notice.content if isinstance(part, Text)
+        ])
         return [notice]
 
     setattr(compression_hook, _RECOVERY_MARKER_ATTR, False)
@@ -1182,11 +1394,25 @@ def prepare_subject_checkpoint(
     else:
         manifest_payloads = semantic_payloads
     manifest = build_group_manifest(manifest_payloads)
+    if not isinstance(command.source_manifest_sha256, str) or re.fullmatch(
+        r"[0-9a-f]{64}", command.source_manifest_sha256
+    ) is None:
+        raise ContextCheckpointManifestError(
+            "source_manifest_sha256 must be exactly 64 lowercase hexadecimal characters",
+            error_code="source_manifest_sha256_invalid_format",
+            manifest=manifest,
+        )
     if manifest.source_manifest_sha256 != command.source_manifest_sha256:
-        raise ContextStewardshipError("context group manifest is stale or mismatched")
+        raise ContextCheckpointManifestError(
+            "context group manifest is stale or mismatched",
+            error_code="source_manifest_mismatch",
+            manifest=manifest,
+        )
     if manifest.current_checkpoint_revision != command.expected_revision:
-        raise ContextStewardshipError(
-            "subject continuity checkpoint revision conflict"
+        raise ContextCheckpointManifestError(
+            "subject continuity checkpoint revision conflict",
+            error_code="checkpoint_revision_conflict",
+            manifest=manifest,
         )
     refs = [record.group_ref for record in manifest.groups]
     try:
@@ -1678,9 +1904,11 @@ class LifeAuthorSelfContinuityCheckpointAction(BaseAction):
     """Let the active subject author its own continuity checkpoint."""
 
     action_name = "author_self_continuity_checkpoint"
+    auto_reason_parameter: ClassVar[bool] = False
     action_description = (
         "滚动上下文进入压缩回合时，由你亲自决定释放哪些旧工作组，并把你希望未来的自己继续"
         "知道的内容写成 continuity_text。系统不会替你概括、挑选重要内容或改写正文。"
+        "必须显式提供非空 thought 参数，不能用 reason 代替。"
         "必须原样使用压缩清单里的 manifest/revision/group_ref；动作先归档精确旧组，随后才在安全边界安装。"
     )
     chatter_allow: ClassVar[list[str]] = ["life_chatter", "life_engine_internal"]
@@ -1722,7 +1950,7 @@ class LifeAuthorSelfContinuityCheckpointAction(BaseAction):
             actor_consciousness_instance_id=actor,
             thought=str(thought or ""),
             continuity_text=str(continuity_text or ""),
-            source_manifest_sha256=str(source_manifest_sha256 or "").strip(),
+            source_manifest_sha256=source_manifest_sha256,
             expected_revision=int(expected_revision),
             release_through_group_ref=str(release_through_group_ref or "").strip(),
             retain_exact_group_refs=tuple(
@@ -1764,6 +1992,8 @@ class LifeAuthorSelfContinuityCheckpointAction(BaseAction):
                 command,
                 runtime_key=runtime_key,
             )
+        except ContextCheckpointManifestError as exc:
+            return False, exc.retry_feedback()
         except ContextStewardshipError as exc:
             return False, str(exc)
         except asyncio.CancelledError:

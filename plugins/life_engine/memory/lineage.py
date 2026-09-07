@@ -35,6 +35,13 @@ class MemoryEvidence:
     relation: str = ""
     relation_reason: str = ""
     exists: bool = True
+    node_id: str = ""
+    document_id: str = ""
+    version_id: str = ""
+    document_revision: int = 0
+    binding_revision: int = 0
+    content_sha256: str = ""
+    file_ref: str = ""
 
 
 @dataclass
@@ -48,6 +55,13 @@ class MemoryTrace:
     reason: str = ""
     direction: str = "later"
     exists: bool = True
+    node_id: str = ""
+    document_id: str = ""
+    version_id: str = ""
+    document_revision: int = 0
+    binding_revision: int = 0
+    content_sha256: str = ""
+    file_ref: str = ""
 
 
 @dataclass
@@ -75,6 +89,9 @@ class MemoryBundle:
     history_trace: list[MemoryTrace] = field(default_factory=list)
     corrections: list[MemoryCorrection] = field(default_factory=list)
     uncertainty: str = ""
+    primary_node_id: str = ""
+    primary_document_id: str = ""
+    primary_version_id: str = ""
 
 
 def row_to_correction(row: sqlite3.Row) -> MemoryCorrection:
