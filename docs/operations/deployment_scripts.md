@@ -29,7 +29,7 @@ PowerShell：
 
 创建范围包括：
 
-- `config/elysium.toml`、`config/models.toml`、`config/mcp.toml`；
+- `config/elysium.toml`、`config/mcp.toml`；
 - Life Engine 的工程开关；
 - 默认关闭的可选平台、语音、直播和游戏配置；
 - `data/runtime/` 与 `logs/` 等工程目录。
@@ -38,7 +38,9 @@ PowerShell：
 
 ## 3. 密钥与模型配置
 
-`config/models.toml` 使用环境变量引用，真实 token 不进入 TOML、命令行或日志。基础示例要求当前终端提供：
+`config/models.toml` 必须由部署者提供；仓库没有模型路由模板，bootstrap 不生成、不覆盖该文件，并拒绝符号链接或其他异常目标。缺失时可以完成基础工程准备，但 doctor 和启动继续明确失败。测试专用的虚拟模型夹具不能用作部署配置。
+
+模型密钥使用环境变量引用，真实 token 不进入 TOML、命令行或日志。变量名与本机配置一致，例如：
 
 ```bash
 export ELYSIUM_NEXUS_API_KEY='...'
