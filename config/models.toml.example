@@ -59,6 +59,9 @@ id = "deepseek-v4-flash"
 ctx = 1000000
 extra = { thinking = { type = "enabled" } }
 
+# MiMo chat models. The local New API relay must resolve these ids only
+# through the Xiaomi/MiMoCN channel. OpenCode / Console Go / Zen channels
+# must not advertise mimo-v2.5 or mimo-v2.5-pro.
 [models."MiMo-V2.5-Pro"]
 provider = "NexusAI"
 id = "mimo-v2.5-pro"
