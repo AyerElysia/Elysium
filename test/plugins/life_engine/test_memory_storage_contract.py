@@ -221,14 +221,18 @@ def test_mysql_memory_immutability_classification_is_exhaustive() -> None:
     for column in MEMORY_WITNESS_MUTABLE_PROJECTION_COLUMNS:
         assert f"OLD.{column} <=> NEW.{column}" not in trigger_ddl
     assert "memory_witnesses_immutable_delete" in trigger_ddl
+    delivery_triggers = [
+        statement
+        for migration in MEMORY_IMMUTABILITY_MIGRATIONS
+        if migration.version == 3
+        for statement in migration.statements
+        if "memory_witness_delivery_authority_immutable_update" in statement
+    ]
+    assert len(delivery_triggers) == 1
+    delivery_trigger = delivery_triggers[0]
     for column in MEMORY_WITNESS_DELIVERY_IMMUTABLE_COLUMNS:
-        assert f"OLD.{column} <=> NEW.{column}" in trigger_ddl
+        assert f"OLD.{column} <=> NEW.{column}" in delivery_trigger
     for column in MEMORY_WITNESS_DELIVERY_MUTABLE_COLUMNS:
-        delivery_trigger = next(
-            statement
-            for statement in MEMORY_IMMUTABILITY_MIGRATIONS[-1].statements
-            if "memory_witness_delivery_authority_immutable_update" in statement
-        )
         assert f"OLD.{column} <=> NEW.{column}" not in delivery_trigger
     assert "memory_witness_delivery_immutable_delete" in trigger_ddl
 

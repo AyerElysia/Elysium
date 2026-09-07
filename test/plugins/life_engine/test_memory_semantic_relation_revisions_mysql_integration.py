@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 from dataclasses import asdict, replace
 from uuid import uuid4
@@ -28,11 +29,15 @@ from plugins.life_engine.storage.memory.mysql import MySQLLivingMemoryStore
 from plugins.life_engine.storage.memory.schema import (
     MEMORY_IMMUTABILITY_MIGRATIONS,
     MEMORY_MIGRATIONS,
+    _semantic_relation_revision_completion_conditions,
 )
 from plugins.life_engine.storage.models import BackendKind
 from src.kernel.storage import canonical_json
 from src.kernel.storage.engine import create_mysql_storage_engine
-from src.kernel.storage.migration_runner import MySQLMigrationRunner
+from src.kernel.storage.migration_runner import (
+    MigrationPostconditionError,
+    MySQLMigrationRunner,
+)
 from test.plugins.life_engine.test_memory_storage_mysql_integration import (
     _generation,
     _mysql_config,
@@ -68,6 +73,64 @@ async def _insert_legacy(connection, relation: SemanticRelation) -> None:
         ),
         values,
     )
+
+
+async def _relation_completion_diagnostics(engine) -> dict:
+    """Only synthetic relation-schema metadata; never connection credentials."""
+    statements = {
+        "columns": (
+            "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, "
+            "CHARACTER_SET_NAME, COLLATION_NAME, EXTRA FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'memory_semantic_relations' "
+            "ORDER BY ORDINAL_POSITION"
+        ),
+        "indexes": (
+            "SELECT INDEX_NAME, NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME, SUB_PART "
+            "FROM information_schema.STATISTICS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'memory_semantic_relations' "
+            "ORDER BY INDEX_NAME, SEQ_IN_INDEX"
+        ),
+        "foreign_keys": (
+            "SELECT k.CONSTRAINT_NAME, k.COLUMN_NAME, k.ORDINAL_POSITION, "
+            "k.REFERENCED_TABLE_NAME, k.REFERENCED_COLUMN_NAME, f.UPDATE_RULE, f.DELETE_RULE "
+            "FROM information_schema.KEY_COLUMN_USAGE k "
+            "JOIN information_schema.REFERENTIAL_CONSTRAINTS f "
+            "ON f.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA "
+            "AND f.CONSTRAINT_NAME = k.CONSTRAINT_NAME "
+            "WHERE k.CONSTRAINT_SCHEMA = DATABASE() "
+            "AND k.TABLE_NAME = 'memory_semantic_relations' "
+            "ORDER BY k.CONSTRAINT_NAME, k.ORDINAL_POSITION"
+        ),
+        "checks": (
+            "SELECT c.CONSTRAINT_NAME, c.CHECK_CLAUSE, t.ENFORCED "
+            "FROM information_schema.CHECK_CONSTRAINTS c "
+            "JOIN information_schema.TABLE_CONSTRAINTS t "
+            "ON t.CONSTRAINT_SCHEMA = c.CONSTRAINT_SCHEMA "
+            "AND t.CONSTRAINT_NAME = c.CONSTRAINT_NAME "
+            "WHERE c.CONSTRAINT_SCHEMA = DATABASE() "
+            "AND t.TABLE_NAME = 'memory_semantic_relations' ORDER BY c.CONSTRAINT_NAME"
+        ),
+        "engine": (
+            "SELECT ENGINE FROM information_schema.TABLES "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'memory_semantic_relations'"
+        ),
+    }
+    result = {"conditions": {}, "metadata": {}}
+    async with engine.connect() as connection:
+        for (
+            name,
+            condition,
+        ) in _semantic_relation_revision_completion_conditions().items():
+            value = await connection.scalar(
+                text(f"SELECT CASE WHEN {condition} THEN 1 ELSE 0 END")
+            )
+            result["conditions"][name] = int(value) == 1
+        for name, statement in statements.items():
+            result["metadata"][name] = [
+                dict(row)
+                for row in (await connection.execute(text(statement))).mappings()
+            ]
+    return result
 
 
 class _ConnectionTraceStore(MySQLLivingMemoryStore):
@@ -195,7 +258,15 @@ async def test_mysql_relation_revision_migration_cas_page_and_reopen() -> None:
                 ).all()
             )
 
-        stores = await open_mysql_memory_storage(runtime, initialize_schema=True)
+        try:
+            stores = await open_mysql_memory_storage(runtime, initialize_schema=True)
+        except MigrationPostconditionError:
+            diagnostics = await _relation_completion_diagnostics(runtime.engine)
+            print(
+                "S3_RELATION_MYSQL_COMPLETION "
+                + json.dumps(diagnostics, sort_keys=True)
+            )
+            raise
         async with runtime.engine.connect() as connection:
             after = dict(
                 (

@@ -19,6 +19,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TEST = "test/plugins/life_engine/test_s3_association_controls.py"
+TEST_TIMEOUT_SECONDS = 180
 
 
 def main() -> int:
@@ -33,29 +34,55 @@ def main() -> int:
     environment.pop("PYTEST_ADDOPTS", None)
     with tempfile.TemporaryDirectory(prefix="s3-protocol-") as folder:
         junit = Path(folder) / "results.xml"
-        run = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pytest",
-                "-q",
-                "-o",
-                "addopts=",
-                "-o",
-                "junit_family=xunit1",
-                TEST,
-                f"--junitxml={junit}",
-            ],
-            cwd=ROOT,
-            env=environment,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        timed_out = False
+        try:
+            run = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pytest",
+                    "-q",
+                    "--no-cov",
+                    "-n",
+                    "0",
+                    "-o",
+                    "addopts=",
+                    "-o",
+                    "junit_family=xunit1",
+                    TEST,
+                    f"--junitxml={junit}",
+                ],
+                cwd=ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=TEST_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            timed_out = True
+            stdout = exc.stdout or ""
+            stderr = exc.stderr or ""
+            run = subprocess.CompletedProcess(
+                args=exc.cmd,
+                returncode=124,
+                stdout=stdout.decode("utf-8", errors="replace")
+                if isinstance(stdout, bytes)
+                else stdout,
+                stderr=stderr.decode("utf-8", errors="replace")
+                if isinstance(stderr, bytes)
+                else stderr,
+            )
         rows = []
         failures = []
+        testcases = []
         if junit.is_file():
-            for testcase in ET.parse(junit).iter("testcase"):
+            try:
+                testcases = list(ET.parse(junit).iter("testcase"))
+            except ET.ParseError:
+                failures.append("JUnitParseError")
+        if testcases:
+            for testcase in testcases:
                 for prop in testcase.findall("./properties/property"):
                     if prop.get("name") == "s3_protocol_result":
                         rows.append(json.loads(prop.attrib["value"]))
@@ -70,7 +97,9 @@ def main() -> int:
         equal_material = len(by_case) == 3 and all(
             len(values) == 1 for values in by_case.values()
         )
-        success = run.returncode == 0 and len(rows) == 30 and equal_material
+        success = (
+            run.returncode == 0 and not failures and len(rows) == 30 and equal_material
+        )
         report = {
             "schema": "s3-synthetic-protocol-comparison-v1",
             "passed": success,
@@ -83,6 +112,9 @@ def main() -> int:
             "measured_runs": len(rows),
             "same_material_across_arms_and_repetitions": equal_material,
             "test_exit_code": run.returncode,
+            "serial_execution": True,
+            "test_timeout_seconds": TEST_TIMEOUT_SECONDS,
+            "timed_out": timed_out,
             "failed_tests": failures,
             "limits": [
                 "Reserved synthetic fixtures, not a blind or independent subject evaluation.",

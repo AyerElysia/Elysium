@@ -6183,12 +6183,13 @@ class LifeEngineService(BaseService):
         query: str,
         top_k: int = 5,
         *,
-        enable_association: bool = True,
+        enable_association: bool = False,
     ) -> str:
-        """检索 life memory；可显式关闭所有额外关联以保留直接命中基线。
+        """检索 life memory；默认保留直接命中，额外关联须显式选择。
 
         ``enable_association=False`` 同时跳过 living 关联展开与记忆包构建；
-        后者会额外读取 lineage、历史证据和修正。默认保留既有增强行为。
+        后者会额外读取 lineage、历史证据和修正。未证明额外回忆收益时不
+        默认加入增强；显式 True 仍可调用既有能力，且不表示认可其内容。
         此开关不修改索引、关系历史或主体内容，也不授权 legacy edge 扩散。
         """
         if type(enable_association) is not bool:

@@ -1085,9 +1085,15 @@ def _semantic_relation_revision_ddl() -> tuple[str, ...]:
     return tuple(steps)
 
 
-def _semantic_relation_revision_completion_check() -> str:
-    """One complete postcondition lets additive DDL resume partial completion."""
-    checks: list[str] = []
+def _semantic_relation_revision_completion_conditions() -> dict[str, str]:
+    """Named read-only conditions, also exposed to isolated test diagnostics."""
+    checks = {
+        "engine:memory_semantic_relations": (
+            "(SELECT COUNT(*) FROM information_schema.TABLES "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'memory_semantic_relations' "
+            "AND ENGINE = 'InnoDB') = 1"
+        ),
+    }
     for name, sql_type, nullable, default_check, charset in (
         ("owner_subject_id", "varchar(128)", "YES", "COLUMN_DEFAULT IS NULL", "utf8mb4_bin"),
         ("root_relation_id", "varchar(255)", "YES", "COLUMN_DEFAULT IS NULL", "ascii_bin"),
@@ -1096,7 +1102,7 @@ def _semantic_relation_revision_completion_check() -> str:
         ("operation", "varchar(16)", "NO", "COLUMN_DEFAULT = 'add'", "ascii_bin"),
     ):
         collation_check = f" AND COLLATION_NAME = '{charset}'" if charset else ""
-        checks.append(
+        checks[f"column:{name}"] = (
             "(SELECT COUNT(*) FROM information_schema.COLUMNS "
             "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'memory_semantic_relations' "
             f"AND COLUMN_NAME = '{name}' AND COLUMN_TYPE = '{sql_type}' "
@@ -1110,7 +1116,7 @@ def _semantic_relation_revision_completion_check() -> str:
             f"SUM(SEQ_IN_INDEX = {position} AND COLUMN_NAME = '{column}') = 1"
             for position, column in enumerate(columns, start=1)
         )
-        checks.append(
+        checks[f"index:{name}"] = (
             "(SELECT COUNT(*) = " + str(len(columns))
             + " AND MIN(NON_UNIQUE) = 0 AND MAX(NON_UNIQUE) = 0 "
             + "AND SUM(SUB_PART IS NOT NULL) = 0 AND " + positions
@@ -1118,7 +1124,9 @@ def _semantic_relation_revision_completion_check() -> str:
             + "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'memory_semantic_relations' "
             + f"AND INDEX_NAME = '{name}')"
         )
-    checks.append(
+    # MySQL reports an omitted referential action as NO ACTION. For InnoDB
+    # (required above) this is immediate rejection, equivalent to RESTRICT.
+    checks["foreign_key:fk_semantic_relation_parent"] = (
         "(SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE k "
         "JOIN information_schema.REFERENTIAL_CONSTRAINTS f "
         "ON f.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA AND f.CONSTRAINT_NAME = k.CONSTRAINT_NAME "
@@ -1128,25 +1136,41 @@ def _semantic_relation_revision_completion_check() -> str:
         "AND k.REFERENCED_TABLE_SCHEMA = DATABASE() "
         "AND k.REFERENCED_TABLE_NAME = 'memory_semantic_relations' "
         "AND k.REFERENCED_COLUMN_NAME = 'relation_id' "
-        "AND f.DELETE_RULE = 'RESTRICT' AND f.UPDATE_RULE = 'RESTRICT') = 1"
+        "AND f.DELETE_RULE IN ('RESTRICT', 'NO ACTION') "
+        "AND f.UPDATE_RULE IN ('RESTRICT', 'NO ACTION')) = 1"
     )
-    normalized_clause = "LOWER(c.CHECK_CLAUSE)"
-    for token in ("`", " ", "(", ")", "_ascii", "_utf8mb4"):
-        normalized_clause = f"REPLACE({normalized_clause}, '{token}', '')"
-    for name, expression in (
-        ("chk_semantic_relation_revision", "revision>=1"),
-        ("chk_semantic_relation_operation", "operationin'add','revise','withdraw'"),
+    # Match complete canonical metadata renderings, not normalized fragments:
+    # MySQL 8 can expose string delimiters as either ' or backslash-apostrophe.
+    # HEX avoids SQL-mode-dependent escaping and collation-insensitive matches.
+    operation_clauses = tuple(
+        "(`operation` in ("
+        + ",".join(prefix + quote + value + quote for value in ("add", "revise", "withdraw"))
+        + "))"
+        for prefix in ("", "_ascii", "_utf8mb4")
+        for quote in ("'", "\\'")
+    )
+    for name, expressions in (
+        ("chk_semantic_relation_revision", ("(`revision` >= 1)",)),
+        ("chk_semantic_relation_operation", operation_clauses),
     ):
-        literal = expression.replace("'", "''")
-        checks.append(
+        literals = ", ".join(
+            f"'{expression.encode('utf-8').hex().upper()}'" for expression in expressions
+        )
+        checks[f"check:{name}"] = (
             "(SELECT COUNT(*) FROM information_schema.CHECK_CONSTRAINTS c "
             "JOIN information_schema.TABLE_CONSTRAINTS t "
             "ON t.CONSTRAINT_SCHEMA = c.CONSTRAINT_SCHEMA AND t.CONSTRAINT_NAME = c.CONSTRAINT_NAME "
             "WHERE c.CONSTRAINT_SCHEMA = DATABASE() AND t.TABLE_NAME = 'memory_semantic_relations' "
             f"AND c.CONSTRAINT_NAME = '{name}' AND t.ENFORCED = 'YES' "
-            f"AND {normalized_clause} = '{literal}') = 1"
+            f"AND HEX(c.CHECK_CLAUSE) IN ({literals})) = 1"
         )
-    return "SELECT CASE WHEN " + " AND ".join(checks) + " THEN 1 ELSE 0 END"
+    return checks
+
+
+def _semantic_relation_revision_completion_check() -> str:
+    """One complete postcondition lets additive DDL resume partial completion."""
+    conditions = _semantic_relation_revision_completion_conditions()
+    return "SELECT CASE WHEN " + " AND ".join(conditions.values()) + " THEN 1 ELSE 0 END"
 
 
 _SEMANTIC_RELATION_REVISIONS = SchemaMigration(

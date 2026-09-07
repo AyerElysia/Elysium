@@ -72,6 +72,23 @@ async def _expand(memory: LifeMemoryService, direct: list[SearchResult], **kwarg
     return await memory.expand_living_document_associations(direct, **options)
 
 
+async def _index_legacy_file(
+    memory: LifeMemoryService,
+    workspace: Path,
+    path: str,
+    content: str,
+    *,
+    title: str,
+) -> None:
+    # Real legacy search requires both its FTS projection and an eligible file.
+    # Only this test's temporary workspace is populated; managed authority is
+    # deliberately not enrolled until the lifecycle case explicitly does so.
+    target = workspace / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content.encode("utf-8"))
+    await memory.upsert_document(path, content, title=title)
+
+
 async def test_real_sqlite_current_expansion_revises_and_withdraws_without_erasing_history(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -81,12 +98,13 @@ async def test_real_sqlite_current_expansion_revises_and_withdraws_without_erasi
     )
     await memory.initialize()
     try:
-        await memory.upsert_document(
-            "notes/seed.md", "s3serviceneedle entry", title="Seed"
+        await _index_legacy_file(
+            memory, tmp_path, "notes/seed.md", "s3serviceneedle entry", title="Seed"
         )
-        await memory.upsert_document(
-            "notes/target.md", "exact target body", title="Target"
+        await _index_legacy_file(
+            memory, tmp_path, "notes/target.md", "exact target body", title="Target"
         )
+        assert await memory.fts_search("s3serviceneedle", top_k=1)
         direct = await memory.search_memory(
             "s3serviceneedle", top_k=1, enable_association=False, return_bundles=False
         )
@@ -163,10 +181,21 @@ async def test_real_legacy_path_relation_does_not_adopt_new_managed_occupant(
         )
         await memory.initialize()
         try:
-            await memory.upsert_document("notes/seed.md", "s3oldpathseed", title="Seed")
-            await memory.upsert_document(
-                "notes/reused.md", "legacy occupant body", title="Legacy"
+            await _index_legacy_file(
+                memory,
+                tmp_path / "memory",
+                "notes/seed.md",
+                "s3oldpathseed",
+                title="Seed",
             )
+            await _index_legacy_file(
+                memory,
+                tmp_path / "memory",
+                "notes/reused.md",
+                "legacy occupant body",
+                title="Legacy",
+            )
+            assert await memory.fts_search("s3oldpathseed", top_k=1)
             legacy = await memory.record_memory_semantic_relation(
                 replace(
                     _relation(target="document:notes/reused.md"),

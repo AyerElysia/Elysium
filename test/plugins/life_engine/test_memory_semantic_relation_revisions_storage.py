@@ -34,6 +34,7 @@ from plugins.life_engine.storage.memory.schema import (
     MEMORY_IMMUTABILITY_MIGRATIONS,
     MEMORY_MIGRATIONS,
     MEMORY_SCHEMA_VERSION,
+    _semantic_relation_revision_completion_conditions,
 )
 from plugins.life_engine.storage.migration.memory_copy import (
     TABLE_SPECS,
@@ -653,6 +654,229 @@ def test_additive_mysql_schema_does_not_rewrite_frozen_v1_statements_or_hashes()
     assert "memory_semantic_relation_revision_immutable_update" in "\n".join(
         new_guard.statements
     )
+
+
+@pytest.mark.parametrize(
+    ("delete_rule", "update_rule", "accepted"),
+    [
+        ("RESTRICT", "NO ACTION", True),
+        ("RESTRICT", "RESTRICT", True),
+        ("NO ACTION", "RESTRICT", True),
+        ("NO ACTION", "NO ACTION", True),
+        ("CASCADE", "NO ACTION", False),
+        ("RESTRICT", "CASCADE", False),
+        ("SET NULL", "RESTRICT", False),
+        ("RESTRICT", "SET NULL", False),
+        ("SET DEFAULT", "RESTRICT", False),
+        ("RESTRICT", "SET DEFAULT", False),
+    ],
+)
+def test_mysql_revision_fk_postcondition_accepts_only_immediate_rejection(
+    delete_rule,
+    update_rule,
+    accepted,
+):
+    # Execute the production predicate against synthetic MySQL-shaped metadata.
+    # This does not claim to run the MySQL server or prove its metadata spelling.
+    database = sqlite3.connect(":memory:")
+    database.create_function("DATABASE", 0, lambda: "synthetic_metadata")
+    try:
+        database.execute("ATTACH DATABASE ':memory:' AS information_schema")
+        database.execute(
+            "CREATE TABLE information_schema.KEY_COLUMN_USAGE ("
+            "CONSTRAINT_SCHEMA TEXT, TABLE_NAME TEXT, CONSTRAINT_NAME TEXT, "
+            "COLUMN_NAME TEXT, ORDINAL_POSITION INTEGER, REFERENCED_TABLE_SCHEMA TEXT, "
+            "REFERENCED_TABLE_NAME TEXT, REFERENCED_COLUMN_NAME TEXT)"
+        )
+        database.execute(
+            "CREATE TABLE information_schema.REFERENTIAL_CONSTRAINTS ("
+            "CONSTRAINT_SCHEMA TEXT, CONSTRAINT_NAME TEXT, DELETE_RULE TEXT, UPDATE_RULE TEXT)"
+        )
+        database.execute(
+            "INSERT INTO information_schema.KEY_COLUMN_USAGE VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "synthetic_metadata",
+                "memory_semantic_relations",
+                "fk_semantic_relation_parent",
+                "parent_relation_id",
+                1,
+                "synthetic_metadata",
+                "memory_semantic_relations",
+                "relation_id",
+            ),
+        )
+        database.execute(
+            "INSERT INTO information_schema.REFERENTIAL_CONSTRAINTS VALUES (?, ?, ?, ?)",
+            (
+                "synthetic_metadata",
+                "fk_semantic_relation_parent",
+                delete_rule,
+                update_rule,
+            ),
+        )
+        condition = _semantic_relation_revision_completion_conditions()[
+            "foreign_key:fk_semantic_relation_parent"
+        ]
+        result = database.execute(
+            f"SELECT CASE WHEN {condition} THEN 1 ELSE 0 END"
+        ).fetchone()[0]
+        assert bool(result) is accepted
+        database.execute(
+            "UPDATE information_schema.KEY_COLUMN_USAGE SET REFERENCED_COLUMN_NAME = 'wrong'"
+        )
+        assert (
+            database.execute(
+                f"SELECT CASE WHEN {condition} THEN 1 ELSE 0 END"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("engine", ["InnoDB", "NDB", "MyISAM"])
+def test_mysql_revision_no_action_equivalence_requires_innodb(engine):
+    database = sqlite3.connect(":memory:")
+    database.create_function("DATABASE", 0, lambda: "synthetic_metadata")
+    try:
+        database.execute("ATTACH DATABASE ':memory:' AS information_schema")
+        database.execute(
+            "CREATE TABLE information_schema.TABLES (TABLE_SCHEMA TEXT, TABLE_NAME TEXT, ENGINE TEXT)"
+        )
+        database.execute(
+            "INSERT INTO information_schema.TABLES VALUES (?, ?, ?)",
+            ("synthetic_metadata", "memory_semantic_relations", engine),
+        )
+        condition = _semantic_relation_revision_completion_conditions()[
+            "engine:memory_semantic_relations"
+        ]
+        result = database.execute(
+            f"SELECT CASE WHEN {condition} THEN 1 ELSE 0 END"
+        ).fetchone()[0]
+        assert bool(result) is (engine == "InnoDB")
+    finally:
+        database.close()
+
+
+_MYSQL_REPORTED_OPERATION_CHECK = (
+    r"(`operation` in (_utf8mb4\'add\',_utf8mb4\'revise\',_utf8mb4\'withdraw\'))"
+)
+
+
+@pytest.mark.parametrize(
+    ("kind", "clause", "enforced", "accepted"),
+    [
+        ("operation", _MYSQL_REPORTED_OPERATION_CHECK, "YES", True),
+        (
+            "operation",
+            "(`operation` in (_utf8mb4'add',_utf8mb4'revise',_utf8mb4'withdraw'))",
+            "YES",
+            True,
+        ),
+        (
+            "operation",
+            r"(`operation` in (_ascii\'add\',_ascii\'revise\',_ascii\'withdraw\'))",
+            "YES",
+            True,
+        ),
+        (
+            "operation",
+            "(`operation` in (_ascii'add',_ascii'revise',_ascii'withdraw'))",
+            "YES",
+            True,
+        ),
+        (
+            "operation",
+            r"(`operation` in (\'add\',\'revise\',\'withdraw\'))",
+            "YES",
+            True,
+        ),
+        ("operation", "(`operation` in ('add','revise','withdraw'))", "YES", True),
+        ("operation", _MYSQL_REPORTED_OPERATION_CHECK, "NO", False),
+        (
+            "operation",
+            _MYSQL_REPORTED_OPERATION_CHECK.replace("withdraw", "remove"),
+            "YES",
+            False,
+        ),
+        (
+            "operation",
+            _MYSQL_REPORTED_OPERATION_CHECK.replace("add", "ADD"),
+            "YES",
+            False,
+        ),
+        (
+            "operation",
+            _MYSQL_REPORTED_OPERATION_CHECK.replace("add", "ad d"),
+            "YES",
+            False,
+        ),
+        (
+            "operation",
+            _MYSQL_REPORTED_OPERATION_CHECK.replace("operation", "other"),
+            "YES",
+            False,
+        ),
+        ("operation", _MYSQL_REPORTED_OPERATION_CHECK + " OR TRUE", "YES", False),
+        (
+            "operation",
+            "(`operation` in ('add','revise','withdraw','anything'))",
+            "YES",
+            False,
+        ),
+        ("operation", "(`operation` in ('add','revise'))", "YES", False),
+        ("operation", "(`operation` in ('add','revise','revise'))", "YES", False),
+        (
+            "operation",
+            _MYSQL_REPORTED_OPERATION_CHECK.replace(chr(92), chr(92) * 2),
+            "YES",
+            False,
+        ),
+        ("operation", "1", "YES", False),
+        ("revision", "(`revision` >= 1)", "YES", True),
+        ("revision", "(`revision` >= 1)", "NO", False),
+        ("revision", "(`revision` >= 0)", "YES", False),
+        ("revision", "(`revision` >= 1) OR TRUE", "YES", False),
+    ],
+)
+def test_mysql_revision_check_requires_exact_supported_rendering_and_enforcement(
+    kind,
+    clause,
+    enforced,
+    accepted,
+):
+    # MySQL 8.0.46's actual escaped CHECK_CLAUSE is frozen above. SQLite here
+    # only evaluates our exact metadata predicate against synthetic rows.
+    database = sqlite3.connect(":memory:")
+    database.create_function("DATABASE", 0, lambda: "synthetic_metadata")
+    name = "chk_semantic_relation_" + kind
+    try:
+        database.execute("ATTACH DATABASE ':memory:' AS information_schema")
+        database.execute(
+            "CREATE TABLE information_schema.CHECK_CONSTRAINTS ("
+            "CONSTRAINT_SCHEMA TEXT, CONSTRAINT_NAME TEXT, CHECK_CLAUSE TEXT)"
+        )
+        database.execute(
+            "CREATE TABLE information_schema.TABLE_CONSTRAINTS ("
+            "CONSTRAINT_SCHEMA TEXT, CONSTRAINT_NAME TEXT, TABLE_NAME TEXT, ENFORCED TEXT)"
+        )
+        database.execute(
+            "INSERT INTO information_schema.CHECK_CONSTRAINTS VALUES (?, ?, ?)",
+            ("synthetic_metadata", name, clause),
+        )
+        database.execute(
+            "INSERT INTO information_schema.TABLE_CONSTRAINTS VALUES (?, ?, ?, ?)",
+            ("synthetic_metadata", name, "memory_semantic_relations", enforced),
+        )
+        condition = _semantic_relation_revision_completion_conditions()["check:" + name]
+        assert "HEX(c.CHECK_CLAUSE)" in condition
+        assert "LOWER(" not in condition and "REPLACE(" not in condition
+        result = database.execute(
+            f"SELECT CASE WHEN {condition} THEN 1 ELSE 0 END"
+        ).fetchone()[0]
+        assert bool(result) is accepted
+    finally:
+        database.close()
 
 
 def _append_competing_process(database_path, identity, ready, outcomes):

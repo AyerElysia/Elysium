@@ -111,8 +111,9 @@ def _search_tool(monkeypatch, *, canonical=True):
 
 
 @pytest.mark.parametrize("canonical", [True, False])
+@pytest.mark.parametrize("options", [{}, {"enable_association": False}])
 async def test_search_tool_association_off_skips_all_extra_branches(
-    monkeypatch, canonical
+    monkeypatch, canonical, options
 ):
     tool, memory, results = _search_tool(monkeypatch, canonical=canonical)
     if canonical:
@@ -124,7 +125,7 @@ async def test_search_tool_association_off_skips_all_extra_branches(
     )
 
     ok, payload = await tool.execute(
-        " synthetic ", top_k=3, enable_association=False
+        " synthetic ", top_k=3, **options
     )
 
     assert ok, payload
@@ -151,9 +152,8 @@ async def test_search_tool_association_off_skips_all_extra_branches(
     assert payload["recall_delivery_binding"] is None
 
 
-@pytest.mark.parametrize("options", [{}, {"enable_association": True}])
-async def test_search_tool_default_and_on_preserve_bundle_and_evidence_paths(
-    monkeypatch, options
+async def test_search_tool_explicit_on_preserves_bundle_and_evidence_paths(
+    monkeypatch
 ):
     tool, memory, results = _search_tool(monkeypatch)
     direct = results[0]
@@ -168,7 +168,7 @@ async def test_search_tool_default_and_on_preserve_bundle_and_evidence_paths(
         )
     ]
 
-    ok, payload = await tool.execute("synthetic", top_k=3, **options)
+    ok, payload = await tool.execute("synthetic", top_k=3, enable_association=True)
 
     assert ok, payload
     assert memory.search_memory.await_args.kwargs["enable_association"] is False
@@ -236,7 +236,7 @@ async def test_bundle_primary_evidence_and_history_preserve_exact_identity_witho
         ],
     )
     service, metadata, _ = _service(tmp_path, monkeypatch, [current], [bundle])
-    output = await service.search_actor_memory("synthetic")
+    output = await service.search_actor_memory("synthetic", enable_association=True)
     assert "权威版本" in output
     assert "Synthetic understanding stays unchanged." in output
     assert output.count("file_ref=subject-file:doc-current@version-current") >= 2
@@ -277,9 +277,8 @@ async def test_direct_and_associated_display_keep_refs_when_no_bundle_was_return
     service._workspace_dir.assert_not_called()
 
 
-@pytest.mark.parametrize("options", [{}, {"enable_association": True}])
-async def test_default_and_explicit_association_keep_existing_expansion(
-    tmp_path, monkeypatch, options
+async def test_explicit_association_keeps_existing_expansion(
+    tmp_path, monkeypatch
 ):
     direct = _hit()
     associated = _hit(
@@ -294,7 +293,7 @@ async def test_default_and_explicit_association_keep_existing_expansion(
     memory = service._memory_service
     memory.expand_living_document_associations = AsyncMock(return_value=expanded)
 
-    output = await service.search_actor_memory(" synthetic ", top_k=3, **options)
+    output = await service.search_actor_memory(" synthetic ", top_k=3, enable_association=True)
 
     memory.search_memory.assert_awaited_once_with(
         "synthetic", top_k=3, enable_association=False, return_bundles=False
@@ -317,8 +316,9 @@ async def test_default_and_explicit_association_keep_existing_expansion(
 
 
 @pytest.mark.parametrize("selected", [True, False])
+@pytest.mark.parametrize("options", [{}, {"enable_association": False}])
 async def test_association_off_skips_expansion_and_bundle_lineage(
-    tmp_path, monkeypatch, selected
+    tmp_path, monkeypatch, selected, options
 ):
     direct = _hit()
     service, metadata, _ = _service(
@@ -333,7 +333,7 @@ async def test_association_off_skips_expansion_and_bundle_lineage(
     )
 
     output = await service.search_actor_memory(
-        " synthetic ", top_k=3, enable_association=False
+        " synthetic ", top_k=3, **options
     )
 
     memory.search_memory.assert_awaited_once_with(
@@ -411,7 +411,7 @@ async def test_selected_bundle_failure_reports_recovery_without_stale_fallback_o
         [],
         error=RuntimeError("ManagedIndexProjectionStale private-token-value"),
     )
-    output = await service.search_actor_memory("synthetic")
+    output = await service.search_actor_memory("synthetic", enable_association=True)
     assert "待恢复" in output and "RuntimeError" in output
     assert "STALE PRIVATE SNIPPET" not in output
     assert "【直接命中的记忆】" not in output

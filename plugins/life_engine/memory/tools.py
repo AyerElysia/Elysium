@@ -969,8 +969,8 @@ class LifeEngineSearchMemoryTool(BaseTool):
         query: Annotated[str, "搜索问题"],
         top_k: Annotated[int, "返回数量"] = 5,
         enable_association: Annotated[
-            bool, "是否启用额外联想与记忆包历史关系展开；false 保留直接检索证据"
-        ] = True,
+            bool, "是否显式启用额外联想与记忆包历史关系展开；默认 false 保留直接检索证据，增强可达性不代表真值或收益"
+        ] = False,
         file_types: Annotated[Optional[List[str]], "限定文件类型"] = None,
         time_range_days: Annotated[int, "时间范围（天），0=不限"] = 0,
         search_mode: Annotated[

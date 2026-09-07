@@ -230,6 +230,8 @@ async def _prepare(store: Any, memory: LifeMemoryService, case: str) -> _Materia
                 content=versions[ref]["text"],
                 source_refs=(ref,),
                 source_occurrence_ids=(f"synthetic-s3:{case}:source:{index}",),
+                scope="Reserved synthetic protocol source only",
+                visibility="private",
             )
             for index, ref in enumerate(source_refs)
         ),
