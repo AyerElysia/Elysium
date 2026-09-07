@@ -299,8 +299,9 @@ def _self_awaken_schema(operation: str) -> tuple[str, dict[str, Any]]:
             },
             "additionalProperties": False,
             "description": (
-                "新建时 provider/referent/workflow 的精确引用必填；已有登记可只提交"
-                "要修改的字段。调度只产生到期机会，不直接执行工作流。"
+                "只修改已有登记，可只提交要修改的字段；首次登记使用 "
+                "nucleus_opportunity_command 的 opportunity.open 并提供精确引用。"
+                "调度只产生到期机会，不直接执行工作流。"
             ),
         }
         return (
@@ -309,7 +310,7 @@ def _self_awaken_schema(operation: str) -> tuple[str, dict[str, Any]]:
                 "type": "object",
                 "properties": {
                     "target_id": {"type": "string"},
-                    "expected_revision": {"type": "integer", "minimum": 0},
+                    "expected_revision": {"type": "integer", "minimum": 1},
                     "arguments": schedule,
                     "reason": {"type": "string"},
                 },
@@ -839,6 +840,12 @@ class NativeCapabilityDispatch:
                 }
             )
             nested_payload = _require_arguments(nested, allowed=schedule_fields)
+            revision = payload["expected_revision"]
+            if type(revision) is not int or revision < 1:
+                raise NativeCapabilityArgumentsInvalid(
+                    "expected_revision must identify an existing registration "
+                    "(integer >= 1); use opportunity.open for first registration"
+                )
             call = runtime.manage(
                 "opportunity.schedule",
                 str(payload["target_id"]),

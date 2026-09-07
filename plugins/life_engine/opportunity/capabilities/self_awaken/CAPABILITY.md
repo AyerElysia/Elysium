@@ -12,7 +12,7 @@
 
 本能力在主体允许的时间策略到期时，只唤醒潜意识，使潜意识获得一次查看近期主体活动并自行判断的运行机会。它不选择动作，不要求表达，也不会把一次唤醒解释成意愿、决定或承诺。
 
-`opportunity.schedule` 管理本能力的时间策略，`opportunity.query` 只读查看登记、状态与可续读机会。二者属于统一机会运行时，不接入旧定时任务库。用户消息、场景事件和其他已有唤醒来源不归本能力所有。
+`opportunity.schedule` 只修改已有登记的时间策略，必须提供当前正整数 `expected_revision`，不会自动新建或恢复已关闭登记。首次登记通过 `nucleus_opportunity_command` 的 `opportunity.open`，提供 provider／referent／workflow 精确引用；这些引用与流程由主体显式选择。`opportunity.query` 只读查看登记、状态与可续读机会。二者属于统一机会运行时，不接入旧定时任务库。用户消息、场景事件和其他已有唤醒来源不归本能力所有。
 
 ## 可观察副作用
 

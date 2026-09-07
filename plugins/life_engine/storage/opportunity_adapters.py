@@ -1640,6 +1640,13 @@ class SQLOpportunityStore:
         session: AsyncSession,
         now: datetime,
     ) -> None:
+        """Retire obsolete pending work without applying a new schedule.
+
+        Keep the last applied registration revision until materialize_due
+        installs its replacement first_due_at; matching the new revision with
+        an empty next_due_at would silently consume an explicit reschedule.
+        """
+
         rows = (
             (
                 await session.execute(
@@ -1700,7 +1707,7 @@ class SQLOpportunityStore:
                     ),
                     {
                         "registration_revision": int(
-                            row["current_registration_revision"] or 0
+                            row["registration_revision"]
                         ),
                         "next_due_at": (
                             None if self.backend == BackendKind.MYSQL else ""
@@ -1752,7 +1759,7 @@ class SQLOpportunityStore:
                         0
                         if str(row["provider_status"] or "")
                         != ProviderStatus.ENABLED.value
-                        else int(row["current_registration_revision"] or 0)
+                        else int(row["registration_revision"])
                     ),
                     "next_due_at": (None if self.backend == BackendKind.MYSQL else ""),
                     "updated_at": self._bind_time(now),

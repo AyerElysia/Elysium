@@ -66,6 +66,13 @@ def describe_protocol(action: str = "") -> dict[str, Any]:
         }
     if action not in _ACTIONS:
         raise ValueError("OpportunityProtocolActionUnknown")
+    if action == "opportunity.open":
+        common["expected_revision"] = "0 for the first registration only"
+    elif action.startswith("opportunity."):
+        common["expected_revision"] = (
+            "exact positive revision of an existing registration; "
+            "first registration uses opportunity.open, never schedule/snooze"
+        )
     return {
         "action": action,
         "common": common,
