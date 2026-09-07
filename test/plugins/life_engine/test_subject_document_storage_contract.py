@@ -798,8 +798,9 @@ async def test_mysql_subject_remote_head_self_heals_legacy_failed_projection(
                 change_context={},
             )
 
-        async def get_projection_task(self, path: str, vid: str):
+        async def get_projection_task(self, path: str, vid: str, *, occurrence_id=None):
             assert path == logical_path and vid == version_id
+            assert occurrence_id is None
             return SubjectProjectionTask(
                 outbox_id=1405,
                 head_event_id="head:legacy",

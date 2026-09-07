@@ -4,6 +4,8 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.service.tool_manifests import (
     get_tool_manifest,
@@ -111,38 +113,47 @@ async def test_apply_patch_rejects_deleting_standing_prompt_file(tmp_path: Path)
 
 async def test_write_standing_prompt_commits_selected_store_before_disk(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    commits: list[dict[str, object]] = []
-
-    async def commit_subject_authority_file_write(**kwargs: object) -> dict[str, str]:
-        assert (tmp_path / "SOUL.md").read_text(encoding="utf-8") == "original\n"
-        commits.append(kwargs)
-        return {"status": "committed"}
-
-    plugin = _plugin(tmp_path)
-    plugin.service._selectable_storage_enabled = True
-    plugin.service.commit_subject_authority_file_write = (
-        commit_subject_authority_file_write
+    from test.plugins.life_engine.test_minimal_subject_file_continuity import (
+        _ACTOR_ID,
+        _bound_write_tool,
+        _memory_plugin,
     )
-    (tmp_path / "SOUL.md").write_text("original\n", encoding="utf-8")
+    from test.plugins.life_engine.test_subject_document_storage_contract import _local_store
 
-    tool = LifeEngineWriteFileTool(plugin=plugin)
-    tool._life_source_instance_id = "consciousness-file-industrial"
-    tool._life_source_occurrence_id = "activity:standing-prompt-write"
-    ok, payload = await tool.execute(
-        "SOUL.md",
-        "next-turn\n",
-        reason="prompt must follow the write",
-    )
+    async with _local_store(tmp_path) as (_, store, _):
+        data_root = tmp_path / "data"
+        plugin, _, _ = _memory_plugin(store, data_root=data_root, monkeypatch=monkeypatch)
+        ok, payload = await _bound_write_tool(plugin, source_id="activity:original").execute(
+            "SOUL.md", "original\n",
+        )
+        assert ok, payload
+        target = data_root / "life_engine_workspace/SOUL.md"
+        read_ok, pinned = await LifeEngineReadFileTool(plugin=plugin).execute("SOUL.md")
+        assert read_ok, pinned
+        commits = []
+        original_append = store.append_version
 
-    assert ok is True
-    assert isinstance(payload, dict)
-    assert len(commits) == 1
-    assert commits[0]["workspace_relative_path"] == "SOUL.md"
-    assert commits[0]["content_bytes"] == b"next-turn\n"
-    assert commits[0]["semantic_actor_id"] == "consciousness-file-industrial"
-    assert commits[0]["semantic_source_id"] == "activity:standing-prompt-write"
-    assert (tmp_path / "SOUL.md").read_text(encoding="utf-8") == "next-turn\n"
+        async def checked_append(command):
+            assert target.read_bytes() == b"original\n"
+            commits.append(command)
+            return await original_append(command)
+
+        monkeypatch.setattr(store, "append_version", checked_append)
+        ok, payload = await _bound_write_tool(
+            plugin, source_id="activity:standing-prompt-write",
+        ).execute(
+            "SOUL.md", "next-turn\n", reason="prompt must follow the write",
+            expected_version=pinned["expected_version"],
+        )
+        assert ok, payload
+        assert len(commits) == 1
+        assert commits[0].logical_path == "life_engine_workspace/SOUL.md"
+        assert commits[0].content_bytes == b"next-turn\n"
+        assert commits[0].semantic_actor_id == _ACTOR_ID
+        assert commits[0].semantic_source_id == "activity:standing-prompt-write"
+        assert target.read_bytes() == b"next-turn\n"
 
 
 async def test_edit_file_strips_read_line_prefixes(tmp_path: Path) -> None:

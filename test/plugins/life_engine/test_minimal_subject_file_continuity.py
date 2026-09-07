@@ -101,6 +101,11 @@ def _bound_write_tool(
     return tool
 
 
+async def _current_memory_pin(plugin: SimpleNamespace) -> str:
+    ok, payload = await LifeEngineReadFileTool(plugin=plugin).execute("MEMORY.md", limit=1)
+    return str(payload["expected_version"]) if ok else ""
+
+
 async def test_memory_tool_versions_survive_new_service_and_keep_exact_origin(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -117,7 +122,10 @@ async def test_memory_tool_versions_survive_new_service_and_keep_exact_origin(
             source = f"activity:memory-write:{ordinal}"
             ok, result = await _bound_write_tool(
                 plugin, source_id=source
-            ).execute("MEMORY.md", content, reason=f"fixture revision {ordinal}")
+            ).execute(
+                "MEMORY.md", content, reason=f"fixture revision {ordinal}",
+                expected_version=await _current_memory_pin(plugin),
+            )
             assert ok, result
             assert isinstance(result, dict)
             assert result["trace_id"].startswith("trace_")
@@ -328,9 +336,13 @@ async def test_authority_append_failure_does_not_write_disk_or_file_trace(
         monkeypatch.setattr(store, "append_version", reject_append)
         ok, error = await _bound_write_tool(
             plugin, source_id="activity:rejected-storage-write"
-        ).execute("MEMORY.md", "不应写入的新字节。\n")
+        ).execute(
+            "MEMORY.md", "不应写入的新字节。\n",
+            expected_version=await _current_memory_pin(plugin),
+        )
         assert ok is False
-        assert "fixture subject append rejected" in str(error)
+        assert error["error_type"] == "RuntimeError"
+        assert error["commit_status"] == "unknown"
         assert len(append_attempts) == 1
         assert append_attempts[0].semantic_actor_id == _ACTOR_ID
         assert append_attempts[0].semantic_source_id == "activity:rejected-storage-write"
@@ -373,6 +385,7 @@ async def _edit_memory_position(
             "位置：待更新",
             "位置：已核对",
             reason="fixture edit must preserve the selected current version",
+            expected_version=await _current_memory_pin(plugin),
         )
     assert operation == "patch"
     return await tool.execute(
@@ -383,6 +396,7 @@ async def _edit_memory_position(
         "+位置：已核对\n"
         "*** End Patch\n",
         reason="fixture patch must preserve the selected current version",
+        expected_versions={"MEMORY.md": await _current_memory_pin(plugin)},
     )
 
 
@@ -404,7 +418,10 @@ async def test_subject_edits_use_latest_authority_and_keep_projection_guard(
         for ordinal, content in enumerate((first_text, second_text), start=1):
             ok, result = await _bound_write_tool(
                 plugin, source_id=f"activity:edit-base:{ordinal}"
-            ).execute("MEMORY.md", content)
+            ).execute(
+                "MEMORY.md", content,
+                expected_version=await _current_memory_pin(plugin),
+            )
             assert ok, result
         second = await service.read_subject_authority_file("MEMORY.md")
         before_history = await store.list_history(_MEMORY_PATH)
@@ -420,13 +437,15 @@ async def test_subject_edits_use_latest_authority_and_keep_projection_guard(
         ok, result = await _edit_memory_position(
             plugin, operation=operation, source_id=source_id
         )
-        # Current local commits append authority before projecting. The
-        # projector deliberately refuses to overwrite divergent/missing
-        # parent bytes. This test does not claim the whole tool succeeded:
-        # only its authoritative edit base is fixed in this increment.
-        assert ok is False
-        assert "SubjectProjectionFailed" in str(result)
-        assert "workspace bytes diverged from the authoritative parent" in str(result)
+        # S2 reports the durable commit independently of failed materialization.
+        # Unknown/stale workspace bytes remain untouched, and the exact operation
+        # receipt tells the caller to recover rather than repeat a new write.
+        assert ok is True
+        assert result["commit_status"] == "committed"
+        receipt = result["files"][0] if operation == "patch" else result
+        assert receipt["projection"]["status"] == (
+            "failed" if disk_state == "stale" else "projected"
+        )
         current = await service.read_subject_authority_file("MEMORY.md")
         expected = second_text.replace("位置：待更新", "位置：已核对")
         assert current.content_bytes == expected.encode("utf-8")
@@ -443,12 +462,14 @@ async def test_subject_edits_use_latest_authority_and_keep_projection_guard(
         assert stored_versions[current.version_id] == current
         projection = await store.get_projection_task(_MEMORY_PATH, current.version_id)
         assert projection is not None
-        assert projection.state == "failed"
-        assert await trace.history("MEMORY.md") == before_trace
+        assert projection.state == ("failed" if disk_state == "stale" else "confirmed")
+        assert len(await trace.history("MEMORY.md")) == len(before_trace) + 1
         if disk_state == "stale":
             assert disk.read_bytes() == first_text.encode("utf-8")
         else:
-            assert not disk.exists()
+            # Missing projection is reconstructed byte-for-byte from the current
+            # authoritative version, with no unknown file replaced.
+            assert disk.read_bytes() == expected.encode("utf-8")
 
         # After the partial failure the actual committed current version
         # remains discoverable, including the v2 text absent from stale disk.

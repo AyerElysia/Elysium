@@ -202,7 +202,7 @@ async def test_heartbeat_request_is_prefix_tools_rolling_without_suffix(
     class _Request:
         def __init__(self) -> None:
             self.payloads: list[Any] = []
-            self.context_manager = None
+            self.context_manager = LLMContextManager()
 
         def add_payload(self, payload: Any) -> None:
             self.payloads.append(payload)
@@ -255,6 +255,7 @@ async def test_heartbeat_request_is_prefix_tools_rolling_without_suffix(
     )
 
     payloads = captured["payloads"]
+    assert prepared.content in request.context_manager.protected_exact_texts
     roles = [getattr(payload.role, "value", payload.role) for payload in payloads]
     assert roles[0] == ROLE.SYSTEM.value
     assert roles[1] == ROLE.TOOL.value

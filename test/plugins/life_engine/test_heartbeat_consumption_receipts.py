@@ -334,3 +334,27 @@ async def test_legacy_prepared_candidates_do_not_count_as_committed(service):
     await asyncio.wait_for(service._heartbeat_loop(), timeout=2)
     assert any("准备了 2 条事件，本拍未消费" in message for message in service._synthetic_logs)
     assert not any("已消费" in message for message in service._synthetic_logs)
+
+
+async def test_unrepresented_pending_activity_is_not_logged_as_no_new_events(service):
+    prepared = SimpleNamespace(
+        content="",
+        selected_event_ids=[],
+        acknowledged_event_ids=[],
+        target_reached=False,
+        dropped_count=2,
+    )
+
+    async def one_round(**_kwargs):
+        service._state.running = False
+        return "", prepared
+
+    service._run_heartbeat_round = one_round
+    service._state.running = True
+    await asyncio.wait_for(service._heartbeat_loop(), timeout=2)
+    assert any(
+        "待处理活动尚未完整投影，本拍未消费" in message
+        for message in service._synthetic_logs
+    )
+    assert not any("无新事件" in message for message in service._synthetic_logs)
+    assert not any("已消费" in message for message in service._synthetic_logs)

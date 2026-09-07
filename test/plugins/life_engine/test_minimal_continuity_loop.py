@@ -40,6 +40,7 @@ from plugins.life_engine.tools.file_tools import LifeEngineReadFileTool
 from src.core.components.types import EventType as TransportEventType
 from src.kernel.event import EventDecision
 from src.kernel.llm import ROLE, LLMPayload, Text, ToolCall, ToolResult
+from src.kernel.llm.context import LLMContextManager
 from src.kernel.storage import canonical_json
 
 from .test_event_stream_simulation import _message
@@ -182,7 +183,10 @@ async def _scripted_memory_write(
     assert ok, read_back
     assert read_back["source_authority"] == "subject_document_store"
     assert read_back["subject_version_id"] == version.version_id
-    response.payloads.extend(
+    # Follow the real append path: a prior checkpoint's assistant Text must
+    # merge with the next scripted call, not become an adjacent assistant frame.
+    context_manager = LLMContextManager()
+    for payload in (
         [
             LLMPayload(
                 ROLE.ASSISTANT,
@@ -215,7 +219,9 @@ async def _scripted_memory_write(
                 [Text(f"SCRIPTED completion after file read, fixture turn {ordinal}.")],
             ),
         ]
-    )
+    ):
+        response.payloads = context_manager.add_payload(response.payloads, payload)
+    context_manager.validate_for_send(response.payloads)
     return version
 
 
