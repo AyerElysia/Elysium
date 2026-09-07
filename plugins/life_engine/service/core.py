@@ -6178,8 +6178,21 @@ class LifeEngineService(BaseService):
             f"subject context projection exhausted cloud models: {detail}"
         )
 
-    async def search_actor_memory(self, query: str, top_k: int = 5) -> str:
-        """深度检索 life memory。"""
+    async def search_actor_memory(
+        self,
+        query: str,
+        top_k: int = 5,
+        *,
+        enable_association: bool = True,
+    ) -> str:
+        """检索 life memory；可显式关闭所有额外关联以保留直接命中基线。
+
+        ``enable_association=False`` 同时跳过 living 关联展开与记忆包构建；
+        后者会额外读取 lineage、历史证据和修正。默认保留既有增强行为。
+        此开关不修改索引、关系历史或主体内容，也不授权 legacy edge 扩散。
+        """
+        if type(enable_association) is not bool:
+            raise TypeError("enable_association must be a bool")
         query_text = str(query or "").strip()
         if not query_text:
             return ""
@@ -6225,7 +6238,9 @@ class LifeEngineService(BaseService):
         exact_read_hint = (
             "\n受管文件请固定上方 file_ref 对应的版本：fetch_life_memory 同时传 "
             "version_ids={路径: version_id}；也可用 nucleus_read_file（read_file）传 "
-            "document_id、version_id 精确续读，不要仅凭当前路径回取历史版本。"
+            "path、version_id 精确读取（正文不传 document_id），或仅传完整 file_ref"
+            "（不与 path、document_id、version_id 混用）。续读保留原选择器并传回 continuation；"
+            "不要仅凭当前路径回取历史版本。"
         )
 
         # 需要 SearchResult 列表：下面既要交给 build_memory_bundles，
@@ -6243,7 +6258,7 @@ class LifeEngineService(BaseService):
             "expand_living_document_associations",
             None,
         )
-        if callable(expand_associations):
+        if enable_association and callable(expand_associations):
             association_seed = int.from_bytes(
                 hashlib.sha256(query_text.encode("utf-8")).digest()[:8],
                 "big",
@@ -6262,10 +6277,14 @@ class LifeEngineService(BaseService):
             return ""
 
         try:
-            bundles = await memory_service.build_memory_bundles(
-                query=query_text,
-                results=results,
-                top_k=max(1, int(top_k)),
+            bundles = (
+                await memory_service.build_memory_bundles(
+                    query=query_text,
+                    results=results,
+                    top_k=max(1, int(top_k)),
+                )
+                if enable_association
+                else []
             )
         except Exception as exc:  # noqa: BLE001
             if selected:
@@ -11766,6 +11785,16 @@ class LifeEngineService(BaseService):
                 f"life_engine 共享同步初始化失败: {self._shared_sync_error}"
             )
 
+    @staticmethod
+    def _should_start_router_context_projection(chatter_cfg: Any) -> bool:
+        """Start Router-only background work only when its consumer is enabled."""
+        return bool(
+            chatter_cfg is not None
+            and getattr(chatter_cfg, "enabled", False)
+            and getattr(chatter_cfg, "router_enabled", True)
+            and getattr(chatter_cfg, "router_context_projection_enabled", True)
+        )
+
     async def start(self) -> None:
         """Start all consumers, rolling back them before the owned runtime."""
 
@@ -12049,14 +12078,8 @@ class LifeEngineService(BaseService):
                 )
 
         chatter_cfg = getattr(cfg, "chatter", None)
-        projection_enabled = bool(
-            chatter_cfg is not None
-            and getattr(chatter_cfg, "enabled", False)
-            and getattr(
-                chatter_cfg,
-                "router_context_projection_enabled",
-                True,
-            )
+        projection_enabled = self._should_start_router_context_projection(
+            chatter_cfg
         )
         if projection_enabled:
             self._router_context_projection = RouterContextProjection(

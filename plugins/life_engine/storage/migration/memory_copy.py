@@ -40,6 +40,7 @@ from ...memory.living import (
     RecallEpisode,
     RecallEvent,
     SemanticRelation,
+    semantic_relation_payload,
 )
 from ..contracts import StorageBackendRuntime, StorageWriterRole
 from ..memory.schema import ensure_memory_storage_schema
@@ -383,6 +384,11 @@ _SPECS = (
             "consciousness_instance_id",
             "stream_scope",
             "metadata_json",
+            "owner_subject_id",
+            "root_relation_id",
+            "parent_relation_id",
+            "revision",
+            "operation",
             "payload_sha256",
         ),
         ("relation_id",),
@@ -717,7 +723,12 @@ def _sha256(value: str) -> str:
 
 
 def _payload_hash(value: Any) -> str:
-    return _sha256(canonical_json(asdict(value)))
+    body = (
+        semantic_relation_payload(value)
+        if isinstance(value, SemanticRelation)
+        else asdict(value)
+    )
+    return _sha256(canonical_json(body))
 
 
 def _strict_json(value: Any, *, expected: type) -> Any:
@@ -1217,6 +1228,17 @@ def _transform_source_row(
             consciousness_instance_id=str(raw.get("consciousness_instance_id") or ""),
             stream_scope=str(raw.get("stream_scope") or ""),
             metadata=metadata,
+            owner_subject_id=(
+                str(raw["owner_subject_id"])
+                if raw.get("owner_subject_id") is not None else None
+            ),
+            root_relation_id=str(raw.get("root_relation_id") or ""),
+            parent_relation_id=(
+                str(raw["parent_relation_id"])
+                if raw.get("parent_relation_id") is not None else None
+            ),
+            revision=int(raw.get("revision", 1)),
+            operation=str(raw.get("operation", "add")),
         )
         return {
             "relation_id": record.relation_id,
@@ -1231,6 +1253,11 @@ def _transform_source_row(
             "consciousness_instance_id": record.consciousness_instance_id,
             "stream_scope": record.stream_scope,
             "metadata_json": canonical_json(metadata),
+            "owner_subject_id": record.owner_subject_id,
+            "root_relation_id": record.root_relation_id or None,
+            "parent_relation_id": record.parent_relation_id,
+            "revision": record.revision,
+            "operation": record.operation,
             "payload_sha256": _payload_hash(record),
         }
     if table == "memory_recall_sessions":
@@ -1544,6 +1571,17 @@ def iter_transformed_source_rows(
     batch_size: int,
 ) -> Iterable[list[dict[str, Any]]]:
     order_columns = _SOURCE_ORDER.get(spec.name, spec.key_columns)
+    if spec.name == "memory_semantic_relations":
+        relation_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(memory_semantic_relations)"
+            )
+        }
+        if {"root_relation_id", "revision"} <= relation_columns:
+            # Parents precede children even if occurrence IDs or wall-clock
+            # timestamps sort backwards. Legacy NULL-root rows remain exact.
+            order_columns = ("root_relation_id", "revision", "relation_id")
     if spec.name == "memory_vector_tombstones":
         source_columns = {
             str(row["name"])

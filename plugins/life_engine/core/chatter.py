@@ -4129,6 +4129,18 @@ class LifeChatter(BaseChatter):
                 ),
             }
 
+        if not bool(
+            getattr(self._get_chatter_config_section(), "router_enabled", True)
+        ):
+            # Only bypass the front selector. The normal expression workflow
+            # still owns subject authority, input delivery, tools and waiting.
+            # No Router model ran, so there is no Router activity to record.
+            return {
+                "reason": "前置 Router 已停用，消息交给主体表达链自行判断",
+                "should_respond": True,
+                "force_reply": False,
+            }
+
         service = self._get_life_service()
         history_text = await self._build_history_text_async(
             chat_stream,

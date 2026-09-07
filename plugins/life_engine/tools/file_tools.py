@@ -1054,7 +1054,9 @@ class LifeEngineReadFileTool(BaseTool):
         "**注意：** 结果每行是 `行号<TAB>正文`。行号只用于定位。"
         "`nucleus_edit_file` / `nucleus_apply_patch` 的文本必须是去掉行号之后的原文，"
         "不要把 `12\\t` 这种前缀拷进去。"
-        "受管文件返回 expected_version；修改时原样传回。旧版用 version_id 精确回取，"
+        "受管文件返回 expected_version；修改时原样传回。旧版用 path＋version_id 精确回取，"
+        "或只传完整 file_ref=subject-file:document_id@version_id（不混用其它身份选择器）。"
+        "file_ref 只读固定版本正文，续读时保持同一 file_ref 和读取参数。"
         "view=history/operations 查版本或操作历史；改名/删除后用 document_id 查原文档。"
         "view=metadata 可看二进制元信息；view=operation + occurrence_id 可核对提交回执。"
     )
@@ -1062,7 +1064,7 @@ class LifeEngineReadFileTool(BaseTool):
 
     async def execute(
         self,
-        path: Annotated[str, "相对于工作空间的文件路径"],
+        path: Annotated[str, "相对于工作空间的文件路径；仅用 file_ref 精确读取时省略"] = "",
         offset: Annotated[int, "从第几行开始读（1-indexed），from_end=true 时忽略"] = 1,
         limit: Annotated[
             int,
@@ -1088,6 +1090,7 @@ class LifeEngineReadFileTool(BaseTool):
         after_recorded_at: Annotated[str, "历史下一数据库页返回的时间游标；先读完 continuation"] = "",
         after_id: Annotated[str, "与 after_recorded_at 一同原样传回"] = "",
         history_limit: Annotated[int, "每数据库页最多100个元数据条目，正文仍按 max_bytes 分页"] = 50,
+        file_ref: Annotated[str, "可选完整 subject-file:document_id@version_id；仅正文，不能混用 path/document_id/version_id"] = "",
     ) -> tuple[bool, str | dict]:
         """读取文件内容，支持行号和偏移/限制。
 
@@ -1095,13 +1098,26 @@ class LifeEngineReadFileTool(BaseTool):
             成功返回 (True, {"path": ..., "content": ..., "size": ...})
             失败返回 (False, error_message)
         """
-        valid, result = _resolve_path(self.plugin, path)
-        if not valid:
-            return False, str(result)
-
-        target = result
+        if file_ref and (
+            path or document_id or version_id or view != "content"
+            or occurrence_id or after_recorded_at or after_id
+        ):
+            return False, "ManagedFileReferenceSelectorConflict"
+        if not path and not file_ref:
+            return False, "FileReadSelectorRequired: provide path or exact file_ref"
         try:
             session = selected_file_session(self, _plugin_life_service(self.plugin))
+            reference_document_id = ""
+            if file_ref:
+                if session is None:
+                    return False, "HistoricalFileReadRequiresSelectedStorage"
+                target, reference_document_id, version_id = await session.resolve_reference(file_ref)
+                path = session.relative(target)
+            else:
+                valid, result = _resolve_path(self.plugin, path)
+                if not valid:
+                    return False, str(result)
+                target = result
             snapshot = None
             if view != "content":
                 if session is None:
@@ -1119,6 +1135,11 @@ class LifeEngineReadFileTool(BaseTool):
             if session is not None:
                 snapshot = await session.read(target, version_id=selected_version_id)
                 version = snapshot.version
+                if file_ref and (
+                    version is None or version.document_id != reference_document_id
+                    or version.version_id != selected_version_id or snapshot.reference != file_ref
+                ):
+                    return False, "ManagedFileReferenceReadIdentityConflict"
             else:
                 if selected_version_id:
                     return False, "HistoricalFileReadRequiresSelectedStorage"

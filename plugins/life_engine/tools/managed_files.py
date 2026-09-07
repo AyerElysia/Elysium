@@ -11,7 +11,7 @@ import asyncio
 import hashlib
 import json
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from ..storage.models import BackendKind
@@ -94,6 +94,42 @@ def pin_file_continuation(continuation: str, version_id: str) -> str:
     return f"mfc1.{version_id}.{continuation}" if continuation else ""
 
 
+def parse_file_reference(file_ref: str) -> tuple[str, str]:
+    """Parse one emitted exact identity; never normalize it into a latest selector."""
+    prefix = "subject-file:"
+    if not isinstance(file_ref, str) or not file_ref.startswith(prefix):
+        raise ValueError("ManagedFileReferenceInvalid")
+    identity = file_ref[len(prefix):]
+    if identity.count("@") != 1:
+        raise ValueError("ManagedFileReferenceInvalid")
+    document_id, version_id = identity.split("@")
+    for value, required_prefix in ((document_id, "doc_"), (version_id, "ver_")):
+        if (
+            not value.startswith(required_prefix)
+            or not len(required_prefix) < len(value) <= 255
+            or not value.isascii()
+            or any(not (char.isalnum() or char in "_-") for char in value)
+        ):
+            raise ValueError("ManagedFileReferenceInvalid")
+    return document_id, version_id
+
+
+def _reference_relative_path(logical_path: str) -> str:
+    """Validate authority metadata without silently accepting path aliases."""
+    if not isinstance(logical_path, str) or not logical_path.startswith(_PREFIX):
+        raise PermissionError("ManagedFileReferenceOutsideWorkspace")
+    relative = logical_path[len(_PREFIX):]
+    if (
+        not relative
+        or "\\" in relative
+        or PurePosixPath(relative).is_absolute()
+        or PurePosixPath(relative).as_posix() != relative
+        or any(part in {".", ".."} for part in relative.split("/"))
+    ):
+        raise PermissionError("ManagedFileReferencePathInvalid")
+    return relative
+
+
 class ManagedFileSession:
     """One authorized existing tool call backed by the selected history store."""
 
@@ -110,6 +146,26 @@ class ManagedFileSession:
         if relative in {"", "."}:
             raise ValueError("ManagedFilePathMustNameAFile")
         return relative
+
+    async def resolve_reference(self, file_ref: str) -> tuple[Path, str, str]:
+        """Authorize exact metadata before loading a blob through the normal reader."""
+        document_id, version_id = parse_file_reference(file_ref)
+        descriptor = await self.store.get_version_descriptor(version_id)
+        if descriptor["version_id"] != version_id:
+            raise ValueError("ManagedFileReferenceVersionConflict")
+        if descriptor["document_id"] != document_id:
+            raise ValueError("ManagedFileVersionDocumentConflict")
+        relative = _reference_relative_path(descriptor["logical_path"])
+        head = await self.store.get_document_head(document_id)
+        if head is None:
+            raise SubjectDocumentNotFound("ManagedFileDocumentNotFound")
+        if head.document_id != document_id:
+            raise ValueError("ManagedFileReferenceDocumentConflict")
+        _reference_relative_path(head.logical_path)
+        target = self.workspace / relative
+        if self.relative(target) != relative:
+            raise PermissionError("ManagedFileReferencePathAlias")
+        return target, document_id, version_id
 
     async def read(
         self,

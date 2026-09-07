@@ -124,6 +124,7 @@ from ...memory.living import (
     RecallEpisode,
     RecallEvent,
     SemanticRelation,
+    SemanticRelationPage,
     append_artifact_version,
     append_corecall_event,
     append_interpretation,
@@ -134,12 +135,14 @@ from ...memory.living import (
     get_artifact_head_state,
     get_artifact_version,
     get_interpretation,
+    get_semantic_relation,
     list_artifact_descriptors,
     list_artifact_heads,
     list_artifact_history,
     list_association_evidence,
     list_interpretations,
     list_semantic_relations,
+    page_semantic_relations,
     rebuild_association_projection,
     search_interpretations,
 )
@@ -1287,8 +1290,26 @@ class LocalLivingMemoryStore(_LocalPort):
         async with self._write_scope():
             return await run_db(append_semantic_relation, self._db(), relation)
 
-    async def list_relations(self, entity_ref: str) -> list[SemanticRelation]:
-        return await run_db(list_semantic_relations, self._db(), entity_ref)
+    async def get_relation(self, relation_id: str) -> SemanticRelation | None:
+        return await run_db(get_semantic_relation, self._db(), relation_id)
+
+    async def page_relations(
+        self, entity_ref: str, *, current_only: bool = False, limit: int = 50,
+        offset: int = 0, expected_frontier_count: int | None = None,
+    ) -> SemanticRelationPage:
+        return await run_db(
+            page_semantic_relations, self._db(), entity_ref,
+            current_only=current_only, limit=limit, offset=offset,
+            expected_frontier_count=expected_frontier_count,
+        )
+
+    async def list_relations(
+        self, entity_ref: str, *, current_only: bool = False,
+    ) -> list[SemanticRelation]:
+        return await run_db(
+            list_semantic_relations, self._db(), entity_ref,
+            current_only=current_only,
+        )
 
     async def list_interpretations(
         self,

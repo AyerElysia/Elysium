@@ -105,6 +105,7 @@ from .living import (
     RecallEpisode,
     RecallEvent,
     SemanticRelation,
+    SemanticRelationPage,
     create_living_memory_schema,
     new_artifact_version,
 )
@@ -1927,10 +1928,41 @@ class LifeMemoryService:
     async def list_memory_semantic_relations(
         self,
         entity_ref: str,
+        *,
+        current_only: bool = False,
     ) -> List[SemanticRelation]:
-        """Return every explicit relation touching one memory entity."""
+        """Read complete history or its rebuildable active-head projection."""
 
-        return await self._require_memory_storage().living.list_relations(entity_ref)
+        return await self._require_memory_storage().living.list_relations(
+            entity_ref, current_only=current_only,
+        )
+
+    async def get_memory_semantic_relation(
+        self,
+        relation_id: str,
+    ) -> SemanticRelation | None:
+        """Read one immutable occurrence; absence is not a latest selector."""
+
+        return await self._require_memory_storage().living.get_relation(relation_id)
+
+    async def page_memory_semantic_relations(
+        self,
+        entity_ref: str,
+        *,
+        current_only: bool = False,
+        limit: int = 50,
+        offset: int = 0,
+        expected_frontier_count: int | None = None,
+    ) -> "SemanticRelationPage":
+        """Read one bounded row page against a checked append-only frontier."""
+
+        return await self._require_memory_storage().living.page_relations(
+            entity_ref,
+            current_only=current_only,
+            limit=limit,
+            offset=offset,
+            expected_frontier_count=expected_frontier_count,
+        )
 
     async def search_memory_interpretations(
         self,
@@ -2018,6 +2050,8 @@ class LifeMemoryService:
         context_key: str,
         random_seed: int,
         limit: int,
+        enable_semantic_relations: bool = True,
+        enable_corecall: bool = True,
     ) -> List[SearchResult]:
         """Add replayable neighbours from the canonical living-memory ledgers.
 
@@ -2025,8 +2059,13 @@ class LifeMemoryService:
         share this one read path.  Neither source is converted into a truth or
         importance score.  A deterministic hash selection makes a bounded
         page replayable without reviving the mutable legacy edge weights.
+        The two read-only controls separate subject assertions from co-recall
+        reachability for controlled evaluation. Neither switch writes history,
+        reinforces a relation, or authorizes access to a referenced document.
         """
 
+        if type(enable_semantic_relations) is not bool or type(enable_corecall) is not bool:
+            raise TypeError("association source controls must be bools")
         from .managed_documents import (
             association_document_metadata, is_current_result, node_identity,
         )
@@ -2034,6 +2073,8 @@ class LifeMemoryService:
         for result in results:
             if not await is_current_result(self, result):
                 raise RuntimeError("ManagedIndexProjectionStale")
+        if int(limit) <= 0:
+            return list(results)
         seed_refs = [
             "subject-file:" + item.document_id
             if getattr(item, "document_id", "") else f"document:{item.file_path}"
@@ -2046,14 +2087,38 @@ class LifeMemoryService:
                 random_seed=random_seed,
                 limit=max(0, int(limit)),
             )
+            if enable_corecall else []
         )
         living = self._require_memory_storage().living
         candidate_signals: dict[str, set[str]] = {}
         candidate_sources: dict[str, set[str]] = {}
         candidate_identities: dict[str, set[str]] = {}
-        for seed_ref in seed_refs:
-            relations = await living.list_relations(seed_ref)
-            for relation in relations:
+        relation_frontier: int | None = None
+        relation_page_limit = min(100, max(1, int(limit)))
+        for seed_ref in seed_refs if enable_semantic_relations else ():
+            page = await living.page_relations(
+                seed_ref,
+                current_only=True,
+                limit=relation_page_limit,
+                expected_frontier_count=relation_frontier,
+            )
+            relation_frontier = page.frontier_count
+            if page.matching_count > relation_page_limit:
+                # A recorded seed chooses a bounded window; tail relations
+                # remain reachable without materializing every historical row.
+                page_seed = hashlib.sha256(
+                    f"{context_key}\0{int(random_seed)}\0{seed_ref}".encode("utf-8")
+                ).digest()
+                offset = int.from_bytes(page_seed[:8], "big") % page.matching_count
+                if offset:
+                    page = await living.page_relations(
+                        seed_ref,
+                        current_only=True,
+                        limit=relation_page_limit,
+                        offset=offset,
+                        expected_frontier_count=relation_frontier,
+                    )
+            for relation in page.relations:
                 target_ref = (
                     relation.target_ref
                     if relation.source_ref == seed_ref

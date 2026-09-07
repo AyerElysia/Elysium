@@ -91,6 +91,11 @@ from ...memory.living import (
     RecallEpisode,
     RecallEvent,
     SemanticRelation,
+    SemanticRelationPage,
+    normalize_semantic_relation,
+    semantic_relation_payload,
+    validate_semantic_relation_page_request,
+    validate_semantic_relation_parent,
 )
 from ...memory.nodes import (
     MemoryNode,
@@ -305,6 +310,11 @@ _MYSQL_MEMORY_READINESS_REQUIREMENTS: dict[
             "source_ref_sha256",
             "target_ref_sha256",
             "payload_sha256",
+            "owner_subject_id",
+            "root_relation_id",
+            "parent_relation_id",
+            "revision",
+            "operation",
         ),
         "memory_recall_sessions": (
             "episode_id",
@@ -406,6 +416,12 @@ _MYSQL_MEMORY_READINESS_INDEX_REQUIREMENTS: dict[
     str,
     dict[str, dict[str, tuple[int, tuple[str, ...]]]],
 ] = {
+    "living": {
+        "memory_semantic_relations": {
+            "uq_semantic_relation_parent": (0, ("parent_relation_id",)),
+            "uq_semantic_relation_revision": (0, ("root_relation_id", "revision")),
+        },
+    },
     "document_index": {
         "memory_nodes": {
             "uq_memory_nodes_file_path_hash": (0, ("file_path_sha256",)),
@@ -674,7 +690,11 @@ def _json_value(value: Any, *, default: Any) -> Any:
 
 
 def _payload(value: Any) -> tuple[str, str]:
-    body = asdict(value)
+    body = (
+        semantic_relation_payload(value)
+        if isinstance(value, SemanticRelation)
+        else asdict(value)
+    )
     encoded = canonical_json(body)
     return encoded, _sha256(encoded)
 
@@ -4003,6 +4023,15 @@ def _semantic_relation_from_row(row: Any) -> SemanticRelation:
         consciousness_instance_id=str(row["consciousness_instance_id"]),
         stream_scope=str(row["stream_scope"]),
         metadata=dict(_json_value(row["metadata_json"], default={})),
+        owner_subject_id=(
+            str(row["owner_subject_id"]) if row["owner_subject_id"] is not None else None
+        ),
+        root_relation_id=str(row["root_relation_id"] or ""),
+        parent_relation_id=(
+            str(row["parent_relation_id"]) if row["parent_relation_id"] is not None else None
+        ),
+        revision=int(row["revision"]),
+        operation=str(row["operation"]),
     )
 
 
@@ -4386,49 +4415,208 @@ class MySQLLivingMemoryStore(_MySQLPort):
         return await self._write(_operation)
 
     async def append_relation(self, relation: SemanticRelation) -> SemanticRelation:
-        if relation.source_ref == relation.target_ref:
-            raise ValueError("semantic relation endpoints must differ")
-        _, payload_hash = _payload(relation)
-
         async def _operation(session: AsyncSession) -> SemanticRelation:
+            existing_row = (
+                (
+                    await session.execute(
+                        text(
+                            "SELECT * FROM memory_semantic_relations "
+                            "WHERE relation_id = :identity FOR UPDATE"
+                        ),
+                        {"identity": relation.relation_id},
+                    )
+                ).mappings().one_or_none()
+            )
+            existing = (
+                _semantic_relation_from_row(existing_row)
+                if existing_row is not None else None
+            )
+            normalized = normalize_semantic_relation(
+                replace(relation, recorded_at=existing.recorded_at)
+                if existing is not None and not relation.recorded_at
+                else relation
+            )
+            _, payload_hash = _payload(normalized)
+            if existing is not None:
+                if (
+                    semantic_relation_payload(existing) != semantic_relation_payload(normalized)
+                    or _row_hash(existing_row) != payload_hash
+                ):
+                    raise RuntimeError("SemanticRelationOccurrenceConflict")
+                return existing
+            if normalized.parent_relation_id is not None:
+                parent_row = (
+                    (
+                        await session.execute(
+                            text(
+                                "SELECT * FROM memory_semantic_relations "
+                                "WHERE relation_id = :identity FOR UPDATE"
+                            ),
+                            {"identity": normalized.parent_relation_id},
+                        )
+                    ).mappings().one_or_none()
+                )
+                parent = (
+                    _semantic_relation_from_row(parent_row)
+                    if parent_row is not None else None
+                )
+                validate_semantic_relation_parent(normalized, parent)
+                child = (
+                    (
+                        await session.execute(
+                            text(
+                                "SELECT relation_id FROM memory_semantic_relations "
+                                "WHERE parent_relation_id = :identity FOR UPDATE"
+                            ),
+                            {"identity": normalized.parent_relation_id},
+                        )
+                    ).mappings().one_or_none()
+                )
+                if child is not None:
+                    raise RuntimeError("SemanticRelationStaleParent")
             await self._immutable_insert(
                 session,
                 table="memory_semantic_relations",
                 identity_column="relation_id",
-                identity=relation.relation_id,
+                identity=normalized.relation_id,
                 values={
-                    "relation_id": relation.relation_id,
-                    "source_ref": relation.source_ref,
-                    "source_ref_sha256": _sha256(relation.source_ref),
-                    "target_ref": relation.target_ref,
-                    "target_ref_sha256": _sha256(relation.target_ref),
-                    "predicate": relation.predicate,
-                    "reason": relation.reason,
-                    "actor": relation.actor,
-                    "recorded_at": relation.recorded_at,
-                    "consciousness_instance_id": relation.consciousness_instance_id,
-                    "stream_scope": relation.stream_scope,
-                    "metadata_json": canonical_json(relation.metadata),
+                    "relation_id": normalized.relation_id,
+                    "source_ref": normalized.source_ref,
+                    "source_ref_sha256": _sha256(normalized.source_ref),
+                    "target_ref": normalized.target_ref,
+                    "target_ref_sha256": _sha256(normalized.target_ref),
+                    "predicate": normalized.predicate,
+                    "reason": normalized.reason,
+                    "actor": normalized.actor,
+                    "recorded_at": normalized.recorded_at,
+                    "consciousness_instance_id": normalized.consciousness_instance_id,
+                    "stream_scope": normalized.stream_scope,
+                    "metadata_json": canonical_json(normalized.metadata),
+                    "owner_subject_id": normalized.owner_subject_id,
+                    "root_relation_id": normalized.root_relation_id or None,
+                    "parent_relation_id": normalized.parent_relation_id,
+                    "revision": normalized.revision,
+                    "operation": normalized.operation,
                     "payload_sha256": payload_hash,
                 },
                 payload_sha256=payload_hash,
             )
-            return relation
+            return normalized
 
         return await self._write(_operation)
 
-    async def list_relations(self, entity_ref: str) -> list[SemanticRelation]:
+    async def get_relation(self, relation_id: str) -> SemanticRelation | None:
+        assert self.runtime.engine is not None
+        async with self.runtime.engine.connect() as connection:
+            row = (
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT * FROM memory_semantic_relations "
+                            "WHERE relation_id = :identity"
+                        ),
+                        {"identity": relation_id},
+                    )
+                ).mappings().one_or_none()
+            )
+        return _semantic_relation_from_row(row) if row is not None else None
+
+    async def page_relations(
+        self, entity_ref: str, *, current_only: bool = False, limit: int = 50,
+        offset: int = 0, expected_frontier_count: int | None = None,
+    ) -> SemanticRelationPage:
+        validate_semantic_relation_page_request(
+            limit=limit, offset=offset,
+            expected_frontier_count=expected_frontier_count,
+        )
+        current_clause = (
+            " AND r.operation <> 'withdraw' AND NOT EXISTS ("
+            "SELECT 1 FROM memory_semantic_relations child "
+            "WHERE child.parent_relation_id = r.relation_id)"
+            if current_only else ""
+        )
+        # Hashes narrow the index lookup; byte equality remains the identity
+        # check before both COUNT and LIMIT, including case/trailing spaces.
+        endpoint_clause = (
+            "((r.source_ref_sha256 = :ref_hash "
+            "AND BINARY r.source_ref = BINARY :entity_ref) "
+            "OR (r.target_ref_sha256 = :ref_hash "
+            "AND BINARY r.target_ref = BINARY :entity_ref))"
+        )
+        parameters = {"ref_hash": _sha256(entity_ref), "entity_ref": entity_ref}
+        assert self.runtime.engine is not None
+        async with self.runtime.engine.connect() as connection:
+            connection = await connection.execution_options(
+                isolation_level="REPEATABLE READ",
+            )
+            async with connection.begin():
+                # Only SELECTs occur in this transaction. Explicit RR keeps the
+                # count and row slice on the same snapshot on every deployment.
+                frontier = int(await connection.scalar(text(
+                    "SELECT COUNT(*) FROM memory_semantic_relations"
+                )))
+                if expected_frontier_count is not None and frontier != expected_frontier_count:
+                    raise RuntimeError("SemanticRelationPageFrontierConflict")
+                matching_count = int(await connection.scalar(
+                    text(
+                        "SELECT COUNT(*) FROM memory_semantic_relations r "
+                        "WHERE " + endpoint_clause + current_clause
+                    ),
+                    parameters,
+                ))
+                rows = (
+                    (
+                        await connection.execute(
+                            text(
+                                "SELECT r.*, (r.operation <> 'withdraw' AND NOT EXISTS ("
+                                "SELECT 1 FROM memory_semantic_relations child "
+                                "WHERE child.parent_relation_id = r.relation_id)) AS current_active "
+                                "FROM memory_semantic_relations r WHERE "
+                                + endpoint_clause
+                                + current_clause
+                                + " ORDER BY r.recorded_at, r.relation_id "
+                                "LIMIT :row_limit OFFSET :row_offset"
+                            ),
+                            {
+                                **parameters,
+                                "row_limit": limit + 1,
+                                "row_offset": offset,
+                            },
+                        )
+                    ).mappings().all()
+                )
+        has_more = len(rows) > limit
+        relations = tuple(_semantic_relation_from_row(row) for row in rows[:limit])
+        return SemanticRelationPage(
+            relations=relations, frontier_count=frontier, offset=offset,
+            next_offset=offset + len(relations) if has_more else None,
+            has_more=has_more,
+            matching_count=matching_count,
+            current_relation_ids=tuple(
+                str(row["relation_id"]) for row in rows[:limit] if bool(row["current_active"])
+            ),
+        )
+
+    async def list_relations(
+        self, entity_ref: str, *, current_only: bool = False,
+    ) -> list[SemanticRelation]:
         ref_hash = _sha256(entity_ref)
+        current_clause = (
+            " AND r.operation <> 'withdraw' AND NOT EXISTS ("
+            "SELECT 1 FROM memory_semantic_relations child "
+            "WHERE child.parent_relation_id = r.relation_id)"
+            if current_only else ""
+        )
         assert self.runtime.engine is not None
         async with self.runtime.engine.connect() as connection:
             rows = (
                 (
                     await connection.execute(
                         text(
-                            "SELECT * FROM memory_semantic_relations "
-                            "WHERE source_ref_sha256 = :ref_hash "
-                            "OR target_ref_sha256 = :ref_hash "
-                            "ORDER BY recorded_at, relation_id"
+                            "SELECT r.* FROM memory_semantic_relations r "
+                            "WHERE (r.source_ref_sha256 = :ref_hash "
+                            "OR r.target_ref_sha256 = :ref_hash)"
+                            + current_clause + " ORDER BY r.recorded_at, r.relation_id"
                         ),
                         {"ref_hash": ref_hash},
                     )

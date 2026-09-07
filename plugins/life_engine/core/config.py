@@ -131,6 +131,7 @@ class LifeEngineConfig(BaseConfig):
             "max_rounds_per_chat",
             "initial_history_messages",
             "recent_history_tail_messages",
+            "router_enabled",
             "router_context_projection_enabled",
             "router_context_projection_task_name",
             "router_context_projection_max_chars",
@@ -1292,6 +1293,14 @@ class LifeEngineConfig(BaseConfig):
             description=(
                 "兼容旧配置：若 initial_history_messages 未显式配置且此值 > 0，"
                 "则回退使用该值作为首轮历史消息条数。"
+            ),
+        )
+
+        router_enabled: bool = Field(
+            default=True,
+            description=(
+                "是否启用对话前置 Router 选择。关闭后普通消息直接交给主表达链，"
+                "由主体决定表达、调用工具或等待；不强制发送回复。"
             ),
         )
 

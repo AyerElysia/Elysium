@@ -111,6 +111,8 @@ class _RelationRuntime:
     """Trusted runtime identity for one explicit relation operation."""
 
     memory_service: LifeMemoryService
+    life_service: Any
+    owner_subject_id: str
     actor_consciousness_instance_id: str
     stream_scope: str
     source_occurrence_id: str
@@ -288,6 +290,10 @@ async def _resolve_relation_runtime(tool: BaseTool) -> _RelationRuntime:
     source_occurrence_id, source_occurrence_kind = _relation_source_occurrence(tool)
     return _RelationRuntime(
         memory_service=memory_service,
+        life_service=service,
+        # The trusted registry contains windows of this one continuous subject.
+        # Instance and stream identity remain occurrence provenance, not owners.
+        owner_subject_id="elysia",
         actor_consciousness_instance_id=actor,
         stream_scope=stream_scope,
         source_occurrence_id=source_occurrence_id,
@@ -326,6 +332,11 @@ def _same_semantic_relation(existing: Any, proposed: Any) -> bool:
         "consciousness_instance_id",
         "stream_scope",
         "metadata",
+        "owner_subject_id",
+        "root_relation_id",
+        "parent_relation_id",
+        "revision",
+        "operation",
     )
     return all(getattr(existing, field) == getattr(proposed, field) for field in fields)
 
@@ -355,6 +366,13 @@ def _semantic_relation_payload(relation: Any, *, center_ref: str) -> dict[str, A
         "direction": direction,
         "counterpart_ref": counterpart_ref,
         "metadata": dict(relation.metadata),
+        "owner_subject_id": relation.owner_subject_id,
+        "root_relation_id": relation.root_relation_id,
+        "parent_relation_id": relation.parent_relation_id,
+        "revision": relation.revision,
+        "operation": relation.operation,
+        "legacy_owner_unbound": relation.owner_subject_id is None,
+        "read_only": relation.owner_subject_id is None,
     }
 
 
@@ -367,8 +385,8 @@ def _legacy_relation_mutation_retired_payload(action: str) -> dict[str, Any]:
         "action": str(action or "").strip().lower(),
         "mutated": False,
         "message": (
-            "SemanticRelation history has no audited retract/supersede contract; "
-            "legacy memory_edges are read-only compatibility data."
+            "Legacy memory_edges remain read-only compatibility data. "
+            "Use explicit revise/withdraw with root and parent IDs for owned relations."
         ),
     }
 
@@ -438,6 +456,68 @@ def _eligible_path_or_error(file_path: str) -> tuple[str | None, str | None]:
     return None, f"不是可操作的记忆文档: {decision.reason}"
 
 
+
+async def _resolve_relation_endpoint(
+    tool: BaseTool,
+    *,
+    entity_ref: str,
+    file_path: str,
+    life_service: Any = None,
+) -> tuple[str, str]:
+    """Authorize stable or exact file metadata without retargeting its identity."""
+    if entity_ref and file_path:
+        raise ValueError("SemanticRelationReferencePathConflict")
+    if not entity_ref:
+        if not file_path:
+            raise ValueError("SemanticRelationEndpointRequired")
+        path, error = _eligible_path_or_error(file_path)
+        if error or path is None:
+            raise ValueError("SemanticRelationPathIneligible")
+        return f"document:{path}", path
+
+    from ..tools.managed_files import (
+        SelectedSubjectStorageNotStarted,
+        parse_file_reference,
+        selected_file_session,
+    )
+
+    # Exact-reference syntax is intentionally shared with the normal file reader.
+    # A stable selector is parsed with a syntax-only marker, then authorized using
+    # its actual head descriptor; the marker is never looked up or persisted.
+    exact = "@" in entity_ref
+    document_id, _ = parse_file_reference(
+        entity_ref if exact else f"{entity_ref}@ver_syntax_only"
+    )
+    if life_service is None:
+        from ..service.registry import get_life_engine_service
+
+        life_service = get_life_engine_service()
+    session = selected_file_session(tool, life_service)
+    if session is None:
+        raise SelectedSubjectStorageNotStarted()
+    authorization_ref = entity_ref
+    if not exact:
+        head = await session.store.get_document_head(document_id)
+        if head is None:
+            raise ValueError("ManagedFileDocumentNotFound")
+        if head.document_id != document_id:
+            raise ValueError("ManagedFileReferenceDocumentConflict")
+        authorization_ref = f"{entity_ref}@{head.current_version_id}"
+    target, _, _ = await session.resolve_reference(authorization_ref)
+    return entity_ref, session.relative(target)
+
+
+async def _authorize_stored_relation_endpoint(
+    tool: BaseTool, entity_ref: str, *, life_service: Any
+) -> tuple[str, str]:
+    """Recheck the current authority boundary without changing a parent's refs."""
+    return await _resolve_relation_endpoint(
+        tool,
+        entity_ref="" if entity_ref.startswith("document:") else entity_ref,
+        file_path=entity_ref[len("document:"):] if entity_ref.startswith("document:") else "",
+        life_service=life_service,
+    )
+
 # ============================================================
 # nucleus_search_memory - 语义检索 + 联想
 # ============================================================
@@ -462,6 +542,7 @@ class LifeEngineSearchMemoryTool(BaseTool):
         "- source='direct'：直接命中的记忆\n"
         "- source='associated'：通过关联路径联想到的，association_path 显示联想路线\n"
         "- memory_bundles：当前理解 + 历史轨迹 + 修正记录；旧记忆不会被删除，会作为演化证据保留\n"
+        "- enable_association=false：关闭额外联想及记忆包的历史关系展开，保留直接检索证据\n"
         "\n"
         "**认识论边界：** search_mode 可自由描述本次回忆意图；相关性排名不等于事实置信度。"
         "第一人称见证表达爱莉如何经历，不自动证明其中的外部事实。\n\n"
@@ -887,7 +968,9 @@ class LifeEngineSearchMemoryTool(BaseTool):
         self,
         query: Annotated[str, "搜索问题"],
         top_k: Annotated[int, "返回数量"] = 5,
-        enable_association: Annotated[bool, "是否启用联想"] = True,
+        enable_association: Annotated[
+            bool, "是否启用额外联想与记忆包历史关系展开；false 保留直接检索证据"
+        ] = True,
         file_types: Annotated[Optional[List[str]], "限定文件类型"] = None,
         time_range_days: Annotated[int, "时间范围（天），0=不限"] = 0,
         search_mode: Annotated[
@@ -1097,7 +1180,7 @@ class LifeEngineSearchMemoryTool(BaseTool):
                     results=document_results,
                     top_k=top_k,
                 )
-                if callable(build_bundles)
+                if bool(enable_association) and callable(build_bundles)
                 else []
             )
             evidence_search = service.search_evidence_aware
@@ -1468,20 +1551,321 @@ class LifeEngineMemoryStatsTool(BaseTool):
 # ============================================================
 
 
+_RELATION_VIEW_PROJECTION = "semantic-relation-view-v1"
+_RELATION_VIEW_MIN_BYTES = 2048
+_RELATION_VIEW_MAX_BYTES = 64 * 1024
+
+
+def _relation_view_cursor(state: dict[str, Any]) -> str:
+    body = base64.urlsafe_b64encode(_canonical_json_bytes(state)).decode("ascii").rstrip("=")
+    return "rv1." + body + "." + hashlib.sha256(body.encode("ascii")).hexdigest()[:16]
+
+
+def _relation_view_authority(service: Any) -> str:
+    """Hash source-generation identity plus a non-durable service read lifetime.
+
+    The nonce is only a bounded projection-cache lifecycle marker: it is not a
+    subject identity, credential, writer lease or durable authority record.
+    """
+    runtime = getattr(service, "storage_runtime", None)
+    source = runtime if runtime is not None else getattr(service, "_memory_storage", None)
+    source = service if source is None else source
+    cached = getattr(service, "_relation_view_projection_identity", None)
+    if cached is None or cached[0] is not source:
+        cached = (source, uuid4().hex)
+        setattr(service, "_relation_view_projection_identity", cached)
+    material: dict[str, Any] = {"service_read_lifetime": cached[1]}
+    if runtime is not None:
+        generation = getattr(runtime, "generation", None)
+        token = getattr(runtime, "authority_token", None)
+        material.update({
+            "backend": str(getattr(runtime, "backend", "")),
+            "backend_identity": str(getattr(runtime, "backend_identity", "")),
+            "generation_id": str(getattr(generation, "generation_id", "")),
+            "registry_id": str(getattr(token, "registry_id", "")),
+            "authority_epoch": getattr(token, "authority_epoch", None),
+            "writer_epoch": getattr(runtime, "writer_epoch", None),
+        })
+    return hashlib.sha256(_canonical_json_bytes(material)).hexdigest()
+
+
+def _decode_relation_view_cursor(continuation: str) -> dict[str, Any]:
+    """Decode only a small, integrity-checked continuation envelope."""
+    try:
+        if not isinstance(continuation, str) or len(continuation) > 4096:
+            raise ValueError("invalid cursor size")
+        prefix, encoded, checksum = continuation.split(".")
+        if (
+            prefix != "rv1"
+            or hashlib.sha256(encoded.encode("ascii")).hexdigest()[:16] != checksum
+        ):
+            raise ValueError("invalid cursor signature")
+        state = json.loads(base64.urlsafe_b64decode(
+            encoded + "=" * (-len(encoded) % 4)
+        ).decode("utf-8"))
+        if not isinstance(state, dict) or state["projection"] != _RELATION_VIEW_PROJECTION:
+            raise ValueError("invalid cursor version")
+        return state
+    except (KeyError, TypeError, ValueError, UnicodeError) as exc:
+        raise ValueError("SemanticRelationContinuationInvalid") from exc
+
+
+def _relation_view_request_page(
+    continuation: str, *, entity_ref: str, current_only: bool,
+    authority_binding: str, request_binding: str,
+) -> tuple[int, int | None, int]:
+    """Recover the exact storage offset/frontier before requesting one page."""
+    if not continuation:
+        return 0, None, int(datetime.now(UTC).timestamp())
+    state = _decode_relation_view_cursor(continuation)
+    try:
+        if state["entity_ref"] != entity_ref or state["view"] != (
+            "current" if current_only else "history"
+        ):
+            raise ValueError("cursor selector mismatch")
+        offset, frontier = state["row_offset"], state["frontier_count"]
+        issued_at = state["issued_at"]
+        if (
+            type(offset) is not int or offset < 0
+            or type(frontier) is not int or frontier < offset
+            or state["row_limit"] != 50
+            or type(issued_at) is not int
+        ):
+            raise ValueError("invalid storage cursor")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("SemanticRelationContinuationInvalid") from exc
+    if state.get("authority_binding") != authority_binding:
+        raise RuntimeError("SemanticRelationContinuationAuthorityChanged")
+    if state.get("request_binding") != request_binding:
+        raise ValueError("SemanticRelationContinuationBindingMismatch")
+    age = int(datetime.now(UTC).timestamp()) - issued_at
+    if age < 0 or age > 30 * 60:
+        raise RuntimeError("SemanticRelationContinuationExpired")
+    return offset, frontier, issued_at
+
+
+def _bounded_relation_view(
+    payload: dict[str, Any], *, max_bytes: int, continuation: str,
+) -> dict[str, Any]:
+    """Bound each storage page and its exact canonical JSON byte continuation.
+
+    Concatenate excerpt content until page_complete to restore one full storage
+    page. The next continuation then advances its bounded row offset. Every
+    cursor pins the global append frontier; intra-page cursors also pin bytes.
+    """
+    if type(max_bytes) is not int or not (
+        _RELATION_VIEW_MIN_BYTES <= max_bytes <= _RELATION_VIEW_MAX_BYTES
+    ):
+        raise ValueError("SemanticRelationViewByteBudgetInvalid")
+    raw = _canonical_json_bytes(payload)
+    digest = hashlib.sha256(raw).hexdigest()
+    storage_page = payload.get("storage_page")
+    offset = 0
+    if continuation:
+        state = _decode_relation_view_cursor(continuation)
+        try:
+            if state["entity_ref"] != payload["entity_ref"] or state["view"] != payload["view"]:
+                raise ValueError("cursor selector mismatch")
+            offset, cursor_digest = state["offset_bytes"], state["sha256"]
+            if type(offset) is not int or offset < 0 or not isinstance(cursor_digest, str):
+                raise ValueError("invalid cursor offset")
+            if cursor_digest == "":
+                if storage_page is None or offset != 0:
+                    raise ValueError("missing byte snapshot")
+            elif len(cursor_digest) != 64:
+                raise ValueError("invalid cursor hash")
+            if storage_page is not None and (
+                state["row_offset"] != storage_page["offset"]
+                or state["frontier_count"] != storage_page["frontier_count"]
+                or state["row_limit"] != storage_page["limit"]
+                or state["authority_binding"] != storage_page["authority_binding"]
+                or state["request_binding"] != storage_page["request_binding"]
+                or state["issued_at"] != storage_page["issued_at"]
+            ):
+                raise ValueError("storage cursor mismatch")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("SemanticRelationContinuationInvalid") from exc
+        if cursor_digest and cursor_digest != digest:
+            raise RuntimeError("SemanticRelationViewSnapshotChanged")
+        if offset >= len(raw):
+            raise ValueError("SemanticRelationContinuationInvalid")
+
+    def next_cursor(next_offset: int) -> str:
+        row_offset = storage_page["offset"] if storage_page else None
+        snapshot_digest = digest
+        if next_offset == len(raw):
+            if storage_page is None or not storage_page["has_more"]:
+                return ""
+            row_offset = storage_page["next_offset"]
+            next_offset, snapshot_digest = 0, ""
+        state = {
+            "projection": _RELATION_VIEW_PROJECTION,
+            "entity_ref": payload["entity_ref"], "view": payload["view"],
+            "sha256": snapshot_digest, "offset_bytes": next_offset,
+        }
+        if storage_page is not None:
+            state.update({
+                "row_offset": row_offset,
+                "row_limit": storage_page["limit"],
+                "frontier_count": storage_page["frontier_count"],
+                "authority_binding": storage_page["authority_binding"],
+                "request_binding": storage_page["request_binding"],
+                "issued_at": storage_page["issued_at"],
+            })
+        return _relation_view_cursor(state)
+
+    common = {
+        "projection_version": _RELATION_VIEW_PROJECTION,
+        "content_ref": "semantic-relation-view:" + digest,
+        "content_sha256": digest,
+        "content_bytes": len(raw),
+        "max_bytes": max_bytes,
+    }
+    completion_cursor = next_cursor(len(raw))
+    structured = {
+        **payload, **common, "complete": not completion_cursor,
+        "page_complete": True, "continuation": completion_cursor,
+    }
+    if offset == 0 and len(_canonical_json_bytes(structured)) <= max_bytes:
+        return structured
+    try:
+        remainder = raw[offset:].decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("SemanticRelationContinuationInvalid") from exc
+
+    def page(character_count: int) -> dict[str, Any]:
+        content = remainder[:character_count]
+        next_offset = offset + len(content.encode("utf-8"))
+        token = next_cursor(next_offset)
+        result = {
+            "action": "view", "entity_ref": payload["entity_ref"],
+            "authority": "memory_semantic_relations", "view": payload["view"],
+            **common,
+            "serialization": "canonical-json-utf8",
+            "projection_kind": "exact_serialized_view_excerpt",
+            "complete": not token,
+            "page_complete": next_offset == len(raw),
+            "offset_bytes": offset, "next_offset_bytes": next_offset,
+            "content": content, "continuation": token,
+        }
+        if storage_page is not None:
+            result["storage_page"] = storage_page
+        return result
+
+    low, high = 0, len(remainder)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if len(_canonical_json_bytes(page(middle))) <= max_bytes:
+            low = middle
+        else:
+            high = middle - 1
+    if low == 0:
+        raise ValueError("SemanticRelationViewBudgetCannotFitIdentity")
+    return page(low)
+
+_RELATION_PUBLIC_ERRORS = frozenset(
+    "SemanticRelation" + suffix for suffix in (
+        "ActorIdentityRequired", "ActorIsNotActive", "AddMustStartNewRoot",
+        "AlreadyWithdrawn", "ContinuationAuthorityChanged",
+        "ContinuationBindingMismatch", "ContinuationExpired", "ContinuationInvalid",
+        "EndpointRequired", "EndpointsImmutable", "EndpointsMustDiffer",
+        "EndpointsRequired", "ExplicitRootAndParentRequired", "IdentityRequired",
+        "LegacyOwnerUnbound", "LineageMismatch", "OccurrenceConflict",
+        "OperationInvalid", "OwnerMismatch", "OwnerRequired",
+        "PageFrontierConflict", "PageFrontierInvalid", "PageFrontierRequired",
+        "PageLimitInvalid", "PageOffsetInvalid", "ParentNotFound", "PathInvalid",
+        "PathIneligible", "PredicateRequired", "ReasonRequired", "ReferencePathConflict",
+        "RevisionIdentityRequired", "RevisionInvalid", "SchemaMissing",
+        "SourceOccurrenceRequired", "StaleParent", "StreamOwnerRequired",
+        "StrengthMustBeSubjectText", "ToolCallIdentityRequired",
+        "ViewBudgetCannotFitIdentity", "ViewByteBudgetInvalid", "ViewSnapshotChanged",
+        "WithdrawalPredicateMismatch",
+    )
+) | frozenset({
+    "LifeEngineServiceUnavailable", "LifeMemoryServiceUnavailable",
+    "SelectedSubjectStorageNotStarted", "ManagedFileDocumentNotFound",
+    "ManagedFileReferenceInvalid", "ManagedFileReferenceDocumentConflict",
+    "ManagedFileReferenceOutsideWorkspace", "ManagedFileReferencePathAlias",
+    "ManagedFileReferencePathInvalid", "ManagedFileReferenceVersionConflict",
+    "ManagedFileVersionDocumentConflict", "ManagedFilePathMustNameAFile",
+})
+
+
+def _relation_error_payload(exc: Exception) -> dict[str, Any]:
+    """Expose protocol codes, never third-party SQL/paths/subject parameters."""
+    message = exc.args[0] if exc.args and isinstance(exc.args[0], str) else ""
+    code = message if message in _RELATION_PUBLIC_ERRORS else "SemanticRelationOperationFailed"
+    if type(exc).__name__ == "SubjectDocumentNotFound":
+        code = "ManagedFileReferenceNotFound"
+    return {
+        "error": code,
+        "error_type": type(exc).__name__[:80],
+        "status": "failed",
+    }
+
+
+def _bounded_relation_mutation_receipt(payload: dict[str, Any]) -> dict[str, Any]:
+    """Keep full subject text in history while bounding an append acknowledgement."""
+    limit = 16 * 1024
+    if len(_canonical_json_bytes(payload)) <= limit:
+        return payload
+    read_from: dict[str, Any] = {
+        "action": "view", "current_only": False, "max_bytes": limit,
+    }
+    if payload["source_ref"].startswith("document:"):
+        read_from["file_path"] = payload["source_path"]
+    else:
+        read_from["entity_ref"] = payload["source_ref"]
+    receipt = {
+        key: payload[key] for key in (
+            "action", "relation_id", "root_relation_id", "parent_relation_id",
+            "revision", "operation", "owner_subject_id", "actor",
+            "source_ref", "target_ref", "recorded_at", "source_occurrence_id",
+            "idempotent_replay", "authority", "legacy_edge_written",
+        )
+    }
+    receipt.update({
+        "projection_kind": "bounded_relation_append_receipt",
+        "receipt_only": True,
+        "relation_ref": "memory-semantic-relation:" + payload["relation_id"],
+        "subject_content_preserved_in_history": True,
+        "read_from": read_from,
+        "read_until_relation_id": payload["relation_id"],
+    })
+    if len(_canonical_json_bytes(receipt)) > limit:
+        # Very long historical identifiers cannot enlarge a receipt indefinitely.
+        # The caller still retains its exact request selectors for view.
+        receipt = {
+            key: receipt[key] for key in (
+                "action", "relation_id", "projection_kind", "receipt_only",
+                "relation_ref", "subject_content_preserved_in_history",
+                "idempotent_replay", "authority",
+            )
+        }
+        receipt["read_instruction"] = "Use view with the request's original source selector."
+    return receipt
+
 class NucleusRelationsTool(BaseTool):
-    """Append or inspect explicit memory relation history."""
+    """Append and inspect subject-owned, immutable relation revisions."""
 
     tool_name: str = "nucleus_relations"
     tool_description: str = (
-        "管理显式记忆关系历史。action=add 只追加 SemanticRelation；"
-        "action=view 优先返回 SemanticRelation，并把 legacy graph 标为只读兼容投影。"
-        "删除、弱化和按分数遗忘不属于当前协议。"
+        "管理显式记忆关系。add 新建；revise/withdraw 追加修订/撤回，必须给出"
+        " root_relation_id 与明确的 parent_relation_id，不覆盖历史或自动换父。"
+        "source_ref/target_ref/entity_ref 接受 subject-file:doc_id 或精确版本"
+        " subject-file:doc_id@ver_id；旧路径参数仅用于旧路径实体，不绑定当前同路径文件。"
+        "view 区分完整历史与当前有效头。关系类型、理由和 subject_strength 均保留主体原话。"
+        "修订省略 subject_strength 保留此前原话，显式空字符串清空。"
+        "view 受 max_bytes 硬预算约束；大结果以 canonical JSON 片段给出 continuation，"
+        "同一 storage_page 的 content 拼到 page_complete 后恢复完整该页 JSON，"
+        "continuation 再续下一页，complete 表示全部读完。任意新增关系使旧接续过期。"
+        "游标仅在同一授权实例/服务及存储世代内有效，30 分钟过期；重启后重新查看。"
+        "大写入回执只返回关系身份与 view 续读入口，主体原文仍完整保存。"
     )
     chatter_allow: list[str] = ["life_engine_internal", "life_chatter"]
 
     async def _get_service(self) -> LifeMemoryService:
-        """Resolve the canonical memory service for read-only relation projection."""
-
+        """Resolve the canonical memory service for read-only projection."""
         from ..service import LifeEngineService
 
         service = LifeEngineService.get_instance()
@@ -1490,66 +1874,122 @@ class NucleusRelationsTool(BaseTool):
             raise RuntimeError("记忆服务未初始化")
         return memory_service
 
-    async def _execute_add(
+    async def _execute_mutation(
         self,
         *,
+        action: str,
+        source_ref: str,
+        target_ref: str,
         source_path: str,
         target_path: str,
         relation_type: str,
         reason: str,
+        root_relation_id: str,
+        parent_relation_id: str,
+        subject_strength: str | None,
     ) -> tuple[bool, dict[str, Any]]:
-        """Append one explicit relation from the bound active consciousness."""
-
-        if not source_path or not target_path:
-            return False, {"error": "source_path 和 target_path 不能为空"}
-
-        relation_text = str(relation_type or "").strip()
-        if not relation_text:
-            return False, {"error": "relation_type 不能为空"}
-        reason_text = str(reason or "").strip()
-        if not reason_text:
+        """Append one explicit occurrence; the store owns atomic parent CAS."""
+        if not isinstance(reason, str) or not reason.strip():
             return False, {"error": "reason 不能为空"}
-
-        source_path, source_error = _eligible_path_or_error(source_path)
-        target_path, target_error = _eligible_path_or_error(target_path)
-        if source_error or target_error:
-            return False, {"error": source_error or target_error}
-        if source_path == target_path:
-            return False, {"error": "SemanticRelationEndpointsMustDiffer"}
+        if action != "withdraw" and (
+            not isinstance(relation_type, str) or not relation_type.strip()
+        ):
+            return False, {"error": "relation_type 不能为空"}
+        if subject_strength is not None and not isinstance(subject_strength, str):
+            return False, {"error": "SemanticRelationStrengthMustBeSubjectText"}
 
         try:
             runtime = await _resolve_relation_runtime(self)
             from .living import SemanticRelation
 
+            relation_id = _stable_relation_id(runtime)
+            parent = None
+            if action == "add":
+                if root_relation_id or parent_relation_id:
+                    raise ValueError("SemanticRelationAddMustStartNewRoot")
+                source_ref, source_path = await _resolve_relation_endpoint(
+                    self, entity_ref=source_ref, file_path=source_path,
+                    life_service=runtime.life_service,
+                )
+                target_ref, target_path = await _resolve_relation_endpoint(
+                    self, entity_ref=target_ref, file_path=target_path,
+                    life_service=runtime.life_service,
+                )
+                if source_ref == target_ref:
+                    raise ValueError("SemanticRelationEndpointsMustDiffer")
+                root_relation_id = relation_id
+                revision = 1
+            else:
+                if not root_relation_id or not parent_relation_id:
+                    raise ValueError("SemanticRelationExplicitRootAndParentRequired")
+                parent = await runtime.memory_service.get_memory_semantic_relation(
+                    parent_relation_id
+                )
+                if parent is None:
+                    raise RuntimeError("SemanticRelationParentNotFound")
+                if parent.owner_subject_id is None:
+                    raise PermissionError("SemanticRelationLegacyOwnerUnbound")
+                if parent.owner_subject_id != runtime.owner_subject_id:
+                    raise PermissionError("SemanticRelationOwnerMismatch")
+                if parent.root_relation_id != root_relation_id:
+                    raise ValueError("SemanticRelationLineageMismatch")
+                if parent.operation == "withdraw":
+                    raise RuntimeError("SemanticRelationAlreadyWithdrawn")
+                for supplied_ref, supplied_path, stored_ref in (
+                    (source_ref, source_path, parent.source_ref),
+                    (target_ref, target_path, parent.target_ref),
+                ):
+                    if supplied_ref or supplied_path:
+                        resolved, _ = await _resolve_relation_endpoint(
+                            self, entity_ref=supplied_ref, file_path=supplied_path,
+                            life_service=runtime.life_service,
+                        )
+                        if resolved != stored_ref:
+                            raise ValueError("SemanticRelationEndpointsImmutable")
+                source_ref, source_path = await _authorize_stored_relation_endpoint(
+                    self, parent.source_ref, life_service=runtime.life_service
+                )
+                target_ref, target_path = await _authorize_stored_relation_endpoint(
+                    self, parent.target_ref, life_service=runtime.life_service
+                )
+                revision = parent.revision + 1
+                if action == "withdraw":
+                    if relation_type and relation_type != parent.predicate:
+                        raise ValueError("SemanticRelationWithdrawalPredicateMismatch")
+                    relation_type = parent.predicate
+
+            metadata: dict[str, Any] = {
+                "protocol": "subject_relation_revision_v1",
+                "source_occurrence_id": runtime.source_occurrence_id,
+                "source_occurrence_kind": runtime.source_occurrence_kind,
+                "tool_call_id": runtime.tool_call_id,
+            }
+            if subject_strength is not None:
+                metadata["subject_strength"] = subject_strength
+            elif parent is not None and "subject_strength" in parent.metadata:
+                metadata["subject_strength"] = parent.metadata["subject_strength"]
+
             proposed = SemanticRelation(
-                relation_id=_stable_relation_id(runtime),
-                source_ref=f"document:{source_path}",
-                target_ref=f"document:{target_path}",
-                predicate=relation_text,
-                reason=reason_text,
+                relation_id=relation_id,
+                source_ref=source_ref,
+                target_ref=target_ref,
+                predicate=relation_type,
+                reason=reason,
                 actor=runtime.actor_consciousness_instance_id,
                 recorded_at=_relation_recorded_at(self),
                 consciousness_instance_id=runtime.actor_consciousness_instance_id,
                 stream_scope=runtime.stream_scope,
-                metadata={
-                    "source_occurrence_id": runtime.source_occurrence_id,
-                    "source_occurrence_kind": runtime.source_occurrence_kind,
-                    "tool_call_id": runtime.tool_call_id,
-                },
+                metadata=metadata,
+                owner_subject_id=runtime.owner_subject_id,
+                root_relation_id=root_relation_id,
+                parent_relation_id=parent_relation_id or None,
+                revision=revision,
+                operation=action,
             )
-            existing_relations = (
-                await runtime.memory_service.list_memory_semantic_relations(
-                    proposed.source_ref
-                )
+            existing = await runtime.memory_service.get_memory_semantic_relation(
+                relation_id
             )
-            existing = next(
-                (
-                    relation
-                    for relation in existing_relations
-                    if relation.relation_id == proposed.relation_id
-                ),
-                None,
-            )
+            idempotent_replay = existing is not None
             if existing is not None:
                 if not _same_semantic_relation(existing, proposed):
                     raise RuntimeError("SemanticRelationOccurrenceConflict")
@@ -1562,76 +2002,90 @@ class NucleusRelationsTool(BaseTool):
                         )
                     )
                 except Exception:
-                    replayed = (
-                        await runtime.memory_service.list_memory_semantic_relations(
-                            proposed.source_ref
-                        )
+                    # An uncertain acknowledgement may follow a committed append.
+                    # Recover only this same occurrence, never choose a newer parent.
+                    existing = await runtime.memory_service.get_memory_semantic_relation(
+                        relation_id
                     )
-                    existing = next(
-                        (
-                            relation
-                            for relation in replayed
-                            if relation.relation_id == proposed.relation_id
-                        ),
-                        None,
-                    )
-                    if existing is None or not _same_semantic_relation(
-                        existing, proposed
-                    ):
+                    if existing is None or not _same_semantic_relation(existing, proposed):
                         raise
                     semantic_relation = existing
+                    idempotent_replay = True
 
             logger.info(
                 "SemanticRelation appended: "
                 f"relation_id={semantic_relation.relation_id} "
                 f"actor={runtime.actor_consciousness_instance_id}"
             )
-            return True, {
-                "action": "add",
+            payload = {
+                **_semantic_relation_payload(semantic_relation, center_ref=source_ref),
+                "action": action,
                 "source_path": source_path,
                 "target_path": target_path,
-                "relation_type": relation_text,
-                "reason": reason_text,
-                "relation_id": semantic_relation.relation_id,
-                "actor": semantic_relation.actor,
+                "relation_type": semantic_relation.predicate,
                 "source_occurrence_id": runtime.source_occurrence_id,
                 "authority": "memory_semantic_relations",
                 "legacy_edge_written": False,
+                "idempotent_replay": idempotent_replay,
             }
+            return True, _bounded_relation_mutation_receipt(payload)
         except Exception as exc:
-            logger.error(f"建立关联失败: {exc}", exc_info=True)
-            return False, {
-                "error": str(exc) or type(exc).__name__,
-                "error_type": type(exc).__name__,
-            }
+            logger.error(f"关系操作失败: {type(exc).__name__}")
+            return False, _relation_error_payload(exc)
 
     async def _execute_view(
         self,
         *,
+        entity_ref: str,
         file_path: str,
+        current_only: bool,
         depth: int,
         min_strength: float,
+        max_bytes: int,
+        continuation: str,
     ) -> tuple[bool, dict[str, Any]]:
-        """Read canonical relation history plus an explicit legacy projection."""
-
-        if not file_path:
-            return False, {"error": "file_path 不能为空"}
-        file_path, path_error = _eligible_path_or_error(file_path)
-        if path_error:
-            return False, {"error": path_error}
-
-        depth = max(1, min(3, depth))
-        min_strength = max(0.0, min(1.0, min_strength))
-
+        """Read one bounded, snapshot-consistent relation page plus exact bytes."""
         try:
-            service = await self._get_service()
-            center_ref = f"document:{file_path}"
-            semantic_relations = await service.list_memory_semantic_relations(center_ref)
+            if type(max_bytes) is not int or not (
+                _RELATION_VIEW_MIN_BYTES <= max_bytes <= _RELATION_VIEW_MAX_BYTES
+            ):
+                raise ValueError("SemanticRelationViewByteBudgetInvalid")
+            runtime = await _resolve_relation_runtime(self)
+            service = runtime.memory_service
+            authority_binding = _relation_view_authority(service)
+            center_ref, file_path = await _resolve_relation_endpoint(
+                self, entity_ref=entity_ref, file_path=file_path,
+                life_service=runtime.life_service,
+            )
+            depth = max(1, min(3, depth))
+            min_strength = max(0.0, min(1.0, min_strength))
+            request_binding = hashlib.sha256(_canonical_json_bytes({
+                "entity_ref": center_ref, "file_path": file_path,
+                "current_only": current_only, "max_bytes": max_bytes,
+                "depth": depth, "min_strength": min_strength,
+                "actor": runtime.actor_consciousness_instance_id,
+                "stream_scope": runtime.stream_scope,
+            })).hexdigest()
+            offset, expected_frontier, issued_at = _relation_view_request_page(
+                continuation, entity_ref=center_ref, current_only=current_only,
+                authority_binding=authority_binding, request_binding=request_binding,
+            )
+            relation_page = await service.page_memory_semantic_relations(
+                center_ref, current_only=current_only, limit=50,
+                offset=offset, expected_frontier_count=expected_frontier,
+            )
+            if authority_binding != _relation_view_authority(service):
+                raise RuntimeError("SemanticRelationContinuationAuthorityChanged")
+            current_ids = set(relation_page.current_relation_ids)
             semantic_payloads = [
-                _semantic_relation_payload(relation, center_ref=center_ref)
-                for relation in semantic_relations
+                {
+                    **_semantic_relation_payload(relation, center_ref=center_ref),
+                    "is_current": relation.relation_id in current_ids,
+                }
+                for relation in relation_page.relations
             ]
-
+            depth = max(1, min(3, depth))
+            min_strength = max(0.0, min(1.0, min_strength))
             legacy_projection: dict[str, Any] = {
                 "projection_kind": "legacy_memory_edges_compatibility",
                 "authoritative": False,
@@ -1641,95 +2095,125 @@ class NucleusRelationsTool(BaseTool):
                 "depth": depth,
                 "min_strength": min_strength,
             }
-            try:
-                legacy_relations = await service.get_file_relations(
-                    file_path=file_path,
-                    depth=depth,
-                    min_strength=min_strength,
-                )
-                if "error" in legacy_relations:
-                    legacy_projection.update(
-                        {
-                            "available": False,
-                            "error": legacy_relations["error"],
-                            "center": None,
-                            "outgoing": [],
-                            "incoming": [],
-                        }
+            if not center_ref.startswith("document:") or offset > 0:
+                legacy_projection.update({
+                    "available": False,
+                    "reason": (
+                        "StableIdentityDoesNotAdoptLegacyPathRelations"
+                        if not center_ref.startswith("document:") else "FirstStoragePageOnly"
+                    ),
+                    "center": None, "outgoing": [], "incoming": [],
+                })
+            else:
+                try:
+                    legacy_relations = await service.get_file_relations(
+                        file_path=file_path, depth=depth, min_strength=min_strength,
                     )
-                else:
-                    legacy_projection.update(
-                        {
+                    if "error" in legacy_relations:
+                        legacy_projection.update({
+                            "available": False,
+                            "error": "LegacyRelationProjectionUnavailable",
+                            "center": None, "outgoing": [], "incoming": [],
+                        })
+                    else:
+                        legacy_projection.update({
                             "available": True,
                             "center": legacy_relations.get("center"),
                             "outgoing": list(legacy_relations.get("outgoing") or []),
                             "incoming": list(legacy_relations.get("incoming") or []),
-                        }
-                    )
-            except Exception as legacy_exc:
-                legacy_projection.update(
-                    {
+                        })
+                except Exception as legacy_exc:
+                    legacy_projection.update({
                         "available": False,
                         "error_type": type(legacy_exc).__name__,
-                        "center": None,
-                        "outgoing": [],
-                        "incoming": [],
-                    }
-                )
+                        "center": None, "outgoing": [], "incoming": [],
+                    })
 
-            return True, {
+            # The append frontier counts ALL relations, not this endpoint's rows.
+            matching_count = relation_page.matching_count
+            payload = {
                 "action": "view",
+                "entity_ref": center_ref,
                 "file_path": file_path,
                 "authority": "memory_semantic_relations",
+                "view": "current" if current_only else "history",
+                "current_only": current_only,
                 "semantic_relation_count": len(semantic_payloads),
                 "semantic_relations": semantic_payloads,
+                "matching_relation_count": matching_count,
+                "history_relation_count": matching_count if not current_only else None,
+                "current_relation_count": (
+                    matching_count if current_only else (
+                        len(current_ids) if offset == 0 and not relation_page.has_more else None
+                    )
+                ),
+                "current_relation_ids": list(relation_page.current_relation_ids),
+                "current_relation_ids_scope": "this_storage_page",
+                "storage_page": {
+                    "offset": relation_page.offset,
+                    "limit": 50,
+                    "next_offset": relation_page.next_offset,
+                    "has_more": relation_page.has_more,
+                    "frontier_count": relation_page.frontier_count,
+                    "frontier_scope": "all_immutable_relation_appends",
+                    "authority_binding": authority_binding,
+                    "request_binding": request_binding,
+                    "issued_at": issued_at,
+                    "continuation_lifetime": "same_service_and_authority_30_minutes",
+                },
                 "legacy_compatibility_projection": legacy_projection,
             }
+            return True, _bounded_relation_view(
+                payload, max_bytes=max_bytes, continuation=continuation,
+            )
         except Exception as exc:
-            logger.error(f"查看关联失败: {exc}", exc_info=True)
-            return False, {
-                "error": str(exc) or type(exc).__name__,
-                "error_type": type(exc).__name__,
-            }
+            logger.error(f"查看关联失败: {type(exc).__name__}")
+            return False, _relation_error_payload(exc)
 
     async def execute(
         self,
-        action: Annotated[Literal["add", "view"], "操作：add/view"] = "view",
-        source_path: Annotated[str, "add 的源文件路径"] = "",
-        target_path: Annotated[str, "add 的目标文件路径"] = "",
-        relation_type: Annotated[
-            str,
-            "add 的开放词汇关系原话；系统不限制固定类型",
-        ] = "",
-        reason: Annotated[str, "add 时由当前主体写下的关系理由"] = "",
-        file_path: Annotated[str, "view 的中心文件路径"] = "",
-        depth: Annotated[int, "view 的 legacy compatibility 遍历深度 1-3"] = 1,
-        min_strength: Annotated[
-            float,
-            "仅用于 view 的 legacy compatibility 可达性阈值",
-        ] = 0.2,
+        action: Annotated[
+            Literal["add", "revise", "withdraw", "view"],
+            "add 新建；revise 修订；withdraw 追加撤回；view 查看",
+        ] = "view",
+        source_path: Annotated[str, "旧路径实体的源路径，不自动绑定受管文件"] = "",
+        target_path: Annotated[str, "旧路径实体的目标路径，不自动绑定受管文件"] = "",
+        relation_type: Annotated[str, "add/revise 的开放关系原话"] = "",
+        reason: Annotated[str, "add/revise/withdraw 时主体明确写下的理由"] = "",
+        file_path: Annotated[str, "view 的旧路径实体，与 entity_ref 互斥"] = "",
+        depth: Annotated[int, "view 的 legacy compatibility 深度 1-3"] = 1,
+        min_strength: Annotated[float, "仅用于 legacy compatibility 可达性"] = 0.2,
+        source_ref: Annotated[str, "源 subject-file:doc_id 或 doc_id@ver_id 引用"] = "",
+        target_ref: Annotated[str, "目标 subject-file:doc_id 或 doc_id@ver_id 引用"] = "",
+        entity_ref: Annotated[str, "view 的 subject-file 稳定实体或精确版本引用"] = "",
+        root_relation_id: Annotated[str, "revise/withdraw 的明确关系根 ID"] = "",
+        parent_relation_id: Annotated[str, "revise/withdraw 预期的当前父记录 ID；冲突不自动换父"] = "",
+        subject_strength: Annotated[Optional[str], "可选关系强弱原话；非数值排名或真值"] = None,
+        current_only: Annotated[bool, "view 仅返回当前未撤回头；默认展示全部历史"] = False,
+        max_bytes: Annotated[int, "view JSON 返回硬预算，2048-65536 字节"] = 16384,
+        continuation: Annotated[str, "view 精确接续游标，须保持相同 entity/path 与 view 参数"] = "",
     ) -> tuple[bool, str | dict[str, Any]]:
         action_value = str(action or "view").strip().lower()
         if action_value in {"forget", "remove", "delete", "weaken"}:
             return False, _legacy_relation_mutation_retired_payload(action_value)
-
-        if action_value not in {"add", "view"}:
+        if action_value not in {"add", "revise", "withdraw", "view"}:
             return False, {
                 "error": "UnsupportedRelationAction",
                 "action": action_value,
-                "allowed_actions": ["add", "view"],
+                "allowed_actions": ["add", "revise", "withdraw", "view"],
             }
-        if action_value == "add":
-            return await self._execute_add(
-                source_path=source_path,
-                target_path=target_path,
-                relation_type=relation_type,
-                reason=reason,
+        if action_value == "view":
+            return await self._execute_view(
+                entity_ref=entity_ref, file_path=file_path, current_only=current_only,
+                depth=depth, min_strength=min_strength,
+                max_bytes=max_bytes, continuation=continuation,
             )
-        return await self._execute_view(
-            file_path=file_path,
-            depth=depth,
-            min_strength=min_strength,
+        return await self._execute_mutation(
+            action=action_value, source_ref=source_ref, target_ref=target_ref,
+            source_path=source_path, target_path=target_path,
+            relation_type=relation_type, reason=reason,
+            root_relation_id=root_relation_id, parent_relation_id=parent_relation_id,
+            subject_strength=subject_strength,
         )
 
 

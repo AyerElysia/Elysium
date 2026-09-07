@@ -56,6 +56,7 @@ from ...memory.living import (
     RecallEpisode,
     RecallEvent,
     SemanticRelation,
+    SemanticRelationPage,
 )
 from ...memory.nodes import (
     ManagedDocumentIndexResult,
@@ -664,7 +665,16 @@ class LivingMemoryStore(MemoryStorePort, Protocol):
 
     async def append_relation(self, relation: SemanticRelation) -> SemanticRelation: ...
 
-    async def list_relations(self, entity_ref: str) -> list[SemanticRelation]: ...
+    async def get_relation(self, relation_id: str) -> SemanticRelation | None: ...
+
+    async def list_relations(
+        self, entity_ref: str, *, current_only: bool = False,
+    ) -> list[SemanticRelation]: ...
+
+    async def page_relations(
+        self, entity_ref: str, *, current_only: bool = False, limit: int = 50,
+        offset: int = 0, expected_frontier_count: int | None = None,
+    ) -> SemanticRelationPage: ...
 
     async def list_interpretations(
         self,
