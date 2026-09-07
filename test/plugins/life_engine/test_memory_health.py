@@ -193,7 +193,7 @@ async def test_health_reports_integrity_schema_counts_orphans_jobs_and_edges(
 
     assert snapshot["integrity_check"] == "ok"
     assert snapshot["foreign_key_check_count"] >= 2
-    assert snapshot["schema_version"] == 6
+    assert snapshot["schema_version"] == 7
     assert snapshot["tokenizer"] in {"trigram", "unicode61"}
     assert snapshot["counts"]["nodes"] == 2
     assert snapshot["counts"]["chunks"] == 3

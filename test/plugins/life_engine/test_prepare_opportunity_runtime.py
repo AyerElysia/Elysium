@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -655,6 +656,176 @@ async def test_verify_requires_writer_runtime_acknowledgement_before_open(
                 ]
             )
         )
+
+
+async def _local_maintenance_settings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> tuple[StorageFactorySettings, FileAuthorityRegistry]:
+    generation = _generation()
+    settings = StorageFactorySettings(
+        enabled=True,
+        authoritative_backend=BackendKind.LOCAL,
+        backend_generation=generation.generation_id,
+        authority_owner_id="maintenance-test",
+        local=LocalBackendSettings(
+            database_path=tmp_path / "selected.sqlite3",
+            authority_state_path=tmp_path / "authority.json",
+        ),
+    )
+    registry = FileAuthorityRegistry(settings.local.authority_state_path)
+    await registry.register_generation(generation)
+    monkeypatch.setattr(prepare, "_load_settings", lambda *_args: settings)
+    monkeypatch.setattr(prepare, "_MAINTENANCE_LOCK_PATH", tmp_path / "service.lock")
+    return settings, registry
+
+
+def _maintenance_args(*extra: str) -> Any:
+    return prepare._arguments([
+        "--apply", "--activate-local-authority", "--confirm-writer-runtime",
+        "--confirm-generation", "opportunity-cli-v1", *extra,
+    ])
+
+
+@pytest.mark.asyncio
+async def test_local_maintenance_uses_service_lock_before_authority_mutation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    from src.app.runtime.single_instance import AlreadyRunningError
+
+    settings, registry = await _local_maintenance_settings(monkeypatch, tmp_path)
+    before = await registry.health()
+    with (
+        prepare.SingleInstanceLock(prepare._MAINTENANCE_LOCK_PATH),
+        pytest.raises(AlreadyRunningError),
+    ):
+        await prepare._run(_maintenance_args())
+    after = await registry.health()
+    assert after["authority_epoch"] == before["authority_epoch"]
+    assert after["audit_event_count"] == before["audit_event_count"]
+    assert not settings.local.database_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_local_maintenance_does_not_replace_existing_authority(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    _settings, registry = await _local_maintenance_settings(monkeypatch, tmp_path)
+    token = await registry.activate_generation(
+        "opportunity-cli-v1", expected_epoch=0, owner_id="incumbent",
+        lease_seconds=60, confirm_previous_writers_stopped=False,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="InactiveAuthority"):
+            await prepare._run(_maintenance_args())
+        await registry.validate(token)
+        assert (await registry.health())["authority_epoch"] == token.authority_epoch
+    finally:
+        await registry.revoke(token)
+
+
+@pytest.mark.asyncio
+async def test_local_maintenance_real_apply_replay_verify_and_release(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    settings, registry = await _local_maintenance_settings(monkeypatch, tmp_path)
+    args = _maintenance_args(
+        "--mark-managed", "--migration-occurrence-id", "maintenance:test:1"
+    )
+    first = await prepare._run(args)
+    second = await prepare._run(args)
+    args.apply = False
+    args.verify = True
+    args.mark_managed = False
+    third = await prepare._run(args)
+    assert [first["status"], second["status"], third["status"]] == [
+        "applied", "applied", "verified"
+    ]
+    assert first["managed_marker"] == second["managed_marker"] == third["managed_marker"]
+    assert (await registry.health())["status"] == "disabled"
+    with prepare.SingleInstanceLock(prepare._MAINTENANCE_LOCK_PATH):
+        pass
+    with sqlite3.connect(settings.local.database_path) as db:
+        assert db.execute("PRAGMA quick_check").fetchone() == ("ok",)
+        tables = db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name LIKE 'opportunity_%'"
+        ).fetchall()
+        assert len(tables) == 10
+        for (table,) in tables:
+            count = db.execute(f'SELECT count(*) FROM "{table}"').fetchone()[0]
+            assert count == (1 if table == "opportunity_runtime_meta" else 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [RuntimeError("open failed"), asyncio.CancelledError()])
+async def test_local_maintenance_open_failure_revokes_acquired_authority(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: BaseException,
+) -> None:
+    _settings, registry = await _local_maintenance_settings(monkeypatch, tmp_path)
+
+    async def failed_open(_settings: object, **_kwargs: object) -> object:
+        raise failure
+
+    monkeypatch.setattr(prepare, "open_storage_backend", failed_open)
+    with pytest.raises(type(failure)) as caught:
+        await prepare._run(_maintenance_args())
+    assert caught.value is failure
+    assert (await registry.health())["status"] == "disabled"
+    with prepare.SingleInstanceLock(prepare._MAINTENANCE_LOCK_PATH):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_local_maintenance_cancelled_activation_settles_before_unlock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    from src.app.runtime.single_instance import AlreadyRunningError
+
+    _settings, registry = await _local_maintenance_settings(monkeypatch, tmp_path)
+    started, release = asyncio.Event(), asyncio.Event()
+    original = FileAuthorityRegistry.activate_generation
+
+    async def delayed(self: Any, *args: Any, **kwargs: Any) -> Any:
+        started.set()
+        await release.wait()
+        return await original(self, *args, **kwargs)
+
+    monkeypatch.setattr(FileAuthorityRegistry, "activate_generation", delayed)
+    task = asyncio.create_task(prepare._run(_maintenance_args()))
+    await started.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    with pytest.raises(AlreadyRunningError):
+        prepare.SingleInstanceLock(prepare._MAINTENANCE_LOCK_PATH).acquire()
+    assert not task.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert (await registry.health())["status"] == "disabled"
+    with prepare.SingleInstanceLock(prepare._MAINTENANCE_LOCK_PATH):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_local_maintenance_requires_ack_and_exact_generation_before_lock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    _settings, registry = await _local_maintenance_settings(monkeypatch, tmp_path)
+    for field, value, error in [
+        ("confirm_writer_runtime", False, "AcknowledgementRequired"),
+        ("confirm_generation", "wrong", "ConfirmationMismatch"),
+    ]:
+        args = _maintenance_args()
+        setattr(args, field, value)
+        with pytest.raises(RuntimeError, match=error):
+            await prepare._run(args)
+    assert (await registry.health())["authority_epoch"] == 0
+    assert not prepare._MAINTENANCE_LOCK_PATH.exists()
+
+
+def test_local_activation_cannot_be_a_dry_run() -> None:
+    with pytest.raises(SystemExit):
+        prepare._arguments(["--activate-local-authority"])
 
 
 def test_marker_arguments_are_explicit() -> None:

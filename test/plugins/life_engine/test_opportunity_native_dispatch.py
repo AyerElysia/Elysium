@@ -634,6 +634,47 @@ async def test_self_awaken_schedule_rejects_unknown_nested_fields_before_mutatio
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("revision", [0, -1, True, "1", 1.5])
+async def test_self_awaken_schedule_requires_existing_integer_revision(
+    monkeypatch: pytest.MonkeyPatch, revision: object,
+) -> None:
+    caller = _caller(monkeypatch, heartbeat=True)
+    facade = _RuntimeFacade()
+    dispatch = NativeCapabilityDispatch(opportunity_runtime=lambda: facade)
+    executor, invocation = _invocation(
+        _catalog(), "life.self_awaken", "opportunity.schedule",
+        {
+            "target_id": "opportunity:self_awaken",
+            "expected_revision": revision,
+            "arguments": {"schedule": "at", "first_due_at": _NOW},
+        },
+        caller,
+    )
+    with pytest.raises(NativeCapabilityArgumentsInvalid, match="opportunity.open"):
+        await dispatch(executor, invocation)
+    assert facade.manage_calls == []
+
+
+def test_self_awaken_schema_distinguishes_initial_open_from_rescheduling() -> None:
+    from plugins.life_engine.opportunity.native_dispatch import _self_awaken_schema
+
+    _description, schema = _self_awaken_schema("opportunity.schedule")
+    assert schema["properties"]["expected_revision"]["minimum"] == 1
+    assert "opportunity.open" in schema["properties"]["arguments"]["description"]
+
+
+@pytest.mark.parametrize("action", ["opportunity.schedule", "opportunity.snooze"])
+def test_registration_protocol_explains_creation_boundary(action: str) -> None:
+    from plugins.life_engine.opportunity.protocol import describe_protocol
+
+    protocol = describe_protocol(action)
+    assert "positive revision" in protocol["common"]["expected_revision"]
+    assert "opportunity.open" in protocol["common"]["expected_revision"]
+    opened = describe_protocol("opportunity.open")
+    assert opened["common"]["expected_revision"] == "0 for the first registration only"
+
+
+@pytest.mark.asyncio
 async def test_cancelled_native_tool_propagates_without_translation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

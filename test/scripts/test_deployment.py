@@ -48,9 +48,10 @@ def _repository(path: Path) -> Path:
     for name in ("AGENTS.md", "main.py", "pyproject.toml", "uv.lock"):
         (path / name).write_text("# fixture\n", encoding="utf-8")
     (path / "config/elysium.toml.example").write_text(_core_template(), encoding="utf-8")
-    (path / "config/models.toml.example").write_text(
+    (path / "config/models.toml").write_text(
         _model_template(), encoding="utf-8"
     )
+    (path / "config/models.toml").chmod(0o600)
     return path
 
 
@@ -88,8 +89,8 @@ def test_initialize_configuration_is_private_create_only_and_idempotent(
     )
 
     assert "config/elysium.toml" in created
-    assert "config/models.toml" in created
-    assert not preserved
+    assert "config/models.toml" not in created
+    assert preserved == ["config/models.toml"]
     assert not (root / "data/life_engine_workspace/SOUL.md").exists()
     if os.name != "nt":
         for relative in created:
@@ -106,8 +107,43 @@ def test_initialize_configuration_is_private_create_only_and_idempotent(
     )
 
     assert not second_created
-    assert set(second_preserved) == set(created)
+    assert set(second_preserved) == set(created + preserved)
     assert core_path.read_bytes() == custom
+
+
+def test_bootstrap_does_not_invent_missing_model_configuration(tmp_path: Path) -> None:
+    root = _repository(tmp_path / "repo")
+    (root / "config/models.toml").unlink()
+
+    created, preserved = deployment.bootstrap(root, with_dev=False, config_only=True)
+
+    assert "config/elysium.toml" in created
+    assert "config/models.toml" not in created + preserved
+    assert not (root / "config/models.toml").exists()
+    report = deployment.doctor_repository(
+        root, environment={}, check_dependencies=False, check_processes=False,
+    )
+    assert not report.ready
+    assert any(
+        check.name == "config/models.toml" and check.status == "failed"
+        for check in report.checks
+    )
+
+
+def test_bootstrap_rejects_operator_model_symlink_before_creating_files(
+    tmp_path: Path,
+) -> None:
+    root = _repository(tmp_path / "repo")
+    external = tmp_path / "external-models.toml"
+    external.write_bytes(b"operator-owned")
+    (root / "config/models.toml").unlink()
+    (root / "config/models.toml").symlink_to(external)
+
+    with pytest.raises(deployment.DeploymentError, match="不是普通文件"):
+        deployment.bootstrap(root, with_dev=False, config_only=True)
+
+    assert external.read_bytes() == b"operator-owned"
+    assert not (root / "config/elysium.toml").exists()
 
 
 def test_shell_entrypoint_works_from_unrelated_cwd_and_unicode_path(
@@ -146,7 +182,7 @@ def test_initialize_configuration_rejects_symlink_without_touching_target(
         deployment.initialize_configuration(root)
 
     assert external.read_bytes() == b"outside\n"
-    assert not (root / "config/models.toml").exists()
+    assert (root / "config/models.toml").read_text(encoding="utf-8") == _model_template()
 
 
 def test_concurrent_configuration_creation_leaves_complete_files(
@@ -302,7 +338,7 @@ def test_doctor_fails_closed_on_invalid_subject_files(
 
 def test_doctor_rejects_model_placeholder_without_echoing_it(tmp_path: Path) -> None:
     root = _repository(tmp_path / "repo")
-    (root / "config/models.toml.example").write_text(
+    (root / "config/models.toml").write_text(
         _model_template("replace-with-private-token"), encoding="utf-8"
     )
     deployment.initialize_configuration(root)
@@ -329,7 +365,7 @@ def test_doctor_rejects_plaintext_model_secret_without_echoing_it(
 ) -> None:
     root = _repository(tmp_path / "repo")
     plaintext = "a-real-looking-secret-value"
-    (root / "config/models.toml.example").write_text(
+    (root / "config/models.toml").write_text(
         _model_template(plaintext), encoding="utf-8"
     )
     deployment.initialize_configuration(root)
@@ -711,11 +747,9 @@ def test_committed_engineering_templates_match_current_schemas(
     from plugins.werewolf_game.config import WerewolfConfig
     from src.core.config.core_config import CoreConfig
     from src.core.config.mcp_config import MCPConfig
-    from src.kernel.config.models_loader import ModelsConfig
 
     project_root = deployment.repository_root()
     core = CoreConfig.load(project_root / "config/elysium.toml.example")
-    models = ModelsConfig(project_root / "config/models.toml.example")
     assert core.storage.backend == "local"
     assert core.http_router.http_router_port == 8000
     assert core.plugin_deps.enabled is False
@@ -723,7 +757,6 @@ def test_committed_engineering_templates_match_current_schemas(
         core.database.mysql_pool_recycle_seconds
         < core.database.mysql_idle_session_timeout_seconds
     )
-    models.require_tasks(deployment.REQUIRED_MODEL_TASKS)
 
     config_types = {
         "config/mcp.toml": MCPConfig,
@@ -752,11 +785,11 @@ def test_schema_helper_loads_every_generated_plugin_config(
 ) -> None:
     root = _repository(tmp_path / "repo")
     shutil.copy2(
-        deployment.repository_root() / "config/models.toml.example",
-        root / "config/models.toml.example",
+        deployment.repository_root() / "test/fixtures/model_registry.toml",
+        root / "config/models.toml",
     )
     deployment.initialize_configuration(root)
-    monkeypatch.setenv("ELYSIUM_NEXUS_API_KEY", "configured")
+    monkeypatch.setenv("ELYSIUM_TEST_MODEL_KEY", "configured")
 
     assert deployment_schema_check.main(root) == 0
 

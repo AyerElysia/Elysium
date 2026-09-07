@@ -1,4 +1,4 @@
-"""Checks for the committed compact model-registry baseline."""
+"""Model-registry contracts using synthetic, non-deployment test data."""
 
 from __future__ import annotations
 
@@ -52,8 +52,8 @@ EXPECTED_ATTEMPT_TIMEOUTS = {
 GENERATIVE_TASKS = set(EXPECTED_TASK_BUDGETS) - {"voice", "embedding"}
 
 
-def test_models_example_is_complete_and_budgeted() -> None:
-    registry_path = Path(__file__).parents[2] / "config" / "models.toml.example"
+def test_models_fixture_is_complete_and_budgeted() -> None:
+    registry_path = Path(__file__).parents[1] / "fixtures" / "model_registry.toml"
     config = ModelsConfig(registry_path)
 
     assert set(config.tasks) == set(EXPECTED_TASK_BUDGETS)
@@ -78,32 +78,30 @@ def test_models_example_is_complete_and_budgeted() -> None:
         assert all(entry["timeout"] == expected_timeout for entry in entries)
 
 
-def test_models_example_uses_environment_credentials_but_remains_structural(
+def test_models_fixture_uses_environment_credentials_but_remains_structural(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    registry_path = Path(__file__).parents[2] / "config" / "models.toml.example"
-    monkeypatch.delenv("ELYSIUM_NEXUS_API_KEY", raising=False)
+    registry_path = Path(__file__).parents[1] / "fixtures" / "model_registry.toml"
+    monkeypatch.delenv("ELYSIUM_TEST_MODEL_KEY", raising=False)
 
     config = ModelsConfig(registry_path)
 
-    assert config.providers["NexusAI"]["api_key"] == "${ELYSIUM_NEXUS_API_KEY}"
+    assert config.providers["fixture"]["api_key"] == "${ELYSIUM_TEST_MODEL_KEY}"
 
 
-def test_example_defines_background_attempt_timeout_policy() -> None:
-    # 仅依赖入库的 models.toml.example（CI 自包含、不含真实密钥）；
-    # 生产 config/models.toml 被 .gitignore 忽略，绝不能作为 CI 测试输入。
-    config_dir = Path(__file__).parents[2] / "config"
-    example = ModelsConfig(config_dir / "models.toml.example")
+def test_fixture_defines_background_attempt_timeout_policy() -> None:
+    # This fixture tests schema inheritance, not current production routing.
+    fixture = ModelsConfig(Path(__file__).parents[1] / "fixtures" / "model_registry.toml")
 
     assert "learning" in PRODUCTION_MODEL_TASKS
     assert {
-        task_name: example.tasks[task_name].get("attempt_timeout_seconds")
+        task_name: fixture.tasks[task_name].get("attempt_timeout_seconds")
         for task_name in EXPECTED_ATTEMPT_TIMEOUTS
     } == EXPECTED_ATTEMPT_TIMEOUTS
 
 
 def test_task_routes_preserve_toml_order() -> None:
-    registry_path = Path(__file__).parents[2] / "config" / "models.toml.example"
+    registry_path = Path(__file__).parents[1] / "fixtures" / "model_registry.toml"
     config = ModelsConfig(registry_path)
 
     for task_name, task in config.tasks.items():
@@ -114,13 +112,13 @@ def test_task_routes_preserve_toml_order() -> None:
 
 
 def test_expression_keeps_vision_capable_fallback() -> None:
-    """表达层文本优先 DeepSeek，但列表必须保留至少一个 vision 模型兜底识图。
+    """虚拟表达路由保留 vision 模型，用于验证文本与视觉能力声明。
 
     media-aware routing (LLMRequest.filter_model_set_for_media) 会在 payload
     含图片/表情时把 model_set 过滤到支持 image 的成员，因此文本优先 + 视觉
     兜底的结构不会丢失原生识图能力。
     """
-    registry_path = Path(__file__).parents[2] / "config" / "models.toml.example"
+    registry_path = Path(__file__).parents[1] / "fixtures" / "model_registry.toml"
     config = ModelsConfig(registry_path)
 
     expression_models = config.tasks["expression"]["models"]
@@ -198,7 +196,7 @@ model_extra = { "qwen3.8-flash" = { thinking = { type = "enabled" }, reasoning_e
 
 
 def test_task_routes_only_reference_unique_registered_models() -> None:
-    registry_path = Path(__file__).parents[2] / "config" / "models.toml.example"
+    registry_path = Path(__file__).parents[1] / "fixtures" / "model_registry.toml"
     config = ModelsConfig(registry_path)
 
     for task in config.tasks.values():
@@ -208,7 +206,7 @@ def test_task_routes_only_reference_unique_registered_models() -> None:
 
 
 def test_task_context_budgets_replace_per_model_triggers() -> None:
-    registry_path = Path(__file__).parents[2] / "config" / "models.toml.example"
+    registry_path = Path(__file__).parents[1] / "fixtures" / "model_registry.toml"
     raw = tomllib.loads(registry_path.read_text(encoding="utf-8"))
 
     for model in raw["models"].values():
@@ -224,8 +222,8 @@ def test_task_context_budgets_replace_per_model_triggers() -> None:
             )
 
 
-def test_example_task_inference_policy_is_task_specific() -> None:
-    registry_path = Path(__file__).parents[2] / "config" / "models.toml.example"
+def test_fixture_task_inference_policy_is_task_specific() -> None:
+    registry_path = Path(__file__).parents[1] / "fixtures" / "model_registry.toml"
     config = ModelsConfig(registry_path)
 
     core = {
@@ -241,15 +239,14 @@ def test_example_task_inference_policy_is_task_specific() -> None:
         for entry in config.get_task("router")
     }
 
-    assert core["deepseek-v4-flash"]["thinking"]["type"] == "enabled"
-    assert core["gpt-5.6-luna"]["reasoning_effort"] == "high"
-    assert expression["gpt-5.6-luna"]["reasoning_effort"] == "low"
-    assert expression["gpt-5.6-terra"]["reasoning_effort"] == "low"
-    assert expression["gpt-5.6-sol"]["reasoning_effort"] == "low"
+    assert core["text"]["thinking"]["type"] == "enabled"
+    assert core["vision"]["reasoning_effort"] == "high"
+    assert expression["vision"]["reasoning_effort"] == "low"
+    assert expression["backup"]["reasoning_effort"] == "low"
     assert all(params["parallel_tool_calls"] is True for params in expression.values())
-    assert router["deepseek-v4-flash"]["thinking"]["type"] == "disabled"
-    assert router["gpt-5.6-luna"]["reasoning_effort"] == "low"
-    assert router["MiMo-V2.5"]["enable_thinking"] is False
+    assert router["text"]["thinking"]["type"] == "disabled"
+    assert router["vision"]["reasoning_effort"] == "low"
+    assert router["backup"]["enable_thinking"] is False
 
 
 def _write_minimal_registry(

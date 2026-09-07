@@ -186,8 +186,9 @@ def test_managed_identity_migration_keeps_retired_paths_without_current_claims()
     assert restored["subject_version_id"] == first.version_id
     assert restored["subject_document_revision"] == 2
     assert restored["document_content"] == first.content
-    migration = MEMORY_MIGRATIONS[-1]
-    assert migration.version == MEMORY_SCHEMA_VERSION == 15
+    migration = next(item for item in MEMORY_MIGRATIONS if item.version == 15)
+    assert migration.version == 15
+    assert MEMORY_SCHEMA_VERSION == 16
     assert sum("PREPARE memory_identity_step FROM" in sql for sql in migration.statements) == 8
     assert migration.statements[-1] == "UPDATE memory_nodes SET file_path_sha256 = NULL WHERE is_deleted = TRUE"
     assert not any("DELETE FROM memory_" in sql for sql in migration.statements)

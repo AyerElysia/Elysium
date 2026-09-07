@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
@@ -89,7 +89,9 @@ def _generation(suffix: str) -> BackendGeneration:
 
 
 @pytest.mark.timeout(180)
-async def test_mysql_opportunity_actor_scheduler_and_receipt_contract() -> None:
+async def test_mysql_opportunity_actor_scheduler_and_receipt_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     config = _mysql_config()
     engine = create_mysql_storage_engine(config)
     registry_id = "life-opportunity-integration"
@@ -321,6 +323,136 @@ async def test_mysql_opportunity_actor_scheduler_and_receipt_contract() -> None:
                     ),
                     {"opportunity_id": opportunity_id},
                 )
+
+        # Exercise both changed SQL branches on this isolated real backend.
+        # Only its scheduler clock is controlled; actor, storage authority,
+        # singleton lease, triggers and commits remain real.
+        clock = datetime.now(UTC)
+
+        async def database_now(_session):
+            return clock
+
+        monkeypatch.setattr(claimed.scheduler, "_database_now", database_now)
+        for old_published in (False, True):
+            case = f"{suffix}:reschedule:{old_published}"
+            command = OpportunityRegistrationCommand(
+                occurrence_id=f"opportunity:mysql:open:{case}",
+                opportunity_id=f"opportunity:mysql:{case}",
+                provider_id=workflow.provider_id,
+                action=OpportunityAction.OPEN,
+                actor_consciousness_instance_id=actor,
+                source_instance_id=actor,
+                source_occurrence_ids=(f"life:event:{case}",),
+                causation_occurrence_id=f"life:cause:{case}",
+                expected_revision=0,
+                referent_kind="workflow",
+                referent_id=workflow.workflow_id,
+                referent_revision=workflow.revision,
+                referent_sha256=workflow.content_sha256,
+                workflow_id=workflow.workflow_id,
+                workflow_revision=workflow.revision,
+                workflow_sha256=workflow.content_sha256,
+                schedule=OpportunitySchedule.AT,
+                first_due_at=(clock - timedelta(seconds=1)).isoformat(),
+                interval_seconds=0,
+                reason="Synthetic actor explicitly opens the isolated test.",
+                occurred_at=clock.isoformat(),
+            )
+            opened = await unclaimed.authority.decide_opportunity(command)
+            old_items = await claimed.scheduler.materialize_due()
+            assert len(old_items) == 1
+            old_occurrence = old_items[0]
+            old_publication = (await claimed.scheduler.pending_publications())[0]
+            if old_published:
+                content = canonical_json(
+                    {
+                        **asdict(old_occurrence),
+                        "schema_version": 1,
+                        "meaning": "availability_only",
+                    }
+                )
+                await event_store.append(
+                    LifeEvent(
+                        event_id=old_publication.life_event_occurrence_id,
+                        sequence=0,
+                        occurrence_id=old_publication.life_event_occurrence_id,
+                        timestamp=old_occurrence.available_at,
+                        source="opportunity_runtime",
+                        channel="life",
+                        event_type="opportunity.available",
+                        content=content,
+                        source_instance_id="infrastructure:opportunity-scheduler",
+                        causation_id=old_occurrence.occurrence_id,
+                        metadata={
+                            "opportunity_occurrence_id": old_occurrence.occurrence_id
+                        },
+                    )
+                )
+                old_publication = await claimed.scheduler.mark_published(
+                    old_publication.outbox_id,
+                    expected_revision=old_publication.revision,
+                    life_event_sha256=_sha(content),
+                )
+            old_event_digest = await event_store.occurrence_digest(
+                old_publication.life_event_occurrence_id
+            )
+            new_due = clock + timedelta(seconds=20)
+            configured = await unclaimed.authority.decide_opportunity(
+                replace(
+                    command,
+                    occurrence_id=f"opportunity:mysql:configure:{case}",
+                    action=OpportunityAction.CONFIGURE,
+                    expected_revision=opened.revision,
+                    first_due_at=new_due.isoformat(),
+                    reason="Synthetic actor explicitly chooses a later time.",
+                )
+            )
+            assert configured.revision == 2
+            assert await claimed.scheduler.materialize_due() == ()
+            clock = new_due - timedelta(microseconds=1)
+            assert await claimed.scheduler.materialize_due() == ()
+            clock = new_due
+            replacements = await claimed.scheduler.materialize_due()
+            assert len(replacements) == 1
+            replacement = replacements[0]
+            assert replacement.registration_revision == configured.revision
+            assert datetime.fromisoformat(replacement.scheduled_for) == new_due
+            assert replacement.occurrence_id != old_occurrence.occurrence_id
+            assert await claimed.scheduler.materialize_due() == ()
+            assert await claimed.scheduler.list_occurrences(command.opportunity_id) == (
+                replacement,
+                old_occurrence,
+            )
+            preserved = await unclaimed.delivery.get_publication(
+                old_publication.life_event_occurrence_id
+            )
+            assert preserved is not None
+            if old_published:
+                assert preserved == old_publication
+            else:
+                assert preserved == replace(
+                    old_publication,
+                    status=PublicationStatus.CANCELLED,
+                    revision=old_publication.revision + 1,
+                    updated_at=preserved.updated_at,
+                )
+            assert (
+                await event_store.occurrence_digest(
+                    old_publication.life_event_occurrence_id
+                )
+                == old_event_digest
+            )
+            # End only this synthetic case before the next isolated branch.
+            await unclaimed.authority.decide_opportunity(
+                replace(
+                    command,
+                    occurrence_id=f"opportunity:mysql:close:{case}",
+                    action=OpportunityAction.CLOSE,
+                    expected_revision=configured.revision,
+                    first_due_at=new_due.isoformat(),
+                )
+            )
+            assert await claimed.scheduler.materialize_due() == ()
     finally:
         try:
             if runtime is not None:

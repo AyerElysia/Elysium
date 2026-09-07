@@ -51,6 +51,7 @@ from .test_minimal_subject_file_continuity import (
     _OCCURRED_AT,
     _STREAM_ID,
     _bound_write_tool,
+    _current_memory_pin,
     _memory_plugin,
 )
 from .test_raw_event_minimal_recall import _read_complete, _recall_tools
@@ -137,6 +138,7 @@ async def _scripted_memory_write(
         "path": "MEMORY.md",
         "content": content,
         "reason": f"explicit engineering fixture decision {ordinal}",
+        "expected_version": await _current_memory_pin(plugin),
     }
     generation = service._event_builder.build_conscious_model_turn_event(
         activity_id=f"{source}:generation",

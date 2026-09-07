@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -18,7 +19,10 @@ from plugins.life_engine.storage.authority import (
     FileAuthorityRegistry,
     StaleAuthorityToken,
 )
-from plugins.life_engine.storage.contracts import StorageBackendRuntime
+from plugins.life_engine.storage.contracts import (
+    StorageBackendRuntime,
+    StorageRuntimeClosed,
+)
 from plugins.life_engine.storage.domain_factory import open_presence_world_stores
 from plugins.life_engine.storage.event_factory import open_life_event_store
 from plugins.life_engine.storage.factory import (
@@ -40,6 +44,7 @@ from plugins.life_engine.storage.opportunity_contracts import (
     OpportunityDeliveryReceipt,
     OpportunityDeliveryRejected,
     OpportunityHistoryFamily,
+    OpportunityPublication,
     OpportunityRegistrationCommand,
     OpportunitySchedule,
     OpportunitySchedulerClaimRequired,
@@ -57,6 +62,7 @@ from plugins.life_engine.storage.opportunity_schema import (
     mark_opportunity_runtime_managed,
     read_opportunity_runtime_marker,
 )
+from plugins.life_engine.storage.writer_claims import SingletonWriterClaimLost
 from src.kernel.storage import canonical_json
 
 _ACTOR = "consciousness:opportunity-contract:1"
@@ -1050,3 +1056,851 @@ async def test_restart_recovers_cancelled_outbox_from_exact_life_event(
         assert await reopened.scheduler.list_occurrences(
             "opportunity:crash-window"
         ) == (occurrence,)
+
+
+@pytest.mark.parametrize("schedule", [OpportunitySchedule.AT, OpportunitySchedule.INTERVAL])
+@pytest.mark.parametrize("old_published", [False, True], ids=["pending", "published-unseen"])
+async def test_configure_pending_opportunity_reschedules_exactly_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    old_published: bool,
+    schedule: OpportunitySchedule,
+) -> None:
+    """A new explicit at time survives a stale, not-yet-seen activation."""
+    async with _local_runtime(tmp_path) as runtime:
+        await _register_actor(runtime)
+        unclaimed, claimed, _ = await _open_ready(runtime)
+        authority = unclaimed.authority
+        scheduler = claimed.scheduler
+        assert scheduler is not None
+        assert unclaimed.delivery is not None
+        delivery = unclaimed.delivery
+        event_store = await open_life_event_store(runtime, initialize_schema=True)
+
+        # Only this isolated scheduler's DB-clock seam is controlled. Storage
+        # authority and its singleton lease keep their real validation paths.
+        clock = datetime(2026, 9, 8, tzinfo=UTC)
+
+        async def database_now(_session):
+            return clock
+
+        monkeypatch.setattr(scheduler, "_database_now", database_now)
+        workflow = await _install_provider(authority, "provider:s4-reschedule")
+        opportunity_id = "opportunity:s4-reschedule"
+        old_due = clock - timedelta(seconds=1)
+        opened = await authority.decide_opportunity(
+            _registration_command(
+                opportunity_id,
+                "provider:s4-reschedule",
+                workflow,
+                "s4-open",
+                schedule=OpportunitySchedule.AT,
+                first_due_at=old_due.isoformat(),
+            )
+        )
+        old_occurrences = await scheduler.materialize_due()
+        assert len(old_occurrences) == 1
+        old_occurrence = old_occurrences[0]
+        assert old_occurrence.registration_revision == opened.revision
+        old_publication = (await scheduler.pending_publications())[0]
+        if old_published:
+            event_sha256 = await _append_publication_event(
+                runtime, old_publication, old_occurrence
+            )
+            old_publication = await scheduler.mark_published(
+                old_publication.outbox_id,
+                expected_revision=old_publication.revision,
+                life_event_sha256=event_sha256,
+            )
+        old_event = await event_store.get_by_occurrence_id(
+            old_publication.life_event_occurrence_id
+        )
+        assert (old_event is not None) is old_published
+        old_event_digest = await event_store.occurrence_digest(
+            old_publication.life_event_occurrence_id
+        )
+        assert await delivery.list_deliveries(opportunity_id) == ()
+
+        new_due = clock + timedelta(seconds=20)
+        configured = await authority.decide_opportunity(
+            _registration_command(
+                opportunity_id,
+                "provider:s4-reschedule",
+                workflow,
+                "s4-explicit-reschedule",
+                action=OpportunityAction.CONFIGURE,
+                expected_revision=opened.revision,
+                schedule=schedule,
+                first_due_at=new_due.isoformat(),
+                interval_seconds=30 if schedule == OpportunitySchedule.INTERVAL else 0,
+                reason="Synthetic actor explicitly chooses this later time.",
+            )
+        )
+        assert configured.revision == opened.revision + 1
+
+        async def assert_old_history_preserved() -> None:
+            assert await scheduler.get_occurrence(old_occurrence.occurrence_id) == (
+                old_occurrence
+            )
+            current = await delivery.get_publication(
+                old_publication.life_event_occurrence_id
+            )
+            assert current is not None
+            if old_published:
+                assert current == old_publication
+            else:
+                # Only the never-published outbox may be cancelled; its
+                # occurrence and exact intended Life Event identity remain.
+                assert current == replace(
+                    old_publication,
+                    status=PublicationStatus.CANCELLED,
+                    revision=old_publication.revision + 1,
+                    updated_at=current.updated_at,
+                )
+            assert await event_store.get_by_occurrence_id(
+                old_publication.life_event_occurrence_id
+            ) == old_event
+            assert await event_store.occurrence_digest(
+                old_publication.life_event_occurrence_id
+            ) == old_event_digest
+            assert await delivery.list_deliveries(opportunity_id) == ()
+
+        # Follow the real pump ordering, including reconciliation before the
+        # first scan. No exact receipt exists to advance the old activation.
+        assert await scheduler.reconcile_deliveries() == ()
+        assert await scheduler.materialize_due() == ()
+        assert await scheduler.pending_publications() == ()
+        await assert_old_history_preserved()
+        clock = new_due - timedelta(microseconds=1)
+        assert await scheduler.reconcile_deliveries() == ()
+        assert await scheduler.materialize_due() == ()
+        assert await scheduler.pending_publications() == ()
+
+        clock = new_due
+        assert await scheduler.reconcile_deliveries() == ()
+        replacements = await scheduler.materialize_due()
+        assert len(replacements) == 1, (
+            "CONFIGURE must preserve the new due time after clearing the "
+            "previous not-yet-seen activation"
+        )
+        replacement = replacements[0]
+        assert replacement.occurrence_id != old_occurrence.occurrence_id
+        assert replacement.opportunity_id == opportunity_id
+        assert replacement.registration_revision == configured.revision
+        assert replacement.scheduled_for == new_due.isoformat()
+        assert replacement.available_at == new_due.isoformat()
+        assert replacement.due_index == old_occurrence.due_index + 1
+        publications = await scheduler.pending_publications()
+        assert len(publications) == 1
+        assert publications[0].occurrence_id == replacement.occurrence_id
+        assert publications[0].status == PublicationStatus.PENDING
+        assert publications[0].life_event_occurrence_id != (
+            old_publication.life_event_occurrence_id
+        )
+
+        assert await scheduler.materialize_due() == ()
+        clock += timedelta(seconds=1)
+        assert await scheduler.reconcile_deliveries() == ()
+        assert await scheduler.materialize_due() == ()
+        assert await scheduler.pending_publications() == publications
+        assert await scheduler.list_occurrences(opportunity_id) == (
+            replacement,
+            old_occurrence,
+        )
+        await assert_old_history_preserved()
+
+        # Seeing the replacement advances only the technical schedule. AT
+        # remains spent; INTERVAL next becomes available exactly one period later.
+        new_digest = await _append_publication_event(
+            runtime, publications[0], replacement
+        )
+        published = await scheduler.mark_published(
+            publications[0].outbox_id,
+            expected_revision=publications[0].revision,
+            life_event_sha256=new_digest,
+        )
+        await delivery.commit_exact(
+            _s4_exact_receipt(published, "replacement", clock)
+        )
+        assert await scheduler.reconcile_deliveries() == (replacement.occurrence_id,)
+        clock = new_due + timedelta(seconds=30, microseconds=-1)
+        assert await scheduler.materialize_due() == ()
+        clock = new_due + timedelta(seconds=30)
+        next_period = await scheduler.materialize_due()
+        if schedule == OpportunitySchedule.INTERVAL:
+            assert len(next_period) == 1
+            assert next_period[0].registration_revision == configured.revision
+            assert next_period[0].scheduled_for == clock.isoformat()
+            assert next_period[0].due_index == replacement.due_index + 1
+        else:
+            assert next_period == ()
+        assert await scheduler.materialize_due() == ()
+
+
+def _s4_exact_receipt(
+    publication: OpportunityPublication,
+    identity: str,
+    occurred_at: datetime,
+) -> OpportunityDeliveryReceipt:
+    """Construct content-free synthetic delivery proof, never a model call."""
+    context = f"synthetic availability {publication.occurrence_id}".encode()
+    digest = _sha(context)
+    return OpportunityDeliveryReceipt(
+        receipt_id=f"opportunity:receipt:s4:{identity}",
+        occurrence_id=publication.occurrence_id,
+        life_event_occurrence_id=publication.life_event_occurrence_id,
+        consumer_consciousness_instance_id=_ACTOR,
+        context_delivery_id=f"context:s4:{identity}",
+        final_request_id=f"request:s4:{identity}",
+        final_attempt_id=f"attempt:s4:{identity}",
+        exact_present=True,
+        expected_bytes=len(context),
+        effective_bytes=len(context),
+        expected_sha256=digest,
+        effective_sha256=digest,
+        perceived_at=occurred_at.isoformat(),
+    )
+
+
+@pytest.mark.parametrize("receipt_phase", ["after-cancel", "after-new-pending"])
+async def test_reschedule_late_old_receipt_never_consumes_new_activation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    receipt_phase: str,
+) -> None:
+    """Historical seen proof cannot consume the replacement occurrence."""
+    async with _local_runtime(tmp_path) as runtime:
+        await _register_actor(runtime)
+        unclaimed, claimed, _ = await _open_ready(runtime)
+        authority, delivery = unclaimed.authority, unclaimed.delivery
+        scheduler = claimed.scheduler
+        assert scheduler is not None and delivery is not None
+        clock = datetime(2026, 9, 8, tzinfo=UTC)
+
+        async def database_now(_session):
+            return clock
+
+        monkeypatch.setattr(scheduler, "_database_now", database_now)
+        workflow = await _install_provider(authority, "provider:s4-late")
+        command = _registration_command(
+            "opportunity:s4-late",
+            "provider:s4-late",
+            workflow,
+            "s4-late-open",
+            schedule=OpportunitySchedule.AT,
+            first_due_at=(clock - timedelta(seconds=1)).isoformat(),
+        )
+        await authority.decide_opportunity(command)
+        old = (await scheduler.materialize_due())[0]
+        publication = (await scheduler.pending_publications())[0]
+        digest = await _append_publication_event(runtime, publication, old)
+        published = await scheduler.mark_published(
+            publication.outbox_id,
+            expected_revision=publication.revision,
+            life_event_sha256=digest,
+        )
+        new_due = clock + timedelta(seconds=20)
+        configured = await authority.decide_opportunity(
+            replace(
+                command,
+                occurrence_id="opportunity:registration-decision:s4-late-configure",
+                action=OpportunityAction.CONFIGURE,
+                expected_revision=1,
+                first_due_at=new_due.isoformat(),
+            )
+        )
+        assert await scheduler.materialize_due() == ()
+        assert await scheduler.pending_publications() == ()
+        receipt = _s4_exact_receipt(published, "late-old", clock)
+        if receipt_phase == "after-cancel":
+            await delivery.commit_exact(receipt)
+            assert await scheduler.reconcile_deliveries() == ()
+
+        clock = new_due
+        replacements = await scheduler.materialize_due()
+        assert len(replacements) == 1
+        replacement = replacements[0]
+        assert replacement.registration_revision == configured.revision
+        assert replacement.scheduled_for == new_due.isoformat()
+        current_publications = await scheduler.pending_publications()
+        assert len(current_publications) == 1
+        assert current_publications[0].occurrence_id == replacement.occurrence_id
+        if receipt_phase == "after-new-pending":
+            await delivery.commit_exact(receipt)
+
+        # Replaying the old receipt is harmless before and after the new due.
+        replay = await delivery.commit_exact(receipt)
+        assert replay.record.idempotent_replay
+        assert await scheduler.reconcile_deliveries() == ()
+        clock += timedelta(seconds=60)
+        assert await scheduler.materialize_due() == ()
+        assert await scheduler.pending_publications() == current_publications
+        assert await delivery.get_publication(published.life_event_occurrence_id) == (
+            published
+        )
+        assert await scheduler.get_occurrence(old.occurrence_id) == old
+
+        new_digest = await _append_publication_event(
+            runtime, current_publications[0], replacement
+        )
+        new_published = await scheduler.mark_published(
+            current_publications[0].outbox_id,
+            expected_revision=current_publications[0].revision,
+            life_event_sha256=new_digest,
+        )
+        await delivery.commit_exact(
+            _s4_exact_receipt(new_published, "late-new", clock)
+        )
+        assert await scheduler.reconcile_deliveries() == (replacement.occurrence_id,)
+        assert await scheduler.reconcile_deliveries() == ()
+        assert await scheduler.materialize_due() == ()
+        assert {
+            item.receipt.occurrence_id
+            for item in await delivery.list_deliveries(command.opportunity_id)
+        } == {old.occurrence_id, replacement.occurrence_id}
+        assert await scheduler.list_occurrences(command.opportunity_id) == (
+            replacement,
+            old,
+        )
+
+
+@pytest.mark.parametrize("stop_kind", ["pause", "close", "provider-pause"])
+async def test_rescheduled_opportunity_stops_until_explicit_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stop_kind: str,
+) -> None:
+    """Rescheduling cannot bypass current registration/provider stop state."""
+    async with _local_runtime(tmp_path) as runtime:
+        await _register_actor(runtime)
+        await open_life_event_store(runtime, initialize_schema=True)
+        unclaimed, claimed, _ = await _open_ready(runtime)
+        authority, delivery = unclaimed.authority, unclaimed.delivery
+        scheduler = claimed.scheduler
+        assert scheduler is not None and delivery is not None
+        clock = datetime(2026, 9, 8, tzinfo=UTC)
+
+        async def database_now(_session):
+            return clock
+
+        monkeypatch.setattr(scheduler, "_database_now", database_now)
+        workflow = await _install_provider(authority, "provider:s4-stop")
+        command = _registration_command(
+            "opportunity:s4-stop",
+            "provider:s4-stop",
+            workflow,
+            "s4-stop-open",
+            schedule=OpportunitySchedule.AT,
+            first_due_at=(clock - timedelta(seconds=1)).isoformat(),
+        )
+        await authority.decide_opportunity(command)
+        old = (await scheduler.materialize_due())[0]
+        old_publication = (await scheduler.pending_publications())[0]
+        new_due = clock + timedelta(seconds=20)
+        configured_command = replace(
+            command,
+            occurrence_id="opportunity:registration-decision:s4-stop-configure",
+            action=OpportunityAction.CONFIGURE,
+            expected_revision=1,
+            first_due_at=new_due.isoformat(),
+        )
+        configured = await authority.decide_opportunity(configured_command)
+        if stop_kind == "provider-pause":
+            await authority.manage_provider(
+                _provider_command(
+                    command.provider_id,
+                    workflow,
+                    "s4-stop-provider-pause",
+                    action=ProviderAction.PAUSE,
+                    expected_revision=1,
+                )
+            )
+        else:
+            await authority.decide_opportunity(
+                replace(
+                    configured_command,
+                    occurrence_id=f"opportunity:registration-decision:s4-{stop_kind}",
+                    action=OpportunityAction(stop_kind),
+                    expected_revision=configured.revision,
+                )
+            )
+
+        clock = new_due
+        assert await scheduler.reconcile_deliveries() == ()
+        assert await scheduler.materialize_due() == ()
+        assert await scheduler.pending_publications() == ()
+        assert await delivery.awaiting_delivery() == ()
+        cancelled = await delivery.get_publication(
+            old_publication.life_event_occurrence_id
+        )
+        assert cancelled is not None
+        assert cancelled.status == PublicationStatus.CANCELLED
+        assert await scheduler.get_occurrence(old.occurrence_id) == old
+        clock += timedelta(seconds=30)
+        assert await scheduler.materialize_due() == ()
+
+        if stop_kind == "close":
+            registration = await authority.get_opportunity(command.opportunity_id)
+            assert registration is not None
+            assert registration.status == OpportunityStatus.CLOSED
+            assert await scheduler.list_occurrences(command.opportunity_id) == (old,)
+            return
+        if stop_kind == "provider-pause":
+            await authority.manage_provider(
+                _provider_command(
+                    command.provider_id,
+                    workflow,
+                    "s4-stop-provider-resume",
+                    action=ProviderAction.RESUME,
+                    expected_revision=2,
+                )
+            )
+            expected_revision = configured.revision
+        else:
+            resumed = await authority.decide_opportunity(
+                replace(
+                    configured_command,
+                    occurrence_id="opportunity:registration-decision:s4-stop-resume",
+                    action=OpportunityAction.RESUME,
+                    expected_revision=configured.revision + 1,
+                )
+            )
+            expected_revision = resumed.revision
+        replacements = await scheduler.materialize_due()
+        assert len(replacements) == 1
+        assert replacements[0].registration_revision == expected_revision
+        assert replacements[0].scheduled_for == new_due.isoformat()
+        assert replacements[0].occurrence_id != old.occurrence_id
+        assert await scheduler.materialize_due() == ()
+
+
+async def test_reschedule_survives_storage_runtime_close_and_new_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Close/reopen the actual isolated engine, not just its store wrappers."""
+    async with _local_runtime(tmp_path) as runtime:
+        await _register_actor(runtime)
+        await open_life_event_store(runtime, initialize_schema=True)
+        unclaimed, claimed, old_claim = await _open_ready(runtime)
+        authority, scheduler = unclaimed.authority, claimed.scheduler
+        assert scheduler is not None
+        clock = datetime(2026, 9, 8, tzinfo=UTC)
+
+        async def database_now(_session):
+            return clock
+
+        monkeypatch.setattr(scheduler, "_database_now", database_now)
+        workflow = await _install_provider(authority, "provider:s4-reopen")
+        command = _registration_command(
+            "opportunity:s4-reopen",
+            "provider:s4-reopen",
+            workflow,
+            "s4-reopen-open",
+            schedule=OpportunitySchedule.AT,
+            first_due_at=(clock - timedelta(seconds=1)).isoformat(),
+        )
+        await authority.decide_opportunity(command)
+        old = (await scheduler.materialize_due())[0]
+        new_due = clock + timedelta(seconds=20)
+        configured = await authority.decide_opportunity(
+            replace(
+                command,
+                occurrence_id="opportunity:registration-decision:s4-reopen-configure",
+                action=OpportunityAction.CONFIGURE,
+                expected_revision=1,
+                first_due_at=new_due.isoformat(),
+            )
+        )
+        assert await scheduler.materialize_due() == ()
+        token = runtime.authority_token
+        generation = runtime.generation
+        assert token is not None and generation is not None
+        old_engine = runtime.engine
+        backend_identity = runtime.backend_identity
+        await runtime.close()
+        with pytest.raises(StorageRuntimeClosed):
+            await scheduler.materialize_due()
+
+        # Keep the existing generation/epoch/token. Do not activate another
+        # authority or recreate the schema merely to make this test pass.
+        reopened = await open_storage_backend(
+            StorageFactorySettings(
+                enabled=True,
+                authoritative_backend=BackendKind.LOCAL,
+                backend_generation=generation.generation_id,
+                schema_version=1,
+                authority_epoch=token.authority_epoch,
+                authority_owner_id=token.owner_id,
+                fencing_token_env="TEST_OPPORTUNITY_FENCE",
+                local=LocalBackendSettings(
+                    database_path=tmp_path / "life.sqlite3",
+                    authority_state_path=tmp_path / "authority.json",
+                ),
+            ),
+            environment={"TEST_OPPORTUNITY_FENCE": token.fencing_token},
+        )
+        try:
+            assert reopened.engine is not old_engine
+            assert reopened.backend_identity == backend_identity
+            assert reopened.generation == generation
+            renewed_authority = await reopened.renew_authority(lease_seconds=300)
+            assert renewed_authority.authority_epoch == token.authority_epoch
+            assert renewed_authority.owner_id == token.owner_id
+            new_claim = await reopened.acquire_singleton_writer(
+                namespace=OPPORTUNITY_SCHEDULER_CLAIM_NAMESPACE,
+                state_key=OPPORTUNITY_SCHEDULER_CLAIM_STATE_KEY,
+                owner_instance_id="opportunity-scheduler:s4-reopened",
+                lease_seconds=120,
+            )
+            assert new_claim.lease_epoch > old_claim.lease_epoch
+            renewed_claim = await reopened.renew_singleton_writer(
+                new_claim, lease_seconds=120
+            )
+            assert renewed_claim.lease_epoch == new_claim.lease_epoch
+            assert renewed_claim.owner_instance_id == new_claim.owner_instance_id
+            stores = await open_opportunity_stores(
+                reopened, writer_claim=renewed_claim, initialize_schema=False
+            )
+            restored_scheduler = stores.scheduler
+            assert restored_scheduler is not None
+            monkeypatch.setattr(restored_scheduler, "_database_now", database_now)
+            assert await stores.authority.get_workflow(
+                workflow.workflow_id, workflow.revision
+            ) == workflow
+            assert await restored_scheduler.get_occurrence(old.occurrence_id) == old
+            clock = new_due - timedelta(microseconds=1)
+            assert await restored_scheduler.reconcile_deliveries() == ()
+            assert await restored_scheduler.materialize_due() == ()
+            clock = new_due
+            replacements = await restored_scheduler.materialize_due()
+            assert len(replacements) == 1
+            assert replacements[0].registration_revision == configured.revision
+            assert replacements[0].scheduled_for == new_due.isoformat()
+            assert replacements[0].occurrence_id != old.occurrence_id
+            assert await restored_scheduler.materialize_due() == ()
+            assert await restored_scheduler.list_occurrences(command.opportunity_id) == (
+                replacements[0],
+                old,
+            )
+        finally:
+            await reopened.close()
+
+
+async def _s4_schedule_snapshot(
+    runtime: StorageBackendRuntime,
+    opportunity_id: str,
+) -> dict[str, list[dict[str, object]]]:
+    """Read exact synthetic business rows in one fenced transaction."""
+    snapshot = {}
+    async with runtime.unit_of_work() as uow:
+        for name, table, order in (
+            ("occurrences", "opportunity_occurrences", "position"),
+            ("publications", "opportunity_publication_outbox", "outbox_id"),
+            ("activation", "opportunity_activation_states", "opportunity_id"),
+        ):
+            rows = await uow.session.execute(
+                text(
+                    f"SELECT * FROM {table} WHERE opportunity_id=:identity ORDER BY {order}"
+                ),
+                {"identity": opportunity_id},
+            )
+            snapshot[name] = [dict(row) for row in rows.mappings()]
+    return snapshot
+
+
+async def test_reschedule_rejects_released_scheduler_claim_without_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A still-open old owner cannot write after another claim epoch starts."""
+    async with _local_runtime(tmp_path) as runtime:
+        await _register_actor(runtime)
+        await open_life_event_store(runtime, initialize_schema=True)
+        unclaimed, claimed, old_claim = await _open_ready(runtime)
+        authority, old_scheduler = unclaimed.authority, claimed.scheduler
+        assert old_scheduler is not None
+        clock = datetime(2026, 9, 8, tzinfo=UTC)
+
+        async def database_now(_session):
+            return clock
+
+        monkeypatch.setattr(old_scheduler, "_database_now", database_now)
+        workflow = await _install_provider(authority, "provider:s4-owner")
+        command = _registration_command(
+            "opportunity:s4-owner",
+            "provider:s4-owner",
+            workflow,
+            "s4-owner-open",
+            schedule=OpportunitySchedule.AT,
+            first_due_at=(clock - timedelta(seconds=1)).isoformat(),
+        )
+        await authority.decide_opportunity(command)
+        old = (await old_scheduler.materialize_due())[0]
+        new_due = clock + timedelta(seconds=20)
+        configured = await authority.decide_opportunity(
+            replace(
+                command,
+                occurrence_id="opportunity:registration-decision:s4-owner-configure",
+                action=OpportunityAction.CONFIGURE,
+                expected_revision=1,
+                first_due_at=new_due.isoformat(),
+            )
+        )
+        assert await runtime.release_singleton_writer(old_claim)
+        new_claim = await runtime.acquire_singleton_writer(
+            namespace=OPPORTUNITY_SCHEDULER_CLAIM_NAMESPACE,
+            state_key=OPPORTUNITY_SCHEDULER_CLAIM_STATE_KEY,
+            owner_instance_id="opportunity-scheduler:s4-new-owner",
+            lease_seconds=120,
+        )
+        assert new_claim.lease_epoch > old_claim.lease_epoch
+        assert new_claim.owner_instance_id != old_claim.owner_instance_id
+        # The underlying runtime is still valid; only the old claim is stale.
+        await runtime.validate_writer()
+        before = await _s4_schedule_snapshot(runtime, command.opportunity_id)
+        clock = new_due
+        with pytest.raises(SingletonWriterClaimLost):
+            await old_scheduler.materialize_due()
+        assert await _s4_schedule_snapshot(runtime, command.opportunity_id) == before
+
+        current = await open_opportunity_stores(
+            runtime, writer_claim=new_claim, initialize_schema=False
+        )
+        scheduler = current.scheduler
+        assert scheduler is not None
+        monkeypatch.setattr(scheduler, "_database_now", database_now)
+        replacements = await scheduler.materialize_due()
+        assert len(replacements) == 1
+        assert replacements[0].registration_revision == configured.revision
+        assert replacements[0].scheduled_for == new_due.isoformat()
+        assert replacements[0].occurrence_id != old.occurrence_id
+        assert await scheduler.materialize_due() == ()
+        after = await _s4_schedule_snapshot(runtime, command.opportunity_id)
+        with pytest.raises(SingletonWriterClaimLost):
+            await old_scheduler.materialize_due()
+        assert await _s4_schedule_snapshot(runtime, command.opportunity_id) == after
+
+
+@pytest.mark.parametrize("failure_type", [RuntimeError, asyncio.CancelledError])
+async def test_reschedule_pending_cancellation_rolls_back_the_entire_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
+) -> None:
+    """Failure after outbox SQL but before activation SQL rolls back both."""
+    async with _local_runtime(tmp_path) as runtime:
+        await _register_actor(runtime)
+        await open_life_event_store(runtime, initialize_schema=True)
+        unclaimed, claimed, _ = await _open_ready(runtime)
+        authority, scheduler = unclaimed.authority, claimed.scheduler
+        assert scheduler is not None
+        clock = datetime(2026, 9, 8, tzinfo=UTC)
+
+        async def database_now(_session):
+            return clock
+
+        monkeypatch.setattr(scheduler, "_database_now", database_now)
+        workflow = await _install_provider(authority, "provider:s4-rollback")
+        command = _registration_command(
+            "opportunity:s4-rollback",
+            "provider:s4-rollback",
+            workflow,
+            "s4-rollback-open",
+            schedule=OpportunitySchedule.AT,
+            first_due_at=(clock - timedelta(seconds=1)).isoformat(),
+        )
+        await authority.decide_opportunity(command)
+        old = (await scheduler.materialize_due())[0]
+        old_publication = (await scheduler.pending_publications())[0]
+        new_due = clock + timedelta(seconds=20)
+        configured = await authority.decide_opportunity(
+            replace(
+                command,
+                occurrence_id="opportunity:registration-decision:s4-rollback-configure",
+                action=OpportunityAction.CONFIGURE,
+                expected_revision=1,
+                first_due_at=new_due.isoformat(),
+            )
+        )
+        before = await _s4_schedule_snapshot(runtime, command.opportunity_id)
+        original_cancel = scheduler._cancel_invalid_pending
+        observed_cancelled_sql = False
+
+        async def fail_between_projection_updates(session, now):
+            original_execute = session.execute
+
+            async def execute_with_failure(statement, *args, **kwargs):
+                nonlocal observed_cancelled_sql
+                if str(statement).lstrip().startswith(
+                    "UPDATE opportunity_activation_states"
+                ):
+                    row = (
+                        await original_execute(
+                            text(
+                                "SELECT status, revision FROM opportunity_publication_outbox "
+                                "WHERE outbox_id=:outbox_id"
+                            ),
+                            {"outbox_id": old_publication.outbox_id},
+                        )
+                    ).mappings().one()
+                    assert row["status"] == PublicationStatus.CANCELLED.value
+                    assert row["revision"] == old_publication.revision + 1
+                    observed_cancelled_sql = True
+                    raise failure_type("synthetic failure before activation update")
+                return await original_execute(statement, *args, **kwargs)
+
+            # Patch only this transaction's actual AsyncSession, not a global
+            # SQLAlchemy class or the authority/claim validation boundary.
+            with monkeypatch.context() as session_patch:
+                session_patch.setattr(session, "execute", execute_with_failure)
+                await original_cancel(session, now)
+
+        clock = new_due
+        with monkeypatch.context() as scheduler_patch:
+            scheduler_patch.setattr(
+                scheduler, "_cancel_invalid_pending", fail_between_projection_updates
+            )
+            with pytest.raises(
+                failure_type, match="synthetic failure before activation update"
+            ):
+                await scheduler.materialize_due()
+        assert observed_cancelled_sql
+        assert await _s4_schedule_snapshot(runtime, command.opportunity_id) == before
+
+        replacements = await scheduler.materialize_due()
+        assert len(replacements) == 1
+        assert replacements[0].registration_revision == configured.revision
+        assert replacements[0].scheduled_for == new_due.isoformat()
+        assert replacements[0].occurrence_id != old.occurrence_id
+        assert await scheduler.materialize_due() == ()
+        assert await scheduler.list_occurrences(command.opportunity_id) == (
+            replacements[0],
+            old,
+        )
+        assert unclaimed.delivery is not None
+        cancelled = await unclaimed.delivery.get_publication(
+            old_publication.life_event_occurrence_id
+        )
+        assert cancelled is not None
+        assert cancelled.status == PublicationStatus.CANCELLED
+        assert cancelled.revision == old_publication.revision + 1
+
+
+async def test_late_publication_ack_and_seen_do_not_replace_rescheduled_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recover an already-published old fact without retaking new activation."""
+    async with _local_runtime(tmp_path) as runtime:
+        await _register_actor(runtime)
+        event_store = await open_life_event_store(runtime, initialize_schema=True)
+        unclaimed, claimed, _ = await _open_ready(runtime)
+        authority, delivery = unclaimed.authority, unclaimed.delivery
+        scheduler = claimed.scheduler
+        assert scheduler is not None and delivery is not None
+        clock = datetime(2026, 9, 8, tzinfo=UTC)
+
+        async def database_now(_session):
+            return clock
+
+        monkeypatch.setattr(scheduler, "_database_now", database_now)
+        workflow = await _install_provider(authority, "provider:s4-late-ack")
+        command = _registration_command(
+            "opportunity:s4-late-ack",
+            "provider:s4-late-ack",
+            workflow,
+            "s4-late-ack-open",
+            schedule=OpportunitySchedule.AT,
+            first_due_at=(clock - timedelta(seconds=1)).isoformat(),
+        )
+        await authority.decide_opportunity(command)
+        old = (await scheduler.materialize_due())[0]
+        old_publication = (await scheduler.pending_publications())[0]
+        old_digest = await _append_publication_event(runtime, old_publication, old)
+        event_before = await event_store.get_by_occurrence_id(
+            old_publication.life_event_occurrence_id
+        )
+        digest_before = await event_store.occurrence_digest(
+            old_publication.life_event_occurrence_id
+        )
+        assert event_before is not None and digest_before is not None
+
+        new_due = clock + timedelta(seconds=20)
+        configured = await authority.decide_opportunity(
+            replace(
+                command,
+                occurrence_id="opportunity:registration-decision:s4-late-ack-configure",
+                action=OpportunityAction.CONFIGURE,
+                expected_revision=1,
+                first_due_at=new_due.isoformat(),
+            )
+        )
+        # Deliberately model the already-in-flight publisher, without running
+        # recovery first: its old ack arrives after the new pending is durable.
+        assert await scheduler.materialize_due() == ()
+        cancelled = await delivery.get_publication(
+            old_publication.life_event_occurrence_id
+        )
+        assert cancelled is not None
+        assert cancelled.status == PublicationStatus.CANCELLED
+        clock = new_due
+        replacement = (await scheduler.materialize_due())[0]
+        assert replacement.registration_revision == configured.revision
+        new_publications = await scheduler.pending_publications()
+        assert len(new_publications) == 1
+        assert new_publications[0].occurrence_id == replacement.occurrence_id
+        activation_before = (
+            await _s4_schedule_snapshot(runtime, command.opportunity_id)
+        )["activation"]
+
+        restored = await scheduler.mark_published(
+            old_publication.outbox_id,
+            expected_revision=old_publication.revision,
+            life_event_sha256=old_digest,
+        )
+        assert restored.status == PublicationStatus.PUBLISHED
+        assert restored.life_event_sha256 == old_digest
+        assert restored.revision == old_publication.revision + 2
+        assert (
+            await _s4_schedule_snapshot(runtime, command.opportunity_id)
+        )["activation"] == activation_before
+        assert await scheduler.pending_publications() == new_publications
+        assert await scheduler.mark_published(
+            old_publication.outbox_id,
+            expected_revision=old_publication.revision,
+            life_event_sha256=old_digest,
+        ) == restored
+
+        await delivery.commit_exact(_s4_exact_receipt(restored, "late-ack-old", clock))
+        assert await scheduler.reconcile_deliveries() == ()
+        assert (
+            await _s4_schedule_snapshot(runtime, command.opportunity_id)
+        )["activation"] == activation_before
+        assert await scheduler.pending_publications() == new_publications
+        assert await scheduler.materialize_due() == ()
+        assert await scheduler.get_occurrence(old.occurrence_id) == old
+        assert await event_store.get_by_occurrence_id(
+            old_publication.life_event_occurrence_id
+        ) == event_before
+        assert await event_store.occurrence_digest(
+            old_publication.life_event_occurrence_id
+        ) == digest_before
+
+        new_digest = await _append_publication_event(
+            runtime, new_publications[0], replacement
+        )
+        new_published = await scheduler.mark_published(
+            new_publications[0].outbox_id,
+            expected_revision=new_publications[0].revision,
+            life_event_sha256=new_digest,
+        )
+        await delivery.commit_exact(
+            _s4_exact_receipt(new_published, "late-ack-new", clock)
+        )
+        assert await scheduler.reconcile_deliveries() == (replacement.occurrence_id,)
+        assert await scheduler.materialize_due() == ()
+        assert await scheduler.list_occurrences(command.opportunity_id) == (
+            replacement,
+            old,
+        )

@@ -587,7 +587,9 @@ class TestConsciousnessManifestContracts:
     def test_memory_witness_has_no_injected_tools(self) -> None:
         assert CONSCIOUSNESS_TOOL_MANIFESTS["memory_witness"] == []
 
-    def test_chat_manifest_contains_deep_memory_and_platform_capabilities(self) -> None:
+    def test_chat_manifest_contains_deep_memory_and_platform_capabilities(
+        self, registered_minecraft_extension,
+    ) -> None:
         manifest = set(get_tool_manifest("chat"))
         assert {
             "tool-nucleus_grep_events",
@@ -628,6 +630,7 @@ class TestConsciousnessManifestContracts:
     def test_visible_expression_manifests_retire_standalone_think_action(
         self,
         kind: str,
+        registered_minecraft_extension,
     ) -> None:
         assert "action-life_send_text" in get_tool_manifest(kind)
         assert "action-think" not in get_tool_manifest(kind)

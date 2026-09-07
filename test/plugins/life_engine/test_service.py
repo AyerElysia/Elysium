@@ -418,7 +418,9 @@ async def test_memory_search_uses_canonical_living_associations() -> None:
     service = object.__new__(LifeEngineService)
     service._memory_service = _Memory()  # type: ignore[assignment]
 
-    assert await service.search_actor_memory("shared memory", top_k=3) == ""
+    assert await service.search_actor_memory(
+        "shared memory", top_k=3, enable_association=True
+    ) == ""
     query, search_kwargs = calls["search"]  # type: ignore[misc]
     assert query == "shared memory"
     assert search_kwargs["enable_association"] is False
