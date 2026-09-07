@@ -2,6 +2,8 @@
 
 from datetime import UTC, datetime
 
+import pytest
+
 from plugins.life_engine.service.chat_events import (
     build_chat_message_event,
     build_chat_provider_notice_event,
@@ -144,6 +146,21 @@ def test_failed_and_unknown_delivery_are_not_confirmed() -> None:
 
     assert failed.event_type == "chat.message.delivery_failed"
     assert unknown.event_type == "chat.message.delivery_unknown"
+
+
+def test_default_and_explicit_confirmed_are_the_same_occurrence() -> None:
+    default = build_chat_message_event(_message(), direction="delivered")
+    explicit = build_chat_message_event(
+        _message(), direction="delivered", delivery_status="confirmed",
+    )
+    assert default == explicit
+
+
+def test_chat_requires_source_identity_instead_of_merging_empty_ids() -> None:
+    message = _message()
+    message.message_id = ""
+    with pytest.raises(ValueError, match="stable message_id"):
+        build_chat_message_event(message, direction="received")
 
 
 def test_notice_mapping_and_occurrence_are_stable() -> None:

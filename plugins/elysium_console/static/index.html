@@ -193,6 +193,11 @@
                 <li>选择“对局域网开放”，端口填写 <strong>25565</strong>。</li>
                 <li>先点“检查连接”，通过后再让爱莉加入。</li>
               </ol>
+              <label class="field-label" for="minecraft-body">客户端类型</label>
+              <select id="minecraft-body">
+                <option value="bot">独立机器人（兼容原版服务器，无游戏画面）</option>
+                <option value="agent">独立 NeoForge 客户端（支持当前模组世界与第一人称画面）</option>
+              </select>
               <label class="field-label" for="minecraft-goal">这次想一起做什么（可留空）</label>
               <input id="minecraft-goal" type="text" maxlength="500" placeholder="例如：和我一起探索、聊天，遇到危险先保护自己">
               <div class="minecraft-actions">

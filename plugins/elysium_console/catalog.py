@@ -201,8 +201,24 @@ async def _maybe_await(value: Any) -> Any:
 class ElysiumDataCatalog:
     """Bounded facade plus the explicit local Minecraft session controls."""
 
-    def __init__(self, service_provider: Callable[[], Any] | None = None) -> None:
+    def __init__(
+        self, service_provider: Callable[[], Any] | None = None, *,
+        minecraft_provider: Callable[[], Any] | None = None,
+    ) -> None:
         self._service_provider = service_provider or get_life_engine_service
+        self._minecraft_provider = minecraft_provider
+
+    def _minecraft_session(self) -> Any | None:
+        if self._minecraft_provider is not None:
+            service = self._minecraft_provider()
+        else:
+            # The console remains usable when the optional game plugin is absent.
+            import sys
+
+            module = sys.modules.get("plugins.minecraft.service")
+            provider = getattr(module, "get_minecraft_service", None)
+            service = provider() if callable(provider) else None
+        return getattr(service, "session", None)
 
     def _service(self) -> Any:
         service = self._service_provider()
@@ -240,7 +256,7 @@ class ElysiumDataCatalog:
     async def minecraft_status(self) -> dict[str, Any]:
         """Return a bounded operational view without exposing full observations."""
 
-        session = getattr(self._service(), "minecraft_session", None)
+        session = self._minecraft_session()
         if session is None:
             return self._envelope(
                 "minecraft_status",
@@ -270,48 +286,52 @@ class ElysiumDataCatalog:
             **safe_value(raw, max_depth=5),
         )
 
-    async def minecraft_preflight(self) -> dict[str, Any]:
+    async def minecraft_preflight(self, *, body_name: str = "bot") -> dict[str, Any]:
         """Check the companion body and configured LAN world without starting it."""
 
-        session = getattr(self._service(), "minecraft_session", None)
+        if body_name not in {"bot", "agent"}:
+            raise ConsoleDataInvalid("unsupported Minecraft companion body")
+        session = self._minecraft_session()
         if session is None:
             raise ConsoleDataUnavailable("Minecraft is not enabled or initialized")
-        result = await session.preflight(body_name="bot")
+        result = await session.preflight(body_name=body_name)
         return self._envelope(
             "minecraft_preflight",
             read_only=True,
-            body_name="bot",
+            body_name=body_name,
             result=safe_value(result, max_depth=5),
         )
 
-    async def minecraft_start(self, *, goal: str = "") -> dict[str, Any]:
+    async def minecraft_start(self, *, goal: str = "", body_name: str = "bot") -> dict[str, Any]:
         """Start the explicitly selected independent companion body."""
 
         normalized_goal = " ".join(str(goal or "").split())
+        if body_name not in {"bot", "agent"}:
+            raise ConsoleDataInvalid("unsupported Minecraft companion body")
         if len(normalized_goal) > 500:
             raise ConsoleDataInvalid("Minecraft session goal is too long")
-        session = getattr(self._service(), "minecraft_session", None)
+        session = self._minecraft_session()
         if session is None:
             raise ConsoleDataUnavailable("Minecraft is not enabled or initialized")
-        result = await session.start(goal=normalized_goal, body_name="bot")
+        result = await session.start(goal=normalized_goal, body_name=body_name)
         return self._envelope(
             "minecraft_start",
             read_only=False,
-            body_name="bot",
+            body_name=body_name,
             result=safe_value(result, max_depth=6),
         )
 
     async def minecraft_stop(self) -> dict[str, Any]:
         """Stop only the Elysium-owned companion session and bot process."""
 
-        session = getattr(self._service(), "minecraft_session", None)
+        session = self._minecraft_session()
         if session is None:
             raise ConsoleDataUnavailable("Minecraft is not enabled or initialized")
         result = await session.stop()
         return self._envelope(
             "minecraft_stop",
             read_only=False,
-            body_name="bot",
+            body_name=getattr(getattr(session, "state", None), "body_name", None),
             result=safe_value(result, max_depth=6),
         )
 

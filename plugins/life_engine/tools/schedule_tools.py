@@ -309,6 +309,8 @@ def _build_trigger_spec(
 def _build_callback(plugin: Any, record: ScheduleRecord):
     async def _callback() -> None:
         service = _get_service(plugin)
+        if _opportunity_managed(plugin):
+            raise RuntimeError("LegacyLifeScheduleRetired:use_nucleus_opportunity_command")
         kind = record.kind
         logger.info(
             f"执行定时任务: title={record.title} kind={kind} task_name={record.task_name}"
@@ -338,6 +340,13 @@ def _build_callback(plugin: Any, record: ScheduleRecord):
         raise ValueError(f"不支持的定时任务 kind: {kind}")
 
     return _callback
+
+
+def _opportunity_managed(plugin: Any) -> bool:
+    service = getattr(plugin, "service", None)
+    configured = bool(getattr(getattr(getattr(plugin, "config", None),
+                                     "opportunity", None), "enabled", False))
+    return bool(getattr(service, "opportunity_managed", configured))
 
 
 async def _remove_scheduler_task_by_record(plugin: Any, record: ScheduleRecord) -> bool:
@@ -440,6 +449,9 @@ async def restore_life_schedules_when_ready(plugin: Any) -> dict[str, str]:
     注册 callback。这样旧的关系改写机制不会因为一次进程重启重新
     进入活跃运行面。
     """
+    if _opportunity_managed(plugin):
+        # Preserve the registry bytes for explicit migration; no old callbacks.
+        return {}
     if not getattr(getattr(plugin, "config", None), "settings", None):
         return {}
 
@@ -562,6 +574,12 @@ class LifeEngineManageScheduleTool(BaseTool):
         # update & delete 专用
         task_ref: Annotated[str, "任务引用：record_id / schedule_id / task_name / title（update/delete 必填）"] = "",
     ) -> tuple[bool, str | dict]:
+        if _opportunity_managed(self.plugin):
+            return False, {
+                "error": "LegacyLifeScheduleRetired",
+                "replacement": "nucleus_opportunity_command",
+                "history_preserved": True,
+            }
         if action == "create":
             return await self._create(title, kind, trigger_mode, trigger_at,
                                       delay_seconds, interval_seconds, recurring,

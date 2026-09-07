@@ -48,17 +48,6 @@ def _looks_like_automation_script(text: str) -> bool:
     return any(marker in lowered for marker in markers)
 
 
-def _get_skill_store(plugin: Any):
-    """获取 SkillStore 实例（通过 learning scheduler）。"""
-    service = getattr(plugin, "service", None) or getattr(plugin, "_service", None)
-    if service is None:
-        return None
-    scheduler = getattr(service, "_learning_scheduler", None)
-    if scheduler is None:
-        return None
-    return getattr(scheduler, "skill_store", None)
-
-
 class LifeEngineSkillTool(BaseTool):
     """管理爱莉的技能（做事方式）。
 
@@ -85,11 +74,25 @@ class LifeEngineSkillTool(BaseTool):
         instructions: Annotated[str, "具体怎么做（draft/refine 时填写）"] = "",
         reason: Annotated[str, "这次操作的原因，便于未来追溯"] = "",
     ) -> tuple[bool, str | dict[str, Any]]:
-        store = _get_skill_store(self.plugin)
-        if store is None:
-            return False, "学习系统未初始化，无法管理技能"
-
         action_value = str(action or "").strip().lower()
+        service = getattr(self.plugin, "service", None)
+        provider = getattr(service, "run_procedural_skill_operation", None)
+        if not callable(provider):
+            return False, "SharedProceduralSkillRuntimeUnavailable"
+        try:
+            return await provider(
+                self, mutate=action_value not in {"list", "detail"},
+                operation=lambda store: self._execute_on_store(
+                    store, action_value, name, observation, description, instructions, reason,
+                ),
+            )
+        except (PermissionError, RuntimeError, ValueError) as exc:
+            return False, {"error_type": type(exc).__name__, "persisted": False}
+
+    def _execute_on_store(
+        self, store: Any, action_value: str, name: str, observation: str,
+        description: str, instructions: str, reason: str,
+    ) -> tuple[bool, Any]:
 
         if action_value == "list":
             return True, self._list_skills(store)

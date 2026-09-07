@@ -22,15 +22,18 @@ from .eligibility import (
     register_indexed_path_sql_function,
 )
 from .nodes import (
+    ManagedDocumentIndexResult,
+    ManagedDocumentIndexSnapshot,
     NodeType,
     canonical_file_node_id,
     compute_content_hash,
     generate_file_node_id,
+    generate_subject_file_node_id,
 )
 from .temporal import extract_document_date
 
 INDEX_SCHEMA_NAME = "document_index"
-INDEX_SCHEMA_VERSION = 6
+INDEX_SCHEMA_VERSION = 7
 ACTIVE_CHUNK_STATE_KEY = "active_chunk_collection"
 DEFAULT_CHUNK_SIZE = 900
 DEFAULT_CHUNK_OVERLAP = 120
@@ -257,7 +260,11 @@ def _ensure_index_tables(db: sqlite3.Connection) -> None:
         "memory_index_state",
         "memory_vector_tombstones",
     )
-    if any(not _table_exists(db, table) for table in required):
+    if any(not _table_exists(db, table) for table in required) or not {
+        "document_content", "subject_document_id", "subject_version_id",
+        "subject_document_revision", "subject_binding_revision", "subject_content_sha256",
+        "subject_projection_sha256", "subject_projection_state",
+    }.issubset(_columns(db, "memory_nodes")):
         create_memory_schema(db)
 
 
@@ -273,7 +280,13 @@ def _stored_row_identity(
     if not decision.eligible:
         raise DocumentIdentityConflict("stored path is not a canonical eligible document")
     path = decision.path
-    canonical_node_id = generate_file_node_id(path)
+    columns = set(row.keys())
+    subject_id = str(row["subject_document_id"] or "") if "subject_document_id" in columns else ""
+    canonical_node_id = (
+        generate_subject_file_node_id(subject_id) if subject_id else generate_file_node_id(path)
+    )
+    if "subject_projection_state" in columns and row["subject_projection_state"] == "legacy_retired":
+        raise DocumentIdentityConflict("legacy identity was retired by an explicit managed path binding")
     if require_node_id and str(row["node_id"] or "") != canonical_node_id:
         raise DocumentIdentityConflict("stored path does not match node ID")
     return path, canonical_node_id
@@ -304,7 +317,7 @@ def _path_is_claimed_by_another_node(
     """Detect canonical or legacy spelling collisions without repairing them."""
     rows = db.execute(
         "SELECT node_id, node_type, file_path FROM memory_nodes "
-        "WHERE lower(COALESCE(node_type, 'file')) = ?",
+        "WHERE lower(COALESCE(node_type, 'file')) = ? AND COALESCE(is_deleted, 0) = 0",
         (NodeType.FILE.value,),
     ).fetchall()
     for row in rows:
@@ -412,9 +425,21 @@ def _ensure_memory_nodes(db: sqlite3.Connection) -> None:
         ("embedding_model", "TEXT"),
         ("embedding_updated_at", "REAL"),
         ("index_revision", "INTEGER NOT NULL DEFAULT 0"),
+        ("document_content", "TEXT"),
+        ("subject_document_id", "TEXT"),
+        ("subject_version_id", "TEXT"),
+        ("subject_document_revision", "INTEGER NOT NULL DEFAULT 0"),
+        ("subject_binding_revision", "INTEGER NOT NULL DEFAULT 0"),
+        ("subject_content_sha256", "TEXT"),
+        ("subject_projection_sha256", "TEXT"),
+        ("subject_projection_state", "TEXT NOT NULL DEFAULT ''"),
     )
     for column, definition in legacy_columns:
         _ensure_column(db, "memory_nodes", column, definition)
+    db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_nodes_subject_document "
+        "ON memory_nodes(subject_document_id)"
+    )
 
 
 def _try_create_chunks_fts(db: sqlite3.Connection) -> str:
@@ -853,6 +878,149 @@ def _insert_chunk_tombstones(
     )
 
 
+def assert_managed_source_revision(
+    row: object | None,
+    snapshot: ManagedDocumentIndexSnapshot,
+) -> bool:
+    """Check source CAS without inferring identity from a shared file path."""
+    snapshot.validate()
+    if row is None:
+        return False
+    current = dict(row)  # SQLite Row and SQLAlchemy RowMapping both preserve names.
+    if (
+        str(current.get("node_id") or "") != generate_subject_file_node_id(snapshot.document_id)
+        or str(current.get("subject_document_id") or "") != snapshot.document_id
+    ):
+        raise DocumentIdentityConflict("managed node belongs to another source document")
+    revision = int(current.get("subject_document_revision") or 0)
+    if revision > snapshot.document_revision:
+        raise DocumentIdentityConflict("managed source revision is stale")
+    if revision == snapshot.document_revision:
+        if str(current.get("subject_projection_sha256") or "") != snapshot.projection_sha256:
+            raise DocumentIdentityConflict("same managed revision has a different exact snapshot")
+        return True
+    return False
+
+
+def _store_managed_source(
+    db: sqlite3.Connection,
+    node_id: str,
+    snapshot: ManagedDocumentIndexSnapshot,
+    state: str,
+) -> None:
+    db.execute(
+        "UPDATE memory_nodes SET subject_document_id = ?, subject_version_id = ?, "
+        "subject_document_revision = ?, subject_binding_revision = ?, "
+        "subject_content_sha256 = ?, subject_projection_sha256 = ?, "
+        "subject_projection_state = ? WHERE node_id = ?",
+        (
+            snapshot.document_id, snapshot.version_id, snapshot.document_revision,
+            snapshot.binding_revision, snapshot.content_sha256,
+            snapshot.projection_sha256, state, node_id,
+        ),
+    )
+
+
+def _retire_document_projection_rows(
+    db: sqlite3.Connection,
+    node_id: str,
+    now: float,
+    *,
+    state: str,
+) -> None:
+    """Retire reachability only; retain nodes, old chunks, and all relation IDs."""
+    row = db.execute(
+        "SELECT is_deleted FROM memory_nodes WHERE node_id = ?", (node_id,),
+    ).fetchone()
+    if row is None:
+        return
+    if not bool(row["is_deleted"]):
+        chunks = [str(item[0]) for item in db.execute(
+            "SELECT chunk_id FROM memory_chunks WHERE node_id = ?", (node_id,),
+        )]
+        _insert_chunk_tombstones(db, chunks, now)
+        db.execute(
+            "UPDATE memory_nodes SET is_deleted = 1, embedding_synced = 0, "
+            "index_revision = index_revision + 1, updated_at = ?, "
+            "subject_projection_state = ? WHERE node_id = ?", (now, state, node_id),
+        )
+    db.execute(
+        "UPDATE memory_index_jobs SET status = 'stale', updated_at = ?, "
+        "claim_token = '', error = 'ManagedProjectionRetired' "
+        "WHERE node_id = ? AND status IN ('pending', 'processing', 'failed')",
+        (now, node_id),
+    )
+
+
+def _retire_other_path_projections(
+    db: sqlite3.Connection,
+    path: str,
+    node_id: str,
+    now: float,
+) -> None:
+    for row in db.execute(
+        "SELECT node_id, subject_document_id FROM memory_nodes "
+        "WHERE node_type = 'file' AND file_path = ? AND node_id <> ? "
+        "AND COALESCE(is_deleted, 0) = 0 ORDER BY node_id", (path, node_id),
+    ).fetchall():
+        _retire_document_projection_rows(
+            db, str(row["node_id"]), now,
+            state="superseded" if row["subject_document_id"] else "legacy_retired",
+        )
+
+
+def project_managed_document_rows(
+    db: sqlite3.Connection,
+    snapshot: ManagedDocumentIndexSnapshot,
+    *,
+    now: float | None = None,
+) -> ManagedDocumentIndexResult:
+    """Atomically rebuild one stable document under the caller's source fence."""
+    snapshot.validate()
+    _ensure_index_tables(db)
+    timestamp = float(time.time() if now is None else now)
+    node_id = generate_subject_file_node_id(snapshot.document_id)
+    indexed = snapshot.content is not None and not snapshot.deleted
+    with transaction(db, immediate=True):
+        existing = db.execute(
+            "SELECT * FROM memory_nodes WHERE node_id = ?", (node_id,),
+        ).fetchone()
+        replay = assert_managed_source_revision(existing, snapshot)
+        if indexed:
+            upsert_document_rows(
+                db, snapshot.path, snapshot.content, snapshot.title,
+                now=timestamp, _managed_snapshot=snapshot,
+            )
+        else:
+            if existing is None:
+                db.execute(
+                    "INSERT INTO memory_nodes (node_id, node_type, file_path, title, "
+                    "created_at, updated_at, is_deleted) VALUES (?, 'file', ?, ?, ?, ?, 1)",
+                    (node_id, snapshot.path, snapshot.title, timestamp, timestamp),
+                )
+            else:
+                _retire_document_projection_rows(
+                    db, node_id, timestamp,
+                    state="deleted" if snapshot.deleted else "unindexable",
+                )
+                db.execute(
+                    "UPDATE memory_nodes SET file_path = ?, updated_at = ? WHERE node_id = ?",
+                    (snapshot.path, timestamp, node_id),
+                )
+            _store_managed_source(
+                db, node_id, snapshot, "deleted" if snapshot.deleted else "unindexable",
+            )
+            # Current opaque bytes still own their path even when no text can
+            # be indexed. A deleted source does not claim its former path.
+            if not snapshot.deleted:
+                _retire_other_path_projections(db, snapshot.path, node_id, timestamp)
+    return ManagedDocumentIndexResult(
+        node_id=node_id, document_id=snapshot.document_id, version_id=snapshot.version_id,
+        document_revision=snapshot.document_revision, indexed=indexed,
+        idempotent_replay=replay,
+    )
+
+
 def ensure_document_reference_rows(
     db: sqlite3.Connection,
     file_path: str,
@@ -925,9 +1093,17 @@ def upsert_document_rows(
     now: float | None = None,
     max_chars: int = DEFAULT_CHUNK_SIZE,
     overlap_chars: int = DEFAULT_CHUNK_OVERLAP,
+    _managed_snapshot: ManagedDocumentIndexSnapshot | None = None,
 ) -> DocumentIndexResult:
     """Atomically upsert one eligible document, its FTS rows, chunks, and outbox job."""
-    normalized_path, node_id = canonical_file_node_id(file_path)
+    if _managed_snapshot is None:
+        normalized_path, node_id = canonical_file_node_id(file_path)
+    else:
+        _managed_snapshot.validate()
+        if file_path != _managed_snapshot.path or content != _managed_snapshot.content:
+            raise DocumentIdentityConflict("managed text does not match its exact source snapshot")
+        normalized_path = _managed_snapshot.path
+        node_id = generate_subject_file_node_id(_managed_snapshot.document_id)
     _ensure_index_tables(db)
     text = str(content or "")
     document_title = str(title or Path(normalized_path).stem)
@@ -946,13 +1122,16 @@ def upsert_document_rows(
     )
     job_id: str | None = None
 
-    with transaction(db):
+    with transaction(db, immediate=_managed_snapshot is not None):
         _ensure_memory_nodes(db)
         existing = db.execute(
             "SELECT * FROM memory_nodes WHERE node_id = ?",
             (node_id,),
         ).fetchone()
-        if existing is not None:
+        if _managed_snapshot is not None:
+            assert_managed_source_revision(existing, _managed_snapshot)
+            _retire_other_path_projections(db, normalized_path, node_id, timestamp)
+        elif existing is not None:
             _assert_stored_file_identity(
                 existing,
                 expected_path=normalized_path,
@@ -1012,6 +1191,10 @@ def upsert_document_rows(
             and existing["fts_content_hash"] == content_hash
             and existing_chunks == chunks
             and existing_chunk_fts == expected_chunk_fts
+            and (
+                _managed_snapshot is None
+                or str(existing["subject_projection_sha256"] or "") == _managed_snapshot.projection_sha256
+            )
         )
         if projection_unchanged:
             db.execute(
@@ -1090,6 +1273,9 @@ def upsert_document_rows(
             ),
         )
         _replace_old_fts(db, node_id, document_title, text)
+        db.execute("UPDATE memory_nodes SET document_content = ? WHERE node_id = ?", (text, node_id))
+        if _managed_snapshot is not None:
+            _store_managed_source(db, node_id, _managed_snapshot, "active")
         old_chunk_ids_for_tombstone: list[str] = [
             str(row["chunk_id"])
             for row in db.execute(
@@ -1163,6 +1349,8 @@ def delete_document_rows_by_id(
         ).fetchone()
         if row is None:
             return False
+        if row["subject_document_id"] or row["subject_projection_state"] == "legacy_retired":
+            raise DocumentIdentityConflict("managed and retired legacy identities cannot be hard deleted")
         if _table_exists(db, "memory_chunks_fts"):
             db.execute("DELETE FROM memory_chunks_fts WHERE node_id = ?", (identifier,))
         if _table_exists(db, "memory_fts"):
@@ -1243,6 +1431,8 @@ def rekey_document_rows_by_id(
         ).fetchone()
         if old_row is None:
             return False
+        if old_row["subject_document_id"] or old_row["subject_projection_state"] == "legacy_retired":
+            raise DocumentIdentityConflict("managed and retired legacy identities cannot be rekeyed")
         old_stored_path, _ = _stored_row_identity(
             old_row,
             require_node_id=False,

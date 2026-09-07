@@ -134,6 +134,69 @@ def test_expression_keeps_vision_capable_fallback() -> None:
     )
 
 
+def test_qwen38_flash_max_tier_is_nonstream_vision_and_xhigh(tmp_path: Path) -> None:
+    """core/expression 可将 qwen3.8-flash 的 max 档（xhigh）设为首选且保留视觉。"""
+
+    registry_path = tmp_path / "models.toml"
+    registry_path.write_text(
+        """
+[providers.gateway]
+base_url = "http://127.0.0.1:3000/v1"
+api_key = "secret-a"
+client_type = "openai"
+timeout = 120
+max_retry = 0
+retry_interval = 0
+
+[models."qwen3.8-flash"]
+provider = "gateway"
+id = "qwen3.8-flash"
+ctx = 1000000
+stream = false
+vision = true
+extra = { thinking = { type = "enabled" }, reasoning_effort = "xhigh" }
+
+[models.backup]
+provider = "gateway"
+id = "backup-id"
+ctx = 1000000
+vision = true
+
+[tasks.core]
+models = ["qwen3.8-flash", "backup"]
+tokens = 32000
+temp = 0.7
+context_tokens = 200000
+model_extra = { "qwen3.8-flash" = { thinking = { type = "enabled" }, reasoning_effort = "xhigh" } }
+
+[tasks.expression]
+models = ["qwen3.8-flash", "backup"]
+tokens = 32000
+temp = 0.8
+context_tokens = 200000
+extra = { parallel_tool_calls = true }
+model_extra = { "qwen3.8-flash" = { thinking = { type = "enabled" }, reasoning_effort = "xhigh" } }
+""".lstrip(),
+        encoding="utf-8",
+    )
+    config = ModelsConfig(registry_path)
+    assert config.tasks["core"]["models"][0] == "qwen3.8-flash"
+    assert config.tasks["expression"]["models"][0] == "qwen3.8-flash"
+    assert config.models["qwen3.8-flash"]["stream"] is False
+    assert config.models["qwen3.8-flash"]["vision"] is True
+    core = {
+        entry["routing_model_alias"]: entry["extra_params"]
+        for entry in config.get_task("core")
+    }
+    expression = {
+        entry["routing_model_alias"]: entry["extra_params"]
+        for entry in config.get_task("expression")
+    }
+    assert core["qwen3.8-flash"]["reasoning_effort"] == "xhigh"
+    assert expression["qwen3.8-flash"]["reasoning_effort"] == "xhigh"
+    assert expression["qwen3.8-flash"]["parallel_tool_calls"] is True
+
+
 def test_task_routes_only_reference_unique_registered_models() -> None:
     registry_path = Path(__file__).parents[2] / "config" / "models.toml.example"
     config = ModelsConfig(registry_path)

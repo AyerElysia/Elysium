@@ -13,7 +13,7 @@ import json
 import random
 import re
 import sqlite3
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any, Iterable, Sequence
 from uuid import uuid4
@@ -153,7 +153,11 @@ class InterpretationSearchResult:
 
 @dataclass(frozen=True, slots=True)
 class SemanticRelation:
-    """An explicit, open-vocabulary relation authored by the subject."""
+    """One immutable event in an explicit, open-vocabulary relation lineage.
+
+    Ownership identifies the continuous subject, never a process or an
+    instance. Rows without an owner remain readable legacy evidence only.
+    """
 
     relation_id: str
     source_ref: str
@@ -165,6 +169,133 @@ class SemanticRelation:
     consciousness_instance_id: str = ""
     stream_scope: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    owner_subject_id: str | None = None
+    root_relation_id: str = ""
+    parent_relation_id: str | None = None
+    revision: int = 1
+    operation: str = "add"
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticRelationPage:
+    """A bounded row page bound to one coarse immutable-ledger frontier."""
+
+    relations: tuple[SemanticRelation, ...]
+    frontier_count: int
+    offset: int
+    next_offset: int | None
+    has_more: bool
+    matching_count: int
+    current_relation_ids: tuple[str, ...]
+
+
+def validate_semantic_relation_page_request(
+    *, limit: int, offset: int, expected_frontier_count: int | None,
+) -> None:
+    if type(limit) is not int or not 1 <= limit <= 100:
+        raise ValueError("SemanticRelationPageLimitInvalid")
+    if type(offset) is not int or offset < 0:
+        raise ValueError("SemanticRelationPageOffsetInvalid")
+    if expected_frontier_count is not None and (
+        type(expected_frontier_count) is not int or expected_frontier_count < 0
+    ):
+        raise ValueError("SemanticRelationPageFrontierInvalid")
+    if offset and expected_frontier_count is None:
+        raise ValueError("SemanticRelationPageFrontierRequired")
+
+
+def semantic_relation_payload(relation: SemanticRelation) -> dict[str, Any]:
+    """Preserve the original v1 digest shape for unowned legacy relations."""
+    body = asdict(relation)
+    if (
+        relation.owner_subject_id is None
+        and not relation.root_relation_id
+        and relation.parent_relation_id is None
+        and relation.revision == 1
+        and relation.operation == "add"
+    ):
+        for name in (
+            "owner_subject_id", "root_relation_id", "parent_relation_id",
+            "revision", "operation",
+        ):
+            del body[name]
+    return body
+
+
+def normalize_semantic_relation(relation: SemanticRelation) -> SemanticRelation:
+    """Validate protocol structure without interpreting predicate or strength."""
+    if not relation.relation_id or not relation.relation_id.strip():
+        raise ValueError("SemanticRelationIdentityRequired")
+    if not relation.source_ref or not relation.target_ref:
+        raise ValueError("SemanticRelationEndpointsRequired")
+    if relation.source_ref == relation.target_ref:
+        raise ValueError("SemanticRelationEndpointsMustDiffer")
+    if not relation.predicate or not relation.predicate.strip():
+        raise ValueError("SemanticRelationPredicateRequired")
+    if relation.operation not in {"add", "revise", "withdraw"}:
+        raise ValueError("SemanticRelationOperationInvalid")
+    if type(relation.revision) is not int or relation.revision < 1:
+        raise ValueError("SemanticRelationRevisionInvalid")
+    if relation.owner_subject_id is not None and not relation.owner_subject_id.strip():
+        raise ValueError("SemanticRelationOwnerRequired")
+    if relation.operation == "add":
+        if relation.parent_relation_id is not None or relation.revision != 1:
+            raise ValueError("SemanticRelationLineageMismatch")
+        if relation.owner_subject_id is None:
+            if relation.root_relation_id:
+                raise ValueError("SemanticRelationOwnerRequired")
+        elif relation.root_relation_id not in {"", relation.relation_id}:
+            raise ValueError("SemanticRelationLineageMismatch")
+    elif (
+        relation.owner_subject_id is None
+        or not relation.root_relation_id
+        or not relation.parent_relation_id
+        or relation.revision < 2
+    ):
+        raise ValueError("SemanticRelationRevisionIdentityRequired")
+    if relation.owner_subject_id is not None:
+        if not relation.reason or not relation.reason.strip():
+            raise ValueError("SemanticRelationReasonRequired")
+        if not relation.actor or not relation.consciousness_instance_id:
+            raise ValueError("SemanticRelationActorIdentityRequired")
+    return replace(
+        relation,
+        root_relation_id=(
+            relation.root_relation_id or relation.relation_id
+            if relation.owner_subject_id is not None
+            else ""
+        ),
+        recorded_at=relation.recorded_at or _now_iso(),
+    )
+
+
+def validate_semantic_relation_parent(
+    relation: SemanticRelation,
+    parent: SemanticRelation | None,
+) -> None:
+    """Validate an exact predecessor; current-head CAS remains database-owned."""
+    if parent is None:
+        raise RuntimeError("SemanticRelationParentNotFound")
+    if parent.owner_subject_id is None:
+        raise PermissionError("SemanticRelationLegacyOwnerUnbound")
+    if relation.owner_subject_id != parent.owner_subject_id:
+        raise PermissionError("SemanticRelationOwnerMismatch")
+    if (
+        relation.parent_relation_id != parent.relation_id
+        or relation.root_relation_id != parent.root_relation_id
+        or relation.revision != parent.revision + 1
+        or relation.relation_id in {parent.relation_id, parent.root_relation_id}
+    ):
+        raise ValueError("SemanticRelationLineageMismatch")
+    if (
+        relation.source_ref != parent.source_ref
+        or relation.target_ref != parent.target_ref
+    ):
+        raise ValueError("SemanticRelationEndpointsImmutable")
+    if parent.operation == "withdraw":
+        raise RuntimeError("SemanticRelationAlreadyWithdrawn")
+    if relation.operation == "withdraw" and relation.predicate != parent.predicate:
+        raise ValueError("SemanticRelationWithdrawalPredicateMismatch")
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,6 +364,144 @@ class AssociationSelection:
     signals: tuple[str, ...]
     event_count: int
     last_event_at: str
+
+
+SEMANTIC_RELATION_REVISION_SCHEMA_VERSION = "semantic-relation-revision-v1"
+
+
+def validate_semantic_relation_revision_schema(db: sqlite3.Connection) -> dict[str, Any]:
+    """Verify revision/CAS metadata and pre-existing immutable-history guards."""
+    observed_columns = {
+        str(row[1]): (str(row[2]).upper(), int(row[3]), row[4])
+        for row in db.execute("PRAGMA table_info(memory_semantic_relations)")
+    }
+    expected_columns = {
+        "owner_subject_id": ("TEXT", 0, None),
+        "root_relation_id": ("TEXT", 0, None),
+        "parent_relation_id": ("TEXT", 0, None),
+        "revision": ("INTEGER", 1, "1"),
+        "operation": ("TEXT", 1, "'add'"),
+    }
+    if any(observed_columns.get(name) != spec for name, spec in expected_columns.items()):
+        raise RuntimeError("SemanticRelationRevisionColumnMismatch")
+    indexes = (
+        ("uq_semantic_relation_parent", ("parent_relation_id",)),
+        ("uq_semantic_relation_revision", ("root_relation_id", "revision")),
+    )
+    observed_indexes = {
+        str(row[1]): (int(row[2]), int(row[4]))
+        for row in db.execute("PRAGMA index_list(memory_semantic_relations)")
+    }
+    for name, columns in indexes:
+        actual_columns = tuple(
+            str(row[2]) for row in db.execute(f"PRAGMA index_info({name})")
+        )
+        if observed_indexes.get(name) != (1, 0) or actual_columns != columns:
+            raise RuntimeError("SemanticRelationRevisionIndexMismatch")
+    foreign_keys = {
+        (str(row[2]), str(row[3]), str(row[4]), str(row[6]).upper())
+        for row in db.execute("PRAGMA foreign_key_list(memory_semantic_relations)")
+    }
+    if (
+        "memory_semantic_relations", "parent_relation_id", "relation_id", "RESTRICT"
+    ) not in foreign_keys:
+        raise RuntimeError("SemanticRelationRevisionForeignKeyMismatch")
+    row = db.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'memory_semantic_relations'"
+    ).fetchone()
+    sql = str(row[0] or "") if row is not None else ""
+    if not re.search(r"CHECK\s*\(\s*revision\s*>=\s*1\s*\)", sql, re.IGNORECASE):
+        raise RuntimeError("SemanticRelationRevisionCheckMismatch")
+    if not re.search(
+        r"CHECK\s*\(\s*operation\s+IN\s*\("
+        r"\s*'add'\s*,\s*'revise'\s*,\s*'withdraw'\s*\)\s*\)",
+        sql, re.IGNORECASE,
+    ):
+        raise RuntimeError("SemanticRelationOperationCheckMismatch")
+    for event in ("update", "delete"):
+        name = f"memory_semantic_relations_immutable_{event}"
+        row = db.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+            (name,),
+        ).fetchone()
+        trigger_sql = " ".join(str(row[0] or "").split()) if row is not None else ""
+        expected = (
+            rf"CREATE TRIGGER (?:IF NOT EXISTS )?{name} "
+            rf"BEFORE {event} ON memory_semantic_relations "
+            r"BEGIN SELECT RAISE\(ABORT,\s*'LivingMemoryRecordImmutable'\); END;?"
+        )
+        if re.fullmatch(expected, trigger_sql, re.IGNORECASE) is None:
+            raise RuntimeError("SemanticRelationImmutabilityTriggerMismatch")
+    return {
+        "protocol_version": SEMANTIC_RELATION_REVISION_SCHEMA_VERSION,
+        "columns": tuple(expected_columns),
+        "unique_indexes": tuple(name for name, _columns in indexes),
+        "parent_foreign_key": True,
+        "immutable_history": True,
+    }
+
+
+def migrate_semantic_relation_revision_schema(db: sqlite3.Connection) -> tuple[str, ...]:
+    """Add revision structure without rewriting, adopting or scanning old rows.
+
+    This bounded migration can run explicitly while the service is stopped.
+    Its NULL ownership/root defaults preserve legacy authority byte-for-byte.
+    """
+    added: list[str] = []
+    with transaction(db, immediate=True):
+        relation_columns = {
+            str(row[1])
+            for row in db.execute("PRAGMA table_info(memory_semantic_relations)")
+        }
+        if not relation_columns:
+            raise RuntimeError("SemanticRelationSchemaMissing")
+        for name, definition in (
+            ("owner_subject_id", "TEXT NULL"),
+            ("root_relation_id", "TEXT NULL"),
+            (
+                "parent_relation_id",
+                (
+                    "TEXT NULL REFERENCES memory_semantic_relations(relation_id) "
+                    "ON DELETE RESTRICT"
+                ),
+            ),
+            ("revision", "INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1)"),
+            (
+                "operation",
+                (
+                    "TEXT NOT NULL DEFAULT 'add' "
+                    "CHECK (operation IN ('add', 'revise', 'withdraw'))"
+                ),
+            ),
+        ):
+            if name not in relation_columns:
+                db.execute(
+                    f"ALTER TABLE memory_semantic_relations "
+                    f"ADD COLUMN {name} {definition}"
+                )
+                added.append(name)
+        indexes = (
+            ("uq_semantic_relation_parent", ("parent_relation_id",)),
+            ("uq_semantic_relation_revision", ("root_relation_id", "revision")),
+        )
+        for name, columns in indexes:
+            db.execute(
+                f"CREATE UNIQUE INDEX IF NOT EXISTS {name} "
+                f"ON memory_semantic_relations({', '.join(columns)})"
+            )
+        observed = {
+            str(row[1]): int(row[2])
+            for row in db.execute("PRAGMA index_list(memory_semantic_relations)")
+        }
+        for name, columns in indexes:
+            actual_columns = tuple(
+                str(row[2]) for row in db.execute(f"PRAGMA index_info({name})")
+            )
+            if observed.get(name) != 1 or actual_columns != columns:
+                raise RuntimeError("SemanticRelationRevisionIndexMismatch")
+        validate_semantic_relation_revision_schema(db)
+    return tuple(added)
 
 
 def create_living_memory_schema(db: sqlite3.Connection) -> None:
@@ -453,6 +722,7 @@ def create_living_memory_schema(db: sqlite3.Connection) -> None:
                 END;
                 """
             )
+        migrate_semantic_relation_revision_schema(db)
         db.execute(
             """INSERT INTO memory_interpretation_fts(
                 interpretation_id, subject_id, content
@@ -839,25 +1109,36 @@ def append_semantic_relation(
     db: sqlite3.Connection,
     relation: SemanticRelation,
 ) -> SemanticRelation:
-    """Append a subject-authored relation without constraining its predicate."""
+    """Append one event atomically, replaying identity before checking head CAS."""
 
-    normalized = replace(
-        relation,
-        predicate=relation.predicate.strip(),
-        reason=relation.reason.strip(),
-        recorded_at=relation.recorded_at or _now_iso(),
-    )
-    if not normalized.source_ref or not normalized.target_ref:
-        raise ValueError("SemanticRelationEndpointsRequired")
-    if not normalized.predicate:
-        raise ValueError("SemanticRelationPredicateRequired")
-    with transaction(db):
+    with transaction(db, immediate=True):
+        existing = get_semantic_relation(db, relation.relation_id)
+        normalized = normalize_semantic_relation(
+            replace(relation, recorded_at=existing.recorded_at)
+            if existing is not None and not relation.recorded_at
+            else relation
+        )
+        if existing is not None:
+            if semantic_relation_payload(existing) != semantic_relation_payload(normalized):
+                raise RuntimeError("SemanticRelationOccurrenceConflict")
+            return existing
+        if normalized.parent_relation_id is not None:
+            parent = get_semantic_relation(db, normalized.parent_relation_id)
+            validate_semantic_relation_parent(normalized, parent)
+            child = db.execute(
+                "SELECT relation_id FROM memory_semantic_relations "
+                "WHERE parent_relation_id = ?",
+                (normalized.parent_relation_id,),
+            ).fetchone()
+            if child is not None:
+                raise RuntimeError("SemanticRelationStaleParent")
         db.execute(
             """INSERT INTO memory_semantic_relations (
                 relation_id, source_ref, target_ref, predicate, reason, actor,
                 recorded_at, consciousness_instance_id, stream_scope,
-                metadata_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                metadata_json, owner_subject_id, root_relation_id,
+                parent_relation_id, revision, operation
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 normalized.relation_id,
                 normalized.source_ref,
@@ -869,38 +1150,130 @@ def append_semantic_relation(
                 normalized.consciousness_instance_id,
                 normalized.stream_scope,
                 json.dumps(normalized.metadata, ensure_ascii=False),
+                normalized.owner_subject_id,
+                normalized.root_relation_id or None,
+                normalized.parent_relation_id,
+                normalized.revision,
+                normalized.operation,
             ),
         )
     return normalized
 
 
+def _semantic_relation_from_row(row: sqlite3.Row) -> SemanticRelation:
+    return SemanticRelation(
+        relation_id=str(row["relation_id"]),
+        source_ref=str(row["source_ref"]),
+        target_ref=str(row["target_ref"]),
+        predicate=str(row["predicate"]),
+        reason=str(row["reason"]),
+        actor=str(row["actor"]),
+        recorded_at=str(row["recorded_at"]),
+        consciousness_instance_id=str(row["consciousness_instance_id"]),
+        stream_scope=str(row["stream_scope"]),
+        metadata=_json_object(row["metadata_json"]),
+        owner_subject_id=(
+            str(row["owner_subject_id"]) if row["owner_subject_id"] is not None else None
+        ),
+        root_relation_id=str(row["root_relation_id"] or ""),
+        parent_relation_id=(
+            str(row["parent_relation_id"]) if row["parent_relation_id"] is not None else None
+        ),
+        revision=int(row["revision"]),
+        operation=str(row["operation"]),
+    )
+
+
+def get_semantic_relation(
+    db: sqlite3.Connection,
+    relation_id: str,
+) -> SemanticRelation | None:
+    """Read one immutable occurrence by its exact identity, not its endpoint."""
+    row = db.execute(
+        "SELECT * FROM memory_semantic_relations WHERE relation_id = ?",
+        (relation_id,),
+    ).fetchone()
+    return _semantic_relation_from_row(row) if row is not None else None
+
+
 def list_semantic_relations(
     db: sqlite3.Connection,
     entity_ref: str,
+    *,
+    current_only: bool = False,
 ) -> list[SemanticRelation]:
-    """Return every explicit relation touching an entity."""
+    """Read history, or derive active heads directly from immutable predecessors."""
 
+    current_clause = (
+        " AND r.operation <> 'withdraw' AND NOT EXISTS ("
+        "SELECT 1 FROM memory_semantic_relations child "
+        "WHERE child.parent_relation_id = r.relation_id)"
+        if current_only else ""
+    )
     rows = db.execute(
-        """SELECT * FROM memory_semantic_relations
-        WHERE source_ref = ? OR target_ref = ?
-        ORDER BY recorded_at, relation_id""",
+        "SELECT r.* FROM memory_semantic_relations r "
+        "WHERE (r.source_ref = ? OR r.target_ref = ?)"
+        + current_clause + " ORDER BY r.recorded_at, r.relation_id",
         (entity_ref, entity_ref),
     ).fetchall()
-    return [
-        SemanticRelation(
-            relation_id=str(row["relation_id"]),
-            source_ref=str(row["source_ref"]),
-            target_ref=str(row["target_ref"]),
-            predicate=str(row["predicate"]),
-            reason=str(row["reason"]),
-            actor=str(row["actor"]),
-            recorded_at=str(row["recorded_at"]),
-            consciousness_instance_id=str(row["consciousness_instance_id"]),
-            stream_scope=str(row["stream_scope"]),
-            metadata=_json_object(row["metadata_json"]),
-        )
-        for row in rows
-    ]
+    return [_semantic_relation_from_row(row) for row in rows]
+
+
+def page_semantic_relations(
+    db: sqlite3.Connection,
+    entity_ref: str,
+    *,
+    current_only: bool = False,
+    limit: int = 50,
+    offset: int = 0,
+    expected_frontier_count: int | None = None,
+) -> SemanticRelationPage:
+    """Bound returned rows, failing continuation on any ledger append.
+
+    COUNT and the page share one read transaction. COUNT is an O(ledger size)
+    coarse frontier, not a claim of constant work or a byte-sized body limit.
+    """
+    validate_semantic_relation_page_request(
+        limit=limit, offset=offset, expected_frontier_count=expected_frontier_count,
+    )
+    current_clause = (
+        " AND r.operation <> 'withdraw' AND NOT EXISTS ("
+        "SELECT 1 FROM memory_semantic_relations child "
+        "WHERE child.parent_relation_id = r.relation_id)"
+        if current_only else ""
+    )
+    with transaction(db):
+        frontier = int(db.execute(
+            "SELECT COUNT(*) FROM memory_semantic_relations"
+        ).fetchone()[0])
+        if expected_frontier_count is not None and frontier != expected_frontier_count:
+            raise RuntimeError("SemanticRelationPageFrontierConflict")
+        matching_count = int(db.execute(
+            "SELECT COUNT(*) FROM memory_semantic_relations r "
+            "WHERE (r.source_ref = ? OR r.target_ref = ?)" + current_clause,
+            (entity_ref, entity_ref),
+        ).fetchone()[0])
+        rows = db.execute(
+            "SELECT r.*, (r.operation <> 'withdraw' AND NOT EXISTS ("
+            "SELECT 1 FROM memory_semantic_relations child "
+            "WHERE child.parent_relation_id = r.relation_id)) AS current_active "
+            "FROM memory_semantic_relations r "
+            "WHERE (r.source_ref = ? OR r.target_ref = ?)"
+            + current_clause
+            + " ORDER BY r.recorded_at, r.relation_id LIMIT ? OFFSET ?",
+            (entity_ref, entity_ref, limit + 1, offset),
+        ).fetchall()
+    has_more = len(rows) > limit
+    relations = tuple(_semantic_relation_from_row(row) for row in rows[:limit])
+    return SemanticRelationPage(
+        relations=relations, frontier_count=frontier, offset=offset,
+        next_offset=offset + len(relations) if has_more else None,
+        has_more=has_more,
+        matching_count=matching_count,
+        current_relation_ids=tuple(
+            str(row["relation_id"]) for row in rows[:limit] if bool(row["current_active"])
+        ),
+    )
 
 
 def _interpretation_from_row(row: sqlite3.Row) -> MemoryInterpretation:
@@ -1392,13 +1765,14 @@ def choose_association_neighbours(
 
 
 __all__ = [
-    "AssociationEvidence",
-    "AssociationSelection",
+    "SEMANTIC_RELATION_REVISION_SCHEMA_VERSION",
     "ArtifactHead",
     "ArtifactHeadConflict",
+    "AssociationEvidence",
+    "AssociationSelection",
     "CoRecallEvent",
-    "InterpretationSource",
     "InterpretationSearchResult",
+    "InterpretationSource",
     "MemoryArtifactDescriptor",
     "MemoryArtifactVersion",
     "MemoryDerivation",
@@ -1406,6 +1780,7 @@ __all__ = [
     "RecallEpisode",
     "RecallEvent",
     "SemanticRelation",
+    "SemanticRelationPage",
     "append_artifact_version",
     "append_corecall_event",
     "append_interpretation",
@@ -1418,13 +1793,21 @@ __all__ = [
     "get_artifact_head_state",
     "get_artifact_version",
     "get_interpretation",
+    "get_semantic_relation",
     "list_artifact_descriptors",
     "list_artifact_heads",
     "list_artifact_history",
     "list_association_evidence",
     "list_interpretations",
-    "search_interpretations",
     "list_semantic_relations",
+    "migrate_semantic_relation_revision_schema",
     "new_artifact_version",
+    "normalize_semantic_relation",
+    "page_semantic_relations",
     "rebuild_association_projection",
+    "search_interpretations",
+    "semantic_relation_payload",
+    "validate_semantic_relation_page_request",
+    "validate_semantic_relation_parent",
+    "validate_semantic_relation_revision_schema",
 ]

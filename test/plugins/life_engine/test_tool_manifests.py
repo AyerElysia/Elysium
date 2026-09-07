@@ -73,7 +73,7 @@ def test_chat_manifest_contains_file_tools() -> None:
     assert "nucleus_glob_file" in names
 
 
-@pytest.mark.parametrize("kind", ["chat", "minecraft", "livestream", "voice_live", "memory_witness"])
+@pytest.mark.parametrize("kind", ["chat", "livestream", "voice_live", "memory_witness"])
 def test_manifest_kind_declared(kind: str) -> None:
     """已声明的意识类型必须能取到清单（未声明的 kind 抛 KeyError 是设计）。"""
     manifest = get_tool_manifest(kind)
@@ -81,7 +81,7 @@ def test_manifest_kind_declared(kind: str) -> None:
     assert all(name.startswith(("tool-", "action-")) for name in manifest)
 
 
-@pytest.mark.parametrize("kind", ["chat", "minecraft", "livestream", "voice_live"])
+@pytest.mark.parametrize("kind", ["chat", "livestream", "voice_live"])
 def test_consciousness_instances_share_one_proactive_surface(kind: str) -> None:
     manifest = set(get_tool_manifest(kind))
     assert {

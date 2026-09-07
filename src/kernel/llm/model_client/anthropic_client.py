@@ -111,13 +111,14 @@ def _callable_accepts_reason(callable_obj: object) -> bool:
 
 
 def _inject_reason_parameter(tool: LLMUsable, input_schema: dict[str, object]) -> dict[str, object]:
-    """在需要时为工具 schema 注入 reason 参数。"""
+    """默认添加 reason；显式关闭自动注入时保留组件原有 schema。"""
     properties_obj = input_schema.get("properties")
     properties: dict[str, object] = properties_obj if isinstance(properties_obj, dict) else {}
     schema_has_reason = "reason" in properties
     execute_has_reason = _callable_accepts_reason(getattr(tool, "execute", None))
+    auto_reason_enabled = getattr(tool, "auto_reason_parameter", True) is not False
 
-    if schema_has_reason or execute_has_reason:
+    if not auto_reason_enabled or schema_has_reason or execute_has_reason:
         input_schema["properties"] = properties
         return input_schema
 

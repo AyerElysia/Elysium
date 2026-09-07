@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "capability_id": "life.narrative_review",
+  "package_version": "1.0.0",
+  "removability": "subject_removable",
+  "provider_kind": "narrative_review",
+  "manual": "CAPABILITY.md",
+  "default_skill": "DEFAULT_SKILL.md",
+  "operations": [
+    "nucleus_write_narrative"
+  ],
+  "dependencies": [
+    "life.narrative_store",
+    "life.presence",
+    "life.timeline",
+    "life.trace"
+  ]
+}

@@ -7,6 +7,8 @@ chat_mode 负责对外交流。
 
 from __future__ import annotations
 
+from ..service.scene_extensions import requires_result_before_reply
+
 import asyncio
 import hashlib
 import json
@@ -21,6 +23,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Annotated, Any, AsyncGenerator, Awaitable, TypeVar
 
 from src.app.plugin_system.base import (
@@ -56,7 +59,6 @@ from src.kernel.storage import canonical_json_sha256
 
 from ..constants import LIFE_CHATTER_GLOBAL_CURSOR_KEY
 from ..inner_dialogue.protocol import INNER_RETURN_SENDER_ID
-from ..memory.prompting import analyze_memory_text, render_memory_prompt
 from ..service.activity_panel import (
     format_decision_panel,
     format_decision_tool_args,
@@ -88,17 +90,22 @@ from .context_stewardship import (
     DEFAULT_EMERGENCY_REFERENCE_MAX_BYTES,
     DEFAULT_PRESSURE_MAX_GROUPS,
     ContextStewardshipError,
+    ContextStewardshipResult,
     LiveContextWindow,
-    apply_pending_subject_checkpoint,
+    acknowledge_subject_checkpoint,
     archive_target_for_runtime,
     build_context_pressure_notice,
     consume_subject_context_recovery_marker,
     ensure_compression_required_appended,
+    get_pending_subject_checkpoint,
     has_compression_required_payload,
     install_subject_context_recovery_hook,
     is_compression_required_part,
     is_compression_required_payload,
+    is_context_stewardship_tool_name,
     is_subject_window_overflow_error,
+    isolate_model_checkpoint_output,
+    prepare_subject_checkpoint,
     register_live_context,
     reset_pending_subject_checkpoint,
     reset_subject_context_recovery_marker,
@@ -106,6 +113,8 @@ from .context_stewardship import (
     strip_compression_maintenance_transport,
     strip_context_pressure_notices,
     unregister_live_context,
+    verify_subject_checkpoint_archives,
+    write_synced_context_file,
 )
 from .multimodal import (
     MediaBudget,
@@ -152,9 +161,6 @@ _SEND_IMAGE = "action-life_send_image"
 _SEND_VOICE = "action-life_send_voice"
 _SEND_FILE = "action-life_send_file"
 _SEND_EMOJI_MEME = "action-send_emoji_meme"
-_MINECRAFT_CAUSAL_TOOL_NAMES = frozenset(
-    {"nucleus_minecraft", "tool-nucleus_minecraft"}
-)
 _RETIRED_THINK_ACTION = "action-think"
 _RETIRED_THINK_ACTIONS = _expand_llm_tool_names(
     frozenset({_RETIRED_THINK_ACTION, "think"})
@@ -384,7 +390,8 @@ class _WorkflowRuntime:
     unread_history_merged_before_turn: bool = False
     media_seen: set[str] = field(default_factory=set)
     active_stream_id: str = ""
-    # must_reply: 路由判定需要回复；在 max_rounds 兜底时检查
+    # must_reply: 这批真实外部输入已接入表达层；循环内可提醒模型作出可追溯选择。
+    # max_rounds 仍无主体可见回复时 fail closed，禁止代写对外正文。
     must_reply: bool = False
     # sent_visible_reply: 本轮 loop 中是否已产生可见回复（跨 follow-up 轮累计）
     sent_visible_reply: bool = False
@@ -1937,6 +1944,9 @@ class LifeChatter(BaseChatter):
     # 多个聊天流共享同一主意识，后续流复用缓存后不再走加载分支，
     # 必须从类属性取当前 revision，否则保存时 CAS 会与 DB 实际值冲突。
     _GLOBAL_ROLLING_CONTEXT_REVISION: int = 0
+    # A write may have committed before its acknowledgement was lost. Until a
+    # fresh runtime loads durable state, no old live chain may overwrite it.
+    _GLOBAL_ROLLING_CONTEXT_RECOVERY_REQUIRED: str = ""
 
     # ── helpers ──────────────────────────────────────────────
 
@@ -1962,6 +1972,7 @@ class LifeChatter(BaseChatter):
         cls._GLOBAL_RUNTIME = None
         cls._GLOBAL_USABLE_MAP = None
         cls._GLOBAL_ROLLING_CONTEXT_REVISION = 0
+        cls._GLOBAL_ROLLING_CONTEXT_RECOVERY_REQUIRED = ""
         reset_pending_subject_checkpoint(
             cls.instance_id,
             runtime_key=CHATTER_RUNTIME_KEY,
@@ -2067,6 +2078,7 @@ class LifeChatter(BaseChatter):
         chat_stream: ChatStream,
     ) -> tuple[_WorkflowRuntime, Any]:
         """懒创建统一主意识的 LLM 请求、工具注册表和 FSM 状态。"""
+        self._assert_rolling_context_writable()
         if (
             self.__class__._GLOBAL_RUNTIME is not None
             and self.__class__._GLOBAL_USABLE_MAP is not None
@@ -2954,13 +2966,34 @@ class LifeChatter(BaseChatter):
             summary_max_chars=summary_max,
         )
 
-    def _maybe_compact_runtime_context(self, response: Any) -> Any:
-        """Apply only a checkpoint explicitly authored by the active subject."""
+    @classmethod
+    def _assert_rolling_context_writable(cls) -> None:
+        if cls._GLOBAL_ROLLING_CONTEXT_RECOVERY_REQUIRED:
+            raise RuntimeError(
+                "RollingContextRecoveryRequired:"
+                + cls._GLOBAL_ROLLING_CONTEXT_RECOVERY_REQUIRED
+            )
+
+    async def _maybe_compact_runtime_context(self, response: Any) -> Any:
+        """Commit a subject-authored snapshot before releasing its live groups.
+
+        Before this commit a crash restores the previous snapshot and the
+        subject may author a new checkpoint. After it, restart restores the
+        committed checkpoint directly. No infrastructure summary is replayed.
+        """
+        self._assert_rolling_context_writable()
         payloads = getattr(response, "payloads", None)
         if not isinstance(payloads, list):
             return None
         chatter = getattr(self._get_config(), "chatter", None)
         if not bool(getattr(chatter, "context_stewardship_enabled", True)):
+            return None
+        command = get_pending_subject_checkpoint(
+            self.instance_id,
+            runtime_key=CHATTER_RUNTIME_KEY,
+        )
+        if command is None:
+            self._register_chatter_live_context(response)
             return None
         checkpoint_max_bytes = max(
             1024,
@@ -2974,29 +3007,71 @@ class LifeChatter(BaseChatter):
             ),
         )
         try:
-            result = apply_pending_subject_checkpoint(
-                self.instance_id,
+            prepared = prepare_subject_checkpoint(
                 [p for p in payloads if isinstance(p, LLMPayload)],
+                command,
                 max_checkpoint_bytes=checkpoint_max_bytes,
-                runtime_key=CHATTER_RUNTIME_KEY,
                 archive_namespace=ARCHIVE_NAMESPACE,
             )
-        except Exception as exc:  # noqa: BLE001 - derived projection fails closed
+        except ContextStewardshipError as exc:
+            # A rejected/stale command is not an installed checkpoint. Release
+            # only its queue slot so the subject can submit a corrected command;
+            # its original tool activity remains in the authoritative history.
+            acknowledge_subject_checkpoint(command, runtime_key=CHATTER_RUNTIME_KEY)
             logger.warning(
                 "主体连续性检查点未能在安全边界安装，原上下文保持不变: "
                 f"error_type={type(exc).__name__}"
             )
             return None
-        if result.triggered:
-            response.payloads = result.payloads
-            logger.info(
-                "主体自述连续性检查点已安装: "
-                f"checkpoint_id={result.checkpoint_id} revision={result.revision} "
-                f"released_groups={result.released_groups} "
-                f"bytes={result.before_utf8_bytes}->{result.after_utf8_bytes}"
+        await self._verify_checkpoint_archives(
+            prepared.payloads, self._get_life_service()
+        )
+        # Do not mutate the response or remove pending intent before this await.
+        # Unknown commit outcomes put the shared runtime into recovery_required.
+        await self._save_rolling_context_snapshot(
+            SimpleNamespace(payloads=prepared.payloads)
+        )
+        try:
+            acknowledge_subject_checkpoint(command, runtime_key=CHATTER_RUNTIME_KEY)
+        except ContextStewardshipError:
+            self.__class__._GLOBAL_ROLLING_CONTEXT_RECOVERY_REQUIRED = (
+                "checkpoint_committed_intent_changed"
             )
+            raise
+        response.payloads = prepared.payloads
+        result = ContextStewardshipResult(
+            triggered=True,
+            payloads=prepared.payloads,
+            before_utf8_bytes=prepared.before_utf8_bytes,
+            after_utf8_bytes=prepared.after_utf8_bytes,
+            released_groups=len(prepared.released_groups),
+            checkpoint_id=prepared.checkpoint_id,
+            revision=prepared.revision,
+            stop_reason="subject_checkpoint_committed",
+        )
+        logger.info(
+            "主体自述连续性检查点已提交并安装: "
+            f"checkpoint_id={result.checkpoint_id} revision={result.revision} "
+            f"released_groups={result.released_groups} "
+            f"bytes={result.before_utf8_bytes}->{result.after_utf8_bytes}"
+        )
         self._register_chatter_live_context(response)
         return result
+
+    async def _verify_checkpoint_archives(
+        self,
+        payloads: list[LLMPayload],
+        service: LifeEngineService | None,
+    ) -> None:
+        """Verify only explicit checkpoint references; never invent recall text."""
+
+        await verify_subject_checkpoint_archives(
+            payloads,
+            actor_consciousness_instance_id=self.instance_id,
+            service=service,
+            workspace_path=self._resolve_workspace_path(service),
+            namespace=ARCHIVE_NAMESPACE,
+        )
 
     @classmethod
     def _deserialize_payload(cls, data: Any) -> LLMPayload | None:
@@ -3039,12 +3114,20 @@ class LifeChatter(BaseChatter):
                 self._rolling_context_state_revision = 0
                 return []
             revision = int(record.revision)
+            try:
+                restored = self._deserialize_rolling_context_snapshot(
+                    record.payload,
+                    outer_integrity_verified=True,
+                )
+                await self._verify_checkpoint_archives(restored, service)
+            except Exception as exc:
+                self.__class__._GLOBAL_ROLLING_CONTEXT_RECOVERY_REQUIRED = (
+                    "stored_snapshot_invalid"
+                )
+                raise RuntimeError("RollingContextRecoveryRequired") from exc
             self.__class__._GLOBAL_ROLLING_CONTEXT_REVISION = revision
             self._rolling_context_state_revision = revision
-            return self._deserialize_rolling_context_snapshot(
-                record.payload,
-                outer_integrity_verified=True,
-            )
+            return restored
 
         path = self._rolling_context_snapshot_path()
         # Phase C: 自动迁移旧版全局滚动上下文到实例路径
@@ -3058,19 +3141,22 @@ class LifeChatter(BaseChatter):
                     shutil.move(str(legacy), str(path))
                     logger.info(f"意识实例迁移: {legacy.name} -> {path}")
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning(f"滚动上下文迁移失败: {exc}")
+                    self.__class__._GLOBAL_ROLLING_CONTEXT_RECOVERY_REQUIRED = (
+                        "legacy_snapshot_migration_failed"
+                    )
+                    raise RuntimeError("RollingContextMigrationFailed") from exc
         if not path.exists():
             return []
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"读取 life_chatter 滚动上下文快照失败: {exc}")
-            return []
-        try:
-            return self._deserialize_rolling_context_snapshot(raw)
-        except RuntimeError as exc:
-            logger.warning(f"忽略无效的 life_chatter 滚动上下文快照: {exc}")
-            return []
+            raw = json.loads(await asyncio.to_thread(path.read_text, encoding="utf-8"))
+            restored = self._deserialize_rolling_context_snapshot(raw)
+            await self._verify_checkpoint_archives(restored, service)
+        except Exception as exc:
+            self.__class__._GLOBAL_ROLLING_CONTEXT_RECOVERY_REQUIRED = (
+                "local_snapshot_invalid"
+            )
+            raise RuntimeError("RollingContextRecoveryRequired") from exc
+        return restored
 
     def _deserialize_rolling_context_snapshot(
         self,
@@ -3116,11 +3202,12 @@ class LifeChatter(BaseChatter):
                 digest_matches = expected_digest == actual_digest
             if not isinstance(expected_digest, str) or not digest_matches:
                 raise RuntimeError("RollingContextPayloadDigestMismatch")
-        payloads = [
-            payload
-            for payload in (self._deserialize_payload(item) for item in payload_items)
-            if payload is not None
-        ]
+        payloads: list[LLMPayload] = []
+        for item in payload_items:
+            payload = self._deserialize_payload(item)
+            if payload is None or len(payload.content) != len(item.get("content", [])):
+                raise RuntimeError("RollingContextPayloadCannotBeDecoded")
+            payloads.append(payload)
         payloads = self._derived_rolling_payloads(
             payloads,
             strip_wake_envelopes=True,
@@ -3144,6 +3231,7 @@ class LifeChatter(BaseChatter):
         Under selected storage this writes the fenced remote state and propagates
         failures. Local JSON remains only for explicit local mode.
         """
+        self._assert_rolling_context_writable()
         payloads = getattr(response, "payloads", None)
         if not isinstance(payloads, list):
             return
@@ -3155,6 +3243,8 @@ class LifeChatter(BaseChatter):
         service = self._get_life_service()
         snapshot_payloads = current_payloads
         data = self._snapshot_data_for_payloads(snapshot_payloads)
+        if not data["payloads"]:
+            return
 
         selected_store = None
         if service is not None:
@@ -3167,69 +3257,87 @@ class LifeChatter(BaseChatter):
             if runtime is not None and getattr(
                 runtime, "acquire_singleton_writer", None
             ) is not None:
-                try:
-                    claim = await runtime.acquire_singleton_writer(
-                        namespace="life_chatter.rolling_context",
-                        state_key=self.instance_id,
-                        owner_instance_id=(
-                            getattr(
-                                service,
-                                "_storage_writer_instance_id",
-                                "life_chatter",
-                            )
-                            or "life_chatter"
-                        ),
-                        lease_seconds=30,
-                    )
-                except Exception as exc:
-                    from ..storage import SingletonWriterClaimConflict
-
-                    if isinstance(exc, SingletonWriterClaimConflict):
-                        # 另一实例持有滚动上下文写租约：跳过本轮保存，
-                        # 同步本地 revision 缓存到数据库最新值，避免下轮
-                        # 再次 CAS 冲突。
-                        try:
-                            latest = await selected_store.get_state(
-                                "life_chatter.rolling_context",
-                                self.instance_id,
-                            )
-                            if latest is not None:
-                                self.__class__._GLOBAL_ROLLING_CONTEXT_REVISION = (
-                                    int(latest.revision)
-                                )
-                                self._rolling_context_state_revision = int(
-                                    latest.revision
-                                )
-                        except Exception:  # noqa: BLE001
-                            pass
-                        logger.warning(
-                            f"滚动上下文写租约被其他实例持有，跳过本轮保存: "
-                            f"namespace=life_chatter.rolling_context "
-                            f"state_key={self.instance_id} "
-                            f"error_type={type(exc).__name__}"
-                        )
-                        return
-                    raise
+                claim = await runtime.acquire_singleton_writer(
+                    namespace="life_chatter.rolling_context",
+                    state_key=self.instance_id,
+                    owner_instance_id=(
+                        getattr(service, "_storage_writer_instance_id", "life_chatter")
+                        or "life_chatter"
+                    ),
+                    lease_seconds=30,
+                )
             try:
-                # 持租约后重读最新 revision：本地缓存可能已过期（另一实例
-                # 曾推进），但此刻租约在手不会有并发写入，读到的一定是最新。
                 latest = await selected_store.get_state(
                     "life_chatter.rolling_context",
                     self.instance_id,
                 )
-                expected_revision = (
-                    int(latest.revision) if latest is not None else 0
-                )
-                self.__class__._GLOBAL_ROLLING_CONTEXT_REVISION = expected_revision
-                self._rolling_context_state_revision = expected_revision
-                record = await selected_store.put_state(
-                    namespace="life_chatter.rolling_context",
-                    state_key=self.instance_id,
-                    expected_revision=expected_revision,
-                    schema_version=_ROLLING_CONTEXT_SNAPSHOT_VERSION,
-                    payload=data,
-                    writer_claim=claim,
-                )
+                latest_revision = int(latest.revision) if latest is not None else 0
+                expected_revision = self.__class__._GLOBAL_ROLLING_CONTEXT_REVISION
+                if latest_revision != expected_revision:
+                    if latest is not None and latest.payload == data:
+                        self.__class__._GLOBAL_ROLLING_CONTEXT_REVISION = latest_revision
+                        self._rolling_context_state_revision = latest_revision
+                        return
+                    self.__class__._GLOBAL_ROLLING_CONTEXT_RECOVERY_REQUIRED = (
+                        "snapshot_revision_conflict"
+                    )
+                    raise RuntimeError("RollingContextSnapshotRevisionConflict")
+                try:
+                    record = await selected_store.put_state(
+                        namespace="life_chatter.rolling_context",
+                        state_key=self.instance_id,
+                        expected_revision=expected_revision,
+                        schema_version=_ROLLING_CONTEXT_SNAPSHOT_VERSION,
+                        payload=data,
+                        writer_claim=claim,
+                    )
+                except asyncio.CancelledError:
+                    self.__class__._GLOBAL_ROLLING_CONTEXT_RECOVERY_REQUIRED = (
+                        "snapshot_write_cancelled"
+                    )
+                    raise
+                except Exception as write_error:
+                    # A timeout can occur after commit. Read back the exact
+                    # intended payload before retrying or retaining the old head.
+                    try:
+                        record = await selected_store.get_state(
+                            "life_chatter.rolling_context", self.instance_id
+                        )
+                    except BaseException:
+                        self.__class__._GLOBAL_ROLLING_CONTEXT_RECOVERY_REQUIRED = (
+                            "snapshot_write_outcome_unknown"
+                        )
+                        raise
+                    if (
+                        record is not None
+                        and int(record.revision) == expected_revision + 1
+                        and record.payload == data
+                    ):
+                        logger.warning("滚动上下文保存回执丢失，已核实相同版本和正文")
+                    elif (
+                        (record is None and latest is None)
+                        or (
+                            record is not None
+                            and latest is not None
+                            and int(record.revision) == expected_revision
+                            and record.payload == latest.payload
+                        )
+                    ):
+                        raise RuntimeError("RollingContextSnapshotSaveFailed") from write_error
+                    else:
+                        self.__class__._GLOBAL_ROLLING_CONTEXT_RECOVERY_REQUIRED = (
+                            "snapshot_write_outcome_conflict"
+                        )
+                        raise RuntimeError("RollingContextRecoveryRequired") from write_error
+                if (
+                    record is None
+                    or int(record.revision) != expected_revision + 1
+                    or record.payload != data
+                ):
+                    self.__class__._GLOBAL_ROLLING_CONTEXT_RECOVERY_REQUIRED = (
+                        "snapshot_commit_receipt_invalid"
+                    )
+                    raise RuntimeError("RollingContextRecoveryRequired")
                 self.__class__._GLOBAL_ROLLING_CONTEXT_REVISION = int(record.revision)
                 self._rolling_context_state_revision = int(record.revision)
             finally:
@@ -3240,26 +3348,28 @@ class LifeChatter(BaseChatter):
                         pass
             return
 
-        tmp_path: Path | None = None
         try:
             path = self._rolling_context_snapshot_path()
-            tmp_path = path.with_suffix(path.suffix + ".tmp")
             await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
             await asyncio.to_thread(
-                tmp_path.write_text,
+                write_synced_context_file,
+                path,
                 json.dumps(
                     data, ensure_ascii=False, separators=(",", ":"), default=str
                 ),
-                encoding="utf-8",
             )
-            await asyncio.to_thread(os.replace, tmp_path, path)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"保存 life_chatter 滚动上下文快照失败: {exc}")
-            try:
-                if tmp_path is not None:
-                    await asyncio.to_thread(tmp_path.unlink, missing_ok=True)
-            except Exception:
-                pass
+        except asyncio.CancelledError:
+            self.__class__._GLOBAL_ROLLING_CONTEXT_RECOVERY_REQUIRED = (
+                "local_snapshot_write_cancelled"
+            )
+            raise
+        except Exception as exc:
+            # The worker may have replaced the destination before reporting an
+            # error. Never let the old live chain overwrite that possible commit.
+            self.__class__._GLOBAL_ROLLING_CONTEXT_RECOVERY_REQUIRED = (
+                "local_snapshot_write_failed"
+            )
+            raise RuntimeError("RollingContextSnapshotSaveFailed") from exc
 
     def _get_life_service(self) -> LifeEngineService | None:
         """获取 life_engine 服务实例。"""
@@ -3576,12 +3686,46 @@ class LifeChatter(BaseChatter):
 
     # ── system prompt ────────────────────────────────────────
 
+    async def _refresh_subject_system_prompt(
+        self,
+        response: Any,
+        service: LifeEngineService | None,
+    ) -> None:
+        """Refresh only the owned SYSTEM prefix at a model-turn boundary.
+
+        The global request outlives file writes and chatter instances. Read the
+        selected authority again before every model/follow-up round, without
+        rebuilding its rolling history, tools or context-manager state. A read
+        failure or an ambiguous SYSTEM owner must never send the cached prefix.
+        """
+
+        self._assert_rolling_context_writable()
+        payloads = response.payloads
+        system_indices = [
+            index for index, payload in enumerate(payloads)
+            if payload.role == ROLE.SYSTEM
+        ]
+        if len(system_indices) != 1:
+            raise RuntimeError("SubjectSystemPromptOwnerMismatch")
+        index = system_indices[0]
+        previous = payloads[index]
+        if len(previous.content) != 1 or not isinstance(previous.content[0], Text):
+            raise RuntimeError("SubjectSystemPromptContentMismatch")
+
+        system_text = await self._build_chat_system_prompt(service, None)
+        if not system_text:
+            raise RuntimeError("SubjectSystemPromptAuthorityUnavailable")
+        if previous.content[0].text != system_text:
+            # Do not append: that would leave two conflicting authority views.
+            # The kernel context manager owns policies, not a second payload list.
+            payloads[index] = LLMPayload(ROLE.SYSTEM, Text(system_text))
+
     async def _build_chat_system_prompt(
         self,
         service: LifeEngineService | None,
         chat_stream: ChatStream | None = None,
     ) -> str:
-        """构建 100% 静态可缓存前缀提示词。"""
+        """从当前主体权威构建流无关前缀；源文件未变时保持稳定。"""
 
         # SOUL/USER/MEMORY 来自唯一绑定的权威源；EXISTENCE.md / TOOLS.md
         # 是工作区里的固定提示词，和日记一样由主体自己改。
@@ -3592,12 +3736,9 @@ class LifeChatter(BaseChatter):
             # 没有灵魂就不说话
             return ""
 
-        memory_text = ""
-        memory_raw = texts.get("MEMORY.md", "")
-        if memory_raw:
-            memory_data = analyze_memory_text(memory_raw)
-            if memory_data.raw_text:
-                memory_text = render_memory_prompt(memory_data, mode="chat")
+        # The current authority is not a ranked or section-limited projection.
+        # Keep the complete text, including custom sections and tail-only edits.
+        memory_text = texts.get("MEMORY.md", "")
         existence_text = self._load_workspace_markdown(service, "EXISTENCE.md")
         tools_text = self._load_workspace_markdown(service, "TOOLS.md")
 
@@ -3986,6 +4127,18 @@ class LifeChatter(BaseChatter):
                 "force_reply": self._should_force_reply_for_unread_batch(
                     unread_msgs
                 ),
+            }
+
+        if not bool(
+            getattr(self._get_chatter_config_section(), "router_enabled", True)
+        ):
+            # Only bypass the front selector. The normal expression workflow
+            # still owns subject authority, input delivery, tools and waiting.
+            # No Router model ran, so there is no Router activity to record.
+            return {
+                "reason": "前置 Router 已停用，消息交给主体表达链自行判断",
+                "should_respond": True,
+                "force_reply": False,
             }
 
         service = self._get_life_service()
@@ -5303,7 +5456,7 @@ class LifeChatter(BaseChatter):
 
     @staticmethod
     def _is_visible_reply_action(call_name: str) -> bool:
-        """判断是否为面向用户的可见回复动作（用于 must_reply 兜底判断）。"""
+        """判断是否为面向用户的可见回复动作（用于本轮是否已有主体可见表达）。"""
         normalized = str(call_name or "").strip().lower()
         return normalized in {
             _SEND_TEXT,
@@ -5320,15 +5473,7 @@ class LifeChatter(BaseChatter):
     def _is_context_stewardship_call(call_name: str) -> bool:
         """Allow only exact-group reads and the subject checkpoint in recovery."""
 
-        normalized = str(call_name or "").strip().lower()
-        if normalized.startswith("action-"):
-            normalized = normalized[7:]
-        elif normalized.startswith("tool-"):
-            normalized = normalized[5:]
-        return normalized in {
-            "author_self_continuity_checkpoint",
-            "read_context_group",
-        }
+        return is_context_stewardship_tool_name(call_name)
 
     @classmethod
     def _is_proactive_trigger_message(cls, message: Message) -> bool:
@@ -5604,12 +5749,12 @@ class LifeChatter(BaseChatter):
         decision: dict[str, Any],
         unread_msgs: list[Message],
     ) -> bool:
-        """路由层已判定要响应时，标记需要在 max_rounds 兜底前闭合可见回复。
+        """路由层已判定要响应时，标记这批外部输入已接入表达层。
 
         路由器只负责判断这批外部消息是否值得接入主对话。一旦它返回
         should_respond=true，后续主模型可以自由 think / 调用工具 / 多轮，
-        但如果一直到 max_rounds 都没产生可见回复，则发一条最小兜底，
-        避免对外界消息完全沉默。
+        并被提醒作出可追溯选择（发送或 pass_and_wait）。若一直到
+        max_rounds 仍没有主体可见回复，本轮 fail closed，禁止代写对外正文。
         """
 
         if not bool(decision.get("should_respond", False)):
@@ -5620,60 +5765,18 @@ class LifeChatter(BaseChatter):
         return cls._should_force_reply_for_unread_batch(unread_msgs)
 
     @staticmethod
-    def _build_must_reply_fallback_text(unread_msgs: list[Message]) -> str:
-        """模型在 max_rounds 内未产生可见回复时的最小兜底。
+    def _close_must_reply_without_subject_speech(rt: _WorkflowRuntime) -> None:
+        """max_rounds 仍无主体可见回复时 fail closed，禁止代写对外正文。"""
 
-        内容保持短确认，不替模型续写复杂表达，避免把主体性兜底变成规则化代答。
-        """
-        latest_text = ""
-        if unread_msgs:
-            latest = unread_msgs[-1]
-            latest_text = str(
-                getattr(latest, "processed_plain_text", None)
-                or getattr(latest, "content", "")
-                or ""
-            ).strip()
-
-        if latest_text and len(latest_text) <= 12:
-            return "在呢，我看到你啦。"
-        return "我看到你的消息了。"
-
-    async def _send_must_reply_fallback(
-        self,
-        chat_stream: ChatStream,
-        unread_msgs: list[Message],
-    ) -> bool:
-        from src.app.plugin_system.api.send_api import send_text
-
-        stream_id = str(
-            getattr(chat_stream, "stream_id", "")
-            or getattr(self, "stream_id", "")
-            or ""
-        ).strip()
-        if not stream_id:
-            return False
-
-        platform = (
-            str(
-                getattr(chat_stream, "platform", "")
-                or (getattr(unread_msgs[-1], "platform", "") if unread_msgs else "")
-                or ""
-            ).strip()
-            or None
+        if not rt.must_reply:
+            return
+        if rt.sent_visible_reply:
+            rt.must_reply = False
+            return
+        logger.warning(
+            "max_rounds 内未产生可见回复；禁止发送最小兜底，本轮以无对外表达收束"
         )
-        content = self._build_must_reply_fallback_text(unread_msgs)
-
-        try:
-            ok = await send_text(content, stream_id=stream_id, platform=platform)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"must_reply 兜底发送失败: {exc}", exc_info=True)
-            return False
-
-        if ok:
-            logger.warning(f"max_rounds 内未产生可见回复，已发送最小兜底: {content}")
-        else:
-            logger.warning("max_rounds 内未产生可见回复，最小兜底回复发送失败")
-        return bool(ok)
+        rt.must_reply = False
 
     @staticmethod
     def _ensure_unique_tool_call_ids(call_list: list[Any]) -> None:
@@ -6179,6 +6282,14 @@ class LifeChatter(BaseChatter):
 
             # ── MODEL_TURN / FOLLOW_UP ───────────────────
             if rt.phase in (_Phase.MODEL_TURN, _Phase.FOLLOW_UP):
+                try:
+                    await self._refresh_subject_system_prompt(rt.response, service)
+                except Exception as error:
+                    logger.error(
+                        "life_chatter subject authority refresh failed: "
+                        f"error_type={type(error).__name__}"
+                    )
+                    return Failure("life_chatter subject authority refresh failed", error)
                 initial_turn = rt.phase == _Phase.MODEL_TURN
                 # Keep the pre-delta state for failure rollback. The request may
                 # include newly fetched unread media, but a failed turn must not
@@ -6198,7 +6309,7 @@ class LifeChatter(BaseChatter):
                     rt.response,
                     strip_wake_envelopes=False,
                 )
-                self._maybe_compact_runtime_context(rt.response)
+                await self._maybe_compact_runtime_context(rt.response)
                 pending_runtime_delivery: Any | None = None
                 if initial_turn:
                     try:
@@ -6441,6 +6552,8 @@ class LifeChatter(BaseChatter):
                             await complete_active_initiative_outreach("failed")
                         return Failure(failure_message, error)
 
+                if isolate_model_checkpoint_output(rt.response):
+                    self._register_chatter_live_context(rt.response)
                 recovery_projection_used = consume_subject_context_recovery_marker(
                     rt.response
                 )
@@ -6637,17 +6750,13 @@ class LifeChatter(BaseChatter):
                             "life_chatter reached max rounds without a terminal choice"
                         )
                         await complete_active_initiative_outreach("failed")
-                        if rt.must_reply:
-                            await self._send_must_reply_fallback(
-                                chat_stream, rt.unreads
-                            )
-                            rt.must_reply = False
+                        self._close_must_reply_without_subject_speech(rt)
                         if self._has_tool_result_tail(llm_response):
                             llm_response.add_payload(
                                 LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT))
                             )
                         self._transition(rt, _Phase.WAIT_USER, "max rounds reached")
-                        self._maybe_compact_runtime_context(llm_response)
+                        await self._maybe_compact_runtime_context(llm_response)
                         await self._save_rolling_context_snapshot(llm_response)
                         return Wait()
                     # must_reply 且本轮输出了独白却没发消息 → 立即提醒
@@ -6671,21 +6780,19 @@ class LifeChatter(BaseChatter):
                             "不要再输出空文本或 __SUSPEND__。）",
                         )
                     self._transition(rt, _Phase.FOLLOW_UP, "empty turn, continue loop")
-                    self._maybe_compact_runtime_context(llm_response)
+                    await self._maybe_compact_runtime_context(llm_response)
                     await self._save_rolling_context_snapshot(llm_response)
                     return Success("follow-up scheduled")
 
                 logger.debug(f"本轮调用: {[c.name for c in call_list]}")
 
-                # Minecraft is an embodied, stateful boundary. A visible reply
-                # emitted in the same assistant turn cannot have observed the
-                # status/start/do receipt yet, so executing it would let the
-                # model promise success before the body actually moved. Run the
-                # embodied call, append every tool result, and force one causal
-                # follow-up before any user-visible claim is delivered.
-                minecraft_result_before_visible_reply = any(
-                    str(getattr(item, "name", "") or "").strip().lower()
-                    in _MINECRAFT_CAUSAL_TOOL_NAMES
+                # A same-turn visible reply has not observed the declared
+                # stateful operation's result. Defer delivery until the model
+                # receives every tool receipt and chooses a follow-up response.
+                stateful_result_before_visible_reply = any(
+                    requires_result_before_reply(
+                        str(getattr(item, "name", "") or "").strip().lower()
+                    )
                     for item in call_list
                 )
 
@@ -6710,10 +6817,15 @@ class LifeChatter(BaseChatter):
                 terminal_initiative_outcome = "failed"
                 activity_outcomes: dict[str, dict[str, Any]] = {}
                 if trigger_msg is not None:
+                    trigger_msg.extra["consciousness_instance_id"] = (
+                        source_instance_id
+                    )
+                    trigger_msg.extra["source_instance_id"] = source_instance_id
                     trigger_msg.extra["life_turn_scope"] = {
                         "stream_id": stream_id,
                         "turn_key": rt.active_unread_turn_key,
                         "consciousness_instance_id": source_instance_id,
+                        "source_instance_id": source_instance_id,
                         "conscious_activity_ids": dict(activity_ids),
                         "autonomy_occurrences": autonomy_occurrences,
                         "initiative_outreach_occurrences": (
@@ -6957,7 +7069,7 @@ class LifeChatter(BaseChatter):
                         continue
 
                     if (
-                        minecraft_result_before_visible_reply
+                        stateful_result_before_visible_reply
                         and self._is_visible_reply_action(str(call_name or ""))
                     ):
                         await flush_parallel_calls()
@@ -6966,10 +7078,9 @@ class LifeChatter(BaseChatter):
                                 ROLE.TOOL_RESULT,
                                 ToolResult(
                                     value=(
-                                        "本轮同时包含 Minecraft 具身调用；这条可见回复未发送。"
-                                        "请先读取本轮全部 Minecraft 工具回执，再在下一轮基于"
-                                        "真实结果行动或回复：未启动就调用 start，启动成功后再"
-                                        "确认已进入，失败则说明精确阻断。"
+                                        "本轮同时包含有状态场景调用；这条可见回复未发送。"
+                                        "请先读取本轮全部场景工具回执，再在下一轮基于"
+                                        "真实结果决定后续行动或回复；失败时说明精确阻断。"
                                     ),
                                     call_id=call.id,
                                     name=call_name,
@@ -6977,7 +7088,7 @@ class LifeChatter(BaseChatter):
                             )
                         )
                         logger.info(
-                            "life_chatter 已延后同轮可见回复，等待 Minecraft 回执续轮"
+                            "life_chatter 已延后同轮可见回复，等待场景回执续轮"
                         )
                         continue
 
@@ -7285,7 +7396,7 @@ class LifeChatter(BaseChatter):
                 )
 
                 if compression_turn_required:
-                    checkpoint_result = self._maybe_compact_runtime_context(
+                    checkpoint_result = await self._maybe_compact_runtime_context(
                         llm_response
                     )
                     checkpoint_installed = bool(
@@ -7362,7 +7473,7 @@ class LifeChatter(BaseChatter):
                         _Phase.WAIT_USER,
                         f"terminal tool failure: {terminal_tool_failure}",
                     )
-                    self._maybe_compact_runtime_context(llm_response)
+                    await self._maybe_compact_runtime_context(llm_response)
                     await self._save_rolling_context_snapshot(llm_response)
                     logger.warning(
                         "life_chatter 已终止不可继续的工具操作: "
@@ -7377,7 +7488,7 @@ class LifeChatter(BaseChatter):
                             LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT))
                         )
                     self._transition(rt, _Phase.WAIT_USER, "pass_and_wait")
-                    self._maybe_compact_runtime_context(llm_response)
+                    await self._maybe_compact_runtime_context(llm_response)
                     await self._save_rolling_context_snapshot(llm_response)
                     return Wait()
 
@@ -7395,7 +7506,7 @@ class LifeChatter(BaseChatter):
                         _Phase.WAIT_USER,
                         "visible action delivery unknown",
                     )
-                    self._maybe_compact_runtime_context(llm_response)
+                    await self._maybe_compact_runtime_context(llm_response)
                     await self._save_rolling_context_snapshot(llm_response)
                     return Wait()
 
@@ -7416,7 +7527,7 @@ class LifeChatter(BaseChatter):
                         else "visible reply sent"
                     )
                     self._transition(rt, _Phase.WAIT_USER, reason)
-                    self._maybe_compact_runtime_context(llm_response)
+                    await self._maybe_compact_runtime_context(llm_response)
                     await self._save_rolling_context_snapshot(llm_response)
                     return Wait()
 
@@ -7428,15 +7539,13 @@ class LifeChatter(BaseChatter):
                         "life_chatter reached max rounds without a terminal choice"
                     )
                     await complete_active_initiative_outreach("failed")
-                    if rt.must_reply and not rt.sent_visible_reply:
-                        await self._send_must_reply_fallback(chat_stream, rt.unreads)
-                        rt.must_reply = False
+                    self._close_must_reply_without_subject_speech(rt)
                     if self._has_tool_result_tail(llm_response):
                         llm_response.add_payload(
                             LLMPayload(ROLE.ASSISTANT, Text(_SUSPEND_TEXT))
                         )
                     self._transition(rt, _Phase.WAIT_USER, "max rounds reached")
-                    self._maybe_compact_runtime_context(llm_response)
+                    await self._maybe_compact_runtime_context(llm_response)
                     await self._save_rolling_context_snapshot(llm_response)
                     return Wait()
 
@@ -7447,7 +7556,7 @@ class LifeChatter(BaseChatter):
                     )
 
                 self._transition(rt, _Phase.FOLLOW_UP, "default loop continue")
-                self._maybe_compact_runtime_context(llm_response)
+                await self._maybe_compact_runtime_context(llm_response)
                 await self._save_rolling_context_snapshot(llm_response)
                 return Success("follow-up scheduled")
 

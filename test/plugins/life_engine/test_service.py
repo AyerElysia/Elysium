@@ -153,10 +153,10 @@ def _heartbeat_result(
         EffectiveContextReceipt(
             delivery_id=delivery_id,
             exact_present=True,
-            expected_utf8_bytes=1,
-            expected_sha256="a" * 64,
-            effective_utf8_bytes=1,
-            effective_sha256="a" * 64,
+            expected_utf8_bytes=len(wake_context.encode("utf-8")),
+            expected_sha256=hashlib.sha256(wake_context.encode("utf-8")).hexdigest(),
+            effective_utf8_bytes=len(wake_context.encode("utf-8")),
+            effective_sha256=hashlib.sha256(wake_context.encode("utf-8")).hexdigest(),
         )
         if delivery_id
         else None
@@ -393,6 +393,7 @@ async def test_memory_behavior_health_marks_missing_selected_runtime_failed(
 
     assert snapshot["status"] == "failed"
     assert snapshot["witness"]["status"] == "disabled"
+    assert snapshot["witness"]["reason"] == "memory_witness_retired"
     assert snapshot["continuity"]["error_type"] == (
         "ContinuityHealthCoherentRuntimeUnavailable"
     )
@@ -1629,6 +1630,57 @@ async def test_heartbeat_failure_keeps_delta_for_retry(
     assert service._state.heartbeat_context_cursor >= event.sequence
 
 
+async def test_opportunity_seen_before_checkpoint_failure_can_retry_new_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _make_service(tmp_path)
+    event = service._event_builder.build_direct_message_event(
+        '{"opportunity_id":"test:retry","meaning":"availability_only"}',
+        stream_id="stream-1",
+    )
+    event.content_type = "opportunity.available"
+    await service._queue_pending_event(event)
+    prepared = await service._prepare_heartbeat_context()
+    assert event.event_id in prepared.selected_event_ids
+    seen = AsyncMock(return_value=1)
+    service._opportunity_runtime = SimpleNamespace(record_seen=seen)
+    original_lock = service._get_lock
+
+    class FailedCheckpointLock:
+        async def __aenter__(self):
+            raise RuntimeError("checkpoint unavailable after seen")
+
+        async def __aexit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(service, "_get_lock", lambda: FailedCheckpointLock())
+    first = _heartbeat_result("", None, prepared.content)
+    with pytest.raises(RuntimeError, match="checkpoint unavailable after seen"):
+        await service._commit_heartbeat_context(
+            prepared, "", "run:1", first.perception_receipt,
+            first.subconscious_receipt, final_request_id="request:1",
+            final_attempt_id="attempt:1", final_completed_at="2026-09-05T00:00:01+00:00",
+        )
+    assert seen.await_count == 1
+    assert not event.heartbeat_context_consumed
+    assert service._state.heartbeat_context_cursor == 0
+    assert service._has_pending_opportunity_context()
+    monkeypatch.setattr(service, "_get_lock", original_lock)
+    second = _heartbeat_result("", None, prepared.content)
+    await service._commit_heartbeat_context(
+        prepared, "", "run:2", second.perception_receipt,
+        second.subconscious_receipt, final_request_id="request:2",
+        final_attempt_id="attempt:2", final_completed_at="2026-09-05T00:00:02+00:00",
+    )
+    assert seen.await_count == 2
+    assert [call.kwargs["final_attempt_id"] for call in seen.await_args_list] == [
+        "attempt:1", "attempt:2",
+    ]
+    assert event.heartbeat_context_consumed
+    assert service._state.heartbeat_context_cursor >= event.sequence
+
+
 async def test_heartbeat_without_world_perception_consumes_delta(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1664,9 +1716,11 @@ async def test_heartbeat_without_world_perception_consumes_delta(
     assert service._state.heartbeat_context_cursor >= event.sequence
 
 
+@pytest.mark.parametrize("forged_matching_hashes", [False, True])
 async def test_heartbeat_without_exact_subconscious_receipt_keeps_delta_pending(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    forged_matching_hashes: bool,
 ) -> None:
     service = _make_service(tmp_path)
     event = service._event_builder.build_direct_message_event(
@@ -1687,7 +1741,12 @@ async def test_heartbeat_without_exact_subconscious_receipt_keeps_delta_pending(
         return HeartbeatModelResult(
             text="看似成功",
             perception_receipt=None,
-            subconscious_receipt=None,
+            subconscious_receipt=(EffectiveContextReceipt(
+                delivery_id=LifeEngineService._subconscious_delivery_identity(wake_context)[0],
+                exact_present=True,
+                expected_utf8_bytes=1, effective_utf8_bytes=1,
+                expected_sha256="a" * 64, effective_sha256="a" * 64,
+            ) if forged_matching_hashes else None),
         )
 
     monkeypatch.setattr(
@@ -1744,6 +1803,7 @@ async def test_heartbeat_compression_unresolved_does_not_consume_delta(
     assert prepared.selected_event_ids == [event.event_id]
     assert event.heartbeat_context_consumed is False
     assert service._state.heartbeat_context_cursor == 0
+    assert getattr(prepared, "consumption_receipt", None) is None
 
 
 async def test_heartbeat_arrival_during_model_is_deferred_to_next_round(
@@ -1948,10 +2008,11 @@ async def test_memory_index_lifecycle_start_toggle_and_stop_close(
         task_id: str | None,
         *,
         timeout: float,
+        strict: bool = False,
     ) -> None:
         if task_id is not None and task_id == service._memory_witness_task_id:
             lifecycle_events.append("witness_wait")
-        await original_await_managed_task(task_id, timeout=timeout)
+        await original_await_managed_task(task_id, timeout=timeout, strict=strict)
 
     monkeypatch.setattr(fake_memory, "close", tracked_close)
     monkeypatch.setattr(service, "_await_managed_task", tracked_await_managed_task)
@@ -1983,6 +2044,44 @@ async def test_memory_index_lifecycle_start_toggle_and_stop_close(
     assert fake_memory.behavior_health_provider is None
     assert fake_memory.close_calls == 1
     assert lifecycle_events.index("witness_wait") < lifecycle_events.index("memory_close")
+
+
+async def test_retired_memory_witness_does_not_start_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_subject_authority(tmp_path)
+    service = _make_service(tmp_path)
+    config = service.plugin.config
+    config.memory_index.enabled = False
+    config.autonomy.enabled = False
+    config.streams.enabled = False
+    config.drives.enabled = False
+    fake_memory = _FakeMemoryIndexService()
+
+    async def fake_init_memory(_integration: object) -> None:
+        service._memory_service = fake_memory  # type: ignore[assignment]
+
+    monkeypatch.setattr(
+        "plugins.life_engine.service.integrations.MemoryIntegration.init_memory_service",
+        fake_init_memory,
+    )
+
+    assert config.memory_witness.enabled is False
+
+    await service.start()
+    try:
+        assert service._memory_witness_task_id is None
+        assert service._memory_witness_coordinator is None
+        snapshot = await service._memory_behavior_health_snapshot()
+        assert snapshot["witness"]["status"] == "disabled"
+        assert snapshot["witness"]["reason"] == "memory_witness_retired"
+        assert fake_memory.behavior_health_provider is not None
+    finally:
+        await service.stop()
+
+    assert service._memory_witness_task_id is None
+    assert service._memory_witness_coordinator is None
 
 
 async def test_selected_storage_disables_legacy_shared_sync_without_bridge(

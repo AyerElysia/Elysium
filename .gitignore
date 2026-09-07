@@ -164,6 +164,10 @@ plugins/commands_plugin/**/__pycache__/
 plugins/commands_plugin/**/*.py[cod]
 !plugins/proactive_message_plugin/
 !plugins/skill_manager/
+!plugins/minecraft/
+!plugins/minecraft/**
+plugins/minecraft/**/__pycache__/
+plugins/minecraft/**/*.py[cod]
 
 # Runtime/local skills are discovered by plugins/skill_manager.
 skill/*

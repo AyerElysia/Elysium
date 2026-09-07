@@ -77,6 +77,22 @@ def _service_plugin(config: LifeEngineConfig | None = None) -> SimpleNamespace:
     )
 
 
+def _bind_synthetic_subject_prefix(monkeypatch, chatter, response) -> None:
+    """Give drive-only fakes the owned prefix a real global request always has.
+
+    Authority refresh itself is exercised here; exact selected-store reads and
+    failures are covered by test_chatter_subject_prompt_refresh.py.
+    """
+
+    prefix = "synthetic driver-test subject prefix"
+    response.payloads.insert(0, LLMPayload(ROLE.SYSTEM, Text(prefix)))
+
+    async def build_prefix(*_args, **_kwargs):
+        return prefix
+
+    monkeypatch.setattr(chatter, "_build_chat_system_prompt", build_prefix)
+
+
 async def _skip_snapshot_save(_response: object) -> None:
     """替换 ``_save_rolling_context_snapshot`` 的异步空实现。
 
@@ -122,7 +138,7 @@ async def test_life_chatter_system_prompt_includes_memory_and_chatter_tools_not_
             [
                 "# 值得记住的事",
                 "",
-                "这里是一大段给编辑者看的说明，不该原样注入。",
+                "主体自己写下的章节前说明，也应完整保留。",
                 "",
                 "### Durable（持久）",
                 "- MEMORY_DURABLE",
@@ -150,8 +166,8 @@ async def test_life_chatter_system_prompt_includes_memory_and_chatter_tools_not_
     assert "USER_CONTENT" in prompt
     assert "MEMORY_DURABLE" in prompt
     assert "MEMORY_ACTIVE" in prompt
-    assert "MEMORY_FADING" not in prompt
-    assert "给编辑者看的说明" not in prompt
+    assert "MEMORY_FADING" in prompt
+    assert "主体自己写下的章节前说明，也应完整保留。" in prompt
     assert "TOOL_CONTENT" not in prompt
     assert "EXISTENCE_CONTENT" in prompt
     assert "CHATTER_TOOLS_CONTENT" in prompt
@@ -756,7 +772,7 @@ async def test_context_checkpoint_install_resumes_with_user_control_frame(
         )
         return True, True
 
-    def fake_install_checkpoint(target):
+    async def fake_install_checkpoint(target):
         target.payloads = [
             LLMPayload(ROLE.USER, Text("仍待处理的当前消息")),
             LLMPayload(ROLE.ASSISTANT, Text("主体亲自写下的连续性检查点")),
@@ -996,6 +1012,7 @@ def test_life_chatter_snapshot_compaction_keeps_payload_when_over_budget() -> No
 async def test_life_chatter_snapshot_save_failure_does_not_mutate_runtime(
     tmp_path, monkeypatch, failure_stage
 ) -> None:
+    LifeChatter.reset_global_runtime()
     config = LifeEngineConfig()
     config.settings.workspace_path = str(tmp_path)
     config.chatter.rolling_context_snapshot_char_budget = 1_000
@@ -1013,23 +1030,25 @@ async def test_life_chatter_snapshot_save_failure_does_not_mutate_runtime(
     original_contents = [payload.content for payload in original_payloads]
 
     compactable_response = SimpleNamespace(payloads=list(payloads))
-    result = chatter._maybe_compact_runtime_context(compactable_response)
-    assert result.triggered is False
+    result = await chatter._maybe_compact_runtime_context(compactable_response)
+    assert result is None
     assert compactable_response.payloads == payloads
 
     if failure_stage == "mkdir":
         monkeypatch.setattr(Path, "mkdir", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("mkdir")))
     elif failure_stage == "write":
-        monkeypatch.setattr(Path, "write_text", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("write")))
+        monkeypatch.setattr(Path, "open", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("write")))
     else:
         monkeypatch.setattr(chatter_module.os, "replace", lambda *_args: (_ for _ in ()).throw(OSError("replace")))
 
-    await chatter._save_rolling_context_snapshot(response)
+    with pytest.raises(RuntimeError, match="RollingContextSnapshotSaveFailed"):
+        await chatter._save_rolling_context_snapshot(response)
 
     assert response.payloads is original_list
     assert response.payloads == original_payloads
     assert all(actual is expected for actual, expected in zip(response.payloads, original_payloads, strict=True))
     assert all(payload.content is content for payload, content in zip(response.payloads, original_contents, strict=True))
+    LifeChatter.reset_global_runtime()
 
 
 async def test_life_chatter_global_runtime_is_reused(monkeypatch) -> None:
@@ -1212,6 +1231,7 @@ async def _drive_router_false_case(
     LifeChatter._GLOBAL_RUNTIME = rt
     LifeChatter._GLOBAL_USABLE_MAP = {}
     chatter = _life_chatter_for_config(config)
+    _bind_synthetic_subject_prefix(monkeypatch, chatter, request)
     chat_stream = SimpleNamespace(
         stream_id="stream-a",
         stream_name="Test",
@@ -1244,7 +1264,7 @@ async def _drive_router_false_case(
     monkeypatch.setattr(chatter, "_build_dynamic_context_text", no_dynamic_context)
     monkeypatch.setattr(chatter, "flush_unreads", flush_unreads)
     monkeypatch.setattr(chatter, "_await_model_turn", immediate_model_turn)
-    monkeypatch.setattr(chatter, "_maybe_compact_runtime_context", lambda _response: None)
+    monkeypatch.setattr(chatter, "_maybe_compact_runtime_context", _skip_snapshot_save)
     monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", _skip_snapshot_save)
     monkeypatch.setattr(
         "src.kernel.concurrency.get_watchdog",
@@ -1303,7 +1323,9 @@ async def test_life_chatter_router_false_without_observable_media_flushes_and_wa
 
     assert isinstance(result, Wait)
     assert request.send_calls == 0
-    assert request.payloads == []
+    assert request.payloads == [
+        LLMPayload(ROLE.SYSTEM, Text("synthetic driver-test subject prefix"))
+    ]
     assert flushed == [unread]
 
 
@@ -2457,6 +2479,7 @@ async def test_life_chatter_follow_up_response_is_sent_once_without_initial_comm
     )
     monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
     monkeypatch.setattr(chatter, "flush_unreads", fail_flush_unreads)
+    _bind_synthetic_subject_prefix(monkeypatch, chatter, response)
     monkeypatch.setattr(chatter, "_await_model_turn", immediate_model_turn)
     monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", _skip_snapshot_save)
 
@@ -2843,7 +2866,7 @@ async def test_initiative_outreach_claims_before_send_and_commits_exact_terminal
 
     monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
     monkeypatch.setattr(chatter, "run_tool_call", fake_run_tool_call)
-    monkeypatch.setattr(chatter, "_maybe_compact_runtime_context", lambda _response: None)
+    monkeypatch.setattr(chatter, "_maybe_compact_runtime_context", _skip_snapshot_save)
     monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", _skip_snapshot_save)
     monkeypatch.setattr(
         "src.kernel.concurrency.get_watchdog",
@@ -2925,7 +2948,7 @@ async def test_life_chatter_delivery_unknown_ends_turn_without_retry(
 
     monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
     monkeypatch.setattr(chatter, "run_tool_call", fake_run_tool_call)
-    monkeypatch.setattr(chatter, "_maybe_compact_runtime_context", lambda _response: None)
+    monkeypatch.setattr(chatter, "_maybe_compact_runtime_context", _skip_snapshot_save)
     monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", _skip_snapshot_save)
     monkeypatch.setattr(
         "src.kernel.concurrency.get_watchdog",
@@ -3015,7 +3038,7 @@ async def test_life_chatter_terminal_platform_failure_ends_turn(
 
     monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
     monkeypatch.setattr(chatter, "run_tool_call", fake_run_tool_call)
-    monkeypatch.setattr(chatter, "_maybe_compact_runtime_context", lambda _response: None)
+    monkeypatch.setattr(chatter, "_maybe_compact_runtime_context", _skip_snapshot_save)
     monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", _skip_snapshot_save)
     monkeypatch.setattr(
         "src.kernel.concurrency.get_watchdog",
@@ -3095,16 +3118,12 @@ async def test_life_chatter_recent_duplicate_reply_is_suppressed_and_ends_turn(m
     async def fail_run_tool_call(*_args, **_kwargs):
         raise AssertionError("duplicate reply must not reach the sender")
 
-    fallback_called = False
-
-    async def fail_fallback(*_args, **_kwargs):
-        nonlocal fallback_called
-        fallback_called = True
-        return True
+    async def fail_send_text(*_args, **_kwargs):
+        raise AssertionError("must not send a must_reply fallback")
 
     monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
     monkeypatch.setattr(chatter, "run_tool_call", fail_run_tool_call)
-    monkeypatch.setattr(chatter, "_send_must_reply_fallback", fail_fallback)
+    monkeypatch.setattr("src.app.plugin_system.api.send_api.send_text", fail_send_text)
     monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", _skip_snapshot_save)
 
     result = await chatter._drive_global_runtime_until_yield(
@@ -3116,7 +3135,6 @@ async def test_life_chatter_recent_duplicate_reply_is_suppressed_and_ends_turn(m
     assert rt.phase == _Phase.WAIT_USER
     assert rt.sent_visible_reply is False
     assert rt.must_reply is False
-    assert fallback_called is False
 
     LifeChatter.reset_global_runtime()
 
@@ -3160,11 +3178,11 @@ async def test_life_chatter_external_media_empty_turn_uses_standard_follow_up(mo
     async def fake_fetch_unreads():
         return [], []
 
-    async def fail_fallback(*_args, **_kwargs):
+    async def fail_send_text(*_args, **_kwargs):
         raise AssertionError("a first empty turn must schedule a normal follow-up")
 
     monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
-    monkeypatch.setattr(chatter, "_send_must_reply_fallback", fail_fallback)
+    monkeypatch.setattr("src.app.plugin_system.api.send_api.send_text", fail_send_text)
     monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", _skip_snapshot_save)
 
     result = await chatter._drive_global_runtime_until_yield(
@@ -3326,8 +3344,30 @@ def test_life_chatter_recent_visible_text_reply_cache_is_scoped_and_expires() ->
     assert LifeChatter._was_recent_visible_text_reply(rt, same_turn, now=401.0) is False
 
 
-async def test_life_chatter_must_reply_fallback_at_max_rounds(monkeypatch) -> None:
-    """must_reply 在 max_rounds 仍未产生可见回复时，发最小兜底。"""
+def test_life_chatter_close_must_reply_without_subject_speech_does_not_author() -> None:
+    rt = _WorkflowRuntime(
+        response=SimpleNamespace(payloads=[]),
+        phase=_Phase.TOOL_EXEC,
+        history_merged=True,
+        unreads=[],
+        cross_round_seen_signatures=set(),
+        unread_msgs_to_flush=[],
+        must_reply=True,
+        sent_visible_reply=False,
+    )
+
+    LifeChatter._close_must_reply_without_subject_speech(rt)
+
+    assert rt.must_reply is False
+    assert rt.sent_visible_reply is False
+    assert not hasattr(LifeChatter, "_send_must_reply_fallback")
+    assert not hasattr(LifeChatter, "_build_must_reply_fallback_text")
+
+
+async def test_life_chatter_must_reply_at_max_rounds_does_not_send_fallback(
+    monkeypatch,
+) -> None:
+    """must_reply 在 max_rounds 仍未产生可见回复时 fail closed，禁止代写。"""
 
     LifeChatter.reset_global_runtime()
 
@@ -3364,24 +3404,16 @@ async def test_life_chatter_must_reply_fallback_at_max_rounds(monkeypatch) -> No
     chatter = LifeChatter.__new__(LifeChatter)
     chatter.plugin = SimpleNamespace(config=None)
     chatter.stream_id = "stream-a"
-    sent: dict[str, object] = {}
 
     async def fake_fetch_unreads():
         return [], []
 
-    async def fake_send_text(content, stream_id, platform=None, reply_to=None):
-        sent.update(
-            {
-                "content": content,
-                "stream_id": stream_id,
-                "platform": platform,
-                "reply_to": reply_to,
-            }
-        )
-        return True
+    async def fail_send_text(*_args, **_kwargs):
+        raise AssertionError("must not send a must_reply fallback")
 
     monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
-    monkeypatch.setattr("src.app.plugin_system.api.send_api.send_text", fake_send_text)
+    monkeypatch.setattr("src.app.plugin_system.api.send_api.send_text", fail_send_text)
+    monkeypatch.setattr(chatter, "_save_rolling_context_snapshot", _skip_snapshot_save)
     monkeypatch.setattr(chatter, "_get_max_rounds", lambda: 5)
 
     result = await chatter._drive_global_runtime_until_yield(
@@ -3392,12 +3424,7 @@ async def test_life_chatter_must_reply_fallback_at_max_rounds(monkeypatch) -> No
     assert isinstance(result, Wait)
     assert rt.phase == _Phase.WAIT_USER
     assert rt.must_reply is False
-    assert sent == {
-        "content": "在呢，我看到你啦。",
-        "stream_id": "stream-a",
-        "platform": "feishu",
-        "reply_to": None,
-    }
+    assert rt.sent_visible_reply is False
 
     LifeChatter.reset_global_runtime()
 
@@ -3947,6 +3974,7 @@ async def test_life_chatter_model_turn_timeout_releases_runtime_owner(monkeypatc
     monkeypatch.setattr(concurrency, "get_watchdog", lambda: DummyWatchDog())
     monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
     monkeypatch.setattr(chatter, "_get_model_turn_timeout", lambda: 0.01)
+    _bind_synthetic_subject_prefix(monkeypatch, chatter, request)
 
     result = await chatter._drive_global_runtime_until_yield(
         SimpleNamespace(stream_id="stream-a"),
@@ -3966,7 +3994,8 @@ async def test_life_chatter_model_turn_timeout_releases_runtime_owner(monkeypatc
     assert rt.media_seen == set()
     assert rt.must_reply is False
     assert rt.sent_visible_reply is False
-    assert [part.text for part in request.payloads[0].content] == ["existing"]
+    assert [payload.role for payload in request.payloads] == [ROLE.SYSTEM, ROLE.USER]
+    assert [part.text for part in request.payloads[1].content] == ["existing"]
 
     LifeChatter.reset_global_runtime()
 
@@ -4060,6 +4089,7 @@ async def test_life_chatter_cursor_persistence_cancellation_keeps_flushed_turn(
 
     monkeypatch.setattr(stream_manager_module, "get_stream_manager", lambda: DummyStreamManager())
     monkeypatch.setattr(chatter, "_get_life_service", lambda: CancellingService())
+    _bind_synthetic_subject_prefix(monkeypatch, chatter, response)
     monkeypatch.setattr(chatter, "fetch_unreads", fake_fetch_unreads)
     monkeypatch.setattr(chatter, "flush_unreads", fake_flush_unreads)
     monkeypatch.setattr(chatter, "_await_model_turn", immediate_model_turn)
@@ -4079,7 +4109,10 @@ async def test_life_chatter_cursor_persistence_cancellation_keeps_flushed_turn(
         for payload in response.payloads
         for part in payload.content
         if isinstance(part, Text)
-    ] == ["older turn", "accepted unread", "completed model response"]
+    ] == [
+        "synthetic driver-test subject prefix",
+        "older turn", "accepted unread", "completed model response",
+    ]
     assert rt.history_merged is True
     assert rt.unread_payloads_before_turn is None
     assert rt.unread_msgs_to_flush == []

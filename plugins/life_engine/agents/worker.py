@@ -50,7 +50,6 @@ _READ_ONLY_TOOL_NAMES: frozenset[str] = frozenset({
     "nucleus_web_search",
     "nucleus_browser_fetch",
     "nucleus_view_screen",
-    "nucleus_minecraft",
     "nucleus_proactive_query",
     "nucleus_schedule",
     "nucleus_list_schedules",

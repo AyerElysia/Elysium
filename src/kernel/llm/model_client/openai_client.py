@@ -160,7 +160,8 @@ def _parse_tool_arguments(args_raw: Any) -> dict[str, Any] | list[Any] | str | i
 def _to_openai_tool(tool: Any) -> dict[str, Any]:
     """将单个 LLMUsable 工具转换为 OpenAI tools 格式。
 
-    自动注入 ``reason`` 必填参数，帮助模型说明选用该工具的原因。
+    默认自动注入 ``reason`` 必填参数；组件可用
+    ``auto_reason_parameter = False`` 显式退出，不改动已声明的参数。
 
     Args:
         tool: 实现了 ``to_schema()`` 的工具对象。
@@ -184,7 +185,8 @@ def _to_openai_tool(tool: Any) -> dict[str, Any]:
     props = params.get("properties", {})
     schema_has_reason = isinstance(props, dict) and "reason" in props
     execute_has_reason = _callable_accepts_reason(getattr(tool, "execute", None))
-    if not schema_has_reason and not execute_has_reason:
+    auto_reason_enabled = getattr(tool, "auto_reason_parameter", True) is not False
+    if auto_reason_enabled and not schema_has_reason and not execute_has_reason:
         props["reason"] = {
             "type": "string",
             "description": "说明你选择此动作/工具的原因",

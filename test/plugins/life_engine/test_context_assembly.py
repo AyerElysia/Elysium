@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from plugins.life_engine.core.context_assembly import (
     AssembledPrompt,
     LifeChatterContextAssembler,
@@ -98,3 +100,70 @@ def test_rolling_payload_upsert_extends_last_user_or_creates_user() -> None:
     assert len(response.payloads) == 1
     assert response.payloads[0].role == ROLE.USER
     assert [part.text for part in response.payloads[0].content] == ["FIRST", "SECOND"]
+
+
+_PREFIX_PARTS = {
+    "soul_text": "SOUL",
+    "user_text": "USER",
+    "memory_text": "MEMORY",
+    "existence_text": "EXISTENCE",
+    "tools_text": "TOOLS",
+    "live_guidance": "LIVE",
+    "primary_tool_guide": "GUIDE",
+}
+_NORMALIZED_PREFIX_PARTS = tuple(
+    name for name in _PREFIX_PARTS if name != "memory_text"
+)
+
+
+@pytest.mark.parametrize("section", _NORMALIZED_PREFIX_PARTS)
+@pytest.mark.parametrize(
+    "empty_value", [None, "", " \r\n\t "], ids=["none", "empty", "whitespace"]
+)
+def test_prefix_normalized_empty_parts_are_skipped_without_reordering(
+    section: str, empty_value: str | None,
+) -> None:
+    parts = {**_PREFIX_PARTS, section: empty_value}
+
+    prompt = LifeChatterContextAssembler.build_prefix_prompt(**parts)
+
+    expected = "\n\n".join(
+        value for name, value in _PREFIX_PARTS.items() if name != section
+    )
+    assert prompt == expected
+
+
+@pytest.mark.parametrize("section", _NORMALIZED_PREFIX_PARTS)
+def test_prefix_other_parts_strip_only_boundary_whitespace(section: str) -> None:
+    body = "fixture  inner\tgap\r\nnext line"
+    parts = {**_PREFIX_PARTS, section: f" \t\r\n{body}\r\n\t "}
+
+    prompt = LifeChatterContextAssembler.build_prefix_prompt(**parts)
+
+    expected = "\n\n".join(
+        body if name == section else value for name, value in _PREFIX_PARTS.items()
+    )
+    assert prompt == expected
+    assert prompt.count(body) == 1
+
+
+@pytest.mark.parametrize("memory", [None, ""], ids=["none", "empty"])
+def test_prefix_absent_memory_is_skipped_without_reordering(memory: str | None) -> None:
+    parts = {**_PREFIX_PARTS, "memory_text": memory}
+
+    prompt = LifeChatterContextAssembler.build_prefix_prompt(**parts)
+
+    expected = "\n\n".join(
+        value for name, value in _PREFIX_PARTS.items() if name != "memory_text"
+    )
+    assert prompt == expected
+
+
+def test_prefix_whitespace_only_memory_is_preserved_verbatim() -> None:
+    memory = " \r\n\t "
+    parts = {**_PREFIX_PARTS, "memory_text": memory}
+
+    prompt = LifeChatterContextAssembler.build_prefix_prompt(**parts)
+
+    assert prompt == "SOUL\n\nUSER\n\n" + memory + "\n\nEXISTENCE\n\nTOOLS\n\nLIVE\n\nGUIDE"
+    assert prompt.count(memory) == 1

@@ -222,15 +222,12 @@ def _normalize_strings(values: list[str] | None) -> set[str]:
     }
 
 
-def _expand_event_types(event_types: list[str] | None) -> tuple[set[str], bool]:
+def _expand_event_types(event_types: list[str] | None) -> tuple[set[str], set[str]]:
     values: set[str] = set()
-    match_minecraft = False
+    namespaces: set[str] = set()
     for item in event_types or []:
         text = str(item or "").strip().lower()
         if not text:
-            continue
-        if text == "minecraft":
-            match_minecraft = True
             continue
         aliases = _EVENT_TYPE_ALIASES.get(text)
         if aliases:
@@ -239,9 +236,9 @@ def _expand_event_types(event_types: list[str] | None) -> tuple[set[str], bool]:
         try:
             text = EventType(text).value
         except ValueError:
-            pass
+            namespaces.add(text)
         values.add(text)
-    return values, match_minecraft
+    return values, namespaces
 
 
 def _is_life_internal_payload(payload: dict[str, Any]) -> bool:
@@ -311,7 +308,7 @@ def _matches_filters(
     stream_filter: set[str],
     include_life_internal: bool,
     type_filter: set[str],
-    match_minecraft: bool,
+    namespaces: set[str],
     exclude_types: set[str],
     exclude_sources: set[str],
     channels: set[str],
@@ -343,23 +340,16 @@ def _matches_filters(
         ):
             return False
     type_candidates = {event_type, content_type, legacy_type}
-    if type_filter and type_candidates.isdisjoint(type_filter):
-        if not (
-            match_minecraft
-            and (
-                source == "minecraft"
-                or content_type.startswith("minecraft")
-                or "minecraft" in content_type
-            )
-        ):
-            return False
-    elif match_minecraft and not type_filter:
-        if not (
-            source == "minecraft"
-            or content_type.startswith("minecraft")
-            or "minecraft" in content_type
-        ):
-            return False
+    namespace_match = any(
+        source == namespace or any(
+            candidate.startswith(namespace + separator)
+            for candidate in (source, content_type)
+            for separator in (".", "_", ":")
+        )
+        for namespace in namespaces
+    )
+    if type_filter and type_candidates.isdisjoint(type_filter) and not namespace_match:
+        return False
     if exclude_types and not type_candidates.isdisjoint(exclude_types):
         return False
     if exclude_sources and source in exclude_sources:
@@ -555,16 +545,16 @@ async def grep_life_events(
     stream_filter = {
         str(sid or "").strip() for sid in (stream_ids or []) if str(sid or "").strip()
     }
-    type_filter, match_minecraft = _expand_event_types(event_types)
-    kind_filter, kind_minecraft = _expand_event_types(kinds)
+    type_filter, namespaces = _expand_event_types(event_types)
+    kind_filter, kind_namespaces = _expand_event_types(kinds)
     content_filter = _normalize_strings(content_types)
     for item in kinds or []:
         text = str(item or "").strip().lower()
-        if text and text not in _EVENT_TYPE_ALIASES and text != "minecraft":
+        if text and text not in _EVENT_TYPE_ALIASES and text not in kind_namespaces:
             content_filter.add(text)
     if kind_filter:
         type_filter |= kind_filter
-    match_minecraft = match_minecraft or kind_minecraft
+    namespaces |= kind_namespaces
     exclude_types, _ = _expand_event_types(exclude_event_types)
     resolved_limit = max(1, min(int(limit or _DEFAULT_LIMIT), _MAX_LIMIT))
     before_ctx = max(0, min(int(context_before or 0), 8))
@@ -639,12 +629,13 @@ async def grep_life_events(
         )
 
     def _payload_identities(payload: dict[str, Any]) -> set[str]:
-        identities: set[str] = set()
+        # Source event IDs may repeat across streams or producers. Only fall
+        # back to that legacy identity when no occurrence identity is present.
         for key in ("occurrence_id", "event_id"):
             value = str(payload.get(key) or "").strip()
             if value:
-                identities.add(value)
-        return identities
+                return {value}
+        return set()
 
     by_identity: dict[str, dict[str, Any]] = {}
     ordered: list[dict[str, Any]] = []
@@ -676,7 +667,7 @@ async def grep_life_events(
         "stream_filter": stream_filter,
         "include_life_internal": bool(include_life_internal),
         "type_filter": type_filter,
-        "match_minecraft": match_minecraft,
+        "namespaces": namespaces,
         "exclude_types": exclude_types,
         "exclude_sources": _normalize_strings(exclude_sources),
         "channels": _normalize_strings(channels),
@@ -765,6 +756,14 @@ async def grep_life_events(
         "order": order,
         "matches": returned,
         "stats": {
+            "ledger_status": (
+                "available" if callable(getattr(store, "scan_window", None))
+                else "unavailable"
+            ),
+            "retrieval_scope": (
+                "ledger_and_runtime" if callable(getattr(store, "scan_window", None))
+                else "runtime_only_incomplete"
+            ),
             "total_events": len(ordered),
             "scanned_events": int(scan_stats.get("scanned_events") or len(ordered)),
             "matched_events": len(matches),
@@ -797,11 +796,12 @@ class LifeEngineGrepEventsTool(BaseTool):
     tool_description: str = (
         "搜索权威 Life Event 账本（不是只搜近期内存投影）。命中只返回节选；"
         "全文用 nucleus_read_event(occurrence_id) 续读。\n"
+        "stats.ledger_status=unavailable 时仅有不完整运行态结果，不能据此判断历史不存在。\n"
         "query 可空：只靠过滤浏览。条件全部可选、可组合，按时间序返回，不按重要性排序。\n"
         "时间：after/before（ISO）、last_hours/last_days、after_position/before_position、"
         "around_occurrence_id。扫不全时 stats.scan_truncated=true，用 scan.next_before_position 继续。\n"
         "窗口：source_instance_ids、stream_ids、cross_stream、channels、sources、chat_types。\n"
-        "种类：event_types 接受原名或别名 thought/tool/chat/minecraft；"
+        "种类：event_types 接受原名或别名 thought/tool/chat 或事件源命名空间；"
         "content_types/kinds；exclude_event_types/exclude_sources。\n"
         "人：person（sender/sender_id/canonical_person_key/actor_id）、sender_ids、senders。\n"
         "工具：tool_names、tool_success、call_id、parent_event_id。\n"
@@ -820,7 +820,7 @@ class LifeEngineGrepEventsTool(BaseTool):
         stream_ids: Annotated[list[str] | None, "限定 stream_id"] = None,
         event_types: Annotated[
             list[str] | None,
-            "事件类型或别名 thought/tool/chat/minecraft",
+            "事件类型或别名 thought/tool/chat 或事件源命名空间",
         ] = None,
         fields: Annotated[list[str] | None, "搜索字段；空则常用文本字段"] = None,
         include_pending: Annotated[bool, "是否包含尚未 checkpoint 的 pending"] = True,
@@ -838,8 +838,8 @@ class LifeEngineGrepEventsTool(BaseTool):
         around_occurrence_id: Annotated[str | None, "先定位该 occurrence 再取邻域"] = None,
         source_instance_ids: Annotated[list[str] | None, "意识实例 id"] = None,
         channels: Annotated[list[str] | None, "chat/life/tool/agent/proactive/system"] = None,
-        sources: Annotated[list[str] | None, "qq/feishu/minecraft/life_engine 等"] = None,
-        chat_types: Annotated[list[str] | None, "private/group/minecraft"] = None,
+        sources: Annotated[list[str] | None, "事件来源标识，如 qq/feishu/life_engine"] = None,
+        chat_types: Annotated[list[str] | None, "private/group 或场景通道标识"] = None,
         content_types: Annotated[list[str] | None, "精确 content_type/kind"] = None,
         kinds: Annotated[list[str] | None, "content_type 别名，同 content_types"] = None,
         exclude_event_types: Annotated[list[str] | None, "排除的类型或别名"] = None,
@@ -1021,13 +1021,23 @@ async def _read_authoritative_event(
     if not identity:
         raise ValueError("occurrence_id 不能为空")
     store = service._get_life_event_store()
+    get_by_occurrence_id = getattr(store, "get_by_occurrence_id", None)
     get_by_event_id = getattr(store, "get_by_event_id", None)
-    if callable(get_by_event_id):
-        event = await get_by_event_id(identity)
+    lookup = (
+        get_by_occurrence_id
+        if callable(get_by_occurrence_id)
+        else get_by_event_id
+    )
+    if callable(lookup):
+        event = await lookup(identity)
         if event is None:
             return None, {"occurrence_id": identity}
+        if str(getattr(event, "occurrence_id", "") or "") != identity:
+            # Legacy getters may match a source_event_id too. Never let that
+            # convenience alias return a different immutable occurrence.
+            raise RuntimeError("authoritative Life Event occurrence read mismatch")
         return event, {
-            "occurrence_id": str(getattr(event, "occurrence_id", "") or identity),
+            "occurrence_id": identity,
             "position": int(getattr(event, "sequence", 0) or 0),
             "content_sha256": sha256_json(
                 {"content": _authoritative_event_content(event)}

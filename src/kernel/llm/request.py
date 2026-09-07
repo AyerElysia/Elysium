@@ -17,6 +17,7 @@ import json
 import math
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any, Self
 
 from src.kernel.llm.payload.tooling import LLMUsable
@@ -928,6 +929,12 @@ class LLMRequest:
                     if _state.get("recorded"):
                         return
                     _state["recorded"] = True
+                    if stream_error is None:
+                        # Public, content-free identity of this completed attempt.
+                        # A failed stream never supplies a success identity.
+                        response_obj.final_request_id = request_id
+                        response_obj.final_attempt_id = _attempt_id
+                        response_obj.final_completed_at = datetime.now(UTC).isoformat()
                     record_attempt(
                         attempt_id=_attempt_id,
                         parent_attempt_id=_parent_attempt_id,

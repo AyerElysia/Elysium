@@ -3,9 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import os
-import stat
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -14,6 +11,15 @@ from .subject_contracts import (
     AppendSubjectDocumentVersion,
     SubjectDocumentCommit,
     SubjectDocumentStorePort,
+    SubjectProjectionTask,
+)
+from .workspace_file_io import (
+    WorkspaceFileConflict,
+    WorkspaceFileError,
+    project_exact_bytes,
+    read_exact_bytes,
+    remove_exact_bytes,
+    run_workspace_file_io,
 )
 
 _DECLARED_ROOTS = {
@@ -78,6 +84,8 @@ class SubjectProjectionResult:
     logical_path: str = ""
     version_id: str = ""
     detail: str = ""
+    outbox_id: int = 0
+    head_event_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,7 +133,12 @@ def _encoding_and_newlines(content: bytes) -> tuple[str | None, str | None]:
 
 
 class SubjectWorkspaceProjector:
-    """Materialize authoritative heads without overwriting unknown bytes."""
+    """Project exact lifecycle tasks inside the store's authority write fence.
+
+    Filesystem projection is recoverable, not atomic with the database commit.
+    Confirmation/failure writes happen after leaving the fence; task identity and
+    idempotent exact-byte helpers make the commit-to-confirm gap retryable.
+    """
 
     def __init__(
         self,
@@ -143,48 +156,163 @@ class SubjectWorkspaceProjector:
             raise ValueError("projector worker and positive lease are required")
 
     @staticmethod
-    def _hash(path: Path) -> str:
-        digest = hashlib.sha256()
-        with path.open("rb") as handle:
-            for block in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(block)
-        return digest.hexdigest()
+    def _projection_path(logical_path: str) -> str:
+        path = normalize_subject_path(logical_path)
+        if not path.startswith(("life_engine_workspace/", "notes/", "diaries/")):
+            raise WorkspaceFileError("projection_path_outside_workspace_namespace")
+        return path
 
     @staticmethod
-    def _replace_exact(path: Path, content: bytes) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        existing_mode = None
-        if path.exists():
-            existing_mode = stat.S_IMODE(path.stat().st_mode)
-        descriptor, temporary_name = tempfile.mkstemp(
-            dir=path.parent,
-            prefix=f".{path.name}.elysium-subject-",
+    def _result(
+        task: SubjectProjectionTask, status: str, detail: str = ""
+    ) -> SubjectProjectionResult:
+        return SubjectProjectionResult(
+            status=status,
+            logical_path=task.logical_path,
+            version_id=task.version_id,
+            outbox_id=task.outbox_id,
+            head_event_id=task.head_event_id,
+            detail=detail,
         )
-        temporary = Path(temporary_name)
+
+    async def _current_target(self, task: SubjectProjectionTask) -> bool:
+        head = await self.store.get_document_head(task.document_id)
+        binding = await self.store.get_path_binding(task.logical_path)
+        if head is None:
+            raise WorkspaceFileError("projection_document_head_missing")
+        if binding is None:
+            raise WorkspaceFileError("projection_path_binding_missing")
+        if task.binding_revision <= 0:
+            raise WorkspaceFileError("projection_binding_revision_missing")
+        if (
+            head.document_id != task.document_id
+            or head.logical_path != task.logical_path
+            or head.current_version_id != task.version_id
+            or head.binding_revision != task.binding_revision
+            or binding.revision != task.binding_revision
+        ):
+            return False
+        if task.operation == "delete":
+            return head.deleted and binding.document_id is None
+        return not head.deleted and binding.document_id == task.document_id
+
+    async def _source_released(self, task: SubjectProjectionTask) -> bool:
+        if not task.previous_logical_path or task.previous_binding_revision <= 0:
+            raise WorkspaceFileError("projection_source_release_identity_missing")
+        binding = await self.store.get_path_binding(task.previous_logical_path)
+        if binding is None:
+            raise WorkspaceFileError("projection_source_binding_missing")
+        return (
+            binding.document_id is None
+            and binding.revision == task.previous_binding_revision
+        )
+
+    async def _previous_hash(self, task: SubjectProjectionTask) -> str:
+        if not task.previous_version_id or not task.previous_content_hash:
+            raise WorkspaceFileError("projection_previous_version_identity_missing")
+        version = await self.store.get_version(task.previous_version_id)
+        if (
+            version.document_id != task.document_id
+            or version.content_hash != task.previous_content_hash
+            or hashlib.sha256(version.content_bytes).hexdigest()
+            != task.previous_content_hash
+        ):
+            raise WorkspaceFileError("projection_previous_version_hash_mismatch")
+        return task.previous_content_hash
+
+    async def _read_optional(self, logical_path: str) -> bytes | None:
         try:
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(content)
-                handle.flush()
-                os.fsync(handle.fileno())
-            if existing_mode is not None:
-                os.chmod(temporary, existing_mode)
-            os.replace(temporary, path)
-            try:
-                directory_fd = os.open(path.parent, os.O_RDONLY)
-            except (OSError, PermissionError):
-                # Windows does not permit opening directories with os.open.
-                # The file itself has already been flushed, fsynced and atomically
-                # replaced; directory fsync remains a best-effort POSIX durability
-                # enhancement rather than a reason to mark projection failed.
-                directory_fd = None
-            if directory_fd is not None:
-                try:
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
-        finally:
-            if temporary.exists():
-                temporary.unlink()
+            return await run_workspace_file_io(
+                read_exact_bytes, self.data_root, logical_path
+            )
+        except FileNotFoundError:
+            return None
+
+    async def _project_claimed(
+        self, task: SubjectProjectionTask
+    ) -> SubjectProjectionResult:
+        if task.operation not in {"write", "copy", "rename", "delete"}:
+            raise WorkspaceFileError("projection_operation_unsupported")
+        if not task.head_event_id or task.outbox_id <= 0:
+            raise WorkspaceFileError("projection_exact_task_identity_missing")
+        target = self._projection_path(task.logical_path)
+        version = await self.store.get_version(task.version_id)
+        if (
+            version.document_id != task.document_id
+            or version.content_hash != task.content_hash
+            or hashlib.sha256(version.content_bytes).hexdigest() != task.content_hash
+        ):
+            raise WorkspaceFileError("authoritative version bytes/hash mismatch")
+        if not await self._current_target(task):
+            return self._result(task, "superseded")
+
+        if task.operation == "delete":
+            if task.previous_logical_path != task.logical_path:
+                raise WorkspaceFileError("projection_delete_source_path_mismatch")
+            if not await self._source_released(task):
+                return self._result(task, "superseded")
+            previous_hash = await self._previous_hash(task)
+            await run_workspace_file_io(
+                remove_exact_bytes,
+                self.data_root,
+                target,
+                expected_hash=previous_hash,
+            )
+            if await self._read_optional(target) is not None:
+                raise WorkspaceFileConflict("projection_delete_path_still_present")
+            return self._result(task, "deleted")
+
+        # The configured root is trusted configuration; descendant traversal is
+        # always performed by the rooted helper, including the first projection.
+        await run_workspace_file_io(self.data_root.mkdir, parents=True, exist_ok=True)
+        existing = await self._read_optional(target)
+        already_equal = existing == version.content_bytes
+        parent_hash: str | None = None
+        if task.operation == "write" and version.parent_version_id:
+            parent = await self.store.get_version(version.parent_version_id)
+            if (
+                parent.document_id != task.document_id
+                or hashlib.sha256(parent.content_bytes).hexdigest()
+                != parent.content_hash
+            ):
+                raise WorkspaceFileError("projection_parent_version_hash_mismatch")
+            parent_hash = parent.content_hash
+        # Rename/copy destinations are no-clobber, even when the source version
+        # happens to have a parent. They do not authorize replacing target bytes.
+        await run_workspace_file_io(
+            project_exact_bytes,
+            self.data_root,
+            target,
+            version.content_bytes,
+            expected_parent_hash=parent_hash,
+        )
+        await run_workspace_file_io(
+            read_exact_bytes,
+            self.data_root,
+            target,
+            expected_hash=task.content_hash,
+        )
+        if not await self._current_target(task):
+            raise WorkspaceFileConflict("projection_binding_changed_inside_fence")
+        if task.operation == "rename":
+            source = self._projection_path(task.previous_logical_path)
+            if source == target:
+                raise WorkspaceFileError("projection_rename_source_equals_target")
+            previous_hash = await self._previous_hash(task)
+            if not await self._source_released(task):
+                return self._result(task, "renamed", "previous_path_rebound_preserved")
+            await run_workspace_file_io(
+                remove_exact_bytes,
+                self.data_root,
+                source,
+                expected_hash=previous_hash,
+            )
+            if await self._read_optional(source) is not None:
+                raise WorkspaceFileConflict("projection_rename_source_still_present")
+            return self._result(task, "renamed")
+        return self._result(
+            task, "confirmed_existing" if already_equal else "projected"
+        )
 
     async def project_one(
         self,
@@ -199,60 +327,32 @@ class SubjectWorkspaceProjector:
         if task is None:
             return SubjectProjectionResult(status="idle")
         try:
-            version = await self.store.get_version(task.version_id)
-            if (
-                version.content_hash != task.content_hash
-                or hashlib.sha256(version.content_bytes).hexdigest()
-                != task.content_hash
-            ):
-                raise RuntimeError("authoritative version bytes/hash mismatch")
-            head = await self.store.get_head(task.logical_path)
-            if head is None:
-                raise RuntimeError("authoritative document head is missing")
-            if head.current_version_id != task.version_id:
-                await self.store.confirm_projection(task, worker_id=self.worker_id)
-                return SubjectProjectionResult(
-                    status="superseded",
-                    logical_path=task.logical_path,
-                    version_id=task.version_id,
-                )
-            path = _safe_workspace_path(self.data_root, task.logical_path)
-            if path.exists() and self._hash(path) == task.content_hash:
-                await self.store.confirm_projection(task, worker_id=self.worker_id)
-                return SubjectProjectionResult(
-                    status="confirmed_existing",
-                    logical_path=task.logical_path,
-                    version_id=task.version_id,
-                )
-            if version.parent_version_id:
-                parent = await self.store.get_version(version.parent_version_id)
-                if not path.exists() or self._hash(path) != parent.content_hash:
-                    raise RuntimeError(
-                        "workspace bytes diverged from the authoritative parent"
-                    )
-            elif path.exists():
-                raise RuntimeError("new authoritative document would overwrite bytes")
-            self._replace_exact(path, version.content_bytes)
-            if self._hash(path) != task.content_hash:
-                raise RuntimeError("workspace verification failed after projection")
+            fence = getattr(self.store, "workspace_projection_fence", None)
+            if not callable(fence):
+                raise WorkspaceFileError("workspace_projection_fence_unavailable")
+            async with fence():
+                result = await self._project_claimed(task)
             await self.store.confirm_projection(task, worker_id=self.worker_id)
-            return SubjectProjectionResult(
-                status="projected",
-                logical_path=task.logical_path,
-                version_id=task.version_id,
-            )
+            return result
         except Exception as exc:  # noqa: BLE001 - persist bounded worker failure
+            # Storage/OS exceptions can carry SQL parameters or private bytes.
+            # Only our content-free workspace diagnostics are safe to surface.
+            detail = (
+                f"{type(exc).__name__}: {exc}"
+                if isinstance(exc, WorkspaceFileError)
+                else type(exc).__name__
+            )
+            if (
+                isinstance(exc, WorkspaceFileConflict)
+                and str(exc) == "workspace_predecessor_hash_mismatch"
+            ):
+                detail += "; workspace bytes diverged from the authoritative parent"
             await self.store.fail_projection(
                 task,
                 worker_id=self.worker_id,
-                error=f"{type(exc).__name__}: {exc}",
+                error=detail,
             )
-            return SubjectProjectionResult(
-                status="failed",
-                logical_path=task.logical_path,
-                version_id=task.version_id,
-                detail=f"{type(exc).__name__}: {exc}",
-            )
+            return self._result(task, "failed", detail)
 
 
 class SubjectWorkspaceObserver:

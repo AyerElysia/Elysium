@@ -26,7 +26,12 @@ from .indexing import (
     transaction,
     write_active_chunk_index_state,
 )
-from .nodes import NodeType, compute_content_hash, generate_file_node_id
+from .nodes import (
+    NodeType,
+    compute_content_hash,
+    generate_file_node_id,
+    generate_subject_file_node_id,
+)
 from .search import EmbeddingResult, embed_texts
 from .sqlite_runtime import run_db
 
@@ -48,6 +53,11 @@ class _ChunkPayload:
     chunk_index: int
     chunk_hash: str
     content: str
+    document_id: str = ""
+    version_id: str = ""
+    document_revision: int = 0
+    binding_revision: int = 0
+    content_sha256: str = ""
 
 
 def _job_identity(job: IndexJob) -> _IndexJobIdentity:
@@ -335,9 +345,18 @@ def _is_active_embeddable_file_node(node: sqlite3.Row | None) -> bool:
     if str(node["node_type"] or "").lower() != NodeType.FILE.value:
         return False
     decision = assess_indexed_document_path(node["file_path"])
+    source_id = str(node["subject_document_id"] or "") if "subject_document_id" in set(node.keys()) else ""
+    expected_id = generate_subject_file_node_id(source_id) if source_id else generate_file_node_id(decision.path)
+    if source_id and (
+        not node["subject_version_id"]
+        or int(node["subject_document_revision"] or 0) <= 0
+        or int(node["subject_binding_revision"] or 0) <= 0
+        or len(str(node["subject_content_sha256"] or "")) != 64
+    ):
+        return False
     return bool(
         decision.eligible
-        and str(node["node_id"] or "") == generate_file_node_id(decision.path)
+        and str(node["node_id"] or "") == expected_id
     )
 
 
@@ -399,6 +418,11 @@ def _payloads_for_job(
                 chunk_index=chunk_index,
                 chunk_hash=chunk_hash,
                 content=content,
+                document_id=str(node["subject_document_id"] or ""),
+                version_id=str(node["subject_version_id"] or ""),
+                document_revision=int(node["subject_document_revision"] or 0),
+                binding_revision=int(node["subject_binding_revision"] or 0),
+                content_sha256=str(node["subject_content_sha256"] or ""),
             )
         )
     return payloads, None
@@ -415,7 +439,7 @@ def _load_job_payloads(
     for job in jobs:
         identity = index_job_report_identity(job)
         node = db.execute(
-            "SELECT node_id, node_type, file_path, title, content_hash, index_revision, is_deleted "
+            "SELECT * "
             "FROM memory_nodes WHERE node_id = ?",
             (job.node_id,),
         ).fetchone()
@@ -514,7 +538,7 @@ def _revalidate_payloads(
             identity = _job_identity(job)
             report_identity = index_job_report_identity(job)
             node = db.execute(
-                "SELECT node_id, node_type, file_path, title, content_hash, index_revision, is_deleted "
+                "SELECT * "
                 "FROM memory_nodes WHERE node_id = ?",
                 (job.node_id,),
             ).fetchone()
@@ -658,7 +682,7 @@ def _complete_jobs(
             identity = _job_identity(job)
             report_identity = index_job_report_identity(job)
             node_row = db.execute(
-                "SELECT node_id, node_type, file_path, title, content_hash, index_revision, is_deleted "
+                "SELECT * "
                 "FROM memory_nodes WHERE node_id = ?",
                 (job.node_id,),
             ).fetchone()
@@ -1160,6 +1184,13 @@ async def process_index_jobs(
             "chunk_hash": payload.chunk_hash,
             "document_hash": payload.document_hash,
             "index_revision": payload.index_revision,
+            **({
+                "document_id": payload.document_id,
+                "version_id": payload.version_id,
+                "document_revision": payload.document_revision,
+                "binding_revision": payload.binding_revision,
+                "content_sha256": payload.content_sha256,
+            } if payload.document_id else {}),
             "embedding_model": model_name,
             "embedding_dimension": dimension,
             "chunk_index": payload.chunk_index,

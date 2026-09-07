@@ -197,8 +197,8 @@ async def test_minecraft_controls_are_pinned_to_independent_bot_body() -> None:
             return {"success": True}
 
     session = Session()
-    service = SimpleNamespace(minecraft_session=session)
-    catalog = ElysiumDataCatalog(lambda: service)
+    service = SimpleNamespace(session=session)
+    catalog = ElysiumDataCatalog(minecraft_provider=lambda: service)
 
     status = await catalog.minecraft_status()
     preflight = await catalog.minecraft_preflight()

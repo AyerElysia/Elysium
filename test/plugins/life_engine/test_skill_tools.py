@@ -16,10 +16,13 @@ def _make_tool(tmp_path: Path) -> tuple[LifeEngineSkillTool, SkillStore]:
     config = LifeEngineConfig()
     config.settings.workspace_path = str(tmp_path)
     store = SkillStore(tmp_path)
+    async def run_operation(tool: Any, *, mutate: bool, operation: Any) -> Any:
+        return operation(store)
+
     plugin = SimpleNamespace(
         config=config,
         service=SimpleNamespace(
-            _learning_scheduler=SimpleNamespace(skill_store=store)
+            run_procedural_skill_operation=run_operation,
         ),
     )
     return LifeEngineSkillTool(plugin=cast(Any, plugin)), store

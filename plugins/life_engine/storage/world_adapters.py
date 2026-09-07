@@ -672,7 +672,7 @@ class SQLWorldProjectionStore:
                 "THEN CAST(value_json AS CHAR) ELSE NULL END"
             )
             transport_echo = """
-                domain = 'minecraft' AND predicate = 'embodied_trace'
+                predicate = 'embodied_trace'
                 AND JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.value.trace_kind')) = 'intent.issued'
                 AND JSON_CONTAINS_PATH(
                     payload_json,
@@ -687,7 +687,7 @@ class SQLWorldProjectionStore:
                 "THEN value_json ELSE NULL END"
             )
             transport_echo = """
-                domain = 'minecraft' AND predicate = 'embodied_trace'
+                predicate = 'embodied_trace'
                 AND json_extract(payload_json, '$.value.trace_kind') = 'intent.issued'
                 AND json_type(
                     payload_json,
@@ -815,9 +815,7 @@ class SQLWorldProjectionStore:
                 AND JSON_UNQUOTE(JSON_EXTRACT(
                     payload_json, '$.assertion.value.trace_kind'
                 )) = 'intent.issued'
-                AND JSON_UNQUOTE(JSON_EXTRACT(
-                    payload_json, '$.assertion.domain'
-                )) = 'minecraft'
+
                 AND JSON_UNQUOTE(JSON_EXTRACT(
                     payload_json, '$.assertion.predicate'
                 )) = 'embodied_trace'
@@ -838,7 +836,7 @@ class SQLWorldProjectionStore:
                 AND json_extract(
                     payload_json, '$.assertion.value.trace_kind'
                 ) = 'intent.issued'
-                AND json_extract(payload_json, '$.assertion.domain') = 'minecraft'
+
                 AND json_extract(
                     payload_json, '$.assertion.predicate'
                 ) = 'embodied_trace'

@@ -2,6 +2,31 @@
 
 > 状态：v1 生产候选设计。它刻意保留扩展接缝，不把当前三种技术决定形状当作爱莉思维的永久分类。真实生产结论必须经过运行手册中的现场端到端验收。
 
+## 独立插件边界
+
+实现位于 `plugins/minecraft/`，不是 `life_engine` 的子包。入口为 `plugin.py`，
+插件名 `minecraft`，配置位于 `config/plugins/minecraft/config.toml` 的 `[settings]`。
+`MinecraftService` 唯一持有 session；插件依赖 `life_engine:service:life_engine`，
+但游戏是否启用不依赖 Learning。加载只创建未启动的会话，只有明确的 `start`
+工具调用才进入游戏；插件卸载关闭自己的会话，关闭失败保留 owner/句柄以供重试。
+组件管理器多次请求服务句柄不会制造第二个 session。
+
+`life_engine` 只提供公共的 `workspace_directory`、意识/Presence 生命周期、主体投影、
+近期潜意识、模型活动、世界观察与 `append_external_event`。它不导入 Minecraft、
+不持有游戏配置或会话，也不定义游戏事件 schema。`events.py` 在新插件内完成
+MC schema 到统一 Life Event 的适配，原 occurrence、source、content type、
+instance/session/stream 与原始正文全部保持兼容；不迁移或改写历史数据库、主体文件。
+
+工具名仍为 `nucleus_minecraft`，组件签名改为 `minecraft:tool:nucleus_minecraft`。
+插件启用时通过通用 `SceneExtension` 登记场景工具清单、聊天入口、证据预算和
+“回执先于同轮可见回复”的约束；禁用/正常卸载后撤销这些声明，不向核心默认清单
+注入游戏能力。控制台通过独立游戏服务查询状态，不再读取 LifeEngineService 上的游戏字段。
+历史事件检索支持通用来源命名空间，因此插件未加载时仍可检索已有游戏经历。
+
+旧配置通过显式 `python -m plugins.minecraft.config_migration` 检查，追加 `--apply`
+才迁移；原 life_engine 配置生成逐字节备份，自定义值不变，新旧配置冲突时拒绝覆盖。
+完整步骤和回滚边界见生产运行手册。
+
 ## 为什么需要独立运行时
 
 Minecraft 是持续、高频、带身体后果的场景。核心 heartbeat 负责主体的长期生命节奏，不能因为进入游戏就被缩短为五秒循环；具身 planner 负责把一个既有意图变成可核验动作，也不应该反过来替主体决定想做什么。
@@ -30,6 +55,8 @@ Agent / Bot / Biomimetic Body
 严格顺序是：加载并验证 `projection_kind=minecraft` 的主体投影，启动/连接身体并通过 playable 判定，注册 Presence，打开 scene，最后创建专属意识受管任务。任一步失败都按逆序清理已经取得的资源。
 
 主体投影同时覆盖 `SOUL.md`、`USER.md` 和 `MEMORY.md` 的预算化派生视图。运行时固定其 source digest、projection hash、version、算法、UTF-8 字节数和预算；身份正文为空、来源缺失、profile 不匹配、哈希无效或字节不一致都会拒绝启动，不能改用临时 persona。
+
+共享选定存储中的主体投影版本键包含 profile、字节预算、projection version 与 source digest：`minecraft.bytes-8192.v1-<digest>`。本地文件目录原本已按预算隔离，因此文件名保持兼容。读取旧的 profile-only 或无 profile 键时，只有 profile、预算、来源、哈希及完整包装校验通过才逐字节复制到新键；旧记录不修改。同一 profile 的旧 16 KiB 投影不能作为新 8 KiB 投影使用，新预算缺少版本时由既有主体投影生成链生成。历史固定版本也使用同一兼容读取路径，不回退到当前主体正文。
 
 ## 一个轮次看到什么
 
@@ -70,7 +97,9 @@ Agent / Bot / Biomimetic Body
 
 专属意识已经读取过近期潜意识，因此它发出的高层任务不会再复制同一正文。外部工具直接发出的 MC 意图是另一个 frontier，仍可读取一次有界近期潜意识。两条入口通过同一 intent lock 和 BodyGate 串行，避免 planner 与专属意识争抢身体。
 
-游戏身体事件采用“先落账、后确认”：bot 把事件留在有界 journal，session 取 FIFO 头并写入当前 Minecraft instance 的 Life Event，成功后才发送 ACK 并唤醒 scene。控制器断开时监听器继续等待同一认证身体；未 ACK 事件原 ID/序列重放，ACK 丢失但已消费的事件只补 ACK。这样聊天不会因 WebSocket 抖动丢失，也不会因重连被回答两次。
+游戏身体事件采用“先落账、后确认”：bot/native agent 把事件留在有界内存 journal，session 取 FIFO 头并写入当前 Minecraft instance 的 Life Event，成功后才发送 ACK 并唤醒 scene。控制器断开时监听器继续等待同一认证身体；未 ACK 事件原 ID/序列重放，ACK 丢失但已消费的事件只补 ACK。连接重建会重放未确认事件；共享账本按 occurrence 幂等。内存 journal 不等于跨游戏进程崩溃的耐久队列，不能宣称已验证进程崩溃零丢失或所有外部回复恰好一次。
+
+`MinecraftService` 向 session 注入身体事件 recorder，再调用共享的 `LifeEngineService.append_external_event`。单一异步锁串行处理 event ID；最多 256 项缓存仅淘汰已经成功的事件，写入结果不确定的事件保留原对象等待重试。缓存淘汰或服务重启后，recorder 从当前选定 Life Event store 按 occurrence 查询原记录，核对内容和 instance/session/stream 归因并复用原 source sequence；同 ID 异载荷明确报冲突。统一落账和 pending checkpoint 完成前不标记成功、不允许 ACK。缓存全为待确认写入时显式报告容量错误，不丢失待处理事件。
 
 ## 停止、超时与恢复
 

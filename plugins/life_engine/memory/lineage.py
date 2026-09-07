@@ -12,17 +12,9 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
-from .edges import EdgeType, MemoryEdge, row_to_edge
+from .edges import EdgeType
 from .sqlite_runtime import run_db
 
-
-LINEAGE_EDGE_TYPES = {
-    EdgeType.CONTINUES,
-    EdgeType.REFINES,
-    EdgeType.CORRECTS,
-    EdgeType.RENAMES,
-    EdgeType.REINTERPRETS,
-}
 
 CANONICAL_EDGE_TYPES = {
     EdgeType.RENAMES,
@@ -43,6 +35,13 @@ class MemoryEvidence:
     relation: str = ""
     relation_reason: str = ""
     exists: bool = True
+    node_id: str = ""
+    document_id: str = ""
+    version_id: str = ""
+    document_revision: int = 0
+    binding_revision: int = 0
+    content_sha256: str = ""
+    file_ref: str = ""
 
 
 @dataclass
@@ -56,6 +55,13 @@ class MemoryTrace:
     reason: str = ""
     direction: str = "later"
     exists: bool = True
+    node_id: str = ""
+    document_id: str = ""
+    version_id: str = ""
+    document_revision: int = 0
+    binding_revision: int = 0
+    content_sha256: str = ""
+    file_ref: str = ""
 
 
 @dataclass
@@ -83,6 +89,9 @@ class MemoryBundle:
     history_trace: list[MemoryTrace] = field(default_factory=list)
     corrections: list[MemoryCorrection] = field(default_factory=list)
     uncertainty: str = ""
+    primary_node_id: str = ""
+    primary_document_id: str = ""
+    primary_version_id: str = ""
 
 
 def row_to_correction(row: sqlite3.Row) -> MemoryCorrection:
@@ -195,40 +204,5 @@ async def list_memory_corrections(
                     break
 
         return [row_to_correction(row) for row in rows[:limit]]
-
-    return await run_db(_do_db_work)
-
-
-async def get_lineage_edges(
-    db: sqlite3.Connection,
-    node_id: str,
-    min_weight: float = 0.0,
-) -> tuple[list[MemoryEdge], list[MemoryEdge]]:
-    """获取某个节点的演化出边和入边。"""
-    edge_values = [edge_type.value for edge_type in LINEAGE_EDGE_TYPES]
-    placeholders = ",".join("?" for _ in edge_values)
-
-    def _do_db_work() -> tuple[list[MemoryEdge], list[MemoryEdge]]:
-        cursor = db.cursor()
-        cursor.execute(
-            f"""
-            SELECT * FROM memory_edges
-            WHERE source_id = ? AND weight >= ? AND edge_type IN ({placeholders})
-            ORDER BY weight DESC, created_at DESC
-            """,
-            (node_id, min_weight, *edge_values),
-        )
-        outgoing = [row_to_edge(row) for row in cursor.fetchall()]
-
-        cursor.execute(
-            f"""
-            SELECT * FROM memory_edges
-            WHERE target_id = ? AND weight >= ? AND edge_type IN ({placeholders})
-            ORDER BY weight DESC, created_at DESC
-            """,
-            (node_id, min_weight, *edge_values),
-        )
-        incoming = [row_to_edge(row) for row in cursor.fetchall()]
-        return outgoing, incoming
 
     return await run_db(_do_db_work)

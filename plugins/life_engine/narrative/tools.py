@@ -9,8 +9,7 @@ from src.app.plugin_system.api import log_api
 from src.app.plugin_system.base import BaseTool
 
 from ..core.config import LifeEngineConfig
-from ..trace.store import LifeTraceStore
-from .store import AUTOBIOGRAPHY_REL_PATH, NarrativeStore
+from .store import AUTOBIOGRAPHY_REL_PATH
 
 logger = log_api.get_logger("life_engine.narrative")
 
@@ -72,6 +71,9 @@ class LifeEngineWriteNarrativeTool(BaseTool):
             service = getattr(self.plugin, "service", None)
             if service is None:
                 raise RuntimeError("LifeEngineServiceUnavailable")
+            from ..opportunity.legacy_gate import require_optional_capability
+
+            await require_optional_capability(service, "life.narrative_review")
             store = service.narrative_store()
             state = await store.load_state()
             records = await service.life_trace_store().recent(limit=500)

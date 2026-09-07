@@ -74,6 +74,12 @@ class SearchResult:
     association_path: List[str] = field(default_factory=list)
     association_reason: str = ""
     score_kind: str = "rank"
+    node_id: str = ""
+    document_id: str = ""
+    version_id: str = ""
+    document_revision: int = 0
+    binding_revision: int = 0
+    content_sha256: str = ""
 
 
 @dataclass(frozen=True)
@@ -217,6 +223,11 @@ class _LoadedNode:
     source_mtime: float | None
     created_at: float
     preview_content: str
+    subject_document_id: str = ""
+    subject_version_id: str = ""
+    subject_document_revision: int = 0
+    subject_binding_revision: int = 0
+    subject_content_sha256: str = ""
 
 
 # ============================================================
@@ -1547,9 +1558,13 @@ async def get_node_by_id(db: sqlite3.Connection, node_id: str) -> Optional[Memor
         row = cursor.fetchone()
         if row is None:
             return None
+        node = row_to_node(row)
+        if node.subject_document_id:
+            # Exact stable IDs remain readable after retirement. Current path
+            # lookup and ranked retrieval separately exclude deleted projections.
+            return node
         if "is_deleted" in row.keys() and bool(row["is_deleted"]):
             return None
-        node = row_to_node(row)
         if (
             node.node_type == NodeType.FILE
             and not is_eligible_indexed_document_path(node.file_path)
@@ -1564,6 +1579,15 @@ async def get_snippet(db: sqlite3.Connection, node_id: str) -> str:
     """获取节点内容摘要，优先读取新分块表。"""
 
     def _do_db_work() -> str:
+        if "subject_document_id" in _table_columns(db, "memory_nodes"):
+            source = db.execute(
+                "SELECT subject_document_id, is_deleted FROM memory_nodes WHERE node_id = ?",
+                (node_id,),
+            ).fetchone()
+            if source is not None and source["subject_document_id"] and bool(source["is_deleted"]):
+                # Retained chunks can predate a now-opaque source version. Do
+                # not label their old text with the current source version.
+                return ""
         if _table_exists(db, "memory_chunks"):
             row = db.execute(
                 "SELECT content FROM memory_chunks WHERE node_id = ? "
@@ -1596,32 +1620,35 @@ class LineageNodeView:
     file_path: str
     title: str
     snippet: str
+    subject_document_id: str = ""
+    subject_version_id: str = ""
+    subject_document_revision: int = 0
+    subject_binding_revision: int = 0
+    subject_content_sha256: str = ""
+    is_deleted: bool = False
 
 
 async def get_lineage_node_views(
     db: sqlite3.Connection,
     node_ids: Iterable[str],
 ) -> Dict[str, LineageNodeView]:
-    """批量取回可见节点及其摘要。
+    """按确切节点 ID 批量取回历史视图，不把路径复用当作身份连续。
 
-    可见性判定与 :func:`get_node_by_id` 完全一致：已删除的节点、以及路径不再
-    合规的文件节点都不会出现在结果里；摘要的生成方式与 :func:`get_snippet`
-    一致。区别只在往返次数——原先每条血缘边要两次查询，现在整批一次。
+    已退役的节点仍返回并带 ``is_deleted``，只供明确血缘/历史读取；当前路径
+    与排序召回另行过滤退役节点。旧 legacy 摘要原样保留；退役 managed 摘要
+    为空，避免把 retained chunks 的旧文本冒充当前不可索引版本。
 
     Args:
         db: SQLite 连接。
         node_ids: 待取回的节点 ID，重复项自动去重。
 
     Returns:
-        Dict[str, LineageNodeView]: node_id 到视图的映射。不可见的节点不在其中，
-        调用方据此判断该节点应被跳过。
+        Dict[str, LineageNodeView]: exact node_id 到历史视图的映射；不合规路径仍排除。
     """
 
     def _do_db_work() -> Dict[str, LineageNodeView]:
         views: Dict[str, LineageNodeView] = {}
         for node_id, node in _load_nodes_by_ids(db, node_ids).items():
-            if node.is_deleted:
-                continue
             if node.node_type == NodeType.FILE.value and not is_eligible_indexed_document_path(
                 node.file_path
             ):
@@ -1630,7 +1657,16 @@ async def get_lineage_node_views(
                 node_id=node.node_id,
                 file_path=node.file_path,
                 title=node.title,
-                snippet=_make_snippet(node.preview_content, ""),
+                snippet=(
+                    "" if node.subject_document_id and node.is_deleted
+                    else _make_snippet(node.preview_content, "")
+                ),
+                subject_document_id=node.subject_document_id,
+                subject_version_id=node.subject_version_id,
+                subject_document_revision=node.subject_document_revision,
+                subject_binding_revision=node.subject_binding_revision,
+                subject_content_sha256=node.subject_content_sha256,
+                is_deleted=node.is_deleted,
             )
         return views
 
@@ -1661,12 +1697,19 @@ def _load_nodes_by_ids(
         else "NULL"
     )
     node_type_expr = "n.node_type" if "node_type" in columns else "'file'"
+    source_columns = (
+        "subject_document_id", "subject_version_id", "subject_document_revision",
+        "subject_binding_revision", "subject_content_sha256",
+    )
+    source_expr = ", ".join(
+        f"n.{name}" if name in columns else f"NULL AS {name}" for name in source_columns
+    )
     rows = db.execute(
         f"""
         SELECT n.node_id, {node_type_expr} AS node_type, n.file_path, n.title,
                {event_expr} AS event_date, {deleted_expr} AS is_deleted,
                {mtime_expr} AS source_mtime, n.created_at,
-               COALESCE({chunk_expr}, {fts_expr}, '') AS preview_content
+               COALESCE({chunk_expr}, {fts_expr}, '') AS preview_content, {source_expr}
         FROM memory_nodes AS n
         WHERE n.node_id IN ({placeholders})
         """,
@@ -1683,6 +1726,11 @@ def _load_nodes_by_ids(
             source_mtime=float(row["source_mtime"]) if row["source_mtime"] is not None else None,
             created_at=float(row["created_at"] or 0.0),
             preview_content=str(row["preview_content"] or ""),
+            subject_document_id=str(row["subject_document_id"] or ""),
+            subject_version_id=str(row["subject_version_id"] or ""),
+            subject_document_revision=int(row["subject_document_revision"] or 0),
+            subject_binding_revision=int(row["subject_binding_revision"] or 0),
+            subject_content_sha256=str(row["subject_content_sha256"] or ""),
         )
         for row in rows
     }
@@ -1740,7 +1788,7 @@ def _node_matches_filters(
         return False
     if not _matches_file_type(node.file_path, file_types):
         return False
-    if not _workspace_file_exists(workspace_path, node.file_path):
+    if not node.subject_document_id and not _workspace_file_exists(workspace_path, node.file_path):
         return False
     if explicit_date is not None:
         if _node_event_date(node) != explicit_date:
@@ -1750,44 +1798,6 @@ def _node_matches_filters(
         if effective_date is None or effective_date < cutoff_date:
             return False
     return True
-
-
-async def filter_results(
-    db: sqlite3.Connection,
-    results: List[Tuple[str, float]],
-    file_types: Optional[List[str]] = None,
-    time_range_days: int = 0,
-    *,
-    now: date | datetime | None = None,
-    workspace_path: str | Path | None = None,
-    event_date: date | None = None,
-) -> List[Tuple[str, float]]:
-    """过滤旧式分数列表；保留兼容 API 并使用严格路径/日期规则。"""
-    current_date = _coerce_search_date(now)
-    if current_date is None and time_range_days > 0:
-        current_date = datetime.now().astimezone().date()
-    cutoff_date = (
-        current_date - timedelta(days=max(0, int(time_range_days)))
-        if current_date is not None and time_range_days > 0 and event_date is None
-        else None
-    )
-    nodes = await _async_db_read(
-        _load_nodes_by_ids,
-        db,
-        (node_id for node_id, _ in results),
-    )
-    return [
-        (node_id, score)
-        for node_id, score in results
-        if node_id in nodes
-        and _node_matches_filters(
-            nodes[node_id],
-            file_types=file_types,
-            explicit_date=event_date,
-            cutoff_date=cutoff_date,
-            workspace_path=workspace_path,
-        )
-    ]
 
 
 # ============================================================
@@ -1935,10 +1945,19 @@ async def search_memory_detailed(
             SearchResult(
                 file_path=node.file_path,
                 title=node.title,
-                snippet=chunk.snippet if chunk else _make_snippet(node.preview_content, query),
+                snippet=(
+                    _make_snippet(node.preview_content, query) if node.subject_document_id
+                    else chunk.snippet if chunk else _make_snippet(node.preview_content, query)
+                ),
                 relevance=score,
                 source="direct",
                 score_kind="rank",
+                node_id=node.node_id,
+                document_id=node.subject_document_id,
+                version_id=node.subject_version_id,
+                document_revision=node.subject_document_revision,
+                binding_revision=node.subject_binding_revision,
+                content_sha256=node.subject_content_sha256,
             )
         )
         seen_paths.add(node.file_path)
@@ -1965,6 +1984,12 @@ async def search_memory_detailed(
                 snippet=_make_snippet(node.preview_content, query),
                 relevance=score * 0.8,
                 source="associated",
+                node_id=node.node_id,
+                document_id=node.subject_document_id,
+                version_id=node.subject_version_id,
+                document_revision=node.subject_document_revision,
+                binding_revision=node.subject_binding_revision,
+                content_sha256=node.subject_content_sha256,
                 association_path=path,
                 association_reason=reason,
                 score_kind="rank",

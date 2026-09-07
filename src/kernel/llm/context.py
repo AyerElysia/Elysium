@@ -59,6 +59,12 @@ class LLMContextManager:
     _reminders: list[RegisteredReminder] | None = None
     _reminder_sources: list[RegisteredReminderSource] | None = None
     _consumed_once_reminder_keys: set[tuple[str, str, str]] = field(default_factory=set)
+    # Opt-in request transport contract, not semantic importance.  Exact texts
+    # stay local to this manager and must never appear in its repr or logs.
+    protected_exact_texts: frozenset[str] = field(default_factory=frozenset, repr=False)
+    # Exact technical controls may be moved out of a dropped group by the
+    # caller's compression hook; their complete Text still cannot be clipped.
+    reprojectable_exact_texts: frozenset[str] = field(default_factory=frozenset, repr=False)
 
     def validate_for_send(self, payloads: list[LLMPayload]) -> None:
         """在发起 LLM 请求前校验上下文结构。
@@ -480,6 +486,10 @@ class LLMContextManager:
             candidate = pinned + self._flatten_groups(kept_groups)
             if token_counter(candidate) <= token_budget:
                 break
+            if self._contains_protected_exact_text(kept_groups[0], for_group_omission=True):
+                # Hooks receive an exact dropped prefix.  Do not skip this
+                # group and reorder later groups around its protected body.
+                break
             dropped_groups.append(kept_groups.pop(0))
 
         remaining_payloads = self._flatten_groups(kept_groups)
@@ -489,6 +499,8 @@ class LLMContextManager:
         if hook_payloads:
             combined = pinned + hook_payloads + remaining_payloads
             while len(kept_groups) > 1 and token_counter(combined) > token_budget:
+                if self._contains_protected_exact_text(kept_groups[0], for_group_omission=True):
+                    break
                 dropped_groups.append(kept_groups.pop(0))
                 remaining_payloads = self._flatten_groups(kept_groups)
                 hook_payloads = self._apply_compression_hook(
@@ -496,17 +508,57 @@ class LLMContextManager:
                     remaining_payloads,
                 )
                 combined = pinned + hook_payloads + remaining_payloads
-            return self._fit_oversized_text_payloads(
+            fitted = self._fit_oversized_text_payloads(
                 combined,
                 token_budget=token_budget,
                 token_counter=token_counter,
             )
+        else:
+            fitted = self._fit_oversized_text_payloads(
+                pinned + remaining_payloads,
+                token_budget=token_budget,
+                token_counter=token_counter,
+            )
+        self._validate_exact_reprojection(payloads, fitted)
+        return fitted
 
-        return self._fit_oversized_text_payloads(
-            pinned + remaining_payloads,
-            token_budget=token_budget,
-            token_counter=token_counter,
+    def _contains_protected_exact_text(
+        self, payloads: list[LLMPayload], *, for_group_omission: bool = False,
+    ) -> bool:
+        """Check exact registered bytes without interpreting their contents."""
+
+        protected = self.protected_exact_texts
+        if for_group_omission:
+            protected = protected - self.reprojectable_exact_texts
+        return bool(protected) and any(
+            isinstance(part, Text) and part.text in protected
+            for payload in payloads
+            for part in payload.content
         )
+
+    def _validate_exact_reprojection(
+        self, original: list[LLMPayload], effective: list[LLMPayload],
+    ) -> None:
+        """A hook may relocate a registered control, never lose its exact text."""
+
+        protected = self.protected_exact_texts & self.reprojectable_exact_texts
+        if not protected:
+            return
+        original_texts = [
+            part.text for payload in original for part in payload.content
+            if isinstance(part, Text)
+        ]
+        effective_texts = [
+            part.text for payload in effective for part in payload.content
+            if isinstance(part, Text)
+        ]
+        if any(
+            original_texts.count(text) != effective_texts.count(text)
+            for text in protected if text in original_texts
+        ):
+            raise LLMContextError(
+                "context compression hook lost protected exact delivery text"
+            )
 
     def _fit_oversized_text_payloads(
         self,
@@ -532,7 +584,11 @@ class LLMContextManager:
             if payload.role in {ROLE.SYSTEM, ROLE.TOOL}:
                 continue
             for content_index, part in enumerate(payload.content):
-                if isinstance(part, Text) and part.text:
+                if (
+                    isinstance(part, Text)
+                    and part.text
+                    and part.text not in self.protected_exact_texts
+                ):
                     candidates.append(
                         (len(part.text), payload_index, content_index, part.text)
                     )
@@ -567,6 +623,12 @@ class LLMContextManager:
 
         final_tokens = token_counter(working)
         if final_tokens > token_budget:
+            if self._contains_protected_exact_text(working):
+                raise LLMContextError(
+                    "task context cannot fit without truncating protected exact "
+                    "delivery text, pinned or structured payloads: "
+                    f"tokens={final_tokens}, budget={token_budget}"
+                )
             raise LLMContextError(
                 "task context cannot fit without truncating pinned or structured "
                 f"payloads: tokens={final_tokens}, budget={token_budget}"

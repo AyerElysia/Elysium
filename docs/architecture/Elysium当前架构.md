@@ -127,7 +127,7 @@ main.py
 ```text
 一个主体
   ├── chat_global      日常对话
-  ├── memory_witness   第一人称记忆见证
+  ├── memory_witness   第一人称记忆见证（当前默认退役，不启动循环）
   ├── minecraft        具身场景
   ├── voice_live       实时语音场景
   └── livestream       直播场景
@@ -145,7 +145,7 @@ Presence 状态与 stream owner 在一个 SQLite 事务中提交；同事务写 
 
 Presence 与 World Projection 使用不同权威：前者描述技术存在，后者描述带来源观察。heartbeat、聊天、语音、Minecraft、memory witness 和直播均按实例 prepare，并只在模型、provider 或动作成功接受上下文后 commit；失败请求保持可重试。旧 `WorldState` 只作为迁移源保留。
 
-`memory_witness` 不注入行动工具，只负责见证和记录。语音、直播和 Minecraft 是环境依赖较强的场景能力，成熟度见[意识实例架构](./意识实例架构.md)。
+`memory_witness` 不注入行动工具，只负责见证和记录。当前部署默认不启动该循环：这是操作者退役，不是“主体不想见证”，也不把 oversized occurrence 伪造成已处理。已有 Experience/Witness 历史与 author cursor 留在账本原位；重新启用前必须先有 oversized occurrence 的显式策略，禁止跳游标或截断。详见[记忆见证意识退役](../report/记忆见证意识退役_2026-09-06.md)。语音、直播和 Minecraft 是环境依赖较强的场景能力，成熟度见[意识实例架构](./意识实例架构.md)。
 
 ---
 
@@ -165,7 +165,7 @@ Life Event（追加式发生历史）
 
 核心原则：
 
-- Raw→Experience 与 Experience→Witness 有独立耐久游标；见证失败不阻塞经历摄取，也不跳 author cursor；
+- Raw→Experience 与 Experience→Witness 有独立耐久游标；见证失败不阻塞经历摄取，也不跳 author cursor。操作者关闭 `[memory_witness].enabled` 会暂停整个 worker（含摄取与投递），这与“窗口规划失败仍保持 cursor”不是同一件事；
 - Witness 使用统一 `SOUL+USER+MEMORY` 投影；decision、exact World commit 和 Markdown projection 可独立恢复；
 - 原始证据、经历、主张、解释、文档版本、关系和 Recall 轨迹只追加；
 - `valid_time` 与 `recorded_time` 分离，旧理解不会被新理解静默覆盖；
@@ -263,7 +263,7 @@ NapCat 适配器已按 `client / events / outgoing / utils` 模块化：
 - `voice_live`：全双工实时语音框架；
 - `livestream`：B站原始事件账本、同一意识导演、TTS、OBS 浏览器舞台、真实播放回执与记忆投射；
 - `tts_voice_plugin`：当前普通消息的本地 TTS Service；本机 live 后端是 GPT-SoVITS v2ProPlus `api_v2`（`legacy_compat`）。IndexTTS2.5 + vLLM-Omni 仍是可配置合同，不是本机正在服务的路径；
-- `minecraft/`：视觉输入、Windows 桥接、键鼠输出和场景意识。
+- `plugins/minecraft/`：独立游戏插件，持有会话、游戏配置、身体协议、原生视觉和场景意识；通过通用端口共享 life_engine 的主体、Presence 与事件账本。
 
 这些场景依赖本地模型、GPU、Windows 桥接或平台认证；“代码存在”不等于环境已经完成生产验收。
 

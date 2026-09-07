@@ -37,7 +37,6 @@ _TASK_DEFAULT_BYTES = {
     "chat": 16 * 1024,
     "voice_live": 8 * 1024,
     "livestream": 8 * 1024,
-    "minecraft": 8 * 1024,
 }
 
 
@@ -196,12 +195,16 @@ class LifeEngineConversationEvidenceTool(BaseTool):
             "chat": "chat_max_result_bytes",
             "voice_live": "voice_max_result_bytes",
             "livestream": "livestream_max_result_bytes",
-            "minecraft": "minecraft_max_result_bytes",
         }.get(task, "core_max_result_bytes")
         configured = int(
             getattr(cfg, field, _TASK_DEFAULT_BYTES.get(task, _DEFAULT_RESULT_BYTES))
             or 0
         )
+        from ..service.scene_extensions import get_scene_extension
+
+        extension = get_scene_extension(task)
+        if extension is not None:
+            configured = extension.evidence_budget_bytes
         configured = max(_MIN_RESULT_BYTES, configured)
         desired = configured if int(requested or 0) <= 0 else int(requested)
         return task, max(_MIN_RESULT_BYTES, min(desired, configured))

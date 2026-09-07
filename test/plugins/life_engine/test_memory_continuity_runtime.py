@@ -68,16 +68,20 @@ def _coherent_service(
         decision_ledger=ledger,
         record_subject_review_outcome=record_subject_review_outcome,
     )
+    shared_state = SimpleNamespace(storage_runtime=selected_runtime, decision_ledger=ledger)
     instance = ConsciousnessInstance(
         instance_id="consciousness-continuity",
         stream_ids=["chat:continuity"],
         status="active" if active else "suspended",
     )
     service = LifeEngineService.__new__(LifeEngineService)
+    service._cfg = lambda: SimpleNamespace(opportunity=SimpleNamespace(enabled=False))
     service._selectable_storage_enabled = True
     service._storage_runtime = selected_runtime
     service._memory_service = memory
     service._learning_scheduler = scheduler
+    service._shared_learning_state = shared_state
+    service._opportunity_runtime = None
     service._subject_document_store = subject
     service._consciousness_registry = _Registry(instance)
     return service, {
@@ -87,6 +91,7 @@ def _coherent_service(
         "subject": subject,
         "ledger": ledger,
         "scheduler": scheduler,
+        "shared_state": shared_state,
         "review_outcomes": review_outcomes,
         "instance": instance,
     }
@@ -117,7 +122,7 @@ async def test_public_provider_uses_one_coherent_selected_runtime_bundle() -> No
 
     assert dependencies["memory"].storage_runtime is dependencies["runtime"]
     assert dependencies["subject"].storage_runtime is dependencies["runtime"]
-    assert dependencies["scheduler"].storage_runtime is dependencies["runtime"]
+    assert dependencies["shared_state"].storage_runtime is dependencies["runtime"]
     assert dependencies["ledger"].storage_runtime is dependencies["runtime"]
     assert runtime.session._subject_authority is dependencies["subject"]
     assert runtime.session._boundary_repository._store is dependencies["living"]
@@ -192,7 +197,7 @@ async def test_runtime_fails_closed_when_selected_storage_is_disabled() -> None:
 
 @pytest.mark.parametrize(
     "missing",
-    ("memory", "scheduler", "subject", "ledger"),
+    ("memory", "shared_state", "subject", "ledger"),
 )
 async def test_runtime_fails_closed_when_coherent_dependency_is_missing(
     missing: str,
@@ -200,12 +205,12 @@ async def test_runtime_fails_closed_when_coherent_dependency_is_missing(
     service, _ = _coherent_service()
     if missing == "memory":
         service._memory_service = None
-    elif missing == "scheduler":
-        service._learning_scheduler = None
+    elif missing == "shared_state":
+        service._shared_learning_state = None
     elif missing == "subject":
         service._subject_document_store = None
     else:
-        service._learning_scheduler.decision_ledger = None
+        service._shared_learning_state.decision_ledger = None
 
     expected = (
         "ContinuityReviewLearningDecisionLedgerUnavailable"
@@ -218,7 +223,7 @@ async def test_runtime_fails_closed_when_coherent_dependency_is_missing(
 
 @pytest.mark.parametrize(
     "mismatched",
-    ("memory", "subject", "scheduler", "ledger"),
+    ("memory", "subject", "shared_state", "ledger"),
 )
 async def test_runtime_fails_closed_when_dependency_uses_another_runtime(
     mismatched: str,
@@ -255,3 +260,15 @@ async def test_tool_resolution_never_reaches_private_service_fields() -> None:
         match="ContinuityReviewPublicRuntimeProviderUnavailable",
     ):
         await resolve_continuity_review_tool_runtime(tool)
+
+
+async def test_continuity_review_survives_learning_uninstall() -> None:
+    service, dependencies = _coherent_service()
+    service._learning_scheduler = None
+    runtime = await resolve_continuity_review_tool_runtime(_bound_tool(service))
+    assert runtime.session._candidate_ledger is dependencies["ledger"]
+    assert service._learning_scheduler is None
+    # A mismatched optional worker is not part of this authority bundle either.
+    service._learning_scheduler = SimpleNamespace(storage_runtime=object())
+    runtime = await resolve_continuity_review_tool_runtime(_bound_tool(service))
+    assert runtime.session._candidate_ledger is dependencies["ledger"]

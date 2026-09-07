@@ -8,7 +8,7 @@ Design principles:
   system's progressive disclosure (boundary reminder pattern).
 - Tools NOT in the manifest are simply not injected as LLM tool schemas,
   saving context budget on every turn.
-- Adding a new consciousness type only requires adding a manifest entry here.
+- Adding a new consciousness type declares its manifest through the scene extension registry.
 - Heartbeat uses HEARTBEAT_TOOL_NAMES (life_engine_internal), not the chat
   kind lists below. Missing schema is not a subject refusal.
 """
@@ -24,9 +24,10 @@ CONSCIOUSNESS_TOOL_MANIFESTS: dict[str, list[str]] = {
     # 记忆见证意识只读取经历账本，不注入聊天或行动工具。
     "memory_witness": [],
     # 全局聊天意识：私聊、群聊、所有日常对话。
-    # nucleus_minecraft 保留在聊天清单里：进入共享世界的邀请常在聊天中发生，
-    # 她必须能在对话里自主调用进入工具，而不是等别人带她。
     "chat": [
+        "tool-nucleus_opportunity_query",
+        "tool-nucleus_opportunity_command",
+        "tool-nucleus_capability_call",
         "action-life_send_text",
         "action-life_send_file",
         "action-life_send_image",
@@ -42,6 +43,7 @@ CONSCIOUSNESS_TOOL_MANIFESTS: dict[str, list[str]] = {
         "tool-recognize_voice",
         "tool-nucleus_save_media",
         "tool-nucleus_grep_events",
+        "tool-nucleus_read_event",
         "tool-nucleus_search_memory",
         "tool-nucleus_read_memory_boundary",
         "tool-nucleus_memory_continuity_review",
@@ -49,7 +51,6 @@ CONSCIOUSNESS_TOOL_MANIFESTS: dict[str, list[str]] = {
         "tool-nucleus_memory_stats",
         "action-send_emoji_meme",
         "tool-platform_action",
-        "tool-nucleus_minecraft",
         "tool-nucleus_proactive_query",
         "tool-nucleus_proactive_command",
         # 基础能力（文件/终端/屏幕/任务/日程/联网/子代理/媒体）：
@@ -74,16 +75,11 @@ CONSCIOUSNESS_TOOL_MANIFESTS: dict[str, list[str]] = {
         "tool-nucleus_view_screen",
         "tool-nucleus_write_file",
     ],
-    # 我的世界意识：具身交互，纯视觉→键鼠
-    "minecraft": [
-        "tool-nucleus_minecraft",
-        "tool-nucleus_proactive_query",
-        "tool-nucleus_proactive_command",
-        "action-life_send_text",
-        "action-report_state",
-    ],
     # 直播意识：弹幕互动，跨场景感知
     "livestream": [
+        "tool-nucleus_opportunity_query",
+        "tool-nucleus_opportunity_command",
+        "tool-nucleus_capability_call",
         "tool-nucleus_proactive_query",
         "tool-nucleus_proactive_command",
         "action-life_send_text",
@@ -93,6 +89,9 @@ CONSCIOUSNESS_TOOL_MANIFESTS: dict[str, list[str]] = {
     ],
     # 语音通话意识：实时语音交互，跨场景感知
     "voice_live": [
+        "tool-nucleus_opportunity_query",
+        "tool-nucleus_opportunity_command",
+        "tool-nucleus_capability_call",
         "tool-nucleus_proactive_query",
         "tool-nucleus_proactive_command",
         "action-report_state",  # 报告通话状态到 WorldState
@@ -109,10 +108,18 @@ def get_tool_manifest(kind: str) -> list[str]:
     inheriting chat powers would blur an instance boundary.
     """
 
+    from .scene_extensions import get_scene_extension, scene_chat_tools
+
     normalized = str(kind or "").strip()
+    extension = get_scene_extension(normalized)
+    if extension is not None:
+        return list(extension.tools)
     if normalized not in CONSCIOUSNESS_TOOL_MANIFESTS:
         raise KeyError(f"consciousness tool manifest is not declared: {normalized!r}")
-    return list(CONSCIOUSNESS_TOOL_MANIFESTS[normalized])
+    tools = list(CONSCIOUSNESS_TOOL_MANIFESTS[normalized])
+    if normalized == "chat":
+        tools = list(dict.fromkeys([*tools, *scene_chat_tools()]))
+    return tools
 
 
 def is_tool_in_manifest(tool_name: str, kind: str) -> bool:
@@ -128,6 +135,9 @@ def is_tool_in_manifest(tool_name: str, kind: str) -> bool:
 # (learning) or one of these already-resident tools (file_care / narrative /
 # MEMORY continuity). Names are tool_name, not the LLM `tool-` prefix.
 HEARTBEAT_TOOL_NAMES: tuple[str, ...] = (
+    "nucleus_opportunity_query",
+    "nucleus_opportunity_command",
+    "nucleus_capability_call",
     "nucleus_rest_heartbeat",
     "nucleus_read_file",
     "nucleus_write_file",
@@ -171,6 +181,7 @@ def heartbeat_tool_classes() -> list[type[Any]]:
         LifeReadContextGroupTool,
     )
     from ..learning.learn_tool import NucleusLearnTool
+    from ..opportunity.tools import OPPORTUNITY_TOOLS
     from ..memory.boundary_tools import LifeReadMemoryBoundaryTool
     from ..memory.continuity_tools import LifeMemoryContinuityReviewSessionTool
     from ..memory.tools import LifeEngineSearchMemoryTool
@@ -199,6 +210,7 @@ def heartbeat_tool_classes() -> list[type[Any]]:
     from ..tools.todo_tools import NucleusTodoTool
 
     classes: tuple[type[Any], ...] = (
+        *OPPORTUNITY_TOOLS,
         LifeEngineRestHeartbeatTool,
         LifeEngineReadFileTool,
         LifeEngineWriteFileTool,

@@ -81,14 +81,13 @@ class SubconsciousIngestReport:
 
 
 def workset_identities(event: Any) -> set[str]:
-    """Return occurrence and event identities used for work-set idempotency."""
+    """Prefer occurrence: a producer event_id may repeat in another stream."""
 
-    identities: set[str] = set()
     for attr in ("occurrence_id", "event_id"):
         value = str(getattr(event, attr, "") or "").strip()
         if value:
-            identities.add(value)
-    return identities
+            return {value}
+    return set()
 
 
 def classify_life_event_for_workset(event: LifeEvent) -> str:
@@ -104,6 +103,8 @@ def classify_life_event_for_workset(event: LifeEvent) -> str:
     event_type = str(event.event_type or "").strip().lower()
     if event_type in _DELIVERY_WORKSET_TYPES:
         return "synthetic_delivery"
+    if event_type == "opportunity.available":
+        return "opportunity_availability"
     return "advance"
 
 
@@ -152,11 +153,15 @@ def reconstruct_workset_event(
         return None
     if decision == "synthetic_delivery":
         return synthetic_delivery_event(event, sequence=next_sequence())
+    if decision == "opportunity_availability":
+        # Typed infrastructure fact, not a subject thought or automatic choice.
+        return synthetic_delivery_event(event, sequence=next_sequence())
     reconstructed = legacy_event_from_life_event(event)
     if reconstructed is None:
         return None
-    if int(reconstructed.sequence or 0) <= 0:
-        reconstructed = replace(reconstructed, sequence=next_sequence())
+    # Producer counters can reset or arrive out of order. Delivery order belongs
+    # to this work set and must never reuse a producer counter as its cursor.
+    reconstructed = replace(reconstructed, sequence=next_sequence())
     identity = str(reconstructed.occurrence_id or reconstructed.event_id or "").strip()
     if not identity:
         reconstructed = replace(
@@ -215,14 +220,6 @@ async def _ledger_frontier(store: Any) -> int:
     return 0
 
 
-def _consumer_never_created(cursor: Any) -> bool:
-    updated_at = str(getattr(cursor, "updated_at", "") or "").strip()
-    revision = int(getattr(cursor, "revision", 0) or 0)
-    metadata = getattr(cursor, "metadata", None)
-    has_metadata = bool(metadata)
-    return not updated_at and revision == 0 and not has_metadata
-
-
 def _now_iso() -> str:
     return datetime.now(UTC).astimezone().isoformat()
 
@@ -242,9 +239,12 @@ async def catch_up_subconscious_ingest(
     """
 
     consumer_id = SUBCONSCIOUS_INGEST_CONSUMER_ID
+    # A heartbeat source counter is not evidence of a completed ledger prefix.
+    # Missing consumers start at zero; bootstrap never silently jumps to tail.
+    del heartbeat_context_cursor
     read_since = getattr(store, "read_since", None)
-    commit_offset = getattr(store, "commit_consumer_offset", None)
-    if not callable(read_since) or not callable(commit_offset):
+    commit_cursor = getattr(store, "commit_consumer_cursor", None)
+    if not callable(read_since) or not callable(commit_cursor):
         raise SubconsciousIngestStoreUnavailable(
             "Life Event store cannot catch up the subconscious consumer"
         )
@@ -252,38 +252,6 @@ async def catch_up_subconscious_ingest(
     from_position = int(getattr(cursor, "position", 0) or 0)
     revision = int(getattr(cursor, "revision", 0) or 0)
     frontier = await _ledger_frontier(store)
-    if (
-        _consumer_never_created(cursor)
-        and frontier > 0
-        and int(heartbeat_context_cursor or 0) > 0
-    ):
-        metadata = {
-            "bootstrap": "high_water",
-            "reason": "do_not_replay_history_as_new_life",
-            "seeded_at": _now_iso(),
-            "heartbeat_context_cursor": int(heartbeat_context_cursor),
-        }
-        committed = int(
-            await commit_offset(consumer_id, frontier, metadata=metadata) or frontier
-        )
-        return (
-            SubconsciousIngestReport(
-                consumer_id=consumer_id,
-                from_position=from_position,
-                through_position=committed,
-                frontier=frontier,
-                scanned=0,
-                queued=0,
-                classified_out=0,
-                bootstrapped=True,
-                backlog=max(0, frontier - committed),
-                gap=False,
-                bootstrap_reason="high_water",
-                revision=revision,
-            ),
-            [],
-        )
-
     try:
         rows = await read_since(from_position, limit=max(1, int(batch_limit)))
     except RawEventGapError as gap:
@@ -297,13 +265,16 @@ async def catch_up_subconscious_ingest(
     through = from_position
     seen = set(known_occurrences)
     for row in rows:
-        through = max(through, int(row.sequence or 0))
+        position = int(row.sequence or 0)
+        if position <= through:
+            raise SubconsciousLedgerGap("Life Event batch is not strictly ordered")
+        through = position
         reconstructed = reconstruct_workset_event(row, next_sequence=next_sequence)
         if reconstructed is None:
             classified_out += 1
             continue
         identities = workset_identities(reconstructed)
-        if identities and identities & seen:
+        if identities & seen or reconstructed.event_id in seen:
             classified_out += 1
             continue
         queued.append(reconstructed)
@@ -329,25 +300,29 @@ async def catch_up_subconscious_ingest(
 async def commit_subconscious_ingest_cursor(
     store: Any,
     *,
+    expected_position: int,
+    expected_revision: int,
     through_position: int,
     metadata: dict[str, Any] | None = None,
 ) -> int:
     """Advance the ingest cursor after the work set is durably checkpointed."""
 
-    commit_offset = getattr(store, "commit_consumer_offset", None)
-    if not callable(commit_offset):
+    commit_cursor = getattr(store, "commit_consumer_cursor", None)
+    if not callable(commit_cursor):
         raise SubconsciousIngestStoreUnavailable(
             "Life Event store cannot commit the subconscious consumer"
         )
     payload = dict(metadata or {})
     payload.setdefault("stage", "subconscious_ingest")
     payload.setdefault("committed_at", _now_iso())
-    committed = await commit_offset(
+    committed = await commit_cursor(
         SUBCONSCIOUS_INGEST_CONSUMER_ID,
-        int(through_position),
+        expected_position=int(expected_position),
+        expected_revision=int(expected_revision),
+        through_position=int(through_position),
         metadata=payload,
     )
-    return int(committed if committed is not None else through_position)
+    return int(committed.position)
 
 
 __all__ = [

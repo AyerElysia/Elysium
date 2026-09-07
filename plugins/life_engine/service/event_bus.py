@@ -1,9 +1,7 @@
-"""Unified event bus primitives for life_engine.
+"""Durable ingress for the one authoritative Life Event stream.
 
-The first version is intentionally compatibility-first: existing
-``LifeEngineEvent`` callers continue to work, while every published event is
-also mirrored into an append-only raw event log for future high-volume
-channels.
+Legacy events and pending buffers are views, not a second occurrence history.
+Publication returns only after append; consumers resume from their own cursors.
 """
 
 from __future__ import annotations
@@ -13,6 +11,7 @@ import hashlib
 import json
 import sqlite3
 import threading
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum, IntEnum
@@ -24,7 +23,7 @@ from src.kernel.sync.local_store import create_local_sync_schema, enqueue_in_tra
 from .event_builder import EventType, LifeEngineEvent
 
 if TYPE_CHECKING:
-    from ..storage.event_contracts import LifeEventStorePort
+    from ..storage.event_contracts import LifeEventConsumerCursor, LifeEventStorePort
 
 RAW_EVENT_LOG_FILE = "life_events.jsonl"
 RAW_EVENT_DB_FILE = "life_events.sqlite3"
@@ -82,6 +81,18 @@ class LifeEvent:
     causation_id: str = ""
     correlation_id: str = ""
     content_ref: str = ""
+
+
+def life_event_source_sequence(event: LifeEvent) -> int:
+    """Keep producer position zero when replaying an already persisted event.
+
+    ``sequence`` is an ingest position on a returned row, not a producer counter.
+    Fresh legacy inputs may still supply their counter in ``sequence``.
+    """
+
+    if event.recorded_at:
+        return int(event.source_sequence)
+    return int(event.source_sequence or event.sequence or 0)
 
 
 def _legacy_channel(event: LifeEngineEvent) -> LifeEventChannel:
@@ -234,7 +245,7 @@ def legacy_event_from_life_event(event: LifeEvent) -> LifeEngineEvent | None:
     """Rebuild a compatibility LifeEngineEvent from one ledger row.
 
     Returns None when the row was not published from a LifeEngineEvent
-    (for example a chat fact or world assertion). Callers must not invent
+    (for example a standalone delivery fact or world assertion). Callers must not invent
     a legacy type for those rows.
     """
 
@@ -266,11 +277,11 @@ def legacy_event_from_life_event(event: LifeEvent) -> LifeEngineEvent | None:
     except (TypeError, ValueError):
         parsed_index = None
     return LifeEngineEvent(
-        event_id=str(event.event_id or ""),
+        event_id=str(metadata.get("legacy_event_id") or event.event_id or ""),
         event_type=event_type,
         timestamp=str(event.timestamp or ""),
         sequence=sequence,
-        source=str(event.source or ""),
+        source=str(metadata.get("legacy_source") or event.source or ""),
         source_detail=str(metadata.get("source_detail") or ""),
         content=raw_content,
         content_type=content_type,
@@ -675,6 +686,7 @@ class RawEventStore(_LegacyJSONLEventStore):
             CREATE TABLE IF NOT EXISTS raw_event_consumer_offsets (
                 consumer_id TEXT PRIMARY KEY,
                 ingest_position INTEGER NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL,
                 metadata_json TEXT NOT NULL DEFAULT '{}'
             );
@@ -701,11 +713,26 @@ class RawEventStore(_LegacyJSONLEventStore):
             END;
             """
         )
+        # Additive, idempotent migration: preserve every old cursor and payload.
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            columns = {
+                row[1] for row in db.execute("PRAGMA table_info(raw_event_consumer_offsets)")
+            }
+            if "revision" not in columns:
+                db.execute(
+                    "ALTER TABLE raw_event_consumer_offsets "
+                    "ADD COLUMN revision INTEGER NOT NULL DEFAULT 1"
+                )
+            db.commit()
+        except BaseException:
+            db.rollback()
+            raise
         create_local_sync_schema(db)
 
     @staticmethod
     def _canonical_payload(event: LifeEvent) -> dict[str, Any]:
-        source_sequence = int(event.source_sequence or event.sequence or 0)
+        source_sequence = life_event_source_sequence(event)
         return life_event_to_dict(
             replace(
                 event,
@@ -758,7 +785,7 @@ class RawEventStore(_LegacyJSONLEventStore):
         db: sqlite3.Connection,
         event: LifeEvent,
     ) -> tuple[LifeEvent, bool]:
-        source_sequence = int(event.source_sequence or event.sequence or 0)
+        source_sequence = life_event_source_sequence(event)
         occurrence_id = str(event.occurrence_id or "").strip()
         if not occurrence_id:
             occurrence_id = self._default_occurrence_id(event)
@@ -975,12 +1002,12 @@ class RawEventStore(_LegacyJSONLEventStore):
         return self._append_many_sync([event])[0]
 
     async def append(self, event: LifeEvent) -> LifeEvent:
-        return await asyncio.to_thread(self._append_sync, event)
+        return await asyncio.to_thread(self._append_sync, deepcopy(event))
 
     async def append_many(self, events: list[LifeEvent]) -> list[LifeEvent]:
         if not events:
             return []
-        return await asyncio.to_thread(self._append_many_sync, events)
+        return await asyncio.to_thread(self._append_many_sync, deepcopy(events))
 
     @staticmethod
     def _event_from_row(row: sqlite3.Row) -> LifeEvent:
@@ -1023,13 +1050,14 @@ class RawEventStore(_LegacyJSONLEventStore):
             sql += " LIMIT ?"
             params.append(max(0, int(limit)))
         with self._connect() as db:
-            bounds = db.execute(
-                """SELECT MIN(ingest_position) AS earliest,
-                MAX(ingest_position) AS latest FROM raw_life_events"""
+            boundary = db.execute(
+                "SELECT value FROM raw_event_store_meta WHERE key = 'history_floor_position'"
             ).fetchone()
-            earliest = int(bounds["earliest"] or 0) if bounds is not None else 0
-            if sequence > 0 and earliest > sequence + 1:
-                raise RawEventGapError(sequence, earliest)
+            floor = int(boundary["value"]) if boundary is not None else 0
+            # Opaque positions can be sparse after rollback or exact import.
+            # Only an explicit missing-history boundary proves a gap.
+            if sequence < floor:
+                raise RawEventGapError(sequence, floor + 1)
             rows = db.execute(sql, params).fetchall()
         return [self._event_from_row(row) for row in rows]
 
@@ -1124,6 +1152,20 @@ class RawEventStore(_LegacyJSONLEventStore):
 
         return await asyncio.to_thread(self._get_by_event_id_sync, event_id)
 
+    def _get_by_occurrence_id_sync(self, occurrence_id: str) -> LifeEvent | None:
+        self._ensure_ready_sync()
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT * FROM raw_life_events WHERE occurrence_id = ?",
+                (str(occurrence_id),),
+            ).fetchone()
+        return self._event_from_row(row) if row is not None else None
+
+    async def get_by_occurrence_id(self, occurrence_id: str) -> LifeEvent | None:
+        """Read exact source evidence without scanning or copying the timeline."""
+
+        return await asyncio.to_thread(self._get_by_occurrence_id_sync, occurrence_id)
+
     def read_since_sync(
         self,
         sequence: int,
@@ -1144,7 +1186,7 @@ class RawEventStore(_LegacyJSONLEventStore):
             ).fetchone()
         return int(row["ingest_position"]) if row is not None else 0
 
-    def _consumer_cursor_sync(self, consumer_id: str) -> Any:
+    def _consumer_cursor_sync(self, consumer_id: str) -> LifeEventConsumerCursor:
         from ..storage.event_contracts import LifeEventConsumerCursor
 
         self._ensure_ready_sync()
@@ -1153,7 +1195,7 @@ class RawEventStore(_LegacyJSONLEventStore):
             raise ValueError("consumer_id must not be empty")
         with self._connect() as db:
             row = db.execute(
-                """SELECT ingest_position, updated_at, metadata_json
+                """SELECT ingest_position, revision, updated_at, metadata_json
                 FROM raw_event_consumer_offsets WHERE consumer_id = ?""",
                 (identity,),
             ).fetchone()
@@ -1170,12 +1212,12 @@ class RawEventStore(_LegacyJSONLEventStore):
         return LifeEventConsumerCursor(
             consumer_id=identity,
             position=int(row["ingest_position"]),
-            revision=0,
+            revision=int(row["revision"]),
             updated_at=str(row["updated_at"] or ""),
             metadata=metadata,
         )
 
-    async def consumer_cursor(self, consumer_id: str) -> Any:
+    async def consumer_cursor(self, consumer_id: str) -> LifeEventConsumerCursor:
         """Return one consumer cursor without creating it."""
 
         return await asyncio.to_thread(self._consumer_cursor_sync, consumer_id)
@@ -1185,36 +1227,73 @@ class RawEventStore(_LegacyJSONLEventStore):
 
         return await asyncio.to_thread(self._get_consumer_offset_sync, consumer_id)
 
-    def _commit_consumer_offset_sync(
+    def _commit_consumer_cursor_sync(
         self,
         consumer_id: str,
-        ingest_position: int,
+        expected_position: int,
+        expected_revision: int,
+        through_position: int,
         metadata: dict[str, Any] | None,
-    ) -> int:
+    ) -> LifeEventConsumerCursor:
+        from ..storage.event_contracts import (
+            LifeEventConsumerConflict,
+            LifeEventConsumerCursor,
+        )
+
         self._ensure_ready_sync()
-        requested = max(0, int(ingest_position))
+        identity = str(consumer_id or "").strip()
+        if not identity:
+            raise ValueError("consumer_id must not be empty")
+        expected = int(expected_position)
+        revision = int(expected_revision)
+        through = int(through_position)
+        if min(expected, revision, through) < 0 or through < expected:
+            raise LifeEventConsumerConflict("invalid cursor boundary")
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             try:
-                current_row = db.execute(
-                    """SELECT ingest_position FROM raw_event_consumer_offsets
+                row = db.execute(
+                    """SELECT ingest_position, revision, updated_at, metadata_json
+                    FROM raw_event_consumer_offsets
                     WHERE consumer_id = ?""",
-                    (str(consumer_id),),
+                    (identity,),
                 ).fetchone()
-                current = int(current_row["ingest_position"]) if current_row else 0
-                committed = max(current, requested)
+                current = LifeEventConsumerCursor(
+                    consumer_id=identity,
+                    position=int(row["ingest_position"]) if row else 0,
+                    revision=int(row["revision"]) if row else 0,
+                    updated_at=str(row["updated_at"]) if row else "",
+                    metadata=json.loads(row["metadata_json"]) if row else {},
+                )
+                if (current.position, current.revision) != (expected, revision):
+                    raise LifeEventConsumerConflict(f"cursor CAS failed for {identity}")
+                latest = int(
+                    db.execute(
+                        "SELECT COALESCE(MAX(ingest_position), 0) FROM raw_life_events"
+                    ).fetchone()[0]
+                )
+                if through > latest:
+                    raise LifeEventConsumerConflict(
+                        f"cursor {through} exceeds ledger frontier {latest}"
+                    )
+                if through == current.position:
+                    db.commit()
+                    return current
+                updated_at = self._now_iso()
                 db.execute(
                     """INSERT INTO raw_event_consumer_offsets (
-                        consumer_id, ingest_position, updated_at, metadata_json
-                    ) VALUES (?, ?, ?, ?)
+                        consumer_id, ingest_position, revision, updated_at, metadata_json
+                    ) VALUES (?, ?, ?, ?, ?)
                     ON CONFLICT(consumer_id) DO UPDATE SET
                         ingest_position = excluded.ingest_position,
+                        revision = excluded.revision,
                         updated_at = excluded.updated_at,
                         metadata_json = excluded.metadata_json""",
                     (
-                        str(consumer_id),
-                        committed,
-                        self._now_iso(),
+                        identity,
+                        through,
+                        revision + 1,
+                        updated_at,
                         json.dumps(metadata or {}, ensure_ascii=False),
                     ),
                 )
@@ -1222,7 +1301,58 @@ class RawEventStore(_LegacyJSONLEventStore):
             except BaseException:
                 db.rollback()
                 raise
-        return committed
+        return LifeEventConsumerCursor(
+            consumer_id=identity,
+            position=through,
+            revision=revision + 1,
+            updated_at=updated_at,
+            metadata=dict(metadata or {}),
+        )
+
+    async def commit_consumer_cursor(
+        self,
+        consumer_id: str,
+        *,
+        expected_position: int,
+        expected_revision: int,
+        through_position: int,
+        metadata: dict[str, Any] | None = None,
+    ) -> LifeEventConsumerCursor:
+        """CAS-advance a consumer only after its batch is durably processed."""
+
+        return await asyncio.to_thread(
+            self._commit_consumer_cursor_sync,
+            consumer_id,
+            expected_position,
+            expected_revision,
+            through_position,
+            metadata,
+        )
+
+    def _commit_consumer_offset_sync(
+        self,
+        consumer_id: str,
+        ingest_position: int,
+        metadata: dict[str, Any] | None,
+    ) -> int:
+        from ..storage.event_contracts import LifeEventConsumerConflict
+
+        for _ in range(4):
+            cursor = self._consumer_cursor_sync(consumer_id)
+            if int(ingest_position) <= cursor.position:
+                return cursor.position
+            try:
+                return self._commit_consumer_cursor_sync(
+                    consumer_id,
+                    cursor.position,
+                    cursor.revision,
+                    int(ingest_position),
+                    metadata,
+                ).position
+            except LifeEventConsumerConflict:
+                if int(ingest_position) > self._health_sync()["latest_position"]:
+                    raise
+        raise LifeEventConsumerConflict("consumer cursor remained contended")
 
     async def commit_consumer_offset(
         self,
@@ -1287,7 +1417,7 @@ class RawEventStore(_LegacyJSONLEventStore):
 
 
 class LifeEventBus:
-    """Compatibility event bus that mirrors legacy events to raw storage."""
+    """Durable ingress; notifications and work sets never replace the ledger."""
 
     def __init__(self, store: RawEventStore | LifeEventStorePort) -> None:
         self._store = store
@@ -1298,14 +1428,16 @@ class LifeEventBus:
         return self._store
 
     async def publish(self, event: LifeEvent) -> LifeEvent:
+        snapshot = deepcopy(event)
         async with self._lock:
-            return await self._store.append(event)
+            return await self._store.append(snapshot)
 
     async def publish_many(self, events: list[LifeEvent]) -> list[LifeEvent]:
         if not events:
             return []
+        snapshots = deepcopy(events)
         async with self._lock:
-            return await self._store.append_many(events)
+            return await self._store.append_many(snapshots)
 
     async def publish_legacy_event(self, event: LifeEngineEvent) -> LifeEvent:
         return await self.publish(life_event_from_legacy(event))

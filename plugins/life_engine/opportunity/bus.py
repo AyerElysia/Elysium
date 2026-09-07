@@ -77,6 +77,13 @@ class OpportunityBus:
         now: datetime | None = None,
         extra_offers: list[CollectedOffer] | None = None,
     ) -> OpportunityPage | None:
+        if bool(getattr(self._service, "opportunity_managed", False)):
+            # Canonical occurrences enter the existing Life Event / rolling
+            # context path. Never revive an independent invitation clock/page.
+            self._pending_page = None
+            self._pending_hooks = {}
+            self._remember_page(None)
+            return None
         collected, errors = await collect_all_offers(
             self._service,
             config=config,

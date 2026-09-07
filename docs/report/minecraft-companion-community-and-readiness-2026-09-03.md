@@ -1,7 +1,7 @@
 # Minecraft 陪玩链路社区审计与生产验收记录
 
 > 日期：2026-09-03  
-> 当前结论：代码生产候选正在收口；自动化专项已通过，现场端到端尚未完成，因此不能标记“已跑通”。
+> 本次历史结论：自动化专项通过，现场端到端未完成，不能标记“已跑通”。下述服务接线和配置默认值已在 2026-09-06 修复；最新现场阻断与证据见[9 月 6 日记录](minecraft-companion-e2e-2026-09-06.md)。
 
 ## 用户目标
 
@@ -148,11 +148,11 @@ MC 的两条近期潜意识入口都显式使用 3 组/4096 bytes 并设置 `inc
 
 ## 尚未跨过的发布门
 
-### 1. 身体事件服务接线
+### 1. 身体事件服务接线（2026-09-06 已修复并完成定向回归）
 
-`MinecraftSession` 对带高层任务能力的 body 明确要求 `record_minecraft_body_event`。当前 `LifeEngineService._create_minecraft_session()` 还没有传入该 callback，所以真实 bot start 会 fail closed；这是当前最直接的软件阻断。
+`MinecraftSession` 对带高层任务能力的 body 明确要求 `record_minecraft_body_event`。9 月 3 日 `LifeEngineService._create_minecraft_session()` 缺少该 callback，导致真实 bot start 会 fail closed；9 月 6 日已补上服务接线、耐久重放和 256 项有界缓存。
 
-需要在共享服务中：
+9 月 6 日实现并测试了：
 
 - 注入 `record_minecraft_body_event=self.record_minecraft_body_event`；
 - 用 event ID 缓存完全相同的 `LifeEngineEvent`；
@@ -161,9 +161,9 @@ MC 的两条近期潜意识入口都显式使用 3 组/4096 bytes 并设置 `inc
 - 已成功落账的重放直接复用；
 - 增加 service 接线、失败重试、幂等与冲突测试。
 
-### 2. 配置模式默认值一致
+### 2. 配置模式默认值一致（2026-09-06 已修复并完成定向回归）
 
-运行实例已经显式配置 `default_body="bot"` 和 8192/8192/4096/3/4 的预算；`MCConfig` 默认也已收紧。但共享 `LifeEngineConfig.MinecraftSection` 的仓库默认仍是 agent 与旧预算，需要在同一授权补丁中对齐并更新配置测试。
+运行实例显式配置 `default_body="bot"` 和 8192/8192/4096/3/4 的预算；`MCConfig` 与共享 `LifeEngineConfig.MinecraftSection` 的仓库默认在 9 月 6 日已对齐，配置测试通过。
 
 ### 3. 手动重启与真实世界
 

@@ -40,6 +40,7 @@ from ...memory.living import (
     RecallEpisode,
     RecallEvent,
     SemanticRelation,
+    semantic_relation_payload,
 )
 from ..contracts import StorageBackendRuntime, StorageWriterRole
 from ..memory.schema import ensure_memory_storage_schema
@@ -134,6 +135,13 @@ _SPECS = (
             "embedding_model",
             "embedding_updated_at",
             "legacy_fts_present",
+            "subject_document_id",
+            "subject_version_id",
+            "subject_document_revision",
+            "subject_binding_revision",
+            "subject_content_sha256",
+            "subject_projection_sha256",
+            "subject_projection_state",
         ),
         ("node_id",),
     ),
@@ -376,6 +384,11 @@ _SPECS = (
             "consciousness_instance_id",
             "stream_scope",
             "metadata_json",
+            "owner_subject_id",
+            "root_relation_id",
+            "parent_relation_id",
+            "revision",
+            "operation",
             "payload_sha256",
         ),
         ("relation_id",),
@@ -635,6 +648,8 @@ _BOOL_COLUMNS = {
     "force_delete",
 }
 _INT_COLUMNS = {
+    "subject_document_revision",
+    "subject_binding_revision",
     "version",
     "access_count",
     "index_revision",
@@ -708,7 +723,12 @@ def _sha256(value: str) -> str:
 
 
 def _payload_hash(value: Any) -> str:
-    return _sha256(canonical_json(asdict(value)))
+    body = (
+        semantic_relation_payload(value)
+        if isinstance(value, SemanticRelation)
+        else asdict(value)
+    )
+    return _sha256(canonical_json(body))
 
 
 def _strict_json(value: Any, *, expected: type) -> Any:
@@ -885,11 +905,16 @@ def _transform_source_row(
             "node_id": node_id,
             "node_type": str(raw["node_type"]),
             "file_path": file_path,
-            "file_path_sha256": _sha256(file_path) if file_path is not None else None,
+            "file_path_sha256": (
+                _sha256(file_path) if file_path is not None and not bool(raw.get("is_deleted")) else None
+            ),
             "content_hash": (
                 str(raw["content_hash"]) if raw["content_hash"] is not None else None
             ),
-            "document_content": context.fts_content.get(node_id, ""),
+            "document_content": (
+                str(raw["document_content"]) if raw.get("document_content") is not None
+                else context.fts_content.get(node_id, "")
+            ),
             "title": str(raw.get("title") or ""),
             "activation_strength": float(raw.get("activation_strength") or 0.0),
             "access_count": int(raw.get("access_count") or 0),
@@ -931,6 +956,13 @@ def _transform_source_row(
                 else None
             ),
             "legacy_fts_present": node_id in context.fts_content,
+            "subject_document_id": str(raw["subject_document_id"]) if raw.get("subject_document_id") is not None else None,
+            "subject_version_id": str(raw["subject_version_id"]) if raw.get("subject_version_id") is not None else None,
+            "subject_document_revision": int(raw.get("subject_document_revision") or 0),
+            "subject_binding_revision": int(raw.get("subject_binding_revision") or 0),
+            "subject_content_sha256": str(raw["subject_content_sha256"]) if raw.get("subject_content_sha256") is not None else None,
+            "subject_projection_sha256": str(raw["subject_projection_sha256"]) if raw.get("subject_projection_sha256") is not None else None,
+            "subject_projection_state": str(raw.get("subject_projection_state") or ""),
         }
     if table == "memory_index_jobs":
         values = {
@@ -1196,6 +1228,17 @@ def _transform_source_row(
             consciousness_instance_id=str(raw.get("consciousness_instance_id") or ""),
             stream_scope=str(raw.get("stream_scope") or ""),
             metadata=metadata,
+            owner_subject_id=(
+                str(raw["owner_subject_id"])
+                if raw.get("owner_subject_id") is not None else None
+            ),
+            root_relation_id=str(raw.get("root_relation_id") or ""),
+            parent_relation_id=(
+                str(raw["parent_relation_id"])
+                if raw.get("parent_relation_id") is not None else None
+            ),
+            revision=int(raw.get("revision", 1)),
+            operation=str(raw.get("operation", "add")),
         )
         return {
             "relation_id": record.relation_id,
@@ -1210,6 +1253,11 @@ def _transform_source_row(
             "consciousness_instance_id": record.consciousness_instance_id,
             "stream_scope": record.stream_scope,
             "metadata_json": canonical_json(metadata),
+            "owner_subject_id": record.owner_subject_id,
+            "root_relation_id": record.root_relation_id or None,
+            "parent_relation_id": record.parent_relation_id,
+            "revision": record.revision,
+            "operation": record.operation,
             "payload_sha256": _payload_hash(record),
         }
     if table == "memory_recall_sessions":
@@ -1523,6 +1571,17 @@ def iter_transformed_source_rows(
     batch_size: int,
 ) -> Iterable[list[dict[str, Any]]]:
     order_columns = _SOURCE_ORDER.get(spec.name, spec.key_columns)
+    if spec.name == "memory_semantic_relations":
+        relation_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(memory_semantic_relations)"
+            )
+        }
+        if {"root_relation_id", "revision"} <= relation_columns:
+            # Parents precede children even if occurrence IDs or wall-clock
+            # timestamps sort backwards. Legacy NULL-root rows remain exact.
+            order_columns = ("root_relation_id", "revision", "relation_id")
     if spec.name == "memory_vector_tombstones":
         source_columns = {
             str(row["name"])

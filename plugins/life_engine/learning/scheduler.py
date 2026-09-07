@@ -70,6 +70,7 @@ from .selectable import (
     SelectedLearningPersistence,
     SelectedSkillStore,
 )
+from .shared_runtime import SharedLearningProjectionRuntime
 from .skill_distiller import SkillDistiller
 from .skill_store import SkillDecisionKind, SkillStore
 from .store import InsightStore
@@ -195,6 +196,8 @@ class LearningScheduler:
         # 记忆服务（用于把"修正型洞察"落成显式修正记录，形成记忆演化链）
         memory_service: Any | None = None,
         maintenance_journal: LearningMaintenanceJournalPort | None = None,
+        shared_state: SharedLearningProjectionRuntime | None = None,
+        opportunity_managed: bool = False,
         learning_store: LearningStorePort | None = None,
         learning_event_store: LearningStorePort | None = None,
         subject_authority: SubjectAuthorityPort | None = None,
@@ -216,10 +219,17 @@ class LearningScheduler:
             float(llm_timeout_seconds or DEFAULT_LEARNING_LLM_TIMEOUT_SECONDS),
         )
         self._memory_service = memory_service
-        self._current_subject_revision = current_subject_revision or (
-            subject_authority.current_subject_revision
-            if subject_authority is not None
-            else None
+        shared_subject_revision = (
+            shared_state.subject_revision_reader if shared_state is not None else None
+        )
+        self._current_subject_revision = (
+            current_subject_revision
+            or shared_subject_revision
+            or (
+                subject_authority.current_subject_revision
+                if subject_authority is not None
+                else None
+            )
         )
         subject_reader = (
             getattr(subject_authority, "read_subject_authority", None)
@@ -232,19 +242,40 @@ class LearningScheduler:
         self._validate_active_consciousness_instance = (
             validate_active_consciousness_instance
         )
+        if shared_state is not None and learning_store is not None:
+            raise ValueError(
+                "LearningSchedulerSharedStateCannotAlsoConstructLearningStore"
+            )
+        self._shared_state = shared_state
+        self._opportunity_managed = bool(opportunity_managed)
+        self._opportunity_quiesced = False
+        self._opportunity_quiesce_reason = ""
 
         # 初始化核心组件
         self._selected_persistence: SelectedLearningPersistence | None = None
-        self._selected_persistence: SelectedLearningPersistence | None = None
         self._learning_event_store = learning_event_store
-        self._storage_runtime = getattr(learning_store, "runtime", None)
+        self._storage_runtime = (
+            shared_state.storage_runtime
+            if shared_state is not None
+            else getattr(learning_store, "runtime", None)
+        )
         self.decision_ledger: LearningDecisionLedger | None = None
         self._writer_instance_id = (
-            str(writer_instance_id).strip() or f"learning_writer_{uuid4().hex}"
+            str(
+                shared_state.writer_instance_id
+                if shared_state is not None and shared_state.writer_instance_id
+                else writer_instance_id
+            ).strip()
+            or f"learning_writer_{uuid4().hex}"
         )
         self._maintenance_start_evidence_failures = 0
         self._maintenance_start_evidence_failed_this_cycle = False
-        if learning_store is None:
+        if shared_state is not None:
+            self.store = shared_state.store
+            self.skill_store = shared_state.skill_store
+            self.decision_ledger = shared_state.decision_ledger
+            self._selected_persistence = shared_state.selected_persistence
+        elif learning_store is None:
             self.store = InsightStore(self._workspace)
             self.skill_store = SkillStore(self._workspace)
         else:
@@ -298,6 +329,11 @@ class LearningScheduler:
         self.metrics = LearningMetrics(store=self.store)
         if maintenance_journal is not None:
             self.maintenance_journal = maintenance_journal
+        elif shared_state is not None and self._selected_persistence is not None:
+            self.maintenance_journal = SelectedLearningMaintenanceJournal(
+                self._selected_persistence.store,
+                writer_instance_id=self._writer_instance_id,
+            )
         elif learning_store is not None:
             self.maintenance_journal = SelectedLearningMaintenanceJournal(
                 learning_store,
@@ -310,7 +346,7 @@ class LearningScheduler:
         # 那两条洞察不知道自己已经在知识文档里。她要是现在重新审视其中一条，
         # 修正会找不到对应表述。只搬 manifest 里的既有事实，不做判断。
         # 包起来：补账失败也不能让她起不来。
-        if self._selected_persistence is None:
+        if self._shared_state is None and self._selected_persistence is None:
             try:
                 self.store.reconcile_knowledge_versions()
             except Exception as exc:  # noqa: BLE001
@@ -374,25 +410,46 @@ class LearningScheduler:
     async def initialize(self) -> None:
         """Restore bounded maintenance health without blocking the event loop."""
 
-        if self._selected_persistence is not None:
+        if self._shared_state is not None:
+            if not self._shared_state.initialized:
+                raise RuntimeError("SharedLearningProjectionRuntimeNotInitialized")
+        elif self._selected_persistence is not None:
             await self._selected_persistence.initialize()
             self.store.reconcile_knowledge_versions()
             await self._selected_persistence.flush()
         await self.maintenance_journal.initialize()
-        await self.reconcile_subject_review_outcomes()
+        if self._shared_state is None or self._shared_state.writable:
+            await self.reconcile_subject_review_outcomes()
 
     async def flush(self) -> None:
         """Durably flush selected learning mutations at an async boundary."""
 
-        if self._selected_persistence is not None:
+        if self._shared_state is not None:
+            await self._shared_state.flush()
+        elif self._selected_persistence is not None:
             await self._selected_persistence.flush()
 
     async def close(self) -> None:
         """Flush learning consumers without closing the injected runtime."""
 
         self._maintenance_wakeup.set()
-        if self._selected_persistence is not None and not self._projector_quiesced:
+        self._opportunity_quiesced = True
+        self._opportunity_quiesce_reason = "scheduler_closed"
+        if (
+            self._shared_state is None
+            and self._selected_persistence is not None
+            and not self._projector_quiesced
+        ):
             await self._selected_persistence.close()
+
+    def quiesce_opportunity(self, *, reason: str) -> None:
+        """Stop only this semantic worker; shared state remains service-owned."""
+
+        self._opportunity_quiesced = True
+        self._opportunity_quiesce_reason = (
+            str(reason or "").strip() or "learning capability is paused"
+        )
+        self._maintenance_wakeup.set()
 
     def quiesce_projector(self, *, reason: str, error_type: str) -> None:
         """Stop derived writes after the exact singleton owner is lost.
@@ -412,6 +469,8 @@ class LearningScheduler:
     def request_maintenance(self) -> None:
         """Wake the independent learning worker without awaiting LLM work."""
 
+        if self._opportunity_managed or self._opportunity_quiesced:
+            return
         self._maintenance_wakeup.set()
 
     async def run(
@@ -427,12 +486,14 @@ class LearningScheduler:
         consuming the main heartbeat's response budget or delaying expression.
         """
 
+        if self._opportunity_managed or self._opportunity_quiesced:
+            return
         poll_seconds = max(1.0, float(poll_interval_seconds))
         self._worker_running = True
         self.request_maintenance()
         try:
             while not stop_event.is_set():
-                if self._projector_quiesced:
+                if self._projector_quiesced or self._opportunity_quiesced:
                     return
                 self._maintenance_wakeup.clear()
                 self._maintenance_start_evidence_failed_this_cycle = False
@@ -682,13 +743,86 @@ class LearningScheduler:
             return None
         if self._learning_event_store is not None:
             await self._ingest_reflection_events()
-        result = await self._run_pending_reflection()
+        # An explicit request owns exactly the job it just persisted.  Running
+        # the queue head here could consume an older experience while leaving
+        # the caller''s selected source pending, which would make this atomic
+        # opportunity report a misleading result.  Backlog processing remains
+        # available through ``run_next_reflection_once()``.
+        result = await self._run_pending_reflection(job_id=job_id)
         if result is None:
             return None
         if result[0] != job_id:
             return None
         _, insights = result
         return insights
+
+    def _require_explicit_cognitive_operation(self) -> None:
+        """Refuse new cognition after this optional worker is quiesced."""
+
+        if self._projector_quiesced:
+            raise RuntimeError("LearningProjectorQuiesced")
+        if self._opportunity_quiesced:
+            raise RuntimeError("LearningCapabilityQuiesced")
+
+    async def run_next_reflection_once(self) -> tuple[str, list[Any]] | None:
+        """Run at most one durable queued reflection in the current task.
+
+        ``None`` truthfully means there was no eligible item (including the
+        existing cooldown).  This method never spawns a worker and never runs a
+        later audit/compression/distillation phase.
+        """
+
+        self._require_explicit_cognitive_operation()
+        if self._learning_event_store is not None:
+            await self._ingest_reflection_events()
+        try:
+            return await self._run_pending_reflection()
+        finally:
+            await self.flush()
+
+    async def run_independent_audit_once(self) -> list[Any]:
+        """Run one configured audit cycle without invoking another phase.
+
+        One cycle may review up to the configured audit batch size.  It does
+        not trigger reflection, knowledge compression, skill distillation, or
+        a subsequent maintenance pass.
+        """
+
+        self._require_explicit_cognitive_operation()
+        try:
+            records = await self.auditor.run_audit_cycle()
+            if records:
+                self._last_audit_at = _now_iso()
+                state = self.store.load_state()
+                state["last_audit_at"] = self._last_audit_at
+                self.store.save_state(state)
+                await self._project_validated_to_epistemic(records)
+            return records
+        finally:
+            # Auditor rollback and stranded-review recovery are state changes
+            # too; persist them even when its LLM call is cancelled or fails.
+            await self.flush()
+
+    async def propose_knowledge_candidate_once(self) -> bool:
+        """Run only candidate generation, bypassing the old cadence gate."""
+
+        self._require_explicit_cognitive_operation()
+        try:
+            proposed = await self.compressor.run_compression()
+            if proposed:
+                self._snapshot_metrics_now()
+            return proposed
+        finally:
+            await self.flush()
+
+    async def distill_skill_candidate_once(self) -> bool:
+        """Run only skill-candidate distillation, never candidate acceptance."""
+
+        self._require_explicit_cognitive_operation()
+        try:
+            return await self.distiller.run_distillation()
+        finally:
+            await self.flush()
 
     def _reflection_work_due(self) -> bool:
         state = self.store.load_state()
@@ -834,12 +968,20 @@ class LearningScheduler:
             datetime.fromisoformat(job.created_at),
         )
 
-    async def _claim_pending_reflection(self) -> LearningReflectionJob | None:
+    async def _claim_pending_reflection(
+        self,
+        *,
+        job_id: str | None = None,
+    ) -> LearningReflectionJob | None:
         """Pick one due reflection job under the queue lock.
 
         The claimed job deliberately stays in the durable queue. If the process
         dies mid-call the experience is re-offered on restart rather than lost;
         the runner lock, not removal, is what keeps two callers off the same job.
+
+        Args:
+            job_id: Exact durable job selected by an explicit opportunity.
+                ``None`` selects the next due backlog item.
 
         Returns:
             The claimed job, or ``None`` when nothing is runnable right now.
@@ -862,7 +1004,11 @@ class LearningScheduler:
                 if retry_time.astimezone(UTC) > datetime.now(UTC):
                     return None
             due = sorted(
-                (job for job in jobs if job.due()),
+                (
+                    job
+                    for job in jobs
+                    if job.due() and (job_id is None or job.job_id == job_id)
+                ),
                 key=self._reflection_order_key,
             )
             if not due:
@@ -945,7 +1091,11 @@ class LearningScheduler:
             self._save_reflection_jobs(remaining, state=state, runtime=runtime)
             await self.flush()
 
-    async def _run_pending_reflection(self) -> tuple[str, list[Any]] | None:
+    async def _run_pending_reflection(
+        self,
+        *,
+        job_id: str | None = None,
+    ) -> tuple[str, list[Any]] | None:
         """Run at most one due reflection without holding the queue lock.
 
         The LLM call used to happen inside ``_reflection_queue_lock``, so every
@@ -954,6 +1104,10 @@ class LearningScheduler:
         reads and writes; ``_reflection_runner_lock`` serializes the calls, and a
         caller who finds it held leaves its request queued instead of waiting.
 
+        Args:
+            job_id: Exact durable job selected by an explicit opportunity.
+                ``None`` selects the next due backlog item.
+
         Returns:
             ``(job_id, insights)`` when a reflection ran, else ``None``.
         """
@@ -961,7 +1115,7 @@ class LearningScheduler:
         if self._reflection_runner_lock.locked():
             return None
         async with self._reflection_runner_lock:
-            job = await self._claim_pending_reflection()
+            job = await self._claim_pending_reflection(job_id=job_id)
             if job is None:
                 return None
             watermark = self.reflection.last_reflection_at
@@ -1015,6 +1169,8 @@ class LearningScheduler:
         actor_consciousness_instance_id: str = "",
     ) -> None:
         """交互结束事件：触发快环反思。"""
+        if self._opportunity_managed or self._opportunity_quiesced:
+            return
         try:
             await self.enqueue_reflection(
                 reflection_kind="interaction",
@@ -1035,6 +1191,8 @@ class LearningScheduler:
         actor_consciousness_instance_id: str = "",
     ) -> None:
         """思考流闭合事件：触发内省反思。"""
+        if self._opportunity_managed or self._opportunity_quiesced:
+            return
         try:
             await self.enqueue_reflection(
                 reflection_kind="introspection",
@@ -1055,6 +1213,8 @@ class LearningScheduler:
     ) -> None:
         """Learn only from an explicit public close statement, never raw CoT."""
 
+        if self._opportunity_managed or self._opportunity_quiesced:
+            return
         statement = str(public_statement or "").strip()
         actor = str(actor_consciousness_instance_id or "").strip()
         sources = [
@@ -2889,7 +3049,11 @@ class LearningScheduler:
 
         由 life_engine 心跳周期调用（低频，不必每次心跳都调用）。
         """
-        if self._projector_quiesced:
+        if (
+            self._projector_quiesced
+            or self._opportunity_managed
+            or self._opportunity_quiesced
+        ):
             return
         async with self._maintenance_lock:
             await self.reconcile_subject_review_outcomes()
@@ -3799,9 +3963,14 @@ class LearningScheduler:
             cooldown_minutes=self._reflection_cooldown_minutes,
         )
         subject_review_health = self._subject_review_health_snapshot()
+        automatic_worker_disabled = (
+            self._opportunity_managed or self._opportunity_quiesced
+        )
         worker_health = {
             "status": (
-                "healthy"
+                "disabled"
+                if automatic_worker_disabled
+                else "healthy"
                 if self._worker_running
                 else "degraded"
                 if self._worker_last_started_at
@@ -3813,6 +3982,13 @@ class LearningScheduler:
             "last_error_type": self._worker_last_error_type,
             "maintenance_start_evidence_failures": (
                 self._maintenance_start_evidence_failures
+            ),
+            "reason": (
+                self._opportunity_quiesce_reason
+                if self._opportunity_quiesced
+                else "opportunity runtime owns scheduling"
+                if self._opportunity_managed
+                else ""
             ),
         }
         component_statuses = {
@@ -3832,7 +4008,9 @@ class LearningScheduler:
             learning_status = "healthy"
         return {
             "status": learning_status,
-            "mode": "projector",
+            "mode": "opportunity_managed" if self._opportunity_managed else "projector",
+            "opportunity_managed": self._opportunity_managed,
+            "automatic_semantic_work": not automatic_worker_disabled,
             "projector_owner": True,
             "event_append_available": self._learning_event_store is not None,
             "insights": stats,
@@ -3840,7 +4018,9 @@ class LearningScheduler:
             "last_audit_at": state.get("last_audit_at", ""),
             "last_compress_at": state.get("last_compress_at", ""),
             "last_metrics_at": state.get("last_metrics_at", ""),
-            "reflection_available": self.reflection.can_reflect,
+            "reflection_available": (
+                self.reflection.can_reflect and not self._opportunity_quiesced
+            ),
             "reflection_queue": reflection_health,
             "skill_candidates": {
                 "open": sum(item.status == "open" for item in skill_candidates),
@@ -3854,6 +4034,11 @@ class LearningScheduler:
             "subject_review": subject_review_health,
             "worker": worker_health,
             "selected_persistence": selected_health,
+            "shared_projection_runtime": (
+                self._shared_state.health_snapshot()
+                if self._shared_state is not None
+                else None
+            ),
             "prompt_projections": {
                 "knowledge": self.compressor.projection_health(),
                 "skills": self.skill_store.catalog_projection_health(),

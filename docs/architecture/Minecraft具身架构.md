@@ -58,9 +58,9 @@ Bot 作为独立玩家加入用户已经打开的 LAN 世界或离线模式服�
 
 ### 正式所有权与就绪
 
-Minecraft 是 `LifeEngineService` 独立持有的可选场景，不属于 LearningScheduler。`minecraft.enabled=true` 时才注册 `nucleus_minecraft`；Learning 关闭不会隐藏或接管它。service 的部分初始化失败和 stop 都会幂等关闭 session，失败 owner 保留以便重试，同时继续释放其他资源。
+Minecraft 是 `plugins/minecraft` 独立插件，`MinecraftService` 唯一持有游戏 session，不属于 LifeEngineService 或 LearningScheduler。配置为 `config/plugins/minecraft/config.toml` 的 `[settings]`，启用后登记 `minecraft:tool:nucleus_minecraft`；Learning 关闭不会隐藏或接管它。插件加载不启动游戏，卸载幂等关闭自己的 session，失败 owner 保留以供重试。Life Engine 只提供共享意识、事件与世界协调的通用端口。
 
-“已经启动”不等于“身体就绪”。Agent Body 必须通过固定版本和摘要预检、共享令牌认证、Bridge/能力匹配、两条连续观察，并明确报告正确单人世界、`world_loaded=true`、`client_paused=false` 和玩家 UUID。标题页、暂停菜单、错误世界、过期桥接、静止观察或多个候选窗口都是显式失败。
+“已经启动”不等于“身体就绪”。Agent Body 必须通过固定版本和摘要预检、共享令牌认证、Bridge/能力匹配、两条连续观察，并明确报告正确世界、`world_loaded=true`、`client_paused=false` 和玩家 UUID。共享 native profile 还要验证独立 game directory、玩家名/UUID、multiplayer 模式与目标服务器；像素从认证身体的 render target 获取，不回退读取人类桌面。标题页、暂停菜单、错误世界、过期桥接、静止观察或不明确的身体身份都是显式失败。
 
 ### 专属 Minecraft 意识
 

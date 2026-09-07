@@ -76,6 +76,8 @@ Life Engine 的轻量 health 在事件总线已创建后还包含：
 
 consumer lag 可以暂时非零；首次导入大量旧 JSONL 后，见证意识会按配置的批量和间隔逐步追赶，不能直接跳到尾部。判断是否健康要连续观察：lag 应总体下降，或至少其消费速度长期不低于新事件产生速度。若上游模型/投影失败，offset 应保持不动；恢复后即使对应 Experience 已在账本中，也必须重试同一见证窗口。`import_issue_count > 0` 必须查看 `raw_event_import_issues`，不能静默忽略。
 
+当前部署默认 `[memory_witness] enabled=false`。关闭期间 consumer lag 允许增大，health 应报告 `disabled` / `memory_witness_retired`，不得把退役当成 `failed`，也不得把游标跳到尾部来“清零 lag”。重新启用前必须先处理 oversized occurrence；见 [记忆见证意识退役_2026-09-06](../report/记忆见证意识退役_2026-09-06.md)。
+
 ## 5. 显式修复
 
 ### 5.1 共同回忆投影漂移

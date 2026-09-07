@@ -1,13 +1,14 @@
-"""``get_lineage_node_views`` 与逐节点读取的等价性契约。
+"""精确历史血缘视图与当前节点读取的边界契约。
 
 组装记忆包时，每条血缘边原先要打两次数据库：一次 :func:`get_node_by_id`
 取节点、一次 :func:`get_snippet` 取摘要。一次召回返回 10 条结果、每条牵出
 若干条前后向边，往返次数就是三位数——而这些往返是串行的，每一次都要排队等
 同一条连接的语句锁。
 
-批量化只有在**语义完全不变**时才是等价改写。本文件把两条路径跑在同一份数据
-上逐节点比对：可见性判定（已删除、路径不再合规）与摘要来源（chunk 优先、
-其次 FTS、都没有则空串）必须一字不差。
+未删除节点的字段与摘要来源（chunk 优先、其次 FTS、都没有则空串）仍须与
+逐节点读取一致。S2 的精确历史边查询还保留已退役旧节点及其原文，不能因为
+当前路径释放而删除历史；当前 legacy 按 ID 读取则保留旧的删除过滤行为。
+两者都必须排除非法、非规范或工作区外路径。
 """
 
 from __future__ import annotations
@@ -54,7 +55,7 @@ CREATE TABLE memory_fts (
 );
 """
 
-# 覆盖 get_lineage_node_views 需要与 get_node_by_id 保持一致的每一条分支：
+# 覆盖历史视图与当前 legacy 读取的共有分支及明确不同的退役可见性：
 # 正常可见、摘要回落到 FTS、无任何内容、已删除、路径不再合规、非文件节点。
 _NODES: tuple[dict[str, object], ...] = (
     {
@@ -174,8 +175,10 @@ def db() -> Iterator[sqlite3.Connection]:
     connection.close()
 
 
-async def test_views_match_per_node_reads_exactly(db: sqlite3.Connection) -> None:
-    """批量视图的可见集合与每个字段都必须与逐节点读取一致。"""
+async def test_history_views_preserve_retired_nodes_without_changing_current_reads(
+    db: sqlite3.Connection,
+) -> None:
+    """历史边保留退役节点，而当前兼容读取仍过滤它。"""
     views = await get_lineage_node_views(db, _ALL_IDS)
 
     expected_visible: set[str] = set()
@@ -183,7 +186,13 @@ async def test_views_match_per_node_reads_exactly(db: sqlite3.Connection) -> Non
         if await get_node_by_id(db, node_id) is not None:
             expected_visible.add(node_id)
 
-    assert set(views) == expected_visible
+    assert "n-deleted" not in expected_visible
+    assert set(views) == expected_visible | {"n-deleted"}
+    assert views["n-deleted"].node_id == "n-deleted"
+    assert views["n-deleted"].file_path == "notes/2026/deleted.md"
+    assert views["n-deleted"].is_deleted
+    assert views["n-deleted"].snippet == "已删除节点的内容"
+    assert not {"n-noncanonical", "n-absolute"}.intersection(views)
     # 数据本身必须真的覆盖了两侧分支，否则这条断言是空的
     assert expected_visible, "测试数据没有任何可见节点"
     assert set(_ALL_IDS) - expected_visible, "测试数据没有任何不可见节点"

@@ -727,28 +727,57 @@ async def test_service_renews_authority_while_memory_is_initializing(
         memory_init_started.set()
         await hold_memory_init.wait()
 
+    marker_reads: list[_FakeRuntime] = []
+
+    async def _no_managed_marker(runtime: _FakeRuntime) -> None:
+        # This fixture models the legacy-compatible generation. Marker SQL
+        # integrity is covered by the real local Opportunity store contracts.
+        assert runtime is runtimes[0]
+        marker_reads.append(runtime)
+        return None
+
+    monkeypatch.setattr(
+        "plugins.life_engine.storage.opportunity_schema.read_opportunity_runtime_marker",
+        _no_managed_marker,
+    )
     monkeypatch.setattr(
         "plugins.life_engine.service.integrations.MemoryIntegration.init_memory_service",
         _delayed_memory_init,
     )
 
-    startup = asyncio.create_task(service._start_impl())
-    await asyncio.wait_for(memory_init_started.wait(), timeout=1.0)
-    await asyncio.sleep(0.03)
-
-    assert runtimes[0].renew_calls
-    assert not startup.done()
-
-    startup.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await startup
-    service._stop_event.set()
-    await service._await_managed_task(
-        service._storage_authority_renew_task_id,
-        timeout=1.0,
+    exit_reasons: list[str] = []
+    monkeypatch.setattr(
+        service,
+        "_exit_for_lost_storage_authority",
+        lambda reason: exit_reasons.append(str(reason)),
     )
-    service._storage_authority_renew_task_id = None
-    await service._close_selected_storage()
+    startup = asyncio.create_task(service._start_impl())
+    try:
+        await asyncio.wait_for(memory_init_started.wait(), timeout=1.0)
+        await asyncio.sleep(0.03)
+        assert marker_reads == [runtimes[0]]
+        assert runtimes[0].renew_calls
+        assert not startup.done()
+    finally:
+        # Announce shutdown before cancelling the startup task and its managed
+        # children. Unexpected authority loss remains an explicit test failure,
+        # never a real os._exit that hides the primary failure from pytest.
+        if service._stop_event is not None:
+            service._stop_event.set()
+        if not startup.done():
+            startup.cancel()
+        try:
+            await startup
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await service._await_managed_task(
+                service._storage_authority_renew_task_id,
+                timeout=1.0,
+            )
+            service._storage_authority_renew_task_id = None
+            await service._close_selected_storage()
+    assert exit_reasons == []
 
 
 async def test_storage_authority_loop_renews_current_writer(

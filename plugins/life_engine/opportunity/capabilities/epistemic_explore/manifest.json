@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "capability_id": "life.epistemic_explore",
+  "package_version": "1.0.0",
+  "removability": "subject_removable",
+  "provider_kind": "epistemic_explore",
+  "manual": "CAPABILITY.md",
+  "default_skill": "DEFAULT_SKILL.md",
+  "operations": [
+    "nucleus_search_memory",
+    "nucleus_grep_events",
+    "nucleus_web_search",
+    "nucleus_browser_fetch"
+  ],
+  "dependencies": [
+    "life.epistemic_candidates",
+    "life.memory_engine",
+    "life.timeline",
+    "life.web_access"
+  ]
+}

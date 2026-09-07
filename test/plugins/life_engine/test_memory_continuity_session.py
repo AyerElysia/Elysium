@@ -58,6 +58,7 @@ from plugins.life_engine.storage.subject_contracts import (
     SubjectDocumentCommit,
     SubjectDocumentHead,
     SubjectDocumentVersion,
+    subject_authority_logical_path,
     subject_revision_from_contents,
 )
 
@@ -108,7 +109,7 @@ class _Authority:
             version = SubjectDocumentVersion(
                 version_id=version_id,
                 document_id=f"document-{path.lower()}",
-                logical_path=path,
+                logical_path=subject_authority_logical_path(path),
                 parent_version_id="",
                 occurrence_id=f"seed:{path}",
                 semantic_actor_id="chat-main",
@@ -128,8 +129,8 @@ class _Authority:
             )
             head = SubjectDocumentHead(
                 document_id=version.document_id,
-                logical_path=path,
-                declared_owner="Elysia",
+                logical_path=subject_authority_logical_path(path),
+                declared_owner="elysia",
                 current_version_id=version_id,
                 revision=index,
             )

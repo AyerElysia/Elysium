@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
-import uuid
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any
@@ -18,7 +16,9 @@ from typing import Any
 from src.kernel.llm import ROLE, LLMPayload, ReasoningText, Text, ToolCall, ToolResult
 from src.kernel.storage import canonical_json_sha256
 
+from ..core.context_stewardship import write_synced_context_file
 from .event_builder import EventType, LifeEngineEvent
+from .historical_redelivery import format_historical_redelivery
 
 HEARTBEAT_ROLLING_NAMESPACE = "life_heartbeat.rolling_context"
 HEARTBEAT_ROLLING_STATE_KEY = "subconscious"
@@ -37,6 +37,12 @@ _VISIBLE_JSON_KEYS = (
 
 
 def format_visible_event(event: LifeEngineEvent) -> str:
+    """Render a declared projection, labelling explicit historical redelivery."""
+
+    return format_historical_redelivery(event, _format_visible_event_body(event))
+
+
+def _format_visible_event_body(event: LifeEngineEvent) -> str:
     """Render one life-domain event as first-person-readable text.
 
     Infrastructure protocol JSON is not copied into the rolling window.
@@ -167,6 +173,10 @@ def deserialize_rolling_payloads(raw: Any) -> list[LLMPayload]:
     version = raw.get("version", 1)
     if version != HEARTBEAT_ROLLING_SNAPSHOT_VERSION:
         raise RuntimeError(f"HeartbeatRollingSnapshotVersionUnsupported:{version}")
+    # Early local snapshots may omit this envelope field. An explicit other
+    # surface is never a compatible heartbeat snapshot.
+    if raw.get("runtime_key") not in {None, HEARTBEAT_ROLLING_NAMESPACE}:
+        raise RuntimeError("HeartbeatRollingRuntimeKeyMismatch")
     payload_items = raw.get("payloads")
     if not isinstance(payload_items, list):
         raise RuntimeError("HeartbeatRollingPayloadsNotList")
@@ -176,9 +186,12 @@ def deserialize_rolling_payloads(raw: Any) -> list[LLMPayload]:
         raise RuntimeError("HeartbeatRollingPayloadDigestMismatch")
     payloads: list[LLMPayload] = []
     for item in payload_items:
+        if not isinstance(item, dict) or not isinstance(item.get("content"), list):
+            raise RuntimeError("HeartbeatRollingPayloadCannotBeDecoded")
         payload = _deserialize_payload(item)
-        if payload is not None:
-            payloads.append(payload)
+        if payload is None or len(payload.content) != len(item["content"]):
+            raise RuntimeError("HeartbeatRollingPayloadCannotBeDecoded")
+        payloads.append(payload)
     return payloads
 
 
@@ -204,15 +217,18 @@ async def load_heartbeat_rolling(
             HEARTBEAT_ROLLING_STATE_KEY,
         )
         if record is None:
+            service._heartbeat_rolling_revision = 0
             return []
-        return deserialize_rolling_payloads(record.payload)
+        payloads = deserialize_rolling_payloads(record.payload)
+        service._heartbeat_rolling_revision = int(record.revision)
+        return payloads
 
     path = _local_snapshot_path(workspace_path)
     if not path.exists():
         return []
     try:
         raw = json.loads(await asyncio.to_thread(path.read_text, encoding="utf-8"))
-    except Exception as exc:  # noqa: BLE001 - derived snapshot fails closed to empty
+    except Exception as exc:  # noqa: BLE001 - never turn corruption into empty state
         raise RuntimeError("HeartbeatRollingSnapshotUnreadable") from exc
     return deserialize_rolling_payloads(raw)
 
@@ -226,32 +242,34 @@ async def save_heartbeat_rolling(
     data = snapshot_dict(payloads)
     store = _runtime_store(service)
     if store is not None:
-        latest = await store.get_state(
-            HEARTBEAT_ROLLING_NAMESPACE,
-            HEARTBEAT_ROLLING_STATE_KEY,
-        )
-        expected_revision = int(latest.revision) if latest is not None else 0
-        await store.put_state(
+        expected_revision = getattr(service, "_heartbeat_rolling_revision", None)
+        if expected_revision is None:
+            # Compatibility for an isolated first save. Production loads before
+            # every heartbeat; subsequent writes must use that observed version.
+            latest = await store.get_state(
+                HEARTBEAT_ROLLING_NAMESPACE,
+                HEARTBEAT_ROLLING_STATE_KEY,
+            )
+            expected_revision = int(latest.revision) if latest is not None else 0
+            service._heartbeat_rolling_revision = expected_revision
+        record = await store.put_state(
             namespace=HEARTBEAT_ROLLING_NAMESPACE,
             state_key=HEARTBEAT_ROLLING_STATE_KEY,
             expected_revision=expected_revision,
             schema_version=HEARTBEAT_ROLLING_SNAPSHOT_VERSION,
             payload=data,
         )
+        if record is None or int(record.revision) != expected_revision + 1:
+            raise RuntimeError("HeartbeatRollingCommitReceiptInvalid")
+        # A failed/cancelled put may have committed. Do not adopt an unobserved
+        # revision; the caller must explicitly read back before another save.
+        service._heartbeat_rolling_revision = int(record.revision)
         return
 
     path = _local_snapshot_path(workspace_path)
-    tmp = path.with_suffix(path.suffix + f".tmp-{os.getpid()}-{uuid.uuid4().hex}")
     text = json.dumps(data, ensure_ascii=False, separators=(",", ":"), default=str)
-    try:
-        await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
-        await asyncio.to_thread(tmp.write_text, text, encoding="utf-8")
-        await asyncio.to_thread(os.replace, tmp, path)
-    finally:
-        try:
-            await asyncio.to_thread(tmp.unlink, missing_ok=True)
-        except OSError:
-            pass
+    await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
+    await asyncio.to_thread(write_synced_context_file, path, text)
 
 
 def estimate_payload_chars(payloads: Sequence[LLMPayload]) -> int:
@@ -368,7 +386,9 @@ def _deserialize_payload(data: Any) -> LLMPayload | None:
         return None
     content = [
         item
-        for item in (_deserialize_part(part) for part in list(data.get("content") or []))
+        for item in (
+            _deserialize_part(part) for part in list(data.get("content") or [])
+        )
         if item is not None
     ]
     if not content:

@@ -321,12 +321,6 @@ def get_memory_boundary_recall_coordinator() -> MemoryBoundaryRecallCoordinator:
     return _RECALL_COORDINATOR
 
 
-def get_memory_recall_delivery_coordinator() -> MemoryBoundaryRecallCoordinator:
-    """Return the canonical coordinator under its non-legacy semantic name."""
-
-    return _RECALL_COORDINATOR
-
-
 def _boundary_ref(stored: StoredMemoryBoundary) -> str:
     return f"memory-boundary-artifact:{stored.artifact.artifact_id}"
 
