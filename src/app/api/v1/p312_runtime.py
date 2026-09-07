@@ -19,6 +19,7 @@ from src.kernel.scheduler import get_unified_scheduler
 
 from .auth_store import SessionRecord
 from .p312 import P312Providers
+from .runtime import APIError
 
 
 def _dict(value: Any) -> dict[str, Any]:
@@ -265,8 +266,16 @@ class RuntimeMemoryProvider:
         return memory
 
     async def search(
-        self, query: str, *, top_k: int, session: SessionRecord
+        self,
+        query: str,
+        *,
+        top_k: int,
+        session: SessionRecord,
+        enable_association: bool = False,
     ) -> list[dict[str, Any]]:
+        """Return direct evidence unless canonical extra reads are opted into."""
+        if type(enable_association) is not bool:
+            raise TypeError("enable_association must be a bool")
         service = self._service()
         direct_results = await service.search_memory(
             query,
@@ -276,10 +285,25 @@ class RuntimeMemoryProvider:
             enable_association=False,
             return_bundles=False,
         )
+        if not enable_association:
+            values = []
+            for item in direct_results:
+                value = _dict(item)
+                document_id, version_id = value.get("document_id"), value.get("version_id")
+                if document_id and version_id:
+                    value.setdefault("file_ref", f"subject-file:{document_id}@{version_id}")
+                values.append(value)
+            return values
+
         expand = getattr(service, "expand_living_document_associations", None)
         build_bundles = getattr(service, "build_memory_bundles", None)
         if not callable(expand) or not callable(build_bundles):
-            raise RuntimeError("canonical memory association facade is unavailable")
+            raise APIError(
+                "component_unavailable",
+                "规范记忆关联能力当前不可用。",
+                status_code=503,
+                retryable=True,
+            )
 
         context_key = f"api-v1/admin/memory:{session.actor_id}"
         random_seed = int.from_bytes(

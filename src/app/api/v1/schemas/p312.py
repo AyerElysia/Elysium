@@ -62,6 +62,10 @@ class P312MemorySearchRequest(VersionedModel):
 
     query: str = Field(min_length=1, max_length=2000)
     top_k: int = Field(default=20, ge=1, le=100)
+    enable_association: bool = Field(
+        default=False,
+        description="显式启用活体关联及记忆包；默认仅返回直接命中。",
+    )
     time_range_days: int = Field(default=0, ge=0, le=36500)
     file_types: tuple[str, ...] = ()
 
