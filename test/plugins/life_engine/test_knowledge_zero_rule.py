@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, AsyncIterator, cast
 
 import pytest
 
@@ -96,9 +97,38 @@ async def test_challenge_records_evidence_without_code_side_confidence_rule(
     config = LifeEngineConfig()
     config.settings.workspace_path = str(tmp_path)
     plugin = SimpleNamespace(config=config)
+
+    async def flush() -> None:
+        return None
+
+    class _Capability:
+        scheduler = SimpleNamespace(flush=flush)
+
+        @property
+        def store(self) -> InsightStore:
+            return store
+
+        @asynccontextmanager
+        async def mutation_context(
+            self,
+            _operation_id: str,
+            *,
+            reason: str = "",
+        ) -> AsyncIterator[None]:
+            del reason
+            yield
+
+    async def bind(
+        _tool: object,
+        *,
+        require_writable: bool = False,
+    ) -> _Capability:
+        assert require_writable is True
+        return _Capability()
+
     monkeypatch.setattr(
-        "plugins.life_engine.learning.tools._get_scheduler",
-        lambda _plugin: None,
+        "plugins.life_engine.learning.tools.LearningOpportunityCapability.bind",
+        bind,
     )
     tool = LifeChallengeInsightTool(plugin=cast(Any, plugin))
 

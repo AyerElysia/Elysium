@@ -610,6 +610,7 @@ function renderMinecraft(data) {
     minecraftDetail("最近错误", data.last_error || "无"),
   );
   $("#minecraft-start").disabled = active || !data.available;
+  $("#minecraft-body").disabled = active;
   $("#minecraft-stop").disabled = !active;
 }
 
@@ -619,14 +620,15 @@ async function loadMinecraft() {
 }
 
 async function runMinecraftPreflight() {
-  const data = await api("api/v1/minecraft/preflight");
+  const query = new URLSearchParams({ body_name: $("#minecraft-body").value });
+  const data = await api("api/v1/minecraft/preflight?" + query);
   $("#minecraft-result").textContent = JSON.stringify(data.result || data, null, 2);
   await loadMinecraft();
 }
 
 async function runMinecraftStart() {
   const goal = $("#minecraft-goal").value.trim();
-  const query = new URLSearchParams({ goal });
+  const query = new URLSearchParams({ goal, body_name: $("#minecraft-body").value });
   const data = await api(`api/v1/minecraft/start?${query}`, { method: "POST" });
   $("#minecraft-result").textContent = JSON.stringify(data.result || data, null, 2);
   await loadMinecraft();

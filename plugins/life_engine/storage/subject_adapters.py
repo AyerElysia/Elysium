@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hashlib
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
+from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
 from typing import Any, TypeVar
@@ -17,8 +20,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.kernel.storage import canonical_json
 
-from .contracts import StorageBackendRuntime
 from ._write_base import run_write_attempts
+from .authority import MySQLAuthorityRegistry
+from .contracts import StorageBackendRuntime
 from .models import BackendKind
 from .subject_contracts import (
     SUBJECT_AUTHORITY_PATHS,
@@ -32,7 +36,11 @@ from .subject_contracts import (
     SubjectDocumentCommit,
     SubjectDocumentConflict,
     SubjectDocumentHead,
+    SubjectDocumentMutation,
+    SubjectDocumentMutationCommit,
     SubjectDocumentNotFound,
+    SubjectDocumentOperation,
+    SubjectDocumentPathBinding,
     SubjectDocumentVersion,
     SubjectProjectionTask,
     subject_authority_logical_path,
@@ -41,6 +49,7 @@ from .subject_contracts import (
 
 _T = TypeVar("_T")
 _MAX_SUBJECT_CANDIDATE_BYTES = 4 * 1024 * 1024
+_LOCAL_WRITE_GATE_TIMEOUT_SECONDS = 30.0
 
 
 def normalize_subject_path(value: str) -> str:
@@ -166,6 +175,8 @@ class SQLSubjectDocumentStore:
             raise RuntimeError("subject document adapter requires enabled storage")
         self.runtime = runtime
         self.backend = runtime.backend
+        self._local_write_gate = asyncio.Lock()
+        self._projection_fence_owner: asyncio.Task[Any] | None = None
 
     @property
     def _for_update(self) -> str:
@@ -197,16 +208,89 @@ class SQLSubjectDocumentStore:
     ) -> _T:
         async def _attempt() -> _T:
             async with self.runtime.unit_of_work() as uow:
+                await self._reserve_document_writer(uow.session)
                 return await operation(uow.session)
 
-        return await run_write_attempts(
-            _attempt,
-            exhaustion_message="bounded subject document retry loop exhausted",
-        )
+        async with self._local_write_scope():
+            return await run_write_attempts(
+                _attempt,
+                exhaustion_message="bounded subject document retry loop exhausted",
+            )
 
-    @staticmethod
-    def _document_id(logical_path: str) -> str:
-        return "doc_" + hashlib.sha256(logical_path.encode()).hexdigest()
+    async def _reserve_document_writer(self, session: AsyncSession) -> None:
+        """Serialize path writes without relying on READ COMMITTED gap locks.
+
+        MySQL uses an existing immutable schema-v5 control row as a transaction
+        mutex. This serializes this subject domain only. Older writers that do
+        not acquire it must be stopped before enabling v5 file lifecycle tools.
+        """
+
+        if self.backend == BackendKind.LOCAL:
+            await session.execute(text("BEGIN IMMEDIATE"))
+            return
+        version = await session.scalar(text(
+            """SELECT version FROM subject_document_schema_migrations
+            WHERE version = 5 FOR UPDATE"""
+        ))
+        if version != 5:
+            raise SubjectDocumentConflict("subject schema v5 writer guard is missing")
+
+    @asynccontextmanager
+    async def _local_write_scope(self) -> AsyncIterator[None]:
+        if self._projection_fence_owner is asyncio.current_task():
+            raise RuntimeError(
+                "subject writes and nested fences are forbidden inside "
+                "a workspace namespace/projection fence; confirm/fail after leaving it"
+            )
+        try:
+            async with asyncio.timeout(_LOCAL_WRITE_GATE_TIMEOUT_SECONDS):
+                await self._local_write_gate.acquire()
+        except TimeoutError as exc:
+            raise SubjectDocumentConflict(
+                "subject write gate deadline exceeded"
+            ) from exc
+        try:
+            yield
+        finally:
+            self._local_write_gate.release()
+
+    @asynccontextmanager
+    async def workspace_projection_fence(self) -> AsyncIterator[None]:
+        """Hold the LOCAL database writer reservation across exact disk changes.
+
+        SQLite's configured busy timeout bounds acquisition across adapters;
+        the coroutine-side write gate bounds and serializes local contenders.
+        No filesystem action is retried here. Exceptions/cancellation unwind
+        the existing fenced UoW and release both reservation and write gate.
+        """
+
+        if self.backend != BackendKind.LOCAL:
+            raise RuntimeError("workspace projection fence is LOCAL-only")
+        async with self.workspace_namespace_fence():
+            yield
+
+    @asynccontextmanager
+    async def workspace_namespace_fence(self) -> AsyncIterator[None]:
+        """Fence path publication on either backend; perform no filesystem I/O."""
+
+        async with self._local_write_scope(), self.runtime.unit_of_work() as uow:
+            await self._reserve_document_writer(uow.session)
+            # UoW validates again at commit, but external publication also
+            # needs authority checked and held before the caller touches disk.
+            if self.runtime._write_fence is not None:
+                await self.runtime._write_fence(uow.session)
+            elif self.backend == BackendKind.MYSQL:
+                registry, token = self.runtime.authority_registry, self.runtime.authority_token
+                if not isinstance(registry, MySQLAuthorityRegistry) or token is None:
+                    raise RuntimeError("MySQL namespace publication lacks writer authority")
+                await registry.validate_in_transaction(
+                    await uow.session.connection(), token,
+                )
+            self._projection_fence_owner = asyncio.current_task()
+            try:
+                yield
+            finally:
+                self._projection_fence_owner = None
 
     @staticmethod
     def _version_id(
@@ -254,6 +338,8 @@ class SQLSubjectDocumentStore:
             declared_owner=_optional(row["declared_owner"]),
             current_version_id=str(row["current_version_id"] or ""),
             revision=int(row["revision"]),
+            binding_revision=int(row.get("binding_revision", 0)),
+            deleted=bool(row.get("is_deleted", False)),
         )
 
     @staticmethod
@@ -417,11 +503,17 @@ class SQLSubjectDocumentStore:
                         d.declared_owner AS head_declared_owner,
                         d.current_version_id AS head_current_version_id,
                         d.revision AS head_revision,
+                        d.binding_revision AS head_binding_revision,
                         {self._version_columns("v")}
                         FROM subject_documents AS d
+                        JOIN subject_document_path_bindings AS b
+                          ON b.document_id = d.document_id
+                          AND b.logical_path = d.logical_path
+                          AND b.revision = d.binding_revision
                         JOIN subject_document_versions AS v
                           ON v.version_id = d.current_version_id
                         WHERE d.logical_path IN (:soul, :user, :memory)
+                          AND d.is_deleted = 0
                         ORDER BY d.logical_path"""
                         + (self._for_update if lock else "")
                     ),
@@ -451,6 +543,7 @@ class SQLSubjectDocumentStore:
                 declared_owner=_optional(row["head_declared_owner"]),
                 current_version_id=str(row["head_current_version_id"]),
                 revision=int(row["head_revision"]),
+                binding_revision=int(row["head_binding_revision"]),
             )
             version = self._decode_version(row)
             if head.declared_owner != "elysia":
@@ -1046,24 +1139,337 @@ class SQLSubjectDocumentStore:
                 "subject authority acceptance conflicted during commit"
             ) from exc
 
-    async def get_head(self, logical_path: str) -> SubjectDocumentHead | None:
-        path = normalize_subject_path(logical_path)
-        async with self.runtime.unit_of_work() as uow:
-            row = (
-                (
-                    await uow.session.execute(
-                        text(
-                            """SELECT document_id, logical_path, declared_owner,
-                            current_version_id, revision FROM subject_documents
-                            WHERE logical_path = :logical_path"""
-                        ),
-                        {"logical_path": path},
-                    )
-                )
-                .mappings()
-                .one_or_none()
+    async def _read_head(
+        self, session: AsyncSession, *, logical_path: str | None = None,
+        document_id: str | None = None, lock: bool = False,
+    ) -> SubjectDocumentHead | None:
+        statement = """SELECT d.document_id, d.logical_path, d.declared_owner,
+            d.current_version_id, d.revision, d.binding_revision, d.is_deleted
+            FROM subject_documents AS d"""
+        if logical_path is not None:
+            statement += """ JOIN subject_document_path_bindings AS b
+                ON b.document_id = d.document_id
+                AND b.logical_path = d.logical_path
+                AND b.revision = d.binding_revision
+                WHERE b.logical_path = :identity AND d.is_deleted = 0"""
+            identity = logical_path
+        else:
+            statement += " WHERE d.document_id = :identity"
+            identity = document_id
+        row = (
+            await session.execute(
+                text(statement + (self._for_update if lock else "")),
+                {"identity": identity},
             )
+        ).mappings().one_or_none()
         return self._decode_head(row)
+
+    async def _read_binding(
+        self, session: AsyncSession, path: str, *, lock: bool = False,
+    ) -> SubjectDocumentPathBinding | None:
+        row = (
+            await session.execute(
+                text("SELECT logical_path, document_id, revision "
+                     "FROM subject_document_path_bindings "
+                     "WHERE logical_path = :path"
+                     + (self._for_update if lock else "")),
+                {"path": path},
+            )
+        ).mappings().one_or_none()
+        return None if row is None else SubjectDocumentPathBinding(
+            logical_path=str(row["logical_path"]),
+            document_id=_optional(row["document_id"]),
+            revision=int(row["revision"]),
+        )
+
+    async def _assert_file_path_shape(
+        self, session: AsyncSession, path: str,
+    ) -> None:
+        """Reject bound ancestor/descendant files while the writer mutex is held."""
+
+        parts = path.split("/")
+        parents = ["/".join(parts[:index]) for index in range(1, len(parts))]
+        if parents:
+            parameters = {f"parent_{index}": parent for index, parent in enumerate(parents)}
+            placeholders = ", ".join(f":{name}" for name in parameters)
+            ancestor = await session.scalar(text(
+                "SELECT logical_path FROM subject_document_path_bindings "
+                "WHERE document_id IS NOT NULL "
+                f"AND logical_path IN ({placeholders}) LIMIT 1"
+            ), parameters)
+            if ancestor is not None:
+                raise SubjectDocumentConflict("a managed file already occupies an ancestor path")
+        # Paths use SQLite BINARY / MySQL utf8mb4_bin. '/' immediately
+        # precedes '0', so this half-open range is the exact descendant prefix.
+        descendant = await session.scalar(text(
+            """SELECT logical_path FROM subject_document_path_bindings
+            WHERE document_id IS NOT NULL AND logical_path >= :lower
+              AND logical_path < :upper ORDER BY logical_path LIMIT 1"""
+        ), {"lower": path + "/", "upper": path + "0"})
+        if descendant is not None:
+            raise SubjectDocumentConflict("managed descendant files already occupy this path")
+
+    async def _set_binding(
+        self, session: AsyncSession, *, path: str,
+        previous: SubjectDocumentPathBinding | None, document_id: str | None,
+        occurrence_id: str, recorded_at: datetime,
+    ) -> int:
+        revision = previous.revision if previous else 0
+        parameters = {
+            "path": path, "document_id": document_id,
+            "previous_document_id": previous.document_id if previous else None,
+            "previous_revision": revision, "revision": revision + 1,
+            "occurrence_id": occurrence_id,
+            "recorded_at": self._bind_time(recorded_at),
+            "event_id": "path_" + hashlib.sha256(canonical_json({
+                "path": path, "revision": revision + 1,
+                "occurrence_id": occurrence_id,
+            }).encode()).hexdigest(),
+        }
+        if previous is None:
+            try:
+                await session.execute(text(
+                    """INSERT INTO subject_document_path_bindings
+                    (logical_path, document_id, revision)
+                    VALUES (:path, :document_id, :revision)"""
+                ), parameters)
+            except IntegrityError as exc:
+                raise SubjectDocumentConflict("concurrent path creation") from exc
+        else:
+            changed = await session.execute(text(
+                """UPDATE subject_document_path_bindings
+                SET document_id = :document_id, revision = :revision
+                WHERE logical_path = :path AND revision = :previous_revision"""
+            ), parameters)
+            if changed.rowcount != 1:
+                raise SubjectDocumentConflict("path binding CAS failed")
+        await session.execute(text(
+            """INSERT INTO subject_document_path_events
+            (event_id, logical_path, previous_document_id, document_id,
+             previous_revision, revision, occurrence_id, recorded_at)
+            VALUES (:event_id, :path, :previous_document_id, :document_id,
+             :previous_revision, :revision, :occurrence_id, :recorded_at)"""
+        ), parameters)
+        return revision + 1
+
+    @staticmethod
+    def _operation_digest(command: Any) -> str:
+        material = asdict(command)
+        if material.get("content_bytes") is not None:
+            content = bytes(material.pop("content_bytes"))
+            material["content_hash"] = hashlib.sha256(content).hexdigest()
+            material["byte_length"] = len(content)
+        return hashlib.sha256(canonical_json(material).encode()).hexdigest()
+
+    @staticmethod
+    def _decode_operation(row: Any) -> SubjectDocumentOperation | None:
+        return None if row is None else SubjectDocumentOperation(
+            occurrence_id=str(row["occurrence_id"]),
+            operation=str(row["operation"]),
+            document_id=str(row["document_id"]),
+            command_digest=str(row["command_digest"]),
+            result=_json_object(row["result_json"]),
+            change_context=_json_object(row["change_context_json"]),
+            recorded_at=_iso(row["recorded_at"]),
+        )
+
+    async def _read_operation(
+        self, session: AsyncSession, occurrence_id: str,
+    ) -> SubjectDocumentOperation | None:
+        row = (
+            await session.execute(
+                text("SELECT * FROM subject_document_operations "
+                     "WHERE occurrence_id = :occurrence_id" + self._for_update),
+                {"occurrence_id": occurrence_id},
+            )
+        ).mappings().one_or_none()
+        return self._decode_operation(row)
+
+    async def _record_operation(
+        self, session: AsyncSession, *, occurrence_id: str, operation: str,
+        digest: str, head: SubjectDocumentHead, version_id: str,
+        context: dict[str, Any], recorded_at: datetime,
+    ) -> None:
+        await session.execute(text(
+            """INSERT INTO subject_document_operations
+            (occurrence_id, operation, document_id, command_digest,
+             result_json, change_context_json, recorded_at)
+            VALUES (:occurrence_id, :operation, :document_id, :digest,
+             :result_json, :context_json, :recorded_at)"""
+        ), {
+            "occurrence_id": occurrence_id, "operation": operation,
+            "document_id": head.document_id, "digest": digest,
+            "result_json": canonical_json({
+                "head": asdict(head), "version_id": version_id,
+                "logical_path": head.logical_path, "revision": head.revision,
+                "binding_revision": head.binding_revision,
+                "deleted": head.deleted,
+            }),
+            "context_json": canonical_json(context),
+            "recorded_at": self._bind_time(recorded_at),
+        })
+
+    async def _replay_operation(
+        self, session: AsyncSession, receipt: SubjectDocumentOperation,
+        digest: str,
+    ) -> SubjectDocumentCommit:
+        if receipt.command_digest != digest:
+            raise SubjectDocumentConflict(
+                f"subject operation identity conflict: {receipt.occurrence_id}"
+            )
+        row = (
+            await session.execute(text(
+                f"SELECT {self._version_columns()} FROM subject_document_versions "
+                "WHERE version_id = :version_id"
+            ), {"version_id": receipt.result["version_id"]})
+        ).mappings().one_or_none()
+        if row is None:
+            raise SubjectDocumentNotFound(str(receipt.result["version_id"]))
+        return SubjectDocumentCommit(
+            version=self._decode_version(row),
+            head=SubjectDocumentHead(**receipt.result["head"]),
+        )
+
+    async def get_path_binding(
+        self, logical_path: str,
+    ) -> SubjectDocumentPathBinding | None:
+        async with self.runtime.unit_of_work() as uow:
+            return await self._read_binding(
+                uow.session, normalize_subject_path(logical_path),
+            )
+
+    async def list_file_bindings(
+        self, *, logical_path_prefix: str = "", after_logical_path: str = "",
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        bounded = min(500, max(0, int(limit)))
+        if bounded == 0:
+            return []
+        prefix = str(logical_path_prefix)
+        if len(prefix) > 512:
+            raise ValueError("logical_path_prefix exceeds 512 characters")
+        cursor = (
+            normalize_subject_path(after_logical_path) if after_logical_path else ""
+        )
+        async with self.runtime.unit_of_work() as uow:
+            rows = (
+                await uow.session.execute(text(
+                    """SELECT b.logical_path, b.document_id,
+                    b.revision AS binding_revision, d.current_version_id,
+                    d.revision AS document_revision, v.byte_length, v.content_hash,
+                    v.recorded_at, v.encoding
+                    FROM subject_document_path_bindings AS b
+                    LEFT JOIN subject_documents AS d
+                      ON d.document_id = b.document_id AND d.logical_path = b.logical_path
+                      AND d.binding_revision = b.revision AND d.is_deleted = 0
+                    LEFT JOIN subject_document_versions AS v
+                      ON v.version_id = d.current_version_id
+                      AND v.document_id = d.document_id
+                    WHERE b.logical_path > :cursor
+                      AND SUBSTR(b.logical_path, 1, :prefix_length) = :prefix
+                    ORDER BY b.logical_path LIMIT :limit"""
+                ), {
+                    "cursor": cursor, "prefix": prefix, "prefix_length": len(prefix),
+                    "limit": bounded,
+                })
+            ).mappings().all()
+        result = [dict(row) for row in rows]
+        for row in result:
+            if row["document_id"] is not None and (
+                not row["current_version_id"] or row["content_hash"] is None
+            ):
+                raise SubjectDocumentConflict("file binding/head/version evidence mismatch")
+            row["binding_revision"] = int(row["binding_revision"])
+            row["document_revision"] = int(row["document_revision"] or 0)
+            row["byte_length"] = (
+                int(row["byte_length"]) if row["byte_length"] is not None else None
+            )
+            row["recorded_at"] = _iso(row["recorded_at"]) or None
+        return result
+
+    async def get_head(self, logical_path: str) -> SubjectDocumentHead | None:
+        async with self.runtime.unit_of_work() as uow:
+            return await self._read_head(
+                uow.session, logical_path=normalize_subject_path(logical_path),
+            )
+
+    async def get_document_head(
+        self, document_id: str,
+    ) -> SubjectDocumentHead | None:
+        async with self.runtime.unit_of_work() as uow:
+            return await self._read_head(uow.session, document_id=document_id)
+
+    async def get_document_projection_frontier(
+        self, *, logical_path_prefix: str = "",
+    ) -> int:
+        prefix = str(logical_path_prefix)
+        if len(prefix) > 512:
+            raise ValueError("logical_path_prefix exceeds 512 characters")
+        async with self.runtime.unit_of_work() as uow:
+            return int((await uow.session.execute(text(
+                "SELECT COALESCE(MAX(outbox_id), 0) "
+                "FROM subject_projection_outbox "
+                "WHERE SUBSTR(logical_path, 1, :prefix_length) = :prefix"
+            ), {"prefix": prefix, "prefix_length": len(prefix)})).scalar_one())
+
+    async def list_document_projection_changes(
+        self, *, after_outbox_id: int, through_outbox_id: int,
+        logical_path_prefix: str = "", limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        if (
+            type(after_outbox_id) is not int or type(through_outbox_id) is not int
+            or after_outbox_id < 0 or through_outbox_id < after_outbox_id
+            or type(limit) is not int or not 1 <= limit <= 500
+            or len(str(logical_path_prefix)) > 512
+        ):
+            raise ValueError("invalid document projection frontier page")
+        prefix = str(logical_path_prefix)
+        async with self.runtime.unit_of_work() as uow:
+            rows = (await uow.session.execute(text(
+                "SELECT outbox_id, document_id FROM subject_projection_outbox "
+                "WHERE outbox_id > :after_id AND outbox_id <= :through_id "
+                "AND SUBSTR(logical_path, 1, :prefix_length) = :prefix "
+                "ORDER BY outbox_id LIMIT :limit"
+            ), {
+                "after_id": after_outbox_id, "through_id": through_outbox_id,
+                "prefix": prefix, "prefix_length": len(prefix), "limit": limit,
+            })).mappings().all()
+        return [
+            {"outbox_id": int(row["outbox_id"]), "document_id": str(row["document_id"])}
+            for row in rows
+        ]
+
+    async def get_document_operation(
+        self, occurrence_id: str,
+    ) -> SubjectDocumentOperation | None:
+        async with self.runtime.unit_of_work() as uow:
+            return await self._read_operation(uow.session, occurrence_id)
+
+    async def list_document_operations(
+        self, document_id: str, *, after_recorded_at: str = "",
+        after_occurrence_id: str = "", limit: int = 100,
+    ) -> list[SubjectDocumentOperation]:
+        parameters: dict[str, Any] = {
+            "document_id": document_id, "limit": min(500, max(0, int(limit))),
+        }
+        statement = ("SELECT * FROM subject_document_operations "
+                     "WHERE document_id = :document_id")
+        if after_recorded_at:
+            parsed = _parse_datetime(after_recorded_at)
+            if parsed is None or not after_occurrence_id:
+                raise ValueError("operation cursor requires valid time and identity")
+            statement += """ AND (recorded_at > :recorded_at OR
+                (recorded_at = :recorded_at AND occurrence_id > :occurrence_id))"""
+            parameters.update(
+                recorded_at=self._bind_time(parsed),
+                occurrence_id=after_occurrence_id,
+            )
+        statement += " ORDER BY recorded_at, occurrence_id LIMIT :limit"
+        async with self.runtime.unit_of_work() as uow:
+            rows = (
+                await uow.session.execute(text(statement), parameters)
+            ).mappings().all()
+        return [self._decode_operation(row) for row in rows]
 
     async def get_version(self, version_id: str) -> SubjectDocumentVersion:
         identity = str(version_id).strip()
@@ -1088,6 +1494,29 @@ class SQLSubjectDocumentStore:
             raise SubjectDocumentNotFound(identity)
         return self._decode_version(row)
 
+    async def get_version_descriptor(self, version_id: str) -> dict[str, Any]:
+        identity = str(version_id).strip()
+        if not identity:
+            raise ValueError("version_id must not be empty")
+        async with self.runtime.unit_of_work() as uow:
+            row = (
+                await uow.session.execute(text(
+                    """SELECT version_id, document_id, logical_path,
+                    parent_version_id, occurrence_id, content_hash, byte_length,
+                    recorded_at, semantic_actor_id, semantic_source_id, occurred_at,
+                    provenance_status, encoding, newline_style, byte_fidelity,
+                    recorded_by, recorded_source FROM subject_document_versions
+                    WHERE version_id = :version_id"""
+                ), {"version_id": identity})
+            ).mappings().one_or_none()
+        if row is None:
+            raise SubjectDocumentNotFound(identity)
+        descriptor = dict(row)
+        descriptor["recorded_at"] = _iso(descriptor["recorded_at"])
+        descriptor["occurred_at"] = _iso(descriptor["occurred_at"]) or None
+        descriptor["byte_length"] = int(descriptor["byte_length"])
+        return descriptor
+
     async def list_heads(
         self,
         *,
@@ -1105,10 +1534,16 @@ class SQLSubjectDocumentStore:
                 (
                     await uow.session.execute(
                         text(
-                            """SELECT document_id, logical_path, declared_owner,
-                            current_version_id, revision FROM subject_documents
-                            WHERE logical_path > :after_logical_path
-                            ORDER BY logical_path LIMIT :limit"""
+                            """SELECT d.document_id, d.logical_path, d.declared_owner,
+                            d.current_version_id, d.revision, d.binding_revision,
+                            d.is_deleted FROM subject_documents AS d
+                            JOIN subject_document_path_bindings AS b
+                              ON b.document_id = d.document_id
+                              AND b.logical_path = d.logical_path
+                              AND b.revision = d.binding_revision
+                            WHERE d.logical_path > :after_logical_path
+                              AND d.is_deleted = 0
+                            ORDER BY d.logical_path LIMIT :limit"""
                         ),
                         {"after_logical_path": cursor, "limit": bounded},
                     )
@@ -1147,11 +1582,17 @@ class SQLSubjectDocumentStore:
                             d.declared_owner AS head_declared_owner,
                             d.current_version_id AS head_current_version_id,
                             d.revision AS head_revision,
+                            d.binding_revision AS head_binding_revision,
                             {self._version_columns("v")}
                             FROM subject_documents AS d
+                            JOIN subject_document_path_bindings AS b
+                              ON b.document_id = d.document_id
+                              AND b.logical_path = d.logical_path
+                              AND b.revision = d.binding_revision
                             JOIN subject_document_versions AS v
                               ON v.version_id = d.current_version_id
                             WHERE d.logical_path > :after_logical_path
+                              AND d.is_deleted = 0
                             ORDER BY d.logical_path LIMIT :limit"""
                         ),
                         {"after_logical_path": cursor, "limit": bounded},
@@ -1168,11 +1609,11 @@ class SQLSubjectDocumentStore:
                 declared_owner=_optional(row["head_declared_owner"]),
                 current_version_id=str(row["head_current_version_id"]),
                 revision=int(row["head_revision"]),
+                binding_revision=int(row["head_binding_revision"]),
             )
             version = self._decode_version(row)
             if (
                 version.document_id != head.document_id
-                or version.logical_path != head.logical_path
                 or version.version_id != head.current_version_id
             ):
                 raise SubjectDocumentConflict(
@@ -1189,15 +1630,26 @@ class SQLSubjectDocumentStore:
         after_version_id: str = "",
         limit: int = 100,
     ) -> list[SubjectDocumentVersion]:
-        path = normalize_subject_path(logical_path)
+        head = await self.get_head(logical_path)
+        if head is None:
+            return []
+        return await self.list_document_history(
+            head.document_id, after_recorded_at=after_recorded_at,
+            after_version_id=after_version_id, limit=limit,
+        )
+
+    async def list_document_history(
+        self, document_id: str, *, after_recorded_at: str = "",
+        after_version_id: str = "", limit: int = 100,
+    ) -> list[SubjectDocumentVersion]:
         bounded = min(500, max(0, int(limit)))
         if bounded == 0:
             return []
         statement = (
             f"SELECT {self._version_columns()} FROM subject_document_versions "
-            "WHERE logical_path = :logical_path"
+            "WHERE document_id = :document_id"
         )
-        parameters: dict[str, Any] = {"logical_path": path, "limit": bounded}
+        parameters: dict[str, Any] = {"document_id": document_id, "limit": bounded}
         if after_recorded_at:
             parsed = _parse_datetime(after_recorded_at)
             if parsed is None or not after_version_id:
@@ -1216,9 +1668,53 @@ class SQLSubjectDocumentStore:
             )
         return [self._decode_version(row) for row in rows]
 
+    async def list_document_version_descriptors(
+        self, document_id: str, *, after_recorded_at: str = "",
+        after_version_id: str = "", limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        bounded = min(500, max(0, int(limit)))
+        if bounded == 0:
+            return []
+        statement = """SELECT version_id, document_id, logical_path,
+            parent_version_id, occurrence_id, content_hash, byte_length,
+            recorded_at, semantic_actor_id, semantic_source_id, occurred_at,
+            provenance_status FROM subject_document_versions
+            WHERE document_id = :document_id"""
+        parameters: dict[str, Any] = {
+            "document_id": document_id, "limit": bounded,
+        }
+        if after_recorded_at:
+            parsed = _parse_datetime(after_recorded_at)
+            if parsed is None or not after_version_id:
+                raise ValueError("history cursor requires valid time and version id")
+            statement += """ AND (recorded_at > :recorded_at OR
+                (recorded_at = :recorded_at AND version_id > :version_id))"""
+            parameters.update(
+                recorded_at=self._bind_time(parsed), version_id=after_version_id,
+            )
+        statement += " ORDER BY recorded_at, version_id LIMIT :limit"
+        async with self.runtime.unit_of_work() as uow:
+            rows = (
+                await uow.session.execute(text(statement), parameters)
+            ).mappings().all()
+        descriptors = [dict(row) for row in rows]
+        for descriptor in descriptors:
+            descriptor["recorded_at"] = _iso(descriptor["recorded_at"])
+            descriptor["occurred_at"] = _iso(descriptor["occurred_at"]) or None
+            descriptor["byte_length"] = int(descriptor["byte_length"])
+        return descriptors
+
     async def append_version(
         self,
         command: AppendSubjectDocumentVersion,
+    ) -> SubjectDocumentCommit:
+        return await self._append_version(command)
+
+    async def _append_version(
+        self, command: AppendSubjectDocumentVersion, *,
+        session: AsyncSession | None = None, operation_name: str = "write",
+        operation_digest: str | None = None, record_operation: bool = True,
+        create_projection: bool = True,
     ) -> SubjectDocumentCommit:
         path = normalize_subject_path(command.logical_path)
         occurrence_id = str(command.occurrence_id).strip()
@@ -1236,44 +1732,30 @@ class SQLSubjectDocumentStore:
         expected_head = str(command.expected_head_version_id or "")
         content = bytes(command.content_bytes)
         content_hash = hashlib.sha256(content).hexdigest()
-        document_id = self._document_id(path)
-        version_id = self._version_id(
-            document_id=document_id,
-            parent_version_id=expected_head,
-            occurrence_id=occurrence_id,
-            content_hash=content_hash,
-            command=command,
-        )
-        head_event_id = self._head_event_id(document_id, occurrence_id)
         context_json = canonical_json(command.change_context or {})
+        command_digest = operation_digest or self._operation_digest(command)
 
         async def operation(session: AsyncSession) -> SubjectDocumentCommit:
-            document_row = (
-                (
-                    await session.execute(
-                        text(
-                            """SELECT document_id, logical_path, declared_owner,
-                            current_version_id, revision FROM subject_documents
-                            WHERE logical_path = :logical_path"""
-                            + self._for_update
-                        ),
-                        {"logical_path": path},
-                    )
-                )
-                .mappings()
-                .one_or_none()
+            receipt = await self._read_operation(session, occurrence_id)
+            if receipt is not None:
+                return await self._replay_operation(session, receipt, command_digest)
+            binding = await self._read_binding(session, path, lock=True)
+            current = await self._read_head(
+                session, logical_path=path, lock=True,
             )
+            # Legacy versions have no S2 receipt. Resolve their immutable
+            # occurrence before path reuse, never derive their identity anew.
             existing_version = (
                 (
                     await session.execute(
                         text(
                             f"SELECT {self._version_columns()} "
                             "FROM subject_document_versions "
-                            "WHERE document_id = :document_id "
+                            "WHERE logical_path = :logical_path "
                             "AND occurrence_id = :occurrence_id" + self._for_update
                         ),
                         {
-                            "document_id": document_id,
+                            "logical_path": path,
                             "occurrence_id": occurrence_id,
                         },
                     )
@@ -1283,35 +1765,68 @@ class SQLSubjectDocumentStore:
             )
             if existing_version is not None:
                 decoded = self._decode_version(existing_version)
-                if decoded.version_id != version_id:
+                legacy_version_id = self._version_id(
+                    document_id=decoded.document_id,
+                    parent_version_id=expected_head, occurrence_id=occurrence_id,
+                    content_hash=content_hash, command=command,
+                )
+                if decoded.version_id != legacy_version_id:
                     raise SubjectDocumentConflict(
                         f"subject occurrence identity conflict: {occurrence_id}"
                     )
-                head = self._decode_head(document_row)
+                head = await self._read_head(
+                    session, document_id=decoded.document_id, lock=True,
+                )
                 if head is None:
                     raise SubjectDocumentConflict(
                         "version exists without document head"
                     )
                 return SubjectDocumentCommit(version=decoded, head=head)
 
-            current = self._decode_head(document_row)
+            actual_binding_revision = binding.revision if binding else 0
+            if (
+                command.expected_binding_revision is not None
+                and int(command.expected_binding_revision) != actual_binding_revision
+            ):
+                raise SubjectDocumentConflict("path binding revision CAS failed")
+            if command.expected_document_id is not None:
+                actual_document_id = current.document_id if current else ""
+                if command.expected_document_id != actual_document_id:
+                    raise SubjectDocumentConflict("document identity CAS failed")
+            if binding is not None and binding.document_id and current is None:
+                raise SubjectDocumentConflict("path binding/head evidence mismatch")
+            document_id = current.document_id if current else (
+                "doc_" + hashlib.sha256(canonical_json({
+                    "create_occurrence_id": occurrence_id, "logical_path": path,
+                }).encode()).hexdigest()
+            )
+            version_id = self._version_id(
+                document_id=document_id, parent_version_id=expected_head,
+                occurrence_id=occurrence_id, content_hash=content_hash,
+                command=command,
+            )
+            head_event_id = self._head_event_id(document_id, occurrence_id)
+            database_now = await self._database_now(session)
             if current is None:
                 if expected_revision != 0 or expected_head:
                     raise SubjectDocumentConflict("new document requires empty head")
+                await self._assert_file_path_shape(session, path)
                 try:
                     await session.execute(
                         text(
                             """INSERT INTO subject_documents (
                                 document_id, logical_path, declared_owner,
-                                current_version_id, revision
+                                current_version_id, revision, binding_revision
                             ) VALUES (
-                                :document_id, :logical_path, :declared_owner, '', 0
+                                :document_id, :logical_path, :declared_owner, '', 0,
+                                :binding_revision
                             )"""
                         ),
                         {
                             "document_id": document_id,
                             "logical_path": path,
                             "declared_owner": command.declared_owner,
+                            "binding_revision": actual_binding_revision + 1,
                         },
                     )
                 except IntegrityError as exc:
@@ -1324,6 +1839,11 @@ class SQLSubjectDocumentStore:
                     declared_owner=command.declared_owner,
                     current_version_id="",
                     revision=0,
+                    binding_revision=await self._set_binding(
+                        session, path=path, previous=binding,
+                        document_id=document_id, occurrence_id=occurrence_id,
+                        recorded_at=database_now,
+                    ),
                 )
             if (
                 current.revision != expected_revision
@@ -1340,7 +1860,6 @@ class SQLSubjectDocumentStore:
             ):
                 raise SubjectDocumentConflict("declared subject owner is immutable")
 
-            database_now = await self._database_now(session)
             await session.execute(
                 text(
                     """INSERT INTO subject_document_versions (
@@ -1416,7 +1935,10 @@ class SQLSubjectDocumentStore:
                         revision = :next_revision
                     WHERE document_id = :document_id
                       AND current_version_id = :expected_head
-                      AND revision = :expected_revision"""
+                      AND revision = :expected_revision
+                      AND logical_path = :logical_path
+                      AND binding_revision = :binding_revision
+                      AND is_deleted = 0"""
                 ),
                 {
                     "version_id": version_id,
@@ -1424,39 +1946,21 @@ class SQLSubjectDocumentStore:
                     "document_id": document_id,
                     "expected_head": expected_head,
                     "expected_revision": expected_revision,
+                    "logical_path": path,
+                    "binding_revision": current.binding_revision,
                 },
             )
             if updated.rowcount != 1:
                 raise SubjectDocumentConflict(f"concurrent subject head update: {path}")
-            await session.execute(
-                text(
-                    """INSERT INTO subject_projection_outbox (
-                        head_event_id, document_id, logical_path, version_id,
-                        content_hash, state, attempt_count, created_at,
-                        confirmed_at, last_error
-                    ) VALUES (
-                        :head_event_id, :document_id, :logical_path, :version_id,
-                        :content_hash, :projection_state, 0, :created_at,
-                        :confirmed_at, ''
-                    )"""
-                ),
-                {
-                    "head_event_id": head_event_id,
-                    "document_id": document_id,
-                    "logical_path": path,
-                    "version_id": version_id,
-                    "content_hash": content_hash,
-                    "projection_state": (
-                        "confirmed" if self.backend == BackendKind.MYSQL else "pending"
-                    ),
-                    "created_at": self._bind_time(database_now),
-                    "confirmed_at": (
-                        self._bind_time(database_now)
-                        if self.backend == BackendKind.MYSQL
-                        else ""
-                    ),
-                },
-            )
+            if create_projection:
+                await self._enqueue_projection(
+                    session, head_event_id=head_event_id, document_id=document_id,
+                    logical_path=path, version_id=version_id,
+                    content_hash=content_hash, database_now=database_now,
+                    operation=operation_name,
+                    binding_revision=current.binding_revision,
+                    previous_version_id=expected_head,
+                )
             version = SubjectDocumentVersion(
                 version_id=version_id,
                 document_id=document_id,
@@ -1479,13 +1983,372 @@ class SQLSubjectDocumentStore:
                 change_context=dict(command.change_context or {}),
             )
             head = SubjectDocumentHead(
-                document_id=document_id,
-                logical_path=path,
+                document_id=document_id, logical_path=path,
                 declared_owner=current.declared_owner,
-                current_version_id=version_id,
-                revision=expected_revision + 1,
+                current_version_id=version_id, revision=expected_revision + 1,
+                binding_revision=current.binding_revision,
             )
+            if record_operation:
+                await self._record_operation(
+                    session, occurrence_id=occurrence_id,
+                    operation=operation_name, digest=command_digest, head=head,
+                    version_id=version_id, context=dict(command.change_context or {}),
+                    recorded_at=database_now,
+                )
             return SubjectDocumentCommit(version=version, head=head)
+
+        if session is not None:
+            return await operation(session)
+        return await self._write(operation)
+
+    async def _enqueue_projection(
+        self, session: AsyncSession, *, head_event_id: str, document_id: str,
+        logical_path: str, version_id: str, content_hash: str,
+        database_now: datetime, operation: str = "write",
+        binding_revision: int = 0, previous_logical_path: str = "",
+        previous_binding_revision: int = 0, previous_version_id: str = "",
+    ) -> None:
+        previous_hash = ""
+        if previous_version_id:
+            previous_hash = str(await session.scalar(text(
+                "SELECT content_hash FROM subject_document_versions "
+                "WHERE version_id = :version_id"
+            ), {"version_id": previous_version_id}) or "")
+            if not previous_hash:
+                raise SubjectDocumentNotFound(previous_version_id)
+        await session.execute(
+                text(
+                    """INSERT INTO subject_projection_outbox (
+                        head_event_id, document_id, logical_path, version_id,
+                        content_hash, state, attempt_count, created_at,
+                        confirmed_at, last_error, operation,
+                        binding_revision, previous_logical_path,
+                        previous_binding_revision, previous_version_id,
+                        previous_content_hash
+                    ) VALUES (
+                        :head_event_id, :document_id, :logical_path, :version_id,
+                        :content_hash, :projection_state, 0, :created_at,
+                        :confirmed_at, '', :operation, :binding_revision,
+                        :previous_logical_path, :previous_binding_revision,
+                        :previous_version_id, :previous_content_hash
+                    )"""
+                ),
+                {
+                    "head_event_id": head_event_id,
+                    "document_id": document_id,
+                    "logical_path": logical_path,
+                    "version_id": version_id,
+                    "content_hash": content_hash,
+                    "operation": operation,
+                    "binding_revision": binding_revision,
+                    "previous_logical_path": previous_logical_path,
+                    "previous_binding_revision": previous_binding_revision,
+                    "previous_version_id": previous_version_id,
+                    "previous_content_hash": previous_hash,
+                    "projection_state": (
+                        "confirmed" if self.backend == BackendKind.MYSQL else "pending"
+                    ),
+                    "created_at": self._bind_time(database_now),
+                    "confirmed_at": (
+                        self._bind_time(database_now)
+                        if self.backend == BackendKind.MYSQL
+                        else ""
+                    ),
+                },
+            )
+
+    async def mutate_document(
+        self, command: SubjectDocumentMutation,
+    ) -> SubjectDocumentMutationCommit:
+        return await self._mutate_document(command)
+
+    async def _mutate_document(
+        self, command: SubjectDocumentMutation, *,
+        session: AsyncSession | None = None,
+    ) -> SubjectDocumentMutationCommit:
+        path = normalize_subject_path(command.logical_path)
+        operation_name = str(command.operation)
+        if operation_name not in {"rename", "delete", "copy"}:
+            raise ValueError("unsupported document lifecycle operation")
+        target = (
+            normalize_subject_path(command.target_logical_path)
+            if command.target_logical_path else ""
+        )
+        if operation_name == "delete":
+            if target or command.content_bytes is not None:
+                raise ValueError("delete accepts neither target nor replacement bytes")
+        elif not target or target == path:
+            raise ValueError("rename/copy requires a distinct target path")
+        fixed = set(SUBJECT_AUTHORITY_PATHS) | {
+            subject_authority_logical_path(item) for item in SUBJECT_AUTHORITY_PATHS
+        }
+        if path in fixed or target in fixed:
+            raise SubjectDocumentConflict(
+                "fixed subject authority slots cannot be renamed, deleted, or copied"
+            )
+        occurrence_id = _required_identity(
+            command.occurrence_id, field="occurrence_id",
+        )
+        _required_identity(command.recorded_by, field="recorded_by", maximum=128)
+        _required_identity(command.recorded_source, field="recorded_source")
+        if (
+            not command.expected_document_id or not command.expected_head_version_id
+            or command.expected_revision <= 0 or command.expected_binding_revision <= 0
+            or command.expected_target_binding_revision < 0
+        ):
+            raise ValueError("lifecycle command requires exact document/head/binding CAS")
+        digest = self._operation_digest(command)
+
+        async def operation(session: AsyncSession) -> SubjectDocumentMutationCommit:
+            receipt = await self._read_operation(session, occurrence_id)
+            if receipt is not None:
+                replay = await self._replay_operation(session, receipt, digest)
+                return SubjectDocumentMutationCommit(
+                    operation=receipt.operation, occurrence_id=occurrence_id,
+                    document_id=replay.head.document_id, head=replay.head,
+                    version=replay.version, idempotent_replay=True,
+                )
+            # Deterministic path-lock order prevents opposite-direction moves
+            # from forming a lock cycle on the shared backend.
+            bindings = {
+                item: await self._read_binding(session, item, lock=True)
+                for item in sorted({path, target} - {""})
+            }
+            source_binding = bindings[path]
+            head = await self._read_head(session, logical_path=path, lock=True)
+            if (
+                head is None or source_binding is None
+                or head.document_id != command.expected_document_id
+                or head.revision != command.expected_revision
+                or head.current_version_id != command.expected_head_version_id
+                or head.binding_revision != command.expected_binding_revision
+                or source_binding.revision != command.expected_binding_revision
+                or source_binding.document_id != head.document_id
+            ):
+                raise SubjectDocumentConflict("lifecycle source identity/head/path CAS failed")
+            target_binding = bindings.get(target)
+            if target and (
+                (target_binding is not None and target_binding.document_id is not None)
+                or (target_binding.revision if target_binding else 0)
+                != command.expected_target_binding_revision
+            ):
+                raise SubjectDocumentConflict("lifecycle target path CAS failed")
+            if target:
+                await self._assert_file_path_shape(session, target)
+            row = (
+                await session.execute(text(
+                    f"SELECT {self._version_columns()} FROM subject_document_versions "
+                    "WHERE version_id = :version_id"
+                ), {"version_id": head.current_version_id})
+            ).mappings().one_or_none()
+            if row is None:
+                raise SubjectDocumentNotFound(head.current_version_id)
+            original = self._decode_version(row)
+            if original.document_id != head.document_id:
+                raise SubjectDocumentConflict("source head/version identity mismatch")
+            database_now = await self._database_now(session)
+            context = dict(command.change_context or {})
+            context.update({
+                "operation_actor_id": command.semantic_actor_id,
+                "operation_source_id": command.semantic_source_id,
+                "operation_occurred_at": _iso(command.occurred_at) or None,
+                "source_document_id": head.document_id,
+                "source_version_id": original.version_id,
+                "previous_logical_path": path,
+                "target_logical_path": target,
+            })
+            if operation_name == "copy":
+                context.update({
+                    "copied_from_document_id": head.document_id,
+                    "copied_from_version_id": original.version_id,
+                    "copy_actor_id": command.semantic_actor_id,
+                    "copy_source_id": command.semantic_source_id,
+                    "copy_occurred_at": _iso(command.occurred_at) or None,
+                })
+                unchanged = command.content_bytes is None
+                copied = await self._append_version(
+                    AppendSubjectDocumentVersion(
+                        logical_path=target, expected_revision=0,
+                        expected_head_version_id="", expected_document_id="",
+                        expected_binding_revision=command.expected_target_binding_revision,
+                        content_bytes=(
+                            original.content_bytes if unchanged
+                            else bytes(command.content_bytes)
+                        ),
+                        occurrence_id=occurrence_id,
+                        recorded_by=command.recorded_by,
+                        recorded_source=command.recorded_source,
+                        declared_owner=head.declared_owner,
+                        semantic_actor_id=(
+                            original.semantic_actor_id if unchanged
+                            else command.semantic_actor_id
+                        ),
+                        semantic_source_id=(
+                            original.semantic_source_id if unchanged
+                            else command.semantic_source_id
+                        ),
+                        occurred_at=original.occurred_at if unchanged else command.occurred_at,
+                        provenance_status=original.provenance_status if unchanged else "complete",
+                        byte_fidelity=original.byte_fidelity if unchanged else "exact_bytes",
+                        encoding=original.encoding if unchanged else command.encoding,
+                        newline_style=original.newline_style if unchanged else command.newline_style,
+                        change_context=context,
+                    ),
+                    session=session, operation_name="copy", operation_digest=digest,
+                )
+                return SubjectDocumentMutationCommit(
+                    operation="copy", occurrence_id=occurrence_id,
+                    document_id=copied.head.document_id,
+                    head=copied.head, version=copied.version,
+                )
+            version = original
+            original_head = head
+            if command.content_bytes is not None:
+                changed = await self._append_version(
+                    AppendSubjectDocumentVersion(
+                        logical_path=path, expected_revision=head.revision,
+                        expected_head_version_id=head.current_version_id,
+                        expected_document_id=head.document_id,
+                        expected_binding_revision=head.binding_revision,
+                        content_bytes=bytes(command.content_bytes),
+                        occurrence_id=occurrence_id,
+                        recorded_by=command.recorded_by,
+                        recorded_source=command.recorded_source,
+                        declared_owner=head.declared_owner,
+                        semantic_actor_id=command.semantic_actor_id,
+                        semantic_source_id=command.semantic_source_id,
+                        occurred_at=command.occurred_at,
+                        encoding=command.encoding,
+                        newline_style=command.newline_style,
+                        change_context=context,
+                    ),
+                    session=session, operation_name=operation_name,
+                    operation_digest=digest, record_operation=False,
+                    create_projection=False,
+                )
+                head, version = changed.head, changed.version
+            release_revision = await self._set_binding(
+                session, path=path, previous=source_binding, document_id=None,
+                occurrence_id=occurrence_id, recorded_at=database_now,
+            )
+            next_binding_revision = release_revision
+            if target:
+                next_binding_revision = await self._set_binding(
+                    session, path=target, previous=target_binding,
+                    document_id=head.document_id, occurrence_id=occurrence_id,
+                    recorded_at=database_now,
+                )
+            next_head = SubjectDocumentHead(
+                document_id=head.document_id, logical_path=target or path,
+                declared_owner=head.declared_owner, current_version_id=version.version_id,
+                revision=original_head.revision + 1,
+                binding_revision=next_binding_revision,
+                deleted=operation_name == "delete",
+            )
+            updated = await session.execute(text(
+                """UPDATE subject_documents SET logical_path = :next_path,
+                binding_revision = :next_binding_revision,
+                revision = :next_revision, is_deleted = :deleted
+                WHERE document_id = :document_id AND logical_path = :path
+                  AND current_version_id = :expected_head
+                  AND revision = :expected_revision
+                  AND binding_revision = :expected_binding_revision
+                  AND is_deleted = 0"""
+            ), {
+                "next_path": next_head.logical_path,
+                "next_binding_revision": next_binding_revision,
+                "next_revision": next_head.revision,
+                "deleted": int(next_head.deleted), "document_id": head.document_id,
+                "path": path, "expected_head": head.current_version_id,
+                "expected_revision": head.revision,
+                "expected_binding_revision": head.binding_revision,
+            })
+            if updated.rowcount != 1:
+                raise SubjectDocumentConflict("lifecycle head CAS failed")
+            head_event_id = self._head_event_id(head.document_id, occurrence_id)
+            if command.content_bytes is None:
+                await session.execute(text(
+                    """INSERT INTO subject_document_head_events
+                    (head_event_id, document_id, previous_version_id, next_version_id,
+                     occurrence_id, actor_id, source_id, occurred_at,
+                     authority_epoch, change_context_json)
+                    VALUES (:head_event_id, :document_id, :version_id, :version_id,
+                     :occurrence_id, :actor_id, :source_id, :occurred_at,
+                     :authority_epoch, :context_json)"""
+                ), {
+                    "head_event_id": head_event_id, "document_id": head.document_id,
+                    "version_id": version.version_id, "occurrence_id": occurrence_id,
+                    "actor_id": command.recorded_by, "source_id": command.recorded_source,
+                    "occurred_at": self._bind_time(database_now),
+                    "authority_epoch": (
+                        self.runtime.authority_token.authority_epoch
+                        if self.runtime.authority_token is not None
+                        else int(self.runtime.writer_epoch)
+                    ),
+                    "context_json": canonical_json(context),
+                })
+            await self._enqueue_projection(
+                session, head_event_id=head_event_id, document_id=head.document_id,
+                logical_path=next_head.logical_path, version_id=version.version_id,
+                content_hash=version.content_hash, database_now=database_now,
+                operation=operation_name, binding_revision=next_binding_revision,
+                previous_logical_path=path, previous_binding_revision=release_revision,
+                previous_version_id=original.version_id,
+            )
+            await self._record_operation(
+                session, occurrence_id=occurrence_id, operation=operation_name,
+                digest=digest, head=next_head, version_id=version.version_id,
+                context=context, recorded_at=database_now,
+            )
+            return SubjectDocumentMutationCommit(
+                operation=operation_name, occurrence_id=occurrence_id,
+                document_id=next_head.document_id, head=next_head, version=version,
+            )
+
+        if session is not None:
+            return await operation(session)
+        return await self._write(operation)
+
+    async def apply_document_batch(
+        self, commands: list[AppendSubjectDocumentVersion | SubjectDocumentMutation],
+    ) -> list[SubjectDocumentCommit | SubjectDocumentMutationCommit]:
+        paths: set[str] = set()
+        occurrences: set[str] = set()
+        for command in commands:
+            if not isinstance(command, (AppendSubjectDocumentVersion, SubjectDocumentMutation)):
+                raise TypeError("batch accepts only explicit document commands")
+            selected = {normalize_subject_path(command.logical_path)}
+            if isinstance(command, SubjectDocumentMutation) and command.target_logical_path:
+                selected.add(normalize_subject_path(command.target_logical_path))
+            if (
+                paths & selected or command.occurrence_id in occurrences
+                or any(
+                    item.startswith(previous + "/") or previous.startswith(item + "/")
+                    for item in selected for previous in paths
+                )
+                or (
+                    len(selected) > 1 and any(
+                        item != other and item.startswith(other + "/")
+                        for item in selected for other in selected
+                    )
+                )
+            ):
+                raise ValueError(
+                    "document batch requires disjoint non-hierarchical paths and occurrences"
+                )
+            paths.update(selected)
+            occurrences.add(command.occurrence_id)
+
+        async def operation(
+            session: AsyncSession,
+        ) -> list[SubjectDocumentCommit | SubjectDocumentMutationCommit]:
+            commits: list[SubjectDocumentCommit | SubjectDocumentMutationCommit] = []
+            for command in commands:
+                if isinstance(command, AppendSubjectDocumentVersion):
+                    commits.append(await self._append_version(command, session=session))
+                else:
+                    commits.append(await self._mutate_document(command, session=session))
+            return commits
 
         return await self._write(operation)
 
@@ -1503,18 +2366,27 @@ class SQLSubjectDocumentStore:
             lease_owner=str(row["lease_owner"] or ""),
             lease_until=_iso(row["lease_until"]),
             revision=int(row["revision"]),
+            operation=str(row["operation"]),
+            previous_logical_path=str(row["previous_logical_path"] or ""),
+            binding_revision=int(row["binding_revision"]),
+            previous_binding_revision=int(row["previous_binding_revision"]),
+            previous_version_id=str(row["previous_version_id"] or ""),
+            previous_content_hash=str(row["previous_content_hash"] or ""),
         )
 
     @staticmethod
     def _projection_columns() -> str:
         return """outbox_id, head_event_id, document_id, logical_path,
         version_id, content_hash, state, attempt_count,
-        lease_owner, lease_until, revision"""
+        lease_owner, lease_until, revision, operation, previous_logical_path,
+        binding_revision, previous_binding_revision, previous_version_id,
+        previous_content_hash"""
 
     async def get_projection_task(
         self,
         logical_path: str,
         version_id: str,
+        *, occurrence_id: str | None = None,
     ) -> SubjectProjectionTask | None:
         path = normalize_subject_path(logical_path)
         identity = str(version_id).strip()
@@ -1529,8 +2401,17 @@ class SQLSubjectDocumentStore:
                             "FROM subject_projection_outbox "
                             "WHERE logical_path = :logical_path "
                             "AND version_id = :version_id"
+                            + (
+                                " AND head_event_id IN (SELECT head_event_id "
+                                "FROM subject_document_head_events "
+                                "WHERE occurrence_id = :occurrence_id)"
+                                if occurrence_id is not None else ""
+                            )
+                            + " ORDER BY outbox_id DESC LIMIT 1"
                         ),
-                        {"logical_path": path, "version_id": identity},
+                        {"logical_path": path, "version_id": identity,
+                         **({"occurrence_id": occurrence_id}
+                            if occurrence_id is not None else {})},
                     )
                 )
                 .mappings()

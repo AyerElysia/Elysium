@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Awaitable, Callable
+from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any, TypeVar
@@ -19,6 +20,7 @@ from ..service.event_bus import (
     LifeEvent,
     RawEventGapError,
     life_event_from_dict,
+    life_event_source_sequence,
     life_event_to_dict,
 )
 from .contracts import StorageBackendRuntime, StorageWriterRole
@@ -127,7 +129,7 @@ class SQLLifeEventStore:
 
     @staticmethod
     def _source_sequence(event: LifeEvent) -> int:
-        return int(event.source_sequence or event.sequence or 0)
+        return life_event_source_sequence(event)
 
     @classmethod
     def _canonical_payload(
@@ -283,6 +285,7 @@ class SQLLifeEventStore:
 
         if not events:
             return []
+        events = deepcopy(events)
 
         async def operation(session: AsyncSession) -> list[LifeEvent]:
             database_now = await self._database_now(session)
@@ -626,6 +629,24 @@ class SQLLifeEventStore:
                 .all()
             )
         return [self._decode_event(row) for row in rows]
+
+    async def get_by_occurrence_id(self, occurrence_id: str) -> LifeEvent | None:
+        """Read an immutable source occurrence directly."""
+
+        async with self.runtime.unit_of_work() as uow:
+            row = (
+                (
+                    await uow.session.execute(
+                        text(
+                            "SELECT * FROM raw_life_events WHERE occurrence_id = :identity"
+                        ),
+                        {"identity": str(occurrence_id)},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+        return self._decode_event(row) if row is not None else None
 
     async def occurrence_digest(self, occurrence_id: str) -> LifeEventDigest | None:
         """Read one occurrence's immutable migration identity and digest."""

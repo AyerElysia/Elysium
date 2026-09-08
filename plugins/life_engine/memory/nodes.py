@@ -7,9 +7,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any, Optional
 
@@ -61,21 +62,109 @@ class MemoryNode:
     embedding_content_hash: str | None = None
     embedding_model: str = ""
     legacy_fts_present: bool = False
+    subject_document_id: str = ""
+    subject_version_id: str = ""
+    subject_document_revision: int = 0
+    subject_binding_revision: int = 0
+    subject_content_sha256: str = ""
+    is_deleted: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ManagedDocumentIndexSnapshot:
+    """A fenced, exact subject head projected into the rebuildable index.
+
+    The caller must hold the subject namespace fence until this projection
+    commits. ``content=None`` means the current bytes are not text-indexable;
+    it never authorizes changing or deleting the authoritative document.
+    """
+
+    document_id: str
+    version_id: str
+    path: str
+    document_revision: int
+    binding_revision: int
+    content_sha256: str
+    content: str | None
+    deleted: bool = False
+    title: str = ""
+
+    def validate(self) -> None:
+        """Reject incomplete source identity instead of inventing provenance."""
+        for value in (self.document_id, self.version_id):
+            if (
+                not isinstance(value, str)
+                or not value
+                or len(value) > 128
+                or not value.isascii()
+                or any(not (char.isalnum() or char in "_-.:@") for char in value)
+            ):
+                raise ValueError("ManagedDocumentSourceIdentityInvalid")
+        if (
+            not isinstance(self.path, str)
+            or not self.path
+            or len(self.path) > 2048
+            or "\\" in self.path
+            or any(part in {"", ".", ".."} for part in self.path.split("/"))
+            or ":" in self.path
+        ):
+            raise ValueError("ManagedDocumentPathInvalid")
+        if (
+            type(self.document_revision) is not int
+            or self.document_revision <= 0
+            or type(self.binding_revision) is not int
+            or self.binding_revision <= 0
+            or type(self.deleted) is not bool
+            or (self.content is not None and not isinstance(self.content, str))
+            or not isinstance(self.title, str)
+            or (self.deleted and self.content is not None)
+        ):
+            raise ValueError("ManagedDocumentProjectionStateInvalid")
+        if (
+            not isinstance(self.content_sha256, str)
+            or len(self.content_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in self.content_sha256)
+        ):
+            raise ValueError("ManagedDocumentContentHashInvalid")
+        if self.content is not None and not assess_indexed_document_path(self.path).eligible:
+            raise ValueError("ManagedDocumentTextPathNotIndexable")
+
+    @property
+    def projection_sha256(self) -> str:
+        """Pin text, title, and source metadata without persisting another body."""
+        self.validate()
+        body = asdict(self)
+        body["content"] = (
+            hashlib.sha256(self.content.encode("utf-8")).hexdigest()
+            if self.content is not None else None
+        )
+        encoded = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class ManagedDocumentIndexResult:
+    """Content-free receipt for a rebuildable managed-document projection."""
+
+    node_id: str
+    document_id: str
+    version_id: str
+    document_revision: int
+    indexed: bool
+    idempotent_replay: bool = False
+
+
+def generate_subject_file_node_id(document_id: str) -> str:
+    """Keep one node across renames without ever hashing its current path."""
+    value = str(document_id)
+    if not value or len(value) > 128 or not value.isascii():
+        raise ValueError("ManagedDocumentSourceIdentityInvalid")
+    return f"subject-file:{value}"
 
 
 # ============================================================
 # 辅助函数
 # ============================================================
-
-
-def normalize_file_path(file_path: str) -> str:
-    """Return an eligible canonical path or an empty string.
-
-    Kept only for callers that need a non-raising compatibility helper. It
-    never strips a leading slash or collapses traversal into a valid identity.
-    """
-    eligibility = assess_document_path(file_path)
-    return eligibility.path if eligibility.eligible else ""
 
 
 def generate_file_node_id(file_path: str) -> str:
@@ -102,11 +191,6 @@ def canonical_file_node_id(file_path: str) -> tuple[str, str]:
 def generate_legacy_file_node_id(file_path: str) -> str:
     """兼容旧实现（直接使用原始字符串）的节点 ID 生成规则。"""
     return f"file:{hashlib.md5(str(file_path).encode()).hexdigest()[:12]}"
-
-
-def generate_concept_node_id(concept: str) -> str:
-    """根据概念名称生成节点 ID。"""
-    return f"concept:{hashlib.md5(concept.encode()).hexdigest()[:12]}"
 
 
 def compute_content_hash(content: str) -> str:
@@ -154,6 +238,12 @@ def row_to_node(row: sqlite3.Row) -> MemoryNode:
             if "legacy_fts_present" in columns
             else False
         ),
+        subject_document_id=str(row["subject_document_id"] or "") if "subject_document_id" in columns else "",
+        subject_version_id=str(row["subject_version_id"] or "") if "subject_version_id" in columns else "",
+        subject_document_revision=int(row["subject_document_revision"] or 0) if "subject_document_revision" in columns else 0,
+        subject_binding_revision=int(row["subject_binding_revision"] or 0) if "subject_binding_revision" in columns else 0,
+        subject_content_sha256=str(row["subject_content_sha256"] or "") if "subject_content_sha256" in columns else "",
+        is_deleted=bool(row["is_deleted"]) if "is_deleted" in columns else False,
     )
 
 
@@ -227,6 +317,8 @@ async def get_node_by_file_path(
     normalized_path = eligibility.path
 
     def _valid_file_row(row: sqlite3.Row) -> Optional[MemoryNode]:
+        if "is_deleted" in set(row.keys()) and bool(row["is_deleted"]):
+            return None
         if str(row["node_type"] or "file").lower() != NodeType.FILE.value:
             return None
         stored = assess_indexed_document_path(row["file_path"])
@@ -252,86 +344,6 @@ async def get_node_by_file_path(
         return valid_rows[0]
 
     return await run_db(_lookup_node)
-
-
-async def migrate_node_identity(
-    db: sqlite3.Connection,
-    old_node_id: str,
-    new_node_id: str,
-    new_file_path: str,
-    emit_visual_event: Any = None,
-    migrate_vector_identity_func: Any = None,
-) -> bool:
-    """Explicitly rekey one legacy file node through the SQLite authority.
-
-    This maintenance operation refuses implicit merges and never writes Chroma.
-    Vector convergence is represented by the SQLite outbox created by the
-    transactional rekey helper.
-    """
-    del emit_visual_event, migrate_vector_identity_func
-    canonical_path, canonical_node_id = canonical_file_node_id(new_file_path)
-    if str(new_node_id or "") != canonical_node_id:
-        raise ValueError("new_node_id 与 canonical 文件路径不一致")
-
-    from .indexing import rekey_document_rows_by_id
-
-    return await run_db(
-        rekey_document_rows_by_id,
-        db,
-        str(old_node_id or "").strip(),
-        canonical_path,
-    )
-
-
-async def migrate_file_path(
-    db: sqlite3.Connection,
-    old_path: str,
-    new_path: str,
-    migrate_node_identity_func: Any = None,
-) -> bool:
-    """Explicitly move a canonical file identity without widening paths."""
-    old_norm, old_node_id = canonical_file_node_id(old_path)
-    new_norm, new_node_id = canonical_file_node_id(new_path)
-    if old_norm == new_norm:
-        return True
-    if migrate_node_identity_func is None:
-        return False
-    migrated = await migrate_node_identity_func(
-        old_node_id=old_node_id,
-        new_node_id=new_node_id,
-        new_file_path=new_norm,
-    )
-    if migrated:
-        logger.info(f"已迁移记忆路径: {old_norm} -> {new_norm}")
-    return migrated
-
-
-async def update_fts(db: sqlite3.Connection, node_id: str, title: str, content: str) -> None:
-    """Compatibility wrapper that performs a complete transactional reindex.
-
-    Updating only legacy FTS would diverge from chunks and the embedding outbox,
-    so callers are resolved back to a strict canonical document identity first.
-    """
-    identifier = str(node_id or "").strip()
-
-    def _path_for_node() -> str | None:
-        row = db.execute(
-            "SELECT node_id, node_type, file_path FROM memory_nodes WHERE node_id = ?",
-            (identifier,),
-        ).fetchone()
-        if row is None or str(row["node_type"] or "file").lower() != NodeType.FILE.value:
-            return None
-        stored = assess_indexed_document_path(row["file_path"])
-        if not stored.eligible or str(row["node_id"] or "") != generate_file_node_id(stored.path):
-            return None
-        return stored.path
-
-    file_path = await run_db(_path_for_node)
-    if file_path is None:
-        return
-    from .indexing import upsert_document_rows
-
-    await run_db(upsert_document_rows, db, file_path, str(content or ""), title)
 
 
 async def increment_access(

@@ -53,6 +53,7 @@ class PatchOp:
     move_to: str | None = None
     hunks: tuple[PatchHunk, ...] = ()
     add_content: str = ""
+    copy_to: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,6 +192,7 @@ def parse_apply_patch(text: str) -> tuple[PatchOp, ...]:
     kind: PatchKind | None = None
     path = ""
     move_to: str | None = None
+    copy_to: str | None = None
     add_lines: list[str] = []
     hunks: list[PatchHunk] = []
     hunk_header = ""
@@ -218,7 +220,7 @@ def parse_apply_patch(text: str) -> tuple[PatchOp, ...]:
         hunk_end = False
 
     def flush_op() -> None:
-        nonlocal kind, path, move_to, add_lines, hunks
+        nonlocal kind, path, move_to, copy_to, add_lines, hunks
         flush_hunk()
         if kind is None:
             return
@@ -230,19 +232,21 @@ def parse_apply_patch(text: str) -> tuple[PatchOp, ...]:
         elif kind == "delete":
             ops.append(PatchOp(kind="delete", path=path))
         else:
-            if not hunks and not move_to:
+            if not hunks and not move_to and not copy_to:
                 raise ApplyPatchError(f"`{path}` 的 Update File 缺少 hunk 或 Move to")
             ops.append(
                 PatchOp(
                     kind="update",
                     path=path,
                     move_to=move_to,
+                    copy_to=copy_to,
                     hunks=tuple(hunks),
                 )
             )
         kind = None
         path = ""
         move_to = None
+        copy_to = None
         add_lines = []
         hunks = []
 
@@ -265,7 +269,14 @@ def parse_apply_patch(text: str) -> tuple[PatchOp, ...]:
         if line.startswith("*** Move to:"):
             if kind != "update":
                 raise ApplyPatchError("*** Move to: 只能出现在 Update File 之后")
+            if move_to or copy_to:
+                raise ApplyPatchError("一个 Update File 只能有一个 Move to 或 Copy to")
             move_to = _normalize_relpath(line[len("*** Move to:") :])
+            continue
+        if line.startswith("*** Copy to:"):
+            if kind != "update" or move_to or copy_to:
+                raise ApplyPatchError("*** Copy to: 只能在 Update File 后单独指定一次")
+            copy_to = _normalize_relpath(line[len("*** Copy to:") :])
             continue
         if line.startswith("*** End of File"):
             if kind != "update" or not in_hunk:
@@ -359,7 +370,16 @@ def apply_ops_to_contents(
         updated = current
         for hunk in op.hunks:
             updated = apply_hunk(updated, hunk, path=op.path)
-        dest = op.move_to or op.path
+        dest = op.move_to or op.copy_to or op.path
+        if op.copy_to:
+            if dest == op.path or working.get(dest) is not None:
+                raise ApplyPatchError(f"Copy to 失败：目标必须是另一个不存在的路径：{dest}")
+            working[dest] = updated
+            planned.append(PlannedFile(
+                path=dest, action="write", content=updated,
+                operation="copy", source_path=op.path,
+            ))
+            continue
         if op.move_to:
             if dest == op.path:
                 raise ApplyPatchError(f"`{op.path}` 的 Move to 与源路径相同")

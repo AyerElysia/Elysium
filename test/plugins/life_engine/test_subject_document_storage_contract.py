@@ -14,6 +14,10 @@ from sqlalchemy.exc import DBAPIError
 
 from plugins.life_engine.core.config import LifeEngineConfig
 from plugins.life_engine.service import LifeEngineService
+from plugins.life_engine.service.consciousness import (
+    ConsciousnessInstance,
+    ConsciousnessRegistry,
+)
 from plugins.life_engine.storage.authority import (
     FileAuthorityRegistry,
     StaleAuthorityToken,
@@ -631,7 +635,6 @@ async def test_generic_subject_writer_rejects_root_authority_without_mutation(
 async def test_file_tool_commit_advances_root_subject_head(tmp_path: Path) -> None:
     async with _local_store(tmp_path) as (_, store, _):
         data_root = tmp_path / "data"
-        workspace = data_root / "life_engine_workspace"
         logical_path = "life_engine_workspace/SOUL.md"
         original = b"original soul\n"
         await store.append_version(
@@ -642,6 +645,13 @@ async def test_file_tool_commit_advances_root_subject_head(tmp_path: Path) -> No
             )
         )
         service = _selected_local_service(store, data_root=data_root)
+        service._consciousness_registry = ConsciousnessRegistry(bootstrap=False)
+        service._consciousness_registry.register(
+            ConsciousnessInstance(
+                instance_id="consciousness-file-contract",
+                stream_ids=["chat:file-contract"],
+            )
+        )
         projected = await service._subject_workspace_projector.project_one(
             logical_path=logical_path
         )
@@ -654,6 +664,9 @@ async def test_file_tool_commit_advances_root_subject_head(tmp_path: Path) -> No
             recorded_by="life_engine",
             recorded_source="nucleus_file_tool",
             encoding="utf-8",
+            semantic_actor_id="consciousness-file-contract",
+            semantic_source_id="activity:soul-rewrite",
+            occurred_at="2026-09-06T03:00:00+00:00",
             reason="subject owns standing prompts",
         )
 
@@ -663,6 +676,9 @@ async def test_file_tool_commit_advances_root_subject_head(tmp_path: Path) -> No
         assert head is not None
         current = await store.get_version(head.current_version_id)
         assert current.content_bytes == b"rewritten soul\n"
+        assert current.semantic_actor_id == "consciousness-file-contract"
+        assert current.semantic_source_id == "activity:soul-rewrite"
+        assert current.provenance_status == "complete"
         with pytest.raises(RootSubjectAuthorityRequired):
             await service.write_selected_subject_document(
                 workspace_relative_path="SOUL.md",
@@ -782,8 +798,9 @@ async def test_mysql_subject_remote_head_self_heals_legacy_failed_projection(
                 change_context={},
             )
 
-        async def get_projection_task(self, path: str, vid: str):
+        async def get_projection_task(self, path: str, vid: str, *, occurrence_id=None):
             assert path == logical_path and vid == version_id
+            assert occurrence_id is None
             return SubjectProjectionTask(
                 outbox_id=1405,
                 head_event_id="head:legacy",

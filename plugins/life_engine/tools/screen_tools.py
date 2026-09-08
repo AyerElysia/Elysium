@@ -8,14 +8,16 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import os
 import re
 import shutil
+import stat
 import tempfile
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Annotated, Any
 
 from PIL import Image as PILImage
@@ -24,11 +26,22 @@ from PIL import ImageGrab
 from src.app.plugin_system.api import log_api
 from src.app.plugin_system.api.llm_api import create_llm_request, get_model_set_by_task
 from src.app.plugin_system.base import BaseTool
-from src.kernel.llm import Image, LLMContextManager, LLMPayload, ROLE, Text
+from src.kernel.llm import ROLE, Image, LLMContextManager, LLMPayload, Text
 
 from ..core.multimodal import _is_supported_image_data
+from ..storage.subject_workspace import subject_path_from_workspace_relative
+from ..storage.workspace_file_io import (
+    WorkspaceFileError,
+    WorkspaceFileRecoveryRequired,
+    project_exact_bytes,
+    run_workspace_file_io,
+)
 from ._utils import _get_workspace
-
+from .file_tools import (
+    _guard_workspace_mutation,
+    _plugin_life_service,
+    _standing_prompt_structural_error,
+)
 
 logger = log_api.get_logger("life_engine.screen_tools")
 
@@ -54,7 +67,11 @@ def _is_wsl() -> bool:
     global _WSL_DETECTED
     if _WSL_DETECTED is None:
         try:
-            version = Path("/proc/version").read_text(encoding="utf-8", errors="ignore").lower()
+            version = (
+                Path("/proc/version")
+                .read_text(encoding="utf-8", errors="ignore")
+                .lower()
+            )
             _WSL_DETECTED = "microsoft" in version
         except Exception:
             _WSL_DETECTED = False
@@ -80,6 +97,174 @@ class CapturedScreen:
     captured_at: str
     method: str
     saved_path: str = ""
+    cache_receipt: dict[str, Any] | None = None
+
+
+class ScreenCacheSafetyError(RuntimeError):
+    """A content-free failure of the optional external screenshot cache."""
+
+
+@dataclass(slots=True)
+class _LatestScreenCacheState:
+    """One process-local cache owner, never persistent subject authority."""
+
+    lock: asyncio.Lock
+    target: Path | None = None
+    content_hash: str | None = None
+
+
+def _latest_cache_relative(plugin: Any) -> str:
+    cfg = _get_screen_cfg(plugin)
+    relative = str(
+        getattr(cfg, "latest_path", "") or "screenshots/latest_screen.png"
+    ).strip()
+    if (
+        not relative
+        or "\\" in relative
+        or "\x00" in relative
+        or PurePosixPath(relative).is_absolute()
+        or PureWindowsPath(relative).drive
+        or any(part in {"", ".", ".."} for part in relative.split("/"))
+    ):
+        raise ScreenCacheSafetyError("ScreenCacheRelativePathRequired")
+    return relative
+
+
+def _guard_latest_cache_paths(plugin: Any, workspace: Path, relative: str) -> list[str]:
+    """Check each lexical component before any cache directory is created."""
+    candidates: list[str] = []
+    current = workspace
+    parts = relative.split("/")
+    for index, part in enumerate(parts):
+        current = current / part
+        candidate = current.relative_to(workspace).as_posix()
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            info = None
+        if info is not None:
+            if stat.S_ISLNK(info.st_mode):
+                raise ScreenCacheSafetyError("ScreenCacheSymlinkPathRejected")
+            if index < len(parts) - 1 and not stat.S_ISDIR(info.st_mode):
+                raise ScreenCacheSafetyError("ScreenCacheParentNotDirectory")
+        ok, guarded = _guard_workspace_mutation(plugin, candidate)
+        if not ok:
+            raise ScreenCacheSafetyError("ScreenCacheReservedPathRejected")
+        if Path(guarded) != current:
+            raise ScreenCacheSafetyError("ScreenCachePathChanged")
+        if _standing_prompt_structural_error(plugin, current):
+            raise ScreenCacheSafetyError("ScreenCacheStandingPromptRejected")
+        if candidate in {"notes", "diaries"} or subject_path_from_workspace_relative(
+            candidate
+        ):
+            raise ScreenCacheSafetyError("ScreenCacheSubjectDocumentRejected")
+        candidates.append(candidate)
+    return candidates
+
+
+async def _save_latest_cache(plugin: Any, content: bytes) -> dict[str, Any]:
+    """Publish only a new or process-owned external cache, under registry fencing.
+
+    A restart intentionally cannot reclaim an existing path. No owner metadata
+    is stored beside subject files; one bounded in-memory record is retained.
+    Unknown files, released managed bindings, and unsupported safe I/O are explicit
+    failures. This does not create, change or remove original-media records.
+    """
+    relative = _latest_cache_relative(plugin)
+    workspace = await run_workspace_file_io(_get_workspace, plugin)
+    target = workspace / relative
+    state = getattr(plugin, "_life_latest_screen_cache_state", None)
+    if state is None:
+        state = _LatestScreenCacheState(lock=asyncio.Lock())
+        plugin._life_latest_screen_cache_state = state
+    if not isinstance(state, _LatestScreenCacheState):
+        raise ScreenCacheSafetyError("ScreenCacheOwnerStateInvalid")
+    service = _plugin_life_service(plugin)
+    if service is None:
+        raise ScreenCacheSafetyError("ScreenCacheRegistryUnavailable")
+    store = getattr(service, "_subject_document_store", None)
+    selected = store is not None or bool(
+        getattr(service, "_selectable_storage_enabled", False)
+    )
+
+    async def publish() -> dict[str, Any]:
+        candidates = await run_workspace_file_io(
+            _guard_latest_cache_paths, plugin, workspace, relative
+        )
+        if selected:
+            get_head = getattr(store, "get_head", None)
+            get_binding = getattr(store, "get_path_binding", None)
+            if not callable(get_head) or not callable(get_binding):
+                raise ScreenCacheSafetyError("ScreenCacheRegistryUnavailable")
+            try:
+                for candidate in candidates:
+                    if await get_head(f"life_engine_workspace/{candidate}") is not None:
+                        raise ScreenCacheSafetyError(
+                            "ScreenCacheRegisteredDocumentRejected"
+                        )
+                if await get_binding(f"life_engine_workspace/{relative}") is not None:
+                    raise ScreenCacheSafetyError(
+                        "ScreenCacheHistoricalManagedPathRejected"
+                    )
+            except ScreenCacheSafetyError:
+                raise
+            except Exception as exc:
+                raise ScreenCacheSafetyError("ScreenCacheRegistryReadFailed") from exc
+        expected = state.content_hash if state.target == target else None
+        if expected is None and await run_workspace_file_io(os.path.lexists, target):
+            raise ScreenCacheSafetyError("ScreenCacheUnownedTargetRejected")
+        await run_workspace_file_io(
+            project_exact_bytes,
+            workspace,
+            relative,
+            content,
+            expected_parent_hash=expected,
+            allow_equal_existing=False,
+        )
+        digest = hashlib.sha256(content).hexdigest()
+        state.target, state.content_hash = target, digest
+        return {
+            "status": "saved",
+            "source_origin": "external_screen_cache",
+            "path": str(target),
+            "sha256": digest,
+            "ownership": "current_process_only",
+        }
+
+    async with state.lock:
+        if not selected:
+            return await publish()
+        fence = getattr(store, "workspace_namespace_fence", None)
+        if not callable(fence):
+            raise ScreenCacheSafetyError("ScreenCacheNamespaceFenceUnavailable")
+        entered = False
+        try:
+            async with fence():
+                entered = True
+                return await publish()
+        except Exception as exc:
+            if not entered:
+                raise ScreenCacheSafetyError(
+                    "ScreenCacheNamespaceFenceRejected"
+                ) from exc
+            raise
+
+
+def _failed_cache_receipt(exc: Exception) -> dict[str, Any]:
+    receipt: dict[str, Any] = {
+        "status": "failed",
+        "source_origin": "external_screen_cache",
+        "detail": type(exc).__name__,
+    }
+    if isinstance(exc, ScreenCacheSafetyError):
+        receipt["detail"] = str(exc)
+    elif isinstance(exc, WorkspaceFileRecoveryRequired):
+        receipt["detail"] = "recovery_required"
+        receipt["recovery_path"] = exc.recovery_path
+        receipt["reason"] = exc.reason
+    elif isinstance(exc, WorkspaceFileError):
+        receipt["detail"] = str(exc).split(":", 1)[0]
+    return receipt
 
 
 def _get_config(plugin: Any) -> Any:
@@ -135,7 +320,9 @@ async def _run_command(args: list[str], timeout_seconds: int) -> tuple[bool, str
         return False, f"启动命令失败: {exc}"
 
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout_seconds
+        )
     except asyncio.TimeoutError:
         proc.kill()
         await proc.communicate()
@@ -171,7 +358,9 @@ async def _detect_screen_size(screen_cfg: Any) -> tuple[int, int]:
 
 
 def _resize_and_resave(path: Path, screen_cfg: Any) -> tuple[int, int, str]:
-    output_format = _normalize_output_format(getattr(screen_cfg, "output_format", "png"))
+    output_format = _normalize_output_format(
+        getattr(screen_cfg, "output_format", "png")
+    )
     max_width = int(getattr(screen_cfg, "max_width", 2560) or 0)
     max_height = int(getattr(screen_cfg, "max_height", 1600) or 0)
     jpeg_quality = int(getattr(screen_cfg, "jpeg_quality", 92) or 92)
@@ -246,7 +435,7 @@ async def _capture_with_powershell(path: Path, screen_cfg: Any) -> tuple[bool, s
         "using System;\n"
         "using System.Runtime.InteropServices;\n"
         "public class DpiHelper {\n"
-        "    [DllImport(\"user32.dll\")]\n"
+        '    [DllImport("user32.dll")]\n'
         "    public static extern bool SetProcessDPIAware();\n"
         "}\n"
         "'@\n"
@@ -287,7 +476,10 @@ async def _capture_with_ffmpeg(path: Path, screen_cfg: Any) -> tuple[bool, str]:
 
     width, height = await _detect_screen_size(screen_cfg)
     display = _display_value(screen_cfg)
-    timeout_seconds = int(getattr(screen_cfg, "capture_timeout_seconds", _DEFAULT_TIMEOUT_SECONDS) or _DEFAULT_TIMEOUT_SECONDS)
+    timeout_seconds = int(
+        getattr(screen_cfg, "capture_timeout_seconds", _DEFAULT_TIMEOUT_SECONDS)
+        or _DEFAULT_TIMEOUT_SECONDS
+    )
     capture_cursor = bool(getattr(screen_cfg, "capture_cursor", True))
 
     args = [
@@ -315,7 +507,10 @@ async def _capture_with_ffmpeg(path: Path, screen_cfg: Any) -> tuple[bool, str]:
 async def _capture_with_grim(path: Path, screen_cfg: Any) -> tuple[bool, str]:
     if not shutil.which("grim"):
         return False, "未安装 grim"
-    timeout_seconds = int(getattr(screen_cfg, "capture_timeout_seconds", _DEFAULT_TIMEOUT_SECONDS) or _DEFAULT_TIMEOUT_SECONDS)
+    timeout_seconds = int(
+        getattr(screen_cfg, "capture_timeout_seconds", _DEFAULT_TIMEOUT_SECONDS)
+        or _DEFAULT_TIMEOUT_SECONDS
+    )
     return await _run_command(["grim", str(path)], timeout_seconds=timeout_seconds)
 
 
@@ -333,7 +528,9 @@ async def _capture_with_pil(path: Path, screen_cfg: Any) -> tuple[bool, str]:
 
 async def _capture_screen(plugin: Any) -> CapturedScreen:
     screen_cfg = _get_screen_cfg(plugin)
-    method = str(getattr(screen_cfg, "capture_method", "auto") or "auto").strip().lower()
+    method = (
+        str(getattr(screen_cfg, "capture_method", "auto") or "auto").strip().lower()
+    )
     if method not in {"auto", "ffmpeg", "grim", "pil", "powershell"}:
         method = "auto"
 
@@ -376,7 +573,9 @@ async def _capture_screen(plugin: Any) -> CapturedScreen:
             if ok and temp_path.exists() and temp_path.stat().st_size > 0:
                 if _is_blank_image(temp_path):
                     errors.append(f"{method_name}: 截图为全黑/空白，已跳过")
-                    logger.warning(f"截图方法 {method_name} 返回全黑图片，跳过（常见于 WSLg x11grab）")
+                    logger.warning(
+                        f"截图方法 {method_name} 返回全黑图片，跳过（常见于 WSLg x11grab）"
+                    )
                     continue
                 used_method = method_name
                 break
@@ -385,20 +584,22 @@ async def _capture_screen(plugin: Any) -> CapturedScreen:
         if not used_method:
             raise RuntimeError("无法截屏；" + " | ".join(errors))
 
-        width, height, image_format = await asyncio.to_thread(_resize_and_resave, temp_path, screen_cfg)
-        b64 = base64.b64encode(temp_path.read_bytes()).decode("ascii")
+        width, height, image_format = await asyncio.to_thread(
+            _resize_and_resave, temp_path, screen_cfg
+        )
+        image_bytes = await run_workspace_file_io(temp_path.read_bytes)
+        b64 = base64.b64encode(image_bytes).decode("ascii")
         if not _is_supported_image_data(f"base64|{b64}"):
             raise RuntimeError("截图生成后未通过图片格式校验")
 
         saved_path = ""
+        cache_receipt = None
         if bool(getattr(screen_cfg, "save_latest", False)):
-            workspace = _get_workspace(plugin)
-            relative = str(getattr(screen_cfg, "latest_path", "screenshots/latest_screen.png") or "").strip()
-            relative = relative.lstrip("/\\") or "screenshots/latest_screen.png"
-            latest_path = (workspace / relative).resolve()
-            latest_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(temp_path, latest_path)
-            saved_path = str(latest_path)
+            try:
+                cache_receipt = await _save_latest_cache(plugin, image_bytes)
+                saved_path = str(cache_receipt["path"])
+            except Exception as exc:  # noqa: BLE001 - an optional cache cannot discard the capture
+                cache_receipt = _failed_cache_receipt(exc)
 
         return CapturedScreen(
             base64_data=b64,
@@ -408,6 +609,7 @@ async def _capture_screen(plugin: Any) -> CapturedScreen:
             captured_at=datetime.now().astimezone().isoformat(timespec="seconds"),
             method=used_method,
             saved_path=saved_path,
+            cache_receipt=cache_receipt,
         )
     finally:
         temp_path.unlink(missing_ok=True)
@@ -497,7 +699,10 @@ async def _observe_screen(
             fallback_error = str(exc)
             logger.warning(f"原生屏幕视觉请求失败，准备走降级路径: {exc}")
 
-    fallback_task = str(getattr(screen_cfg, "fallback_task_name", "vision") or "vision").strip() or "vision"
+    fallback_task = (
+        str(getattr(screen_cfg, "fallback_task_name", "vision") or "vision").strip()
+        or "vision"
+    )
     try:
         observation = await _analyze_screenshot_with_model(
             model_task_name=fallback_task,
@@ -507,12 +712,16 @@ async def _observe_screen(
         )
         if observation:
             if fallback_error:
-                observation = f"（原生视觉失败，已走 VLM 降级：{fallback_error}）\n{observation}"
+                observation = (
+                    f"（原生视觉失败，已走 VLM 降级：{fallback_error}）\n{observation}"
+                )
             return "vlm_fallback", observation
     except Exception as exc:  # noqa: BLE001
         logger.error(f"屏幕 VLM 降级识别失败: {exc}", exc_info=True)
         if fallback_error:
-            raise RuntimeError(f"原生视觉失败: {fallback_error}; VLM 降级也失败: {exc}") from exc
+            raise RuntimeError(
+                f"原生视觉失败: {fallback_error}; VLM 降级也失败: {exc}"
+            ) from exc
         raise
 
     raise RuntimeError("视觉模型没有返回可用观察结果")
@@ -554,14 +763,21 @@ class LifeEngineViewScreenTool(BaseTool):
     async def execute(
         self,
         focus: Annotated[str, "本次看屏幕的关注点。留空表示整体观察当前屏幕。"] = "",
-        detail: Annotated[str, "详细程度：brief / normal / detailed。默认 normal。"] = "normal",
-        mode: Annotated[str, "视觉路径：auto / native / fallback。默认 auto。"] = "auto",
+        detail: Annotated[
+            str, "详细程度：brief / normal / detailed。默认 normal。"
+        ] = "normal",
+        mode: Annotated[
+            str, "视觉路径：auto / native / fallback。默认 auto。"
+        ] = "auto",
     ) -> tuple[bool, str | dict]:
         screen_cfg = _get_screen_cfg(self.plugin)
         if screen_cfg is None:
             return False, "life_engine 缺少 screen 配置区段，无法截屏。"
         if not bool(getattr(screen_cfg, "enabled", False)):
-            return False, "屏幕观察工具未启用。请在 config/plugins/life_engine/config.toml 的 [screen] 中设置 enabled = true。"
+            return (
+                False,
+                "屏幕观察工具未启用。请在 config/plugins/life_engine/config.toml 的 [screen] 中设置 enabled = true。",
+            )
 
         try:
             captured = await _capture_screen(self.plugin)
@@ -584,6 +800,8 @@ class LifeEngineViewScreenTool(BaseTool):
             }
             if captured.saved_path:
                 result["saved_path"] = captured.saved_path
+            if captured.cache_receipt is not None:
+                result["cache"] = captured.cache_receipt
             return True, result
         except Exception as exc:  # noqa: BLE001
             logger.error(f"观察屏幕失败: {exc}", exc_info=True)

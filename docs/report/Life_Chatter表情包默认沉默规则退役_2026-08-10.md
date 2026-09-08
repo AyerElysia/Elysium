@@ -22,7 +22,7 @@
 1. 删除 `reaction_only` 消息/批次分类及其运行态字段。
 2. 删除 `<reaction_only_hint>` 注入，模型不再收到“表情/图片更适合沉默”的隐式建议。
 3. 删除表情/图片空响应提前结束分支；已被 Router 接入的外部媒体与文字一样，遵循普通 follow-up 与轮次闭合机制。
-4. `_should_force_reply_for_unread_batch` 不再排除表情或图片。它只防止真实外部轮次因空响应意外丢失，不替主体决定具体表达。
+4. `_should_force_reply_for_unread_batch` 不再排除表情或图片。它只标记真实外部轮次已接入表达层，循环内可提醒模型作出可追溯选择，不替主体决定具体表达；`max_rounds` 仍无可见回复时不得代写对外正文。
 5. 加入派生滚动上下文迁移：加载和下次正常保存会移除历史 `<reaction_only_hint>`。读取路径不写盘，权威记录不变。
 6. 保留 `LifePassAndWaitAction`。显式等待仍是主体动作，不再由输入类型自动诱导或代替。
 

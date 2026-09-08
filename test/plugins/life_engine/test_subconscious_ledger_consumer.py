@@ -37,7 +37,7 @@ def _message(**kwargs: Any) -> Message:
 
 async def test_ledger_only_write_reaches_next_prepare(tmp_path: Any) -> None:
     service = _make_service(tmp_path)
-    event = service._event_builder.build_dfc_message_event(
+    event = service._event_builder.build_direct_message_event(
         "只写在账本里",
         stream_id="stream-1",
         platform="qq",
@@ -65,7 +65,7 @@ async def test_ledger_only_write_reaches_next_prepare(tmp_path: Any) -> None:
 
 async def test_duplicate_occurrence_is_not_queued_twice(tmp_path: Any) -> None:
     service = _make_service(tmp_path)
-    event = service._event_builder.build_dfc_message_event(
+    event = service._event_builder.build_direct_message_event(
         "同一条经历",
         stream_id="stream-1",
     )
@@ -75,25 +75,24 @@ async def test_duplicate_occurrence_is_not_queued_twice(tmp_path: Any) -> None:
     assert len(service._pending_events) == len(pending_before)
 
 
-async def test_bootstrap_high_water_does_not_replay_history_as_new_delta(
+async def test_missing_cursor_replays_history_instead_of_silently_jumping_to_tail(
     tmp_path: Any,
 ) -> None:
     service = _make_service(tmp_path)
-    old = service._event_builder.build_dfc_message_event("旧经历不应重放")
+    old = service._event_builder.build_direct_message_event("尚未证明完成摄取的经历")
     await service._publish_raw_events([old])
     service._state.heartbeat_context_cursor = 9
 
     await service.catch_up_subconscious_ingest()
 
-    assert service._pending_events == []
-    assert service._subconscious_ingest_health["bootstrapped"] is True
+    assert len(service._pending_events) == 1
+    assert service._pending_events[0].sequence > 9
+    assert service._subconscious_ingest_health["bootstrapped"] is False
     cursor = await service._get_event_bus().store.consumer_cursor(
         SUBCONSCIOUS_INGEST_CONSUMER_ID
     )
     assert cursor.position > 0
-    assert (cursor.metadata or {}).get("bootstrap") == "high_water"
-    prepared = await service._prepare_heartbeat_context()
-    assert prepared.selected_event_ids == []
+    assert (cursor.metadata or {}).get("bootstrap") is None
 
 
 async def test_ledger_gap_fails_closed_without_advancing_cursor(
@@ -114,7 +113,7 @@ async def test_ledger_gap_fails_closed_without_advancing_cursor(
         async def get_consumer_offset(self, consumer_id: str) -> int:
             return 2
 
-        async def commit_consumer_offset(self, *args: object, **kwargs: object) -> int:
+        async def commit_consumer_cursor(self, *args: object, **kwargs: object) -> int:
             raise AssertionError("gap must not commit")
 
         async def health_snapshot(self) -> dict[str, Any]:
@@ -208,7 +207,7 @@ async def test_message_and_activity_order_preserved_through_catch_up(
     tmp_path: Any,
 ) -> None:
     service = _make_service(tmp_path)
-    message = service._event_builder.build_dfc_message_event("先收到消息")
+    message = service._event_builder.build_direct_message_event("先收到消息")
     activity = service._event_builder.build_conscious_model_turn_event(
         activity_id="act-1",
         transport_request_id="req-1",

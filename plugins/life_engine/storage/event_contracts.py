@@ -71,6 +71,9 @@ class LifeEventStorePort(Protocol):
     async def append_many(self, events: list[LifeEvent]) -> list[LifeEvent]:
         """Atomically append a batch in caller order."""
 
+    async def get_by_occurrence_id(self, occurrence_id: str) -> LifeEvent | None:
+        """Read exact evidence by occurrence without making a new occurrence."""
+
     async def read_since(
         self,
         position: int,

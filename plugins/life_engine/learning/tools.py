@@ -24,6 +24,7 @@ from src.app.plugin_system.base import BaseTool
 from ..storage.subject_contracts import SubjectDocumentPath
 from .decisions import LearningCandidate, LearningDecision
 from .models import Evidence, EvidenceKind
+from .opportunity_capability import LearningOpportunityCapability
 from .store import InsightStore
 
 logger = log_api.get_logger("life_engine.learning")
@@ -41,55 +42,6 @@ def _get_workspace(plugin: Any) -> Path:
     path = Path(workspace).resolve()
     path.mkdir(parents=True, exist_ok=True)
     return path
-
-
-def _get_scheduler(plugin: Any) -> Any:
-    """获取 LearningScheduler 实例。"""
-    try:
-        from ..service.registry import get_life_engine_service
-
-        service = get_life_engine_service()
-        if service is not None:
-            return getattr(service, "_learning_scheduler", None)
-    except Exception:
-        pass
-    return None
-
-
-def _get_store(plugin: Any) -> InsightStore:
-    """获取洞察账本。
-
-    优先复用调度器那一个长生命周期实例。原因是 InsightStore.load() 在
-    _loaded 为真时直接 return，而 _save() 整文件覆盖：如果工具各建一个
-    store，工具写入的证据会被调度器下一次落盘用它的陈旧内存静默抹掉，
-    而且没有任何日志会告诉她东西丢了。共享同一实例，写入即对双方可见。
-
-    拿不到调度器时（未初始化、或单元测试）退回按工作区自建。
-    """
-    scheduler = _get_scheduler(plugin)
-    store = getattr(scheduler, "store", None)
-    if isinstance(store, InsightStore):
-        store.load()
-        return store
-
-    config = getattr(plugin, "config", None)
-    storage = getattr(config, "storage", None)
-    if bool(getattr(storage, "enabled", False)):
-        raise RuntimeError(
-            "SelectedLearningStoreUnavailable: the active LearningScheduler "
-            "must expose the selected backend; local fallback is forbidden"
-        )
-
-    store = InsightStore(_get_workspace(plugin))
-    store.load()
-    return store
-
-
-async def _flush_scheduler(plugin: Any) -> None:
-    scheduler = _get_scheduler(plugin)
-    flush = getattr(scheduler, "flush", None)
-    if callable(flush):
-        await flush()
 
 
 def _decision_actor(tool: BaseTool) -> tuple[Any, str]:
@@ -154,35 +106,43 @@ class LifeReflectNowTool(BaseTool):
         if not text:
             return False, "请告诉我你想反思什么。"
 
-        scheduler = _get_scheduler(self.plugin)
-        if scheduler is None:
-            return False, "学习系统未初始化。"
-
         try:
-            _, actor = _decision_actor(self)
+            capability = await LearningOpportunityCapability.bind(
+                self,
+                require_writable=True,
+            )
+            scheduler = capability.scheduler
+            actor = capability.actor_consciousness_instance_id
             rtype = str(reflection_type or "introspection").strip().lower()
-            if rtype == "interaction":
-                insights = await scheduler.submit_reflection(
-                    reflection_kind="interaction",
-                    reflection_text=text,
-                    context="主体主动发起的反思",
-                    actor_consciousness_instance_id=actor,
-                )
-            else:
-                insights = await scheduler.submit_reflection(
-                    reflection_kind="introspection",
-                    reflection_text=text,
-                    context="主体主动发起的内省",
-                    actor_consciousness_instance_id=actor,
-                )
-            await scheduler.flush()
+            async with capability.mutation_context(
+                "reflect_now",
+                reason=text,
+            ):
+                if rtype == "interaction":
+                    insights = await scheduler.submit_reflection(
+                        reflection_kind="interaction",
+                        reflection_text=text,
+                        context="主体主动发起的反思",
+                        actor_consciousness_instance_id=actor,
+                    )
+                else:
+                    insights = await scheduler.submit_reflection(
+                        reflection_kind="introspection",
+                        reflection_text=text,
+                        context="主体主动发起的内省",
+                        actor_consciousness_instance_id=actor,
+                    )
+                await scheduler.flush()
 
             if insights is None:
                 return True, {
                     "action": "reflect_now",
                     "insights_count": 0,
                     "queued": True,
-                    "note": "反思请求已保存，会在冷却结束后继续。",
+                    "note": (
+                        "反思材料已保存但尚未执行；系统不会自动继续。"
+                        "之后若想处理，可显式选择 run_next_reflection。"
+                    ),
                 }
             if not insights:
                 return True, {
@@ -203,6 +163,159 @@ class LifeReflectNowTool(BaseTool):
             return False, f"反思失败: {type(exc).__name__}"
 
 
+class LifeRunNextReflectionTool(BaseTool):
+    """Run one already-durable reflection without starting a worker."""
+
+    tool_name = "nucleus_run_next_reflection"
+    tool_description = (
+        "显式处理反思队列中下一条当前可处理的经历。一次最多处理一条；"
+        "不会继续触发审计、知识候选或技能蒸馏。没有可处理项或仍在冷却时如实返回。"
+    )
+    chatter_allow = ["life_engine_internal"]
+
+    async def execute(self) -> tuple[bool, str | dict[str, Any]]:
+        try:
+            capability = await LearningOpportunityCapability.bind(
+                self,
+                require_writable=True,
+            )
+            async with capability.mutation_context("run_next_reflection"):
+                result = await capability.scheduler.run_next_reflection_once()
+        except Exception as exc:  # noqa: BLE001 - explicit tool refusal
+            return False, f"反思队列处理失败: {type(exc).__name__}"
+        if result is None:
+            return True, {
+                "action": "run_next_reflection",
+                "processed": False,
+                "note": "当前没有可处理的反思项，或既有冷却仍未结束。",
+            }
+        job_id, insights = result
+        return True, {
+            "action": "run_next_reflection",
+            "processed": True,
+            "job_id": job_id,
+            "insights_count": len(insights),
+            "insight_ids": [str(item.insight_id) for item in insights],
+        }
+
+
+class LifeRunIndependentAuditTool(BaseTool):
+    """Run one independent audit cycle and no subsequent cognitive phase."""
+
+    tool_name = "nucleus_run_independent_audit"
+    tool_description = (
+        "显式运行一轮独立洞察审计。只审计当前候选批次并记录结果；"
+        "不会自动反思、压缩知识、蒸馏技能或接受任何候选。"
+    )
+    chatter_allow = ["life_engine_internal"]
+
+    async def execute(
+        self,
+        reason: Annotated[str, "你现在选择独立审计的理由"],
+    ) -> tuple[bool, str | dict[str, Any]]:
+        if not str(reason or "").strip():
+            return False, "独立审计必须填写 reason。"
+        try:
+            capability = await LearningOpportunityCapability.bind(
+                self,
+                require_writable=True,
+            )
+            async with capability.mutation_context(
+                "audit_once",
+                reason=str(reason),
+            ):
+                records = await capability.scheduler.run_independent_audit_once()
+        except Exception as exc:  # noqa: BLE001 - explicit tool refusal
+            return False, f"独立审计失败: {type(exc).__name__}"
+        return True, {
+            "action": "audit_once",
+            "reviewed_count": len(records),
+            "records": [
+                {
+                    "audit_id": str(record.audit_id),
+                    "insight_id": str(record.insight_id),
+                    "verdict": str(record.verdict),
+                }
+                for record in records
+            ],
+            "automatic_follow_up": False,
+        }
+
+
+class LifeProposeKnowledgeCandidateTool(BaseTool):
+    """Generate one derived knowledge candidate without accepting it."""
+
+    tool_name = "nucleus_propose_knowledge_candidate"
+    tool_description = (
+        "显式运行一次学习派生观察候选生成。它只产生未获授权的候选；"
+        "不会自动接受候选，也不会触发反思、独立审计或技能蒸馏。"
+    )
+    chatter_allow = ["life_engine_internal"]
+
+    async def execute(
+        self,
+        reason: Annotated[str, "你现在选择整理知识候选的理由"],
+    ) -> tuple[bool, str | dict[str, Any]]:
+        if not str(reason or "").strip():
+            return False, "知识候选生成必须填写 reason。"
+        try:
+            capability = await LearningOpportunityCapability.bind(
+                self,
+                require_writable=True,
+            )
+            async with capability.mutation_context(
+                "propose_knowledge_candidate",
+                reason=str(reason),
+            ):
+                proposed = (
+                    await capability.scheduler.propose_knowledge_candidate_once()
+                )
+        except Exception as exc:  # noqa: BLE001 - explicit tool refusal
+            return False, f"知识候选生成失败: {type(exc).__name__}"
+        return True, {
+            "action": "propose_knowledge_candidate",
+            "candidate_created": bool(proposed),
+            "automatic_acceptance": False,
+            "automatic_follow_up": False,
+        }
+
+
+class LifeDistillSkillCandidateTool(BaseTool):
+    """Generate one procedural-skill proposal without accepting it."""
+
+    tool_name = "nucleus_distill_skill_candidate"
+    tool_description = (
+        "显式运行一次程序性技能候选蒸馏。它只产生等待当前意识决定的候选；"
+        "不会自动接受、修改现有技能或触发其它认知阶段。"
+    )
+    chatter_allow = ["life_engine_internal"]
+
+    async def execute(
+        self,
+        reason: Annotated[str, "你现在选择蒸馏技能候选的理由"],
+    ) -> tuple[bool, str | dict[str, Any]]:
+        if not str(reason or "").strip():
+            return False, "技能候选蒸馏必须填写 reason。"
+        try:
+            capability = await LearningOpportunityCapability.bind(
+                self,
+                require_writable=True,
+            )
+            async with capability.mutation_context(
+                "distill_skill_candidate",
+                reason=str(reason),
+            ):
+                proposed = await capability.scheduler.distill_skill_candidate_once()
+        except Exception as exc:  # noqa: BLE001 - explicit tool refusal
+            return False, f"技能候选蒸馏失败: {type(exc).__name__}"
+        return True, {
+            "action": "distill_skill_candidate",
+            "candidate_created": bool(proposed),
+            "automatic_acceptance": False,
+            "automatic_follow_up": False,
+        }
+
+
 class LifeListInsightsTool(BaseTool):
     """查看洞察账本。"""
 
@@ -220,7 +333,8 @@ class LifeListInsightsTool(BaseTool):
         ] = "all",
         limit: Annotated[int, "最多显示条数（默认 10）"] = 10,
     ) -> tuple[bool, str | dict]:
-        store = _get_store(self.plugin)
+        capability = await LearningOpportunityCapability.bind(self)
+        store = capability.store
 
         status = str(status_filter or "all").strip().lower()
         max_items = max(1, min(50, int(limit or 10)))
@@ -294,7 +408,11 @@ class LifeChallengeInsightTool(BaseTool):
         if not text:
             return False, "请说明你的质疑理由。"
 
-        store = _get_store(self.plugin)
+        capability = await LearningOpportunityCapability.bind(
+            self,
+            require_writable=True,
+        )
+        store = capability.store
 
         insight = store.get_insight(iid)
         if insight is None:
@@ -306,8 +424,12 @@ class LifeChallengeInsightTool(BaseTool):
             supports=False,
             context="主体主动质疑",
         )
-        store.add_evidence(iid, evidence)
-        await _flush_scheduler(self.plugin)
+        async with capability.mutation_context(
+            "challenge_insight",
+            reason=text,
+        ):
+            store.add_evidence(iid, evidence)
+            await capability.scheduler.flush()
 
         return True, {
             "action": "challenge_insight",
@@ -348,7 +470,11 @@ class LifeReconsiderInsightTool(BaseTool):
         if not iid:
             return False, "请指定要重新审视的洞察 ID。"
 
-        store = _get_store(self.plugin)
+        capability = await LearningOpportunityCapability.bind(
+            self,
+            require_writable=True,
+        )
+        store = capability.store
         insight = store.get_insight(iid)
         if insight is None:
             return False, f"未找到洞察 {iid}。"
@@ -356,10 +482,14 @@ class LifeReconsiderInsightTool(BaseTool):
         old_status = insight.status
         kvs = list(insight.knowledge_versions)
 
-        ok = store.reconsider_insight(iid, reason=note)
-        if not ok:
-            return False, f"重新审视 {iid} 失败。"
-        await _flush_scheduler(self.plugin)
+        async with capability.mutation_context(
+            "reconsider_insight",
+            reason=note,
+        ):
+            ok = store.reconsider_insight(iid, reason=note)
+            if not ok:
+                return False, f"重新审视 {iid} 失败。"
+            await capability.scheduler.flush()
 
         return True, {
             "action": "reconsider_insight",
@@ -397,7 +527,8 @@ class LifeViewKnowledgeTool(BaseTool):
         self,
         show_stats: Annotated[bool, "是否同时显示学习统计（默认 true）"] = True,
     ) -> tuple[bool, str | dict]:
-        store = _get_store(self.plugin)
+        capability = await LearningOpportunityCapability.bind(self)
+        store = capability.store
 
         knowledge = store.read_current_knowledge()
         manifest = store.load_knowledge_manifest()
@@ -459,14 +590,28 @@ class LifeKnowledgeCandidatesTool(BaseTool):
         ] = 3,
     ) -> tuple[bool, str | dict]:
         action_name = str(action or "list").strip().lower()
-        store = _get_store(self.plugin)
+        capability = await LearningOpportunityCapability.bind(
+            self,
+            require_writable=action_name == "decide",
+        )
+        store = capability.store
 
         if action_name == "list":
             return await self._execute_list(store, int(limit or 3))
         if action_name == "diff":
             return await self._execute_diff(store, version)
         if action_name == "decide":
-            return await self._execute_decide(store, version, decision, reason)
+            async with capability.mutation_context(
+                "decide_knowledge_candidate",
+                reason=str(reason or ""),
+            ):
+                return await self._execute_decide(
+                    store,
+                    version,
+                    decision,
+                    reason,
+                    scheduler=capability.scheduler,
+                )
         return False, f"UnknownAction:{action_name}"
 
     @staticmethod
@@ -561,6 +706,8 @@ class LifeKnowledgeCandidatesTool(BaseTool):
         version: int | None,
         decision: str | None,
         reason: str | None,
+        *,
+        scheduler: Any,
     ) -> tuple[bool, str | dict]:
         decision_name = str(decision or "").strip().lower()
         if decision_name not in {"accept", "decline"}:
@@ -589,7 +736,7 @@ class LifeKnowledgeCandidatesTool(BaseTool):
                 )
             except ValueError as exc:
                 return False, f"{type(exc).__name__}:{exc}"
-            await _flush_scheduler(self.plugin)
+            await scheduler.flush()
             return True, {
                 "action": "knowledge_candidate_accepted",
                 "version": identity,
@@ -613,7 +760,7 @@ class LifeKnowledgeCandidatesTool(BaseTool):
             )
         except ValueError as exc:
             return False, f"{type(exc).__name__}:{exc}"
-        await _flush_scheduler(self.plugin)
+        await scheduler.flush()
         return True, {
             "action": "knowledge_candidate_declined",
             "version": identity,
@@ -671,12 +818,14 @@ class LifeReviewSubjectDocumentTool(BaseTool):
             "仅 status 且指定 target_path：本次最多读取 1024-32768 字节",
         ] = 16384,
     ) -> tuple[bool, str | dict]:
-        scheduler = _get_scheduler(self.plugin)
-        if scheduler is None:
-            return False, "学习系统未初始化。"
         normalized = str(action or "status").strip().lower()
         if normalized not in {"status", "unchanged", "snooze", "propose"}:
             return False, "action 必须是 status/unchanged/snooze/propose。"
+        capability = await LearningOpportunityCapability.bind(
+            self,
+            require_writable=normalized != "status",
+        )
+        scheduler = capability.scheduler
 
         if normalized == "status":
             try:
@@ -794,7 +943,7 @@ class LifeReviewSubjectDocumentTool(BaseTool):
                     "snooze_until": record.get("snooze_until", ""),
                 }
 
-            ledger = getattr(scheduler, "decision_ledger", None)
+            ledger = capability.decision_ledger
             if normalized == "propose" and ledger is None:
                 return False, (
                     "SubjectAuthorityMigrationRequired: 正式主体存储迁移尚未完成；"
@@ -952,8 +1101,8 @@ class LifeListSubjectCandidatesTool(BaseTool):
         ] = "open",
         limit: Annotated[int, "最多返回多少条，1-50"] = 10,
     ) -> tuple[bool, str | dict]:
-        scheduler = _get_scheduler(self.plugin)
-        ledger = getattr(scheduler, "decision_ledger", None)
+        capability = await LearningOpportunityCapability.bind(self)
+        ledger = capability.decision_ledger
         if ledger is None:
             return False, "主体候选账本仅在统一可选存储就绪后可用。"
         try:
@@ -991,8 +1140,8 @@ class LifeReadSubjectCandidateTool(BaseTool):
         offset_bytes: Annotated[int, "从哪个 UTF-8 字节偏移开始"] = 0,
         max_bytes: Annotated[int, "本次最多读取 1024-32768 字节"] = 16384,
     ) -> tuple[bool, str | dict]:
-        scheduler = _get_scheduler(self.plugin)
-        ledger = getattr(scheduler, "decision_ledger", None)
+        capability = await LearningOpportunityCapability.bind(self)
+        ledger = capability.decision_ledger
         if ledger is None:
             return False, "主体候选账本仅在统一可选存储就绪后可用。"
         try:
@@ -1093,8 +1242,12 @@ class LifeDecideSubjectCandidateTool(BaseTool):
             "仅 accepted 时填写：当前意识最终选择的完整目标文档",
         ] = "",
     ) -> tuple[bool, str | dict]:
-        scheduler = _get_scheduler(self.plugin)
-        ledger = getattr(scheduler, "decision_ledger", None)
+        capability = await LearningOpportunityCapability.bind(
+            self,
+            require_writable=True,
+        )
+        scheduler = capability.scheduler
+        ledger = capability.decision_ledger
         if ledger is None:
             return False, "主体候选账本仅在统一可选存储就绪后可用。"
         normalized = str(decision or "").strip().lower()
@@ -1231,13 +1384,11 @@ class LifeListSkillCandidatesTool(BaseTool):
         status: Annotated[str, "open|accepted|rejected|all，默认 open"] = "open",
         limit: Annotated[int, "最多返回多少条，1-20"] = 10,
     ) -> tuple[bool, str | dict]:
-        scheduler = _get_scheduler(self.plugin)
-        if scheduler is None:
-            return False, "学习系统未初始化。"
+        capability = await LearningOpportunityCapability.bind(self)
         normalized = str(status or "open").strip().lower()
         if normalized not in {"open", "accepted", "rejected", "all"}:
             return False, "status 必须是 open/accepted/rejected/all。"
-        candidates = scheduler.skill_store.list_candidates(
+        candidates = capability.skill_store.list_candidates(
             status=None if normalized == "all" else normalized
         )[: max(1, min(20, int(limit or 10)))]
         return True, {
@@ -1280,10 +1431,8 @@ class LifeReadSkillCandidateTool(BaseTool):
         offset_bytes: Annotated[int, "本次从哪个 UTF-8 字节偏移开始"] = 0,
         max_bytes: Annotated[int, "本次最多读取字节数，1024-32768"] = 16384,
     ) -> tuple[bool, str | dict]:
-        scheduler = _get_scheduler(self.plugin)
-        if scheduler is None:
-            return False, "学习系统未初始化。"
-        candidate = scheduler.skill_store.get_candidate(candidate_id)
+        capability = await LearningOpportunityCapability.bind(self)
+        candidate = capability.skill_store.get_candidate(candidate_id)
         if candidate is None:
             return False, f"未找到技能候选 {candidate_id}。"
         raw = json.dumps(
@@ -1356,9 +1505,11 @@ class LifeDecideSkillCandidateTool(BaseTool):
             str, "接受时可选：你最终选择的完整技能正文"
         ] = "",
     ) -> tuple[bool, str | dict]:
-        scheduler = _get_scheduler(self.plugin)
-        if scheduler is None:
-            return False, "学习系统未初始化。"
+        capability = await LearningOpportunityCapability.bind(
+            self,
+            require_writable=True,
+        )
+        scheduler = capability.scheduler
         normalized = str(decision or "").strip().lower()
         if normalized not in {"accepted", "rejected", "kept_open"}:
             return False, "decision 必须是 accepted/rejected/kept_open。"
@@ -1417,7 +1568,8 @@ class LifeObserveStaleInsightsTool(BaseTool):
         threshold_days: Annotated[int, "陈旧阈值（天），默认90"] = 90,
         max_results: Annotated[int, "最多返回几条，默认10"] = 10,
     ) -> tuple[bool, str | dict]:
-        store = _get_store(self.plugin)
+        capability = await LearningOpportunityCapability.bind(self)
+        store = capability.store
 
         stale_insights = store.get_stale_insights(
             staleness_threshold_days=threshold_days
@@ -1479,7 +1631,8 @@ class LifeListValidationExperimentsTool(BaseTool):
         status: Annotated[str, "pending|completed|all，默认pending"] = "pending",
         max_results: Annotated[int, "最多返回几条，默认10"] = 10,
     ) -> tuple[bool, str | dict]:
-        store = _get_store(self.plugin)
+        capability = await LearningOpportunityCapability.bind(self)
+        store = capability.store
 
         if status == "pending":
             experiments = store.list_pending_experiments()
@@ -1567,7 +1720,11 @@ class LifeCompleteValidationExperimentTool(BaseTool):
         ],
         notes: Annotated[str, "补充说明（可选）"] = "",
     ) -> tuple[bool, str | dict]:
-        store = _get_store(self.plugin)
+        capability = await LearningOpportunityCapability.bind(
+            self,
+            require_writable=True,
+        )
+        store = capability.store
 
         # 验证 result_type
         valid_types = {"confirmed", "contradicted", "inconclusive"}
@@ -1576,20 +1733,24 @@ class LifeCompleteValidationExperimentTool(BaseTool):
                 "error": f"result_type 必须是 {valid_types} 之一",
             }
 
-        success = store.complete_experiment(
-            experiment_id=experiment_id,
-            actual_outcome=actual_outcome,
-            result_type=result_type,
-            notes=notes,
-        )
+        async with capability.mutation_context(
+            "complete_validation_experiment",
+            reason=actual_outcome,
+        ):
+            success = store.complete_experiment(
+                experiment_id=experiment_id,
+                actual_outcome=actual_outcome,
+                result_type=result_type,
+                notes=notes,
+            )
 
-        if not success:
-            return False, {
-                "action": "complete_validation_experiment",
-                "error": "实验不存在或已完成",
-                "experiment_id": experiment_id,
-            }
-        await _flush_scheduler(self.plugin)
+            if not success:
+                return False, {
+                    "action": "complete_validation_experiment",
+                    "error": "实验不存在或已完成",
+                    "experiment_id": experiment_id,
+                }
+            await capability.scheduler.flush()
 
         # 获取完成后的实验
         exp = store.get_experiment(experiment_id)
@@ -1615,6 +1776,10 @@ class LifeCompleteValidationExperimentTool(BaseTool):
 
 LEARNING_TOOLS = [
     LifeReflectNowTool,
+    LifeRunNextReflectionTool,
+    LifeRunIndependentAuditTool,
+    LifeProposeKnowledgeCandidateTool,
+    LifeDistillSkillCandidateTool,
     LifeListInsightsTool,
     LifeChallengeInsightTool,
     LifeReconsiderInsightTool,

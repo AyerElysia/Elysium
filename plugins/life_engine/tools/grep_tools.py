@@ -125,16 +125,21 @@ def _grep_file(
     *,
     context_lines: int = 0,
     max_line_length: int = 500,
+    raw_content: bytes | None = None,
 ) -> list[dict[str, Any]]:
     """在单个文件中搜索匹配行。"""
     matches: list[dict[str, Any]] = []
 
     try:
         # 检查文件大小
-        if file_path.stat().st_size > _MAX_FILE_SIZE:
+        if (len(raw_content) if raw_content is not None else file_path.stat().st_size) > _MAX_FILE_SIZE:
             return []
 
-        content = file_path.read_text(encoding="utf-8", errors="replace")
+        content = (
+            raw_content.decode("utf-8", errors="replace")
+            if raw_content is not None
+            else file_path.read_text(encoding="utf-8", errors="replace")
+        )
         lines = content.splitlines()
 
         for line_num, line in enumerate(lines, start=1):
@@ -255,6 +260,13 @@ class LifeEngineGrepFileTool(BaseTool):
             return False, "搜索模式不能为空"
 
         workspace = _get_workspace(self.plugin)
+        from .file_tools import _plugin_life_service
+        from .managed_files import selected_file_session
+
+        try:
+            managed_session = selected_file_session(self, _plugin_life_service(self.plugin))
+        except Exception as exc:
+            return False, str(exc)
 
         # 确定搜索根路径
         if path.strip():
@@ -262,7 +274,7 @@ class LifeEngineGrepFileTool(BaseTool):
             if not ok:
                 return False, str(resolved_path)
             search_root = resolved_path
-            if not search_root.exists():
+            if not search_root.exists() and managed_session is None:
                 return False, f"路径不存在: {path}"
         else:
             search_root = workspace
@@ -276,7 +288,39 @@ class LifeEngineGrepFileTool(BaseTool):
             return False, f"正则表达式语法错误: {e}"
 
         # 收集要搜索的文件
-        if search_root.is_file():
+        managed_items: dict[Path, dict[str, Any]] = {}
+        if managed_session is not None:
+            from .managed_file_inventory import load_managed_inventory
+
+            try:
+                source_path = search_root.relative_to(workspace).as_posix()
+                bound_head = await managed_session.store.get_head(
+                    "life_engine_workspace/" + source_path
+                ) if source_path != "." else None
+                is_file_query = bound_head is not None or search_root.is_file()
+                inventory_root = search_root.parent if is_file_query else search_root
+                inventory = await load_managed_inventory(
+                    managed_session, root=inventory_root,
+                    max_depth=1 if is_file_query else max(0, max_depth),
+                    include_hidden=False,
+                )
+                for item in inventory:
+                    if item["type"] != "file":
+                        continue
+                    file_path = workspace / item["path"]
+                    if is_file_query and file_path != search_root:
+                        continue
+                    if _should_skip_path(file_path):
+                        continue
+                    if _excluded_by_glob(file_path, exclude_glob, workspace):
+                        continue
+                    if not _matches_glob(file_path, glob, workspace):
+                        continue
+                    managed_items[file_path] = item
+                files_to_search = list(managed_items)
+            except Exception as exc:
+                return False, f"ManagedFileInventoryUnavailable: {type(exc).__name__}: {exc}"
+        elif search_root.is_file():
             files_to_search = [search_root]
         else:
             files_to_search = []
@@ -322,7 +366,10 @@ class LifeEngineGrepFileTool(BaseTool):
             files_to_search = [
                 fpath
                 for fpath in files_to_search
-                if _mtime_in_range(fpath.stat().st_mtime, after_bound, before_bound)
+                if _mtime_in_range(
+                    float(managed_items[fpath]["_mtime"]) if managed_session is not None
+                    else fpath.stat().st_mtime, after_bound, before_bound,
+                )
             ]
 
         limit_unit = "file" if output_mode == "files_with_matches" else "line"
@@ -333,7 +380,12 @@ class LifeEngineGrepFileTool(BaseTool):
             return False, f"不支持的 sort: {sort}"
         if sort_mode == "mtime":
             files_to_search.sort(key=lambda item: str(item))
-            files_to_search.sort(key=lambda item: item.stat().st_mtime_ns, reverse=True)
+            files_to_search.sort(
+                key=lambda item: (
+                    float(managed_items[item]["_mtime"]) if managed_session is not None
+                    else item.stat().st_mtime
+                ), reverse=True,
+            )
         else:
             files_to_search = sorted(files_to_search)
         candidate_files = len(files_to_search)
@@ -353,29 +405,49 @@ class LifeEngineGrepFileTool(BaseTool):
                 search_truncated = True
                 break
 
-            stat_before = fpath.stat()
-            file_matches = _grep_file(
-                fpath,
-                compiled,
-                context_lines=context_lines if output_mode == "content" else 0,
-            )
+            pinned_version_id = str(managed_items.get(fpath, {}).get("subject_version_id") or "")
+            if pinned_version_id:
+                if int(managed_items[fpath]["size"]) > _MAX_FILE_SIZE:
+                    continue
+                version = await managed_session.store.get_version(pinned_version_id)
+                raw_bytes = bytes(version.content_bytes)
+                if (
+                    version.document_id != managed_items[fpath]["document_id"]
+                    or version.content_hash != hashlib.sha256(raw_bytes).hexdigest()
+                ):
+                    return False, "ManagedFileSearchVersionIntegrityError"
+                from ..storage.workspace_file_io import run_workspace_file_io
+
+                file_matches = await run_workspace_file_io(
+                    _grep_file, fpath, compiled,
+                    context_lines=context_lines if output_mode == "content" else 0,
+                    raw_content=raw_bytes,
+                )
+            else:
+                stat_before = fpath.stat()
+                file_matches = _grep_file(
+                    fpath, compiled,
+                    context_lines=context_lines if output_mode == "content" else 0,
+                )
 
             if not file_matches:
                 continue
 
             rel_path = str(fpath.relative_to(workspace))
-            raw_bytes = fpath.read_bytes()
-            stat_after = fpath.stat()
-            if (
-                stat_before.st_size != stat_after.st_size
-                or stat_before.st_mtime_ns != stat_after.st_mtime_ns
-            ):
-                return False, "file changed while grep results were prepared"
+            if not pinned_version_id:
+                raw_bytes = fpath.read_bytes()
+                stat_after = fpath.stat()
+                if (
+                    stat_before.st_size != stat_after.st_size
+                    or stat_before.st_mtime_ns != stat_after.st_mtime_ns
+                ):
+                    return False, "file changed while grep results were prepared"
             source_files.append(
                 {
                     "path": rel_path,
                     "bytes": len(raw_bytes),
                     "content_sha256": hashlib.sha256(raw_bytes).hexdigest(),
+                    "subject_version_id": pinned_version_id,
                 }
             )
             total_match_count += len(file_matches)
@@ -392,6 +464,10 @@ class LifeEngineGrepFileTool(BaseTool):
                     "match_count": len(file_matches),
                     "matches": file_matches[:max_results - (total_match_count - len(file_matches))],
                 })
+            if pinned_version_id:
+                matched_files[-1]["document_id"] = version.document_id
+                matched_files[-1]["subject_version_id"] = pinned_version_id
+                matched_files[-1]["file_ref"] = f"subject-file:{version.document_id}@{pinned_version_id}"
 
         census = {
             "candidate_files": candidate_files,

@@ -535,7 +535,7 @@ class MemoryWitnessCoordinator:
 
     async def loop(self) -> None:
         cfg = self.config
-        if cfg is None or not bool(getattr(cfg, "enabled", True)):
+        if cfg is None or not bool(getattr(cfg, "enabled", False)):
             return
         run_immediately = bool(getattr(cfg, "run_on_startup", True))
         interval = max(60, int(getattr(cfg, "interval_seconds", 1800)))

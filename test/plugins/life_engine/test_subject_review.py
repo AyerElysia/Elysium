@@ -69,6 +69,30 @@ async def _is_active(actor: str) -> bool:
     return actor == "consciousness-1"
 
 
+def _bind_learning_scheduler(
+    monkeypatch: pytest.MonkeyPatch,
+    scheduler: object,
+) -> None:
+    """Inject the formal call-scoped capability used by Learning tools."""
+
+    async def bind(
+        _tool: object,
+        *,
+        require_writable: bool = False,
+    ) -> SimpleNamespace:
+        del require_writable
+        return SimpleNamespace(
+            scheduler=scheduler,
+            decision_ledger=getattr(scheduler, "decision_ledger", None),
+        )
+
+    monkeypatch.setattr(
+        learning_tools.LearningOpportunityCapability,
+        "bind",
+        bind,
+    )
+
+
 def _remote_snapshot(
     contents: dict[str, bytes],
     *,
@@ -1300,7 +1324,7 @@ async def test_review_tool_fails_closed_for_proposal_before_migration(
     tool = LifeReviewSubjectDocumentTool(
         plugin=SimpleNamespace(config=config),
     )
-    monkeypatch.setattr(learning_tools, "_get_scheduler", lambda _plugin: scheduler)
+    _bind_learning_scheduler(monkeypatch, scheduler)
     monkeypatch.setattr(
         learning_tools,
         "_decision_actor",
@@ -1333,7 +1357,7 @@ async def test_review_tool_records_unchanged_against_exact_hash(
     config = LifeEngineConfig()
     config.settings.workspace_path = str(tmp_path)
     tool = LifeReviewSubjectDocumentTool(plugin=SimpleNamespace(config=config))
-    monkeypatch.setattr(learning_tools, "_get_scheduler", lambda _plugin: scheduler)
+    _bind_learning_scheduler(monkeypatch, scheduler)
     monkeypatch.setattr(
         learning_tools,
         "_decision_actor",
@@ -1369,7 +1393,7 @@ async def test_generic_subject_review_rejects_memory_proposal_even_when_selected
     config = LifeEngineConfig()
     config.settings.workspace_path = str(tmp_path)
     tool = LifeReviewSubjectDocumentTool(plugin=SimpleNamespace(config=config))
-    monkeypatch.setattr(learning_tools, "_get_scheduler", lambda _plugin: scheduler)
+    _bind_learning_scheduler(monkeypatch, scheduler)
     monkeypatch.setattr(
         learning_tools,
         "_decision_actor",
@@ -1420,7 +1444,7 @@ async def test_generic_subject_review_never_reads_or_proposes_remote_memory(
     config = LifeEngineConfig()
     config.settings.workspace_path = str(tmp_path)
     tool = LifeReviewSubjectDocumentTool(plugin=SimpleNamespace(config=config))
-    monkeypatch.setattr(learning_tools, "_get_scheduler", lambda _plugin: scheduler)
+    _bind_learning_scheduler(monkeypatch, scheduler)
     monkeypatch.setattr(
         learning_tools,
         "_decision_actor",
@@ -1494,7 +1518,7 @@ async def test_generic_candidate_decision_rejects_every_memory_target(
             raise AssertionError("generic MEMORY decisions must remain unreachable")
 
     scheduler = SimpleNamespace(decision_ledger=_CandidateLedger())
-    monkeypatch.setattr(learning_tools, "_get_scheduler", lambda _plugin: scheduler)
+    _bind_learning_scheduler(monkeypatch, scheduler)
     tool = learning_tools.LifeDecideSubjectCandidateTool(plugin=SimpleNamespace())
     ok, payload = await tool.execute(
         candidate_id=candidate.candidate_id,
@@ -1533,10 +1557,9 @@ async def test_historical_generic_memory_candidate_is_readable_for_audit_only(
         async def read_candidate(self, _candidate_id: str) -> LearningCandidate:
             return candidate
 
-    monkeypatch.setattr(
-        learning_tools,
-        "_get_scheduler",
-        lambda _plugin: SimpleNamespace(decision_ledger=_CandidateLedger()),
+    _bind_learning_scheduler(
+        monkeypatch,
+        SimpleNamespace(decision_ledger=_CandidateLedger()),
     )
     tool = learning_tools.LifeReadSubjectCandidateTool(plugin=SimpleNamespace())
 
@@ -1569,10 +1592,9 @@ async def test_continuity_candidate_generic_read_cannot_create_delivery_proof(
         async def read_candidate(self, _candidate_id: str) -> LearningCandidate:
             return candidate
 
-    monkeypatch.setattr(
-        learning_tools,
-        "_get_scheduler",
-        lambda _plugin: SimpleNamespace(decision_ledger=_CandidateLedger()),
+    _bind_learning_scheduler(
+        monkeypatch,
+        SimpleNamespace(decision_ledger=_CandidateLedger()),
     )
     tool = learning_tools.LifeReadSubjectCandidateTool(plugin=SimpleNamespace())
 
@@ -1628,7 +1650,7 @@ async def test_generic_candidate_acceptance_remains_available_for_non_memory_sub
         current_subject_revision=current_subject_revision,
         record_subject_review_outcome=record_subject_review_outcome,
     )
-    monkeypatch.setattr(learning_tools, "_get_scheduler", lambda _plugin: scheduler)
+    _bind_learning_scheduler(monkeypatch, scheduler)
     monkeypatch.setattr(
         learning_tools,
         "_decision_actor",

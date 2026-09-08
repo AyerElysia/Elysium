@@ -151,7 +151,9 @@ async def test_life_send_text_missing_thought_returns_structured_failure(monkeyp
 
 
 @pytest.mark.parametrize("kind", ["chat", "minecraft", "livestream"])
-def test_visible_expression_manifests_share_atomic_persona_schema(kind: str) -> None:
+def test_visible_expression_manifests_share_atomic_persona_schema(
+    kind: str, registered_minecraft_extension,
+) -> None:
     from plugins.life_engine.service.tool_manifests import get_tool_manifest
 
     assert "action-life_send_text" in get_tool_manifest(kind)

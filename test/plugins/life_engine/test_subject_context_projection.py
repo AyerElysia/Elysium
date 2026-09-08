@@ -143,10 +143,13 @@ async def test_each_authority_changes_revision_and_per_source_hash(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("selected_store", [False, True])
 async def test_profile_and_budget_are_part_of_immutable_projection_identity(
     tmp_path: Path,
+    selected_store: bool,
 ) -> None:
     _write_authorities(tmp_path)
+    runtime_store = _RuntimeStore() if selected_store else None
 
     async def author(_digest: str, sources: tuple[Any, ...]) -> SubjectContextDraft:
         return _draft_from_sources(sources)
@@ -156,18 +159,21 @@ async def test_profile_and_budget_are_part_of_immutable_projection_identity(
         projection_profile="voice_live",
         max_bytes=8192,
         author=author,
+        runtime_store=runtime_store,
     )
     wider = SubjectContextProjection(
         str(tmp_path),
         projection_profile="voice_live",
         max_bytes=12288,
         author=author,
+        runtime_store=runtime_store,
     )
     other_surface = SubjectContextProjection(
         str(tmp_path),
         projection_profile="conversation_router",
         max_bytes=8192,
         author=author,
+        runtime_store=runtime_store,
     )
 
     compact_snapshot = await compact.ensure_current_snapshot()
@@ -397,7 +403,7 @@ async def test_corrupt_pinned_content_fails_without_overwriting_version(
     snapshot = await projection.ensure_current_snapshot()
     assert snapshot is not None
     revision = str(snapshot["source_digest"])
-    version_path = projection.versions_dir / (_version_key("voice_live", revision) + ".md")
+    version_path = projection.runtime_dir / snapshot["projection_path"]
     corrupted = version_path.read_text(encoding="utf-8") + "tampered\n"
     version_path.write_text(corrupted, encoding="utf-8")
 
@@ -433,7 +439,9 @@ async def test_missing_or_corrupt_manifest_never_gets_silently_reconstructed(
     snapshot = await projection.ensure_current_snapshot()
     assert snapshot is not None
     revision = str(snapshot["source_digest"])
-    manifest_path = projection.versions_dir / (_version_key("voice_live", revision) + ".json")
+    manifest_path = (projection.runtime_dir / snapshot["projection_path"]).with_suffix(
+        ".json"
+    )
     original_manifest = manifest_path.read_text(encoding="utf-8")
     manifest_path.unlink()
 
@@ -558,8 +566,11 @@ async def test_subject_author_tries_next_model_after_per_source_budget_failure(
 _VERSION_NAMESPACE = "router_context_projection.version"
 
 
-def _version_key(profile: str, source_digest: str) -> str:
-    return f"{profile}.v{SUBJECT_CONTEXT_PROJECTION_VERSION}-{source_digest}"
+def _version_key(profile: str, source_digest: str, budget: int = 8192) -> str:
+    return (
+        f"{profile}.bytes-{budget}."
+        f"v{SUBJECT_CONTEXT_PROJECTION_VERSION}-{source_digest}"
+    )
 
 
 @pytest.mark.asyncio
@@ -604,7 +615,7 @@ async def test_profiles_with_shared_digest_keep_independent_remote_versions(
         _VERSION_NAMESPACE, _version_key("voice_live", digest)
     )
     witness_record = await runtime_store.get_state(
-        _VERSION_NAMESPACE, _version_key("memory_witness", digest)
+        _VERSION_NAMESPACE, _version_key("memory_witness", digest, 24576)
     )
     assert voice_record is not None and witness_record is not None
     assert voice_record.payload["projection_profile"] == "voice_live"
@@ -618,8 +629,10 @@ async def test_profiles_with_shared_digest_keep_independent_remote_versions(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("legacy_profile_prefix", [False, True])
 async def test_legacy_version_key_is_adopted_only_by_its_owning_profile(
     tmp_path: Path,
+    legacy_profile_prefix: bool,
 ) -> None:
     _write_authorities(tmp_path)
 
@@ -638,8 +651,14 @@ async def test_legacy_version_key_is_adopted_only_by_its_owning_profile(
     assert seed_snapshot is not None
     digest = str(seed_snapshot["source_digest"])
     legacy_key = f"v{SUBJECT_CONTEXT_PROJECTION_VERSION}-{digest}"
+    if legacy_profile_prefix:
+        legacy_key = "voice_live." + legacy_key
     legacy_payload = dict(
-        (await seed_store.get_state(_VERSION_NAMESPACE, _version_key("voice_live", digest))).payload
+        (
+            await seed_store.get_state(
+                _VERSION_NAMESPACE, _version_key("voice_live", digest)
+            )
+        ).payload
     )
 
     # The owning profile adopts the legacy record without re-authoring.
@@ -667,9 +686,12 @@ async def test_legacy_version_key_is_adopted_only_by_its_owning_profile(
     assert adopted is not None
     assert adopted["text"] == seed_snapshot["text"]
     assert owning_calls == 0
-    assert await owning_store.get_state(
-        _VERSION_NAMESPACE, _version_key("voice_live", digest)
-    ) is not None
+    assert (
+        await owning_store.get_state(
+            _VERSION_NAMESPACE, _version_key("voice_live", digest)
+        )
+        is not None
+    )
 
     # A foreign profile must not adopt the record; it regenerates its own.
     foreign_store = _RuntimeStore()
@@ -696,11 +718,137 @@ async def test_legacy_version_key_is_adopted_only_by_its_owning_profile(
     assert regenerated is not None
     assert foreign_calls == 1
     foreign_record = await foreign_store.get_state(
-        _VERSION_NAMESPACE, _version_key("memory_witness", digest)
+        _VERSION_NAMESPACE, _version_key("memory_witness", digest, 24576)
     )
     assert foreign_record is not None
     assert foreign_record.payload["projection_profile"] == "memory_witness"
     # The legacy record is never migrated to a profile it does not belong to.
-    assert await foreign_store.get_state(
-        _VERSION_NAMESPACE, _version_key("voice_live", digest)
-    ) is None
+    assert (
+        await foreign_store.get_state(
+            _VERSION_NAMESPACE, _version_key("voice_live", digest)
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy_budget", [8192, 16384])
+async def test_budget_migration_preserves_legacy_and_historical_snapshot(
+    tmp_path: Path,
+    legacy_budget: int,
+) -> None:
+    _write_authorities(tmp_path)
+    calls = 0
+
+    async def author(_digest: str, sources: tuple[Any, ...]) -> SubjectContextDraft:
+        nonlocal calls
+        calls += 1
+        return _draft_from_sources(sources)
+
+    seed_store = _RuntimeStore()
+    seed = SubjectContextProjection(
+        str(tmp_path),
+        projection_profile="minecraft",
+        max_bytes=legacy_budget,
+        author=author,
+        runtime_store=seed_store,
+    )
+    snapshot = await seed.ensure_current_snapshot()
+    assert snapshot is not None
+    digest = snapshot["source_digest"]
+    legacy_key = f"minecraft.v{SUBJECT_CONTEXT_PROJECTION_VERSION}-{digest}"
+    store = _RuntimeStore()
+    legacy = SimpleNamespace(revision=1, payload=dict(snapshot))
+    store.states[(_VERSION_NAMESPACE, legacy_key)] = legacy
+    compact = SubjectContextProjection(
+        str(tmp_path),
+        projection_profile="minecraft",
+        max_bytes=8192,
+        author=author,
+        runtime_store=store,
+    )
+    current = await compact.ensure_current_snapshot()
+    assert current is not None and current["budget"]["max_bytes"] == 8192
+    assert calls == (1 if legacy_budget == 8192 else 2)
+    assert store.states[(_VERSION_NAMESPACE, legacy_key)] is legacy
+    assert legacy.payload == snapshot and legacy.revision == 1
+
+    # Pinning after a restart must not read or re-author current authorities.
+    for filename in ("SOUL.md", "USER.md", "MEMORY.md"):
+        (tmp_path / filename).unlink()
+    restored = SubjectContextProjection(
+        str(tmp_path),
+        projection_profile="minecraft",
+        max_bytes=legacy_budget,
+        author=author,
+        runtime_store=store,
+    )
+    historical = await restored.get_snapshot(digest)
+    assert historical == snapshot
+    assert calls == (1 if legacy_budget == 8192 else 2)
+    assert store.states[(_VERSION_NAMESPACE, legacy_key)].payload == snapshot
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["before_write", "after_write", "corrupt"])
+async def test_legacy_adoption_never_hides_corruption_or_unproven_write(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    _write_authorities(tmp_path)
+
+    async def author(_digest: str, sources: tuple[Any, ...]) -> SubjectContextDraft:
+        return _draft_from_sources(sources)
+
+    seed = SubjectContextProjection(
+        str(tmp_path),
+        projection_profile="minecraft",
+        max_bytes=8192,
+        author=author,
+        runtime_store=_RuntimeStore(),
+    )
+    snapshot = await seed.ensure_current_snapshot()
+    assert snapshot is not None
+    digest = snapshot["source_digest"]
+    new_key = _version_key("minecraft", digest)
+    legacy_key = f"minecraft.v{SUBJECT_CONTEXT_PROJECTION_VERSION}-{digest}"
+
+    class FailingStore(_RuntimeStore):
+        fail_once = True
+
+        async def put_state(self, **kwargs):
+            if kwargs["state_key"] == new_key and self.fail_once:
+                self.fail_once = False
+                if failure == "after_write":
+                    await super().put_state(**kwargs)
+                raise OSError("injected projection migration failure")
+            return await super().put_state(**kwargs)
+
+    store = FailingStore()
+    payload = dict(snapshot)
+    if failure == "corrupt":
+        payload["text"] += "tampered"
+    store.states[(_VERSION_NAMESPACE, legacy_key)] = SimpleNamespace(
+        revision=1,
+        payload=payload,
+    )
+    projection = SubjectContextProjection(
+        str(tmp_path),
+        projection_profile="minecraft",
+        max_bytes=8192,
+        author=author,
+        runtime_store=store,
+    )
+    if failure == "corrupt":
+        with pytest.raises(RuntimeError, match="content hash mismatch"):
+            await projection.get_snapshot(digest)
+        assert await store.get_state(_VERSION_NAMESPACE, new_key) is None
+    else:
+        if failure == "before_write":
+            with pytest.raises(OSError, match="injected"):
+                await projection.get_snapshot(digest)
+            assert await store.get_state(_VERSION_NAMESPACE, new_key) is None
+        assert await projection.get_snapshot(digest) == snapshot
+        record = await store.get_state(_VERSION_NAMESPACE, new_key)
+        assert record.revision == 1 and record.payload == snapshot
+    assert store.states[(_VERSION_NAMESPACE, legacy_key)].payload == payload

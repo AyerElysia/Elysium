@@ -176,7 +176,7 @@ MySQL 异步引擎要求 SQLAlchemy ≥ 2.0.50；项目声明已经固定该下�
 
 ## 5. 首次生成配置
 
-`bootstrap` 会从当前 schema 示例创建缺失的 `elysium.toml` 与 `models.toml`，同时写入默认关闭的可选插件工程配置。已存在普通文件绝不覆盖，异常目标类型直接失败。不要依赖一次失败启动来自动生成配置。
+`bootstrap` 会从当前 schema 示例创建缺失的 `elysium.toml`，同时写入默认关闭的可选插件工程配置。`models.toml` 由部署者单独提供；仓库不维护模型路由模板，bootstrap 不生成它，缺失时 doctor 和启动明确失败。已存在普通文件绝不覆盖，异常目标类型直接失败。不要依赖一次失败启动来自动生成配置，也不要部署测试专用模型夹具。
 
 模型密钥保持为 `${ELYSIUM_NEXUS_API_KEY}` 等环境引用，真实值由当前终端或受控 secret manager 注入。正式模型加载会拒绝空值、未解析变量和示例占位符；部署 doctor 还会拒绝明文密钥。部署不创建 `.env`，也不把密钥放入命令参数或日志。本地 Router 等可选侧车在独立验收后再加入配置。
 
@@ -526,7 +526,7 @@ temp = 0.7
 现阶段的路由目标是：
 
 - `tasks.core`：Life Engine 潜意识/心跳模型。
-- `tasks.expression`：Life Chatter 对话表达模型。文本请求优先使用任务列表首个模型（当前生产为 DeepSeek-V4-Flash 正式版 `ark-code-latest` 路由）；聊天请求可能直接携带图片/表情，`LLMRequest` 会在发送前按 payload 媒体模态把 `models` 列表过滤到支持对应模态的成员，因此列表内**必须至少保留一个声明并真实支持 `vision = true` 的模型**（生产为 `xiaomi-mimo-v2.5`）承接识图，不能换成纯文本单模型。
+- `tasks.expression`：Life Chatter 对话表达模型。文本请求优先使用 `config/models.toml` 任务列表的首个模型；聊天请求可能直接携带图片/表情，`LLMRequest` 会在发送前按 payload 媒体模态把 `models` 列表过滤到支持对应模态的成员，因此列表内**必须至少保留一个声明并真实支持 `vision = true` 的模型**承接识图，不能换成纯文本单模型。
 - `witness`、`agent`、`utility`、`router`、`router_context_projection` 等任务：根据能力和成本选择纯文本模型。
 - `vision`：显式图片/视频观察任务，只能绑定经过媒体协议验收的多模态模型。
 - `live`：场景任务可能携带多模态感知；没有完成场景级媒体路由核对前，按多模态任务管理，不随纯文本模型批量切换。
@@ -1113,7 +1113,7 @@ Ctrl+C
 
 - [ ] `.venv` 中 Python 版本不低于 3.11。
 - [ ] `deploy.sh bootstrap` 或 `deploy.ps1 bootstrap` 成功，依赖与 `uv.lock` 一致。
-- [ ] `config/elysium.toml`、`config/models.toml` 已生成并保存；真实密钥未进入 Git。
+- [ ] `config/elysium.toml` 已准备，本机 `config/models.toml` 已由部署者提供；真实密钥未进入 Git。
 - [ ] SQLite 文件可创建或打开。
 - [ ] 启动过程无 Fatal error。
 - [ ] 仅有一个 Elysium 实例占用目标端口。
@@ -1318,6 +1318,8 @@ uv: command not found
 - 应用可用范围不包含当前用户或群。
 - 本地中转站若只有某个渠道持续返回固定 403，应先确认渠道协议或客户端限制；确认永久不兼容后只停用该渠道并保留其他同模型渠道，不要靠延长超时或无限重试掩盖错误。
 - New API 同时维护 `channels` 与派生 `abilities` 路由；停用渠道时必须让对应 ability 一并失效并验证真实请求不再选中它。没有任何健康 ability 的模型应暂时移出自动任务候选，但可继续保留注册信息用于恢复探针。
+- **MiMo 只能走小米渠道。** `mimo-v2.5` / `mimo-v2.5-pro` 不得出现在 OpenCode / Console Go / Zen 渠道的 `models` 或 `abilities` 中。检查与修复：`python scripts/pin_mimo_to_xiaomi_channel.py --db /root/Elysia/new-api/one-api.db`（只读），确认后加 `--apply`，再按运维规范重载 New API。不要为此重启 Elysium。
+- **OpenCode 渠道必须自带 `x-opencode-session`。** Console Go 缺该头会 400 `MissingSessionID`，Qwen/GLM 等只挂在该渠道的模型会全部失败。会话头只写在 New API 渠道 48 的 `header_override`，不要加到小米渠道，也不要借此把 MiMo 加回 OpenCode。
 
 ### 14.6 429/502/超时
 

@@ -211,6 +211,23 @@ def test_source_instance_never_defaults_to_actor_outside_core_heartbeat() -> Non
         _source_instance(tool, "chat_global")  # type: ignore[arg-type]
 
 
+def test_source_instance_reads_nested_life_turn_scope() -> None:
+    tool = SimpleNamespace(
+        _life_source_instance_id="",
+        trigger_message=SimpleNamespace(
+            extra={
+                "life_turn_scope": {
+                    "consciousness_instance_id": "chat_global",
+                    "stream_id": "kook-stream",
+                }
+            }
+        ),
+        _runtime_task_name="life_chatter",
+        get_current_stream_id=lambda: "kook-stream",
+    )
+    assert _source_instance(tool, "chat_global") == "chat_global"  # type: ignore[arg-type]
+
+
 def test_heartbeat_source_time_prefers_timestamp_over_missing_occurred_at() -> None:
     from plugins.life_engine.service.core import LifeEngineService
 

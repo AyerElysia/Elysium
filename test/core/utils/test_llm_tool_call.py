@@ -123,6 +123,41 @@ async def test_run_tool_call_binds_tool_runtime_stream_context() -> None:
     assert response.payloads[0].content[0].value == "message-stream"
 
 
+async def test_run_tool_call_binds_source_instance_from_turn_scope() -> None:
+    class SourceAwareTool(BaseTool):
+        tool_name = "source_aware"
+        tool_description = "source aware"
+
+        async def execute(self) -> tuple[bool, str]:
+            return True, str(
+                getattr(self, "_life_source_instance_id", "") or ""
+            )
+
+    registry = ToolRegistry()
+    registry.register(SourceAwareTool)
+    response = _FakeResponse()
+
+    result = await run_tool_call(
+        calls=[ToolCall(id="1", name="tool-source_aware", args={})],
+        response=response,
+        usable_map=registry,
+        trigger_msg=SimpleNamespace(
+            message_id="m1",
+            stream_id="kook-stream",
+            extra={
+                "life_turn_scope": {
+                    "consciousness_instance_id": "chat_global",
+                }
+            },
+        ),
+        plugin=MagicMock(),
+        stream_id="kook-stream",
+    )
+
+    assert result == [(True, True)]
+    assert response.payloads[0].content[0].value == "chat_global"
+
+
 async def test_run_tool_call_preserves_structured_result_for_canonical_json() -> None:
     class StructuredTool(BaseTool):
         tool_name = "structured"

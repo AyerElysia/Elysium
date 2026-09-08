@@ -29,7 +29,7 @@ import net.minecraft.client.Minecraft;
 /** Authenticated outbound WebSocket endpoint for one embodiment controller. */
 final class BridgeServer {
     static final String PROTOCOL = "elysium.minecraft.bridge/1";
-    static final String BRIDGE_VERSION = "0.2.1";
+    static final String BRIDGE_VERSION = "0.3.0";
     private static final long AUTHENTICATION_DEADLINE_SECONDS = 5L;
     private static final int MAX_DROPPABLE_OUTBOUND_MESSAGES = 32;
     private static final int MAX_TERMINAL_COMMAND_RECEIPTS = 1024;
@@ -46,6 +46,9 @@ final class BridgeServer {
     private final AtomicBoolean connecting = new AtomicBoolean();
     private final AtomicInteger outboundPending = new AtomicInteger();
     private final AtomicLong droppedObservations = new AtomicLong();
+    private final AtomicLong observationSequence = new AtomicLong();
+    private final AtomicBoolean framePending = new AtomicBoolean();
+    private final BodyEventJournal eventJournal;
     private final CommandLedger commandLedger = new CommandLedger(MAX_TERMINAL_COMMAND_RECEIPTS);
     private final Object outboundLock = new Object();
     private CompletableFuture<Void> outboundTail = CompletableFuture.completedFuture(null);
@@ -61,6 +64,8 @@ final class BridgeServer {
         this.client = client;
         this.controls = controls;
         this.instanceId = instanceId;
+        this.eventJournal = new BodyEventJournal(instanceId, 256);
+        controls.setEventPublisher(this::publishEvent);
         this.networkExecutor = Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "elysium-bridge-network");
             thread.setDaemon(true);
@@ -89,17 +94,18 @@ final class BridgeServer {
         networkExecutor.shutdownNow();
     }
 
-    /** Publish one factual state with a contiguous connection-local sequence. */
+    /** Publish one factual state, resuming from the controller's last delivered sequence. */
     void broadcastObservation(JsonObject facts) {
         WebSocket socket = connection.get();
         ConnectionState state = connectionState.get();
         if (socket == null || state == null || !state.authenticated) {
             return;
         }
-        long nextSequence = state.observationSequence.get() + 1L;
+        long nextSequence = observationSequence.get() + 1L;
         JsonObject transport = new JsonObject();
         transport.addProperty("pending_messages", outboundPending.get());
         transport.addProperty("dropped_observations", droppedObservations.get());
+        transport.addProperty("pending_events", eventJournal.size());
         facts.add("bridge_transport", transport);
         JsonObject observation = new JsonObject();
         observation.addProperty("observation_id", "observation_" + UUID.randomUUID());
@@ -112,10 +118,29 @@ final class BridgeServer {
         envelope.addProperty("type", "observation");
         envelope.add("observation", observation);
         if (send(socket, envelope, true)) {
-            state.observationSequence.set(nextSequence);
+            observationSequence.set(nextSequence);
         } else {
             droppedObservations.incrementAndGet();
         }
+    }
+
+    /** Keep each occurrence until its exact durable-consumer acknowledgement. */
+    void publishEvent(String kind, JsonObject payload) {
+        synchronized (eventJournal) {
+            JsonObject event = eventJournal.publish(kind, payload);
+            WebSocket socket = connection.get();
+            ConnectionState state = connectionState.get();
+            if (socket != null && state != null && state.authenticated) {
+                sendEvent(socket, event);
+            }
+        }
+    }
+
+    private void sendEvent(WebSocket socket, JsonObject event) {
+        JsonObject envelope = new JsonObject();
+        envelope.addProperty("type", "event");
+        envelope.add("event", event);
+        send(socket, envelope, false);
     }
 
     /** Connect to the WSL listener; retry only while the configured endpoint is absent. */
@@ -218,9 +243,18 @@ final class BridgeServer {
         hello.addProperty("neoforge_version", "21.1.219");
         hello.addProperty("nonce", state.nonce);
         hello.addProperty("instance_id", instanceId);
+        hello.addProperty("player_name", client.getUser().getName());
+        hello.addProperty("player_uuid", client.getUser().getProfileId().toString());
+        hello.addProperty("game_directory", client.gameDirectory.getAbsolutePath());
         com.google.gson.JsonArray capabilities = new com.google.gson.JsonArray();
         controls.operations().stream().sorted().forEach(capabilities::add);
+        capabilities.add("vision.capture");
         hello.add("capabilities", capabilities);
+        com.google.gson.JsonArray taskKinds = new com.google.gson.JsonArray();
+        if (StateCollector.baritoneAvailable()) {
+            NativeTaskEngine.KINDS.stream().sorted().forEach(taskKinds::add);
+        }
+        hello.add("task_kinds", taskKinds);
         send(socket, hello, false);
     }
 
@@ -253,8 +287,10 @@ final class BridgeServer {
             switch (type) {
                 case "command" -> command(socket, state, message);
                 case "interrupt" -> interrupt(message);
+                case "event_ack" -> eventJournal.acknowledge(required(message, "event_id"));
+                case "frame_request" -> captureFrame(socket, message);
                 case "release_all" -> client.execute(
-                        () -> controls.releaseAll(message.has("reason")
+                        () -> controls.interrupt(message.has("reason")
                                 ? message.get("reason").getAsString() : "release_all"));
                 default -> throw new IllegalArgumentException("Unsupported message type: " + type);
             }
@@ -286,11 +322,49 @@ final class BridgeServer {
             rejectAuthentication(socket);
             return;
         }
-        state.authenticated = true;
         JsonObject response = new JsonObject();
         response.addProperty("type", "authentication");
         response.addProperty("accepted", true);
-        send(socket, response, false);
+        synchronized (eventJournal) {
+            if (message.has("last_observation_sequence")
+                    && !message.get("last_observation_sequence").isJsonNull()) {
+                long resume = message.get("last_observation_sequence").getAsLong();
+                if (resume < 0 || resume > observationSequence.get()) {
+                    throw new IllegalArgumentException("invalid observation resume sequence");
+                }
+                observationSequence.set(resume);
+            }
+            send(socket, response, false);
+            for (var event : eventJournal.snapshot()) sendEvent(socket, event.getAsJsonObject());
+            state.authenticated = true;
+        }
+    }
+
+    /** Capture only this represented client's render target; never another desktop window. */
+    private void captureFrame(WebSocket socket, JsonObject message) {
+        String requestId = required(message, "request_id");
+        if (!requestId.matches("[A-Za-z0-9_.:-]{1,160}")) {
+            throw new IllegalArgumentException("invalid frame request identity");
+        }
+        int maxWidth = message.has("max_width")
+                ? OperationContracts.boundedInt(message, "max_width", 160, 960) : 960;
+        if (!framePending.compareAndSet(false, true)) {
+            throw new IllegalStateException("native frame request already pending");
+        }
+        client.execute(() -> {
+            JsonObject result = new JsonObject();
+            result.addProperty("type", "frame");
+            result.addProperty("request_id", requestId);
+            result.addProperty("instance_id", instanceId);
+            try {
+                result.add("frame", NativeVision.capture(client, maxWidth));
+            } catch (Exception exception) {
+                result.addProperty("error", exception.getClass().getSimpleName());
+            } finally {
+                framePending.set(false);
+            }
+            send(socket, result, false);
+        });
     }
 
     /** Reject authentication without revealing whether the token was malformed. */
@@ -319,13 +393,13 @@ final class BridgeServer {
                 sendReceipt(socket, receipt(
                         commandId, intentId, false, true, false,
                         new JsonObject(), "command_id was already used for another payload",
-                        state.observationSequence.get()));
+                        observationSequence.get()));
                 return;
             }
             case PENDING_REPLAY -> {
                 sendReceipt(socket, receipt(
                         commandId, intentId, true, false, false,
-                        new JsonObject(), null, state.observationSequence.get()));
+                        new JsonObject(), null, observationSequence.get()));
                 decision.pendingCompletion().thenAccept(
                         terminal -> sendReceipt(socket, terminal.deepCopy()));
                 return;
@@ -342,21 +416,21 @@ final class BridgeServer {
             JsonObject rejected = receipt(
                     commandId, intentId, false, true, false,
                     new JsonObject(), "Unsupported operation: " + operation,
-                    state.observationSequence.get());
+                    observationSequence.get());
             commandLedger.complete(commandId, rejected);
             sendReceipt(socket, rejected);
             return;
         }
         sendReceipt(socket, receipt(
                 commandId, intentId, true, false, false,
-                new JsonObject(), null, state.observationSequence.get()));
+                new JsonObject(), null, observationSequence.get()));
         client.execute(() -> {
             JsonObject terminal;
             try {
                 JsonObject facts = controls.execute(operation, parameters);
                 terminal = receipt(
                         commandId, intentId, true, true, false,
-                        facts, null, state.observationSequence.get());
+                        facts, null, observationSequence.get());
             } catch (RuntimeException exception) {
                 JsonObject facts = new JsonObject();
                 facts.addProperty("exception_type", exception.getClass().getName());
@@ -371,7 +445,7 @@ final class BridgeServer {
                         exception);
                 terminal = receipt(
                         commandId, intentId, true, true, false,
-                        facts, exception.getMessage(), state.observationSequence.get());
+                        facts, exception.getMessage(), observationSequence.get());
             }
             commandLedger.complete(commandId, terminal);
             sendReceipt(socket, terminal);
@@ -471,7 +545,6 @@ final class BridgeServer {
     private static final class ConnectionState {
         private final String nonce;
         private volatile boolean authenticated;
-        private final AtomicLong observationSequence = new AtomicLong();
 
         /** Create a fresh challenge and empty observation stream. */
         private ConnectionState() {

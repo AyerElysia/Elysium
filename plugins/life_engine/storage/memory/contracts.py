@@ -56,8 +56,13 @@ from ...memory.living import (
     RecallEpisode,
     RecallEvent,
     SemanticRelation,
+    SemanticRelationPage,
 )
-from ...memory.nodes import MemoryNode
+from ...memory.nodes import (
+    ManagedDocumentIndexResult,
+    ManagedDocumentIndexSnapshot,
+    MemoryNode,
+)
 from ...memory.search import DetailedSearchResult, LineageNodeView
 from ...memory.witness_pipeline import (
     WitnessDecision,
@@ -306,11 +311,23 @@ class CanonicalDocumentMetadata:
     index_revision: int
     is_deleted: bool
     updated_at: float
+    subject_document_id: str = ""
+    subject_version_id: str = ""
+    subject_document_revision: int = 0
+    subject_binding_revision: int = 0
+    subject_content_sha256: str = ""
 
 
 @runtime_checkable
 class DocumentIndexProjection(MemoryStorePort, Protocol):
     """Rebuildable lexical/chunk/vector-work projection."""
+
+    async def project_managed_document(
+        self,
+        snapshot: ManagedDocumentIndexSnapshot,
+    ) -> ManagedDocumentIndexResult:
+        """Project a stable subject identity while its caller holds the source fence."""
+        ...
 
     async def get_document_metadata(
         self,
@@ -648,7 +665,16 @@ class LivingMemoryStore(MemoryStorePort, Protocol):
 
     async def append_relation(self, relation: SemanticRelation) -> SemanticRelation: ...
 
-    async def list_relations(self, entity_ref: str) -> list[SemanticRelation]: ...
+    async def get_relation(self, relation_id: str) -> SemanticRelation | None: ...
+
+    async def list_relations(
+        self, entity_ref: str, *, current_only: bool = False,
+    ) -> list[SemanticRelation]: ...
+
+    async def page_relations(
+        self, entity_ref: str, *, current_only: bool = False, limit: int = 50,
+        offset: int = 0, expected_frontier_count: int | None = None,
+    ) -> SemanticRelationPage: ...
 
     async def list_interpretations(
         self,

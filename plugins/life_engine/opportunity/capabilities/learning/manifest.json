@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "capability_id": "life.learning",
+  "package_version": "1.0.0",
+  "removability": "subject_removable",
+  "provider_kind": "learning",
+  "manual": "CAPABILITY.md",
+  "default_skill": "DEFAULT_SKILL.md",
+  "operations": [
+    "nucleus_learn"
+  ],
+  "dependencies": [
+    "life.learning_engine",
+    "life.presence",
+    "life.subject_authority",
+    "life.timeline"
+  ]
+}

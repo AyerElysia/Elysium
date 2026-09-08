@@ -71,20 +71,20 @@ class LifeChatterContextAssembler:
     ) -> str:
         """Build the stable prefix prompt.
 
-        Empty sections are skipped and non-empty sections are joined exactly the
-        same way as the previous inline implementation.
+        MEMORY is an authority document: preserve its text without normalization.
+        Other sections retain their existing boundary-whitespace normalization.
         """
 
         parts = [
-            soul_text,
-            user_text,
+            (soul_text or "").strip(),
+            (user_text or "").strip(),
             memory_text,
-            existence_text,
-            tools_text,
-            live_guidance,
-            primary_tool_guide,
+            (existence_text or "").strip(),
+            (tools_text or "").strip(),
+            (live_guidance or "").strip(),
+            (primary_tool_guide or "").strip(),
         ]
-        return "\n\n".join(part.strip() for part in parts if str(part or "").strip())
+        return "\n\n".join(part for part in parts if part)
 
     @staticmethod
     def build_rolling_prompt(

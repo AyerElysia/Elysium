@@ -44,9 +44,19 @@ from .apply_patch import (
 )
 from .bounded_projection import (
     BoundedContinuationError,
+    _finalize_delivered_bytes,
     project_bounded_items,
     project_bounded_text,
+    resolve_tool_result_budget,
     sha256_json,
+)
+from .managed_file_reads import read_managed_file_view
+from .managed_files import (
+    FileSnapshot,
+    ManagedFileSession,
+    pin_file_continuation,
+    selected_file_session,
+    split_file_continuation,
 )
 
 if TYPE_CHECKING:
@@ -456,7 +466,7 @@ def _plugin_life_service(plugin: Any) -> Any:
 
 
 async def _commit_subject_authority_file_write(
-    plugin: Any,
+    tool: Any,
     target: Path,
     content: str,
     *,
@@ -466,6 +476,7 @@ async def _commit_subject_authority_file_write(
 ) -> tuple[bool, str | None]:
     """CAS-append SOUL/USER/MEMORY so the next prompt reads what she just wrote."""
 
+    plugin = tool.plugin
     subject_path = _subject_authority_path(plugin, target)
     if subject_path is None:
         return True, None
@@ -476,7 +487,21 @@ async def _commit_subject_authority_file_write(
         return True, None
     commit = getattr(service, "commit_subject_authority_file_write", None)
     if not callable(commit):
-        return True, None
+        return False, "SelectedSubjectCommitUnavailable"
+    scope = (getattr(getattr(tool, "trigger_message", None), "extra", {}) or {}).get(
+        "life_turn_scope", {}
+    )
+    scope = scope if isinstance(scope, dict) else {}
+    activities = scope.get("conscious_activity_ids", {})
+    activities = activities if isinstance(activities, dict) else {}
+    actor = str(getattr(tool, "_life_source_instance_id", "") or scope.get(
+        "consciousness_instance_id", ""
+    )).strip()
+    source = str(getattr(tool, "_life_source_occurrence_id", "") or activities.get(
+        str(getattr(tool, "_tool_call_id", "") or ""), ""
+    )).strip()
+    if not actor or not source:
+        return False, "SubjectFileWriteOriginRequired"
     try:
         await commit(
             workspace_relative_path=subject_path,
@@ -485,6 +510,9 @@ async def _commit_subject_authority_file_write(
             recorded_by="life_engine",
             recorded_source="nucleus_file_tool",
             encoding=encoding,
+            semantic_actor_id=actor,
+            semantic_source_id=source,
+            occurred_at=str(getattr(tool, "_life_source_occurred_at", "") or "") or None,
             reason=reason,
         )
     except Exception as exc:  # noqa: BLE001
@@ -494,6 +522,21 @@ async def _commit_subject_authority_file_write(
         )
         return False, f"写入主体固定提示词账本失败: {exc}"
     return True, None
+
+
+async def _read_selected_subject_file(plugin: Any, target: Path) -> Any | None:
+    """Read immutable selected bytes; missing authority never means stale disk."""
+
+    subject_path = _subject_authority_path(plugin, target)
+    if subject_path is None:
+        return None
+    service = _plugin_life_service(plugin)
+    if service is None or not bool(getattr(service, "_selectable_storage_enabled", False)):
+        return None
+    read = getattr(service, "read_subject_authority_file", None)
+    if not callable(read):
+        raise RuntimeError("SelectedSubjectReadUnavailable")
+    return await read(subject_path)
 
 
 def _guard_workspace_mutation(plugin: Any, path: str) -> tuple[bool, Any]:
@@ -556,6 +599,12 @@ def _workspace_authority_mutation_path(
     relative = _workspace_relative(workspace, exact_target)
     if relative is None:
         return None
+    if not PurePosixPath(relative).parts:
+        return None
+    if len(PurePosixPath(relative).parts) > 1 and PurePosixPath(relative).parts[0] in _SUBJECT_AUTHORITY_PATHS:
+        return relative, "standing_prompt_file_ancestor"
+    if PurePosixPath(relative).parts[0] in {".memory", ".git", ".trace", "runtime"}:
+        return relative, "workspace_runtime_or_history_store"
     if relative in _RETIRED_IMMUTABLE_PATHS:
         return relative, "retired_thought_stream_archive"
 
@@ -609,6 +658,376 @@ def _workspace_authority_mutation_error(path: str, owner: str) -> str:
     )
 
 
+
+def _managed_failure(exc: Exception, *, occurrence_id: str = "", attempted: bool = False) -> tuple[bool, dict[str, Any]]:
+    """Never confuse an unknown durable outcome with a pre-commit rejection."""
+    from ..storage.subject_contracts import (
+        SubjectDocumentConflict,
+        SubjectDocumentNotFound,
+    )
+
+    rejected = isinstance(exc, (SubjectDocumentConflict, SubjectDocumentNotFound, PermissionError, ValueError))
+    return False, {
+        "schema": "elysium.file_commit.v1",
+        "commit_status": "not_committed" if rejected or not attempted else "unknown",
+        "occurrence_id": occurrence_id,
+        "error_type": type(exc).__name__,
+        "error": str(exc)[:360] if rejected else type(exc).__name__,
+        "retry_guidance": (
+            "read the current file and submit a new intended operation"
+            if rejected or not attempted else "query this operation before retrying; do not invent a new operation identity"
+        ),
+    }
+
+
+async def _complete_managed_write(
+    tool: Any,
+    session: ManagedFileSession,
+    committed: dict[str, Any],
+    *,
+    snapshot: FileSnapshot | None,
+    content: str | None,
+    encoding: str,
+    reason: str,
+    operation: str,
+) -> dict[str, Any]:
+    receipt = await session.finish(committed)
+    receipt["trace_id"] = ""
+    receipt["artifact_version_id"] = committed["version_id"]
+    receipt["trace_projection"] = {"status": "not_replayed" if committed["idempotent_replay"] else "not_requested"}
+    if snapshot is not None and not committed["idempotent_replay"]:
+        try:
+            receipt["trace_id"] = await _record_file_trace(
+                tool.plugin,
+                path=str(committed["logical_path"]).removeprefix("life_engine_workspace/"),
+                before_content=snapshot.content.decode(encoding) if snapshot.content is not None else None,
+                after_content=content,
+                operation=operation,
+                tool_name=tool.tool_name,
+                reason=reason,
+                **_tool_trace_context(tool),
+            )
+            receipt["trace_projection"] = {"status": "recorded"}
+        except Exception as exc:  # noqa: BLE001 - history already committed; report failed projection
+            receipt["trace_projection"] = {
+                "status": "rebuild_from_document_history",
+                "error_type": type(exc).__name__,
+            }
+    return receipt
+
+
+async def _execute_managed_write(
+    tool: Any,
+    target: Path,
+    *,
+    content: str,
+    encoding: str,
+    reason: str,
+    expected_version: str,
+    old_text: str | None = None,
+    replace_all: bool = False,
+) -> tuple[bool, str | dict[str, Any]] | None:
+    try:
+        session = selected_file_session(tool, _plugin_life_service(tool.plugin))
+    except Exception as exc:
+        return _managed_failure(exc)
+    if session is None:
+        return None
+    occurrence = ""
+    attempted = False
+    snapshot = None
+    try:
+        origin = await session.origin()
+        occurrence = session.occurrence(origin[0], origin[1])
+        request = {
+            "tool": tool.tool_name, "path": session.relative(target),
+            "content": content, "encoding": encoding, "reason": reason,
+            "expected_version": expected_version, "old_text": old_text,
+            "replace_all": replace_all,
+        }
+        digest = session.request_digest(request)
+        committed = await session.replay(occurrence, digest)
+        replacements = 0
+        if committed is None:
+            snapshot = await session.read(target, allow_missing=old_text is None)
+            session.require_pin(snapshot, expected_version)
+            if old_text is not None:
+                if snapshot.content is None:
+                    raise ValueError("ManagedFileNotFound")
+                before = snapshot.content.decode(encoding)
+                search = old_text
+                count = before.count(search)
+                if count == 0:
+                    stripped = strip_read_line_prefixes(old_text)
+                    if stripped is not None:
+                        search = stripped
+                        count = before.count(search)
+                if not search or count == 0 or (count > 1 and not replace_all):
+                    raise ValueError("ManagedFileEditNeedsUniqueExactText")
+                replacement = content
+                if search != old_text:
+                    stripped_new = strip_read_line_prefixes(content)
+                    if stripped_new is not None:
+                        replacement = stripped_new
+                content = before.replace(search, replacement, -1 if replace_all else 1)
+                replacements = count if replace_all else 1
+            standing = _standing_prompt_content_error(tool.plugin, target, content)
+            if standing is not None:
+                raise PermissionError(standing)
+            attempted = True
+            committed = await session.write(
+                snapshot, content.encode(encoding),
+                expected_version=expected_version,
+                occurrence=occurrence, request_digest=digest, origin=origin,
+                encoding=encoding, reason=reason,
+            )
+        else:
+            version = await session.store.get_version(committed["version_id"])
+            content = version.content_bytes.decode(encoding)
+        receipt = await _complete_managed_write(
+            tool, session, committed, snapshot=snapshot, content=content,
+            encoding=encoding, reason=reason,
+            operation="edit" if old_text is not None else "write",
+        )
+        receipt.update(
+            action="edit_file" if old_text is not None else "write_file",
+            path=session.relative(target),
+            created=snapshot is not None and snapshot.content is None,
+            size_human=_format_size(len(content.encode(encoding))),
+        )
+        if old_text is not None:
+            receipt["replacements"] = replacements if not committed["idempotent_replay"] else None
+        return True, receipt
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        if attempted and occurrence:
+            try:
+                committed = await session.replay(occurrence, digest)
+                if committed is not None:
+                    return True, await session.finish(committed)
+            except asyncio.CancelledError:
+                raise
+            except Exception as reconcile_error:  # noqa: BLE001 - retain unknown commit outcome
+                logger.warning("file commit reconciliation failed: %s", type(reconcile_error).__name__)
+        return _managed_failure(exc, occurrence_id=occurrence, attempted=attempted)
+
+
+
+def _bounded_file_batch_receipt(tool: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    """Keep every operation identity/status; omit only duplicate presentation data."""
+    _, budget = resolve_tool_result_budget(getattr(tool, "_runtime_task_name", ""), None)
+    if len(str(payload).encode("utf-8")) <= budget:
+        return payload
+    compact = dict(payload)
+    captures = compact.pop("legacy_captures", [])
+    compact["legacy_capture_count"] = len(captures)
+    compact["receipt_details"] = "read_file view=operation with each occurrence_id returns its immutable receipt"
+    if "files" in compact:
+        compact["files"] = [
+            {
+                **{key: item[key] for key in (
+                    "occurrence_id", "operation", "document_id", "version_id", "commit_status",
+                )},
+                "ordinal": ordinal,
+                "projection_status": item["projection"]["status"],
+                "index_projection_status": item["index_projection"]["status"],
+                "trace_projection_status": item.get("trace_projection", {}).get("status", "not_requested"),
+                "context_notification_status": item["context_notification"]["status"],
+            }
+            for ordinal, item in enumerate(compact["files"])
+        ]
+    if len(str(compact).encode("utf-8")) > budget:
+        raise RuntimeError("ManagedFileReceiptBudgetExceeded")
+    return compact
+
+
+async def _execute_managed_patch(
+    tool: Any,
+    ops: Any,
+    resolved: dict[str, Path],
+    *,
+    input_text: str,
+    reason: str,
+    encoding: str,
+    expected_versions: dict[str, str] | None,
+) -> tuple[bool, str | dict[str, Any]] | None:
+    try:
+        session = selected_file_session(tool, _plugin_life_service(tool.plugin))
+    except Exception as exc:
+        return _managed_failure(exc)
+    if session is None:
+        return None
+    attempted = False
+    occurrences: list[str] = []
+    digests: list[str] = []
+    captures: list[str] = []
+    try:
+        if len(ops) > 8:
+            raise ValueError("ManagedFileBatchExceedsOperationBudget")
+        expected = expected_versions or {}
+        if not isinstance(expected, dict):
+            raise ValueError("ManagedFileExpectedVersionsMustBeAnObject")
+        origin = await session.origin()
+        canonical_paths: list[str] = []
+        for op in ops:
+            canonical_paths.append(session.relative(resolved[op.path]))
+            destination = op.move_to or op.copy_to
+            if destination:
+                canonical_paths.append(session.relative(resolved[destination]))
+        if len(canonical_paths) != len(set(canonical_paths)):
+            raise ValueError("ManagedFileBatchPathsOverlap: combine hunks or use separate calls")
+        ordered_paths = sorted(canonical_paths)
+        if any(
+            right.startswith(left + "/")
+            for left, right in zip(ordered_paths, ordered_paths[1:])
+        ):
+            raise ValueError("ManagedFileBatchFileDirectoryConflict")
+        replayed: list[dict[str, Any] | None] = []
+        for ordinal, op in enumerate(ops):
+            occurrence = session.occurrence(origin[0], origin[1], str(ordinal))
+            digest = session.request_digest({
+                "tool": tool.tool_name, "input": input_text, "reason": reason,
+                "encoding": encoding, "expected_versions": expected,
+                "ordinal": ordinal,
+            })
+            occurrences.append(occurrence)
+            digests.append(digest)
+            replayed.append(await session.replay(occurrence, digest))
+        if any(replayed):
+            if not all(replayed):
+                return False, {
+                    "schema": "elysium.file_batch_commit.v1",
+                    "commit_status": "recovery_required",
+                    "error": "ManagedFileBatchReceiptSetIncomplete",
+                    "occurrence_ids": occurrences,
+                }
+            receipts = [await session.finish(item) for item in replayed if item is not None]
+            return True, _bounded_file_batch_receipt(tool, {
+                "schema": "elysium.file_batch_commit.v1",
+                "action": "apply_patch", "commit_status": "committed",
+                "atomicity": "authority_transaction",
+                "idempotent_replay": True, "files": receipts,
+            })
+        snapshots = {
+            path: await session.read(target, allow_missing=True)
+            for path, target in resolved.items()
+        }
+        # Validate every existing read pin before even capturing legacy bytes.
+        for op in ops:
+            snapshot = snapshots[op.path]
+            if op.kind == "add":
+                if snapshot.content is not None:
+                    raise ValueError("ManagedFileAddTargetExists")
+            else:
+                session.require_pin(snapshot, str(expected.get(op.path) or ""))
+                if snapshot.content is None:
+                    raise ValueError("ManagedFilePatchSourceMissing")
+            destination = op.move_to or op.copy_to
+            if destination and snapshots[destination].content is not None:
+                raise ValueError("ManagedFileTargetAlreadyExists")
+        commands = []
+        prepared: list[tuple[FileSnapshot, str | None, str]] = []
+        for ordinal, op in enumerate(ops):
+            snapshot = snapshots[op.path]
+            token = str(expected.get(op.path) or "")
+            target_path = op.move_to or op.copy_to
+            content_bytes: bytes | None
+            if op.kind == "add":
+                content_bytes = op.add_content.encode(encoding)
+                content = op.add_content
+            elif op.kind == "delete":
+                content_bytes = None
+                content = None
+            elif not op.hunks:
+                content_bytes = None
+                try:
+                    content = snapshot.content.decode(encoding)
+                except UnicodeDecodeError:
+                    content = None
+            else:
+                contents = {op.path: snapshot.content.decode(encoding)}
+                if target_path:
+                    contents[target_path] = None
+                planned = apply_ops_to_contents([op], contents)
+                content = next(item.content for item in planned if item.action == "write")
+                content_bytes = (content or "").encode(encoding)
+            checked_target = resolved[target_path or op.path]
+            if content is not None:
+                standing = _standing_prompt_content_error(tool.plugin, checked_target, content)
+                if standing is not None:
+                    raise PermissionError(standing)
+            operation = "delete" if op.kind == "delete" else (
+                "rename" if op.move_to else "copy" if op.copy_to else "write"
+            )
+            common = {
+                "expected_version": token,
+                "occurrence": occurrences[ordinal],
+                "request_digest": digests[ordinal],
+                "origin": origin,
+                "reason": reason,
+            }
+            if operation == "write":
+                command = await session.prepare_write(
+                    snapshot, content_bytes or b"", encoding=encoding, **common,
+                )
+            else:
+                command = await session.prepare_mutation(
+                    snapshot, operation=operation,
+                    target=snapshots[target_path] if target_path else None,
+                    content_bytes=content_bytes, encoding=encoding, **common,
+                )
+            if snapshot.legacy:
+                captures.append(snapshot.logical_path)
+            commands.append(command)
+            prepared.append((snapshot, content, operation))
+        attempted = True
+        commits = await session.store.apply_document_batch(commands)
+        receipts = []
+        for ordinal, (commit, details) in enumerate(zip(commits, prepared, strict=True)):
+            snapshot, content, operation = details
+            result = session.commit_result(commit, occurrences[ordinal], operation)
+            receipt = await _complete_managed_write(
+                tool, session, result, snapshot=snapshot, content=content,
+                encoding=encoding, reason=reason, operation=operation,
+            )
+            receipt["path"] = str(result["logical_path"]).removeprefix("life_engine_workspace/")
+            if operation in {"rename", "copy"}:
+                receipt["source_path"] = snapshot.path
+            receipts.append(receipt)
+        return True, _bounded_file_batch_receipt(tool, {
+            "schema": "elysium.file_batch_commit.v1",
+            "action": "apply_patch", "commit_status": "committed",
+            "atomicity": "authority_transaction",
+            "files": receipts, "legacy_captures": captures,
+        })
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        if attempted and occurrences:
+            try:
+                committed = [
+                    await session.replay(occurrence, digest)
+                    for occurrence, digest in zip(occurrences, digests, strict=True)
+                ]
+                if all(committed):
+                    return True, _bounded_file_batch_receipt(tool, {
+                        "schema": "elysium.file_batch_commit.v1",
+                        "action": "apply_patch", "commit_status": "committed",
+                        "atomicity": "authority_transaction",
+                        "files": [await session.finish(item) for item in committed if item is not None],
+                        "legacy_captures": captures,
+                    })
+            except asyncio.CancelledError:
+                raise
+            except Exception as reconcile_error:  # noqa: BLE001 - retain unknown batch outcome
+                logger.warning("file batch reconciliation failed: %s", type(reconcile_error).__name__)
+        ok, failure = _managed_failure(exc, attempted=attempted)
+        failure["legacy_captures"] = captures
+        failure["occurrence_ids"] = occurrences
+        return ok, _bounded_file_batch_receipt(tool, failure)
+
+
 class LifeEngineReadFileTool(BaseTool):
     """读取文件内容工具。"""
 
@@ -635,12 +1054,17 @@ class LifeEngineReadFileTool(BaseTool):
         "**注意：** 结果每行是 `行号<TAB>正文`。行号只用于定位。"
         "`nucleus_edit_file` / `nucleus_apply_patch` 的文本必须是去掉行号之后的原文，"
         "不要把 `12\\t` 这种前缀拷进去。"
+        "受管文件返回 expected_version；修改时原样传回。旧版用 path＋version_id 精确回取，"
+        "或只传完整 file_ref=subject-file:document_id@version_id（不混用其它身份选择器）。"
+        "file_ref 只读固定版本正文，续读时保持同一 file_ref 和读取参数。"
+        "view=history/operations 查版本或操作历史；改名/删除后用 document_id 查原文档。"
+        "view=metadata 可看二进制元信息；view=operation + occurrence_id 可核对提交回执。"
     )
     chatter_allow: list[str] = FILE_CHATTER_ALLOW
 
     async def execute(
         self,
-        path: Annotated[str, "相对于工作空间的文件路径"],
+        path: Annotated[str, "相对于工作空间的文件路径；仅用 file_ref 精确读取时省略"] = "",
         offset: Annotated[int, "从第几行开始读（1-indexed），from_end=true 时忽略"] = 1,
         limit: Annotated[
             int,
@@ -659,6 +1083,14 @@ class LifeEngineReadFileTool(BaseTool):
             int | None,
             "Optional result byte budget; the task hard cap still applies",
         ] = None,
+        version_id: Annotated[str, "可选：精确历史 version_id；不填读取当前版本，续读自动固定原版"] = "",
+        view: Annotated[Literal["content", "metadata", "history", "operations", "operation"], "正文、字节元信息、版本历史、操作历史或查询单次提交"] = "content",
+        document_id: Annotated[str, "可选稳定文档身份；改名或删除后查询历史时使用"] = "",
+        occurrence_id: Annotated[str, "view=operation 时传提交回执中的 occurrence_id"] = "",
+        after_recorded_at: Annotated[str, "历史下一数据库页返回的时间游标；先读完 continuation"] = "",
+        after_id: Annotated[str, "与 after_recorded_at 一同原样传回"] = "",
+        history_limit: Annotated[int, "每数据库页最多100个元数据条目，正文仍按 max_bytes 分页"] = 50,
+        file_ref: Annotated[str, "可选完整 subject-file:document_id@version_id；仅正文，不能混用 path/document_id/version_id"] = "",
     ) -> tuple[bool, str | dict]:
         """读取文件内容，支持行号和偏移/限制。
 
@@ -666,25 +1098,77 @@ class LifeEngineReadFileTool(BaseTool):
             成功返回 (True, {"path": ..., "content": ..., "size": ...})
             失败返回 (False, error_message)
         """
-        valid, result = _resolve_path(self.plugin, path)
-        if not valid:
-            return False, str(result)
-
-        target = result
-        if not target.exists():
-            return False, f"文件不存在: {path}"
-        if not target.is_file():
-            return False, f"路径不是文件: {path}"
-
+        if file_ref and (
+            path or document_id or version_id or view != "content"
+            or occurrence_id or after_recorded_at or after_id
+        ):
+            return False, "ManagedFileReferenceSelectorConflict"
+        if not path and not file_ref:
+            return False, "FileReadSelectorRequired: provide path or exact file_ref"
         try:
-            stat_before = target.stat()
-            raw_bytes = target.read_bytes()
-            stat_after = target.stat()
-            if (
-                stat_before.st_size != stat_after.st_size
-                or stat_before.st_mtime_ns != stat_after.st_mtime_ns
-            ):
-                return False, "file changed while the read page was prepared"
+            session = selected_file_session(self, _plugin_life_service(self.plugin))
+            reference_document_id = ""
+            if file_ref:
+                if session is None:
+                    return False, "HistoricalFileReadRequiresSelectedStorage"
+                target, reference_document_id, version_id = await session.resolve_reference(file_ref)
+                path = session.relative(target)
+            else:
+                valid, result = _resolve_path(self.plugin, path)
+                if not valid:
+                    return False, str(result)
+                target = result
+            snapshot = None
+            if view != "content":
+                if session is None:
+                    return False, "ManagedFileHistoryRequiresSelectedStorage"
+                return True, await read_managed_file_view(
+                    session, target, view=view, document_id=document_id,
+                    version_id=version_id, occurrence_id=occurrence_id,
+                    after_recorded_at=after_recorded_at, after_id=after_id,
+                    history_limit=history_limit, continuation=continuation,
+                    max_bytes=max_bytes,
+                )
+            if document_id:
+                return False, "ContentReadUseExactVersionId: resolve document_id with view=metadata first"
+            inner_continuation, selected_version_id = split_file_continuation(continuation, version_id)
+            if session is not None:
+                snapshot = await session.read(target, version_id=selected_version_id)
+                version = snapshot.version
+                if file_ref and (
+                    version is None or version.document_id != reference_document_id
+                    or version.version_id != selected_version_id or snapshot.reference != file_ref
+                ):
+                    return False, "ManagedFileReferenceReadIdentityConflict"
+            else:
+                if selected_version_id:
+                    return False, "HistoricalFileReadRequiresSelectedStorage"
+                version = await _read_selected_subject_file(self.plugin, target)
+            if snapshot is not None:
+                raw_bytes = snapshot.content
+                if raw_bytes is None:
+                    return False, "ManagedFileNotFound"
+                source_size = len(raw_bytes)
+                source_mtime = 0
+            elif version is not None:
+                raw_bytes = version.content_bytes
+                source_size = len(raw_bytes)
+                source_mtime = 0
+            else:
+                if not target.exists():
+                    return False, f"文件不存在: {path}"
+                if not target.is_file():
+                    return False, f"路径不是文件: {path}"
+                stat_before = target.stat()
+                raw_bytes = await asyncio.to_thread(target.read_bytes)
+                stat_after = target.stat()
+                if (
+                    stat_before.st_size != stat_after.st_size
+                    or stat_before.st_mtime_ns != stat_after.st_mtime_ns
+                ):
+                    return False, "file changed while the read page was prepared"
+                source_size = stat_after.st_size
+                source_mtime = stat_after.st_mtime_ns
             raw_content = raw_bytes.decode(encoding)
             lines = raw_content.splitlines()
             total_lines = len(lines)
@@ -703,7 +1187,6 @@ class LifeEngineReadFileTool(BaseTool):
                 for i, line in enumerate(selected_lines)
             )
 
-            stat = stat_after
             workspace = _get_workspace_read_only(self.plugin)
             normalized_path = str(target.relative_to(workspace))
             file_sha256 = hashlib.sha256(raw_bytes).hexdigest()
@@ -713,10 +1196,24 @@ class LifeEngineReadFileTool(BaseTool):
                 "normalized_path": normalized_path,
                 "total_lines": total_lines,
                 "showing": f"{start_idx + 1}-{end_idx}",
-                "size_human": _format_size(stat.st_size),
-                "source_file_bytes": stat.st_size,
+                "size_human": _format_size(source_size),
+                "source_file_bytes": source_size,
                 "file_content_sha256": file_sha256,
+                **({"subject_version_id": version.version_id,
+                    "source_authority": "subject_document_store"} if version else {}),
             }
+            if snapshot is not None:
+                base_payload["expected_version"] = snapshot.expected_version
+                base_payload["source_authority"] = (
+                    "subject_document_store" if version else "unregistered_workspace_file"
+                )
+                if version is not None:
+                    base_payload["document_id"] = version.document_id
+                    base_payload["file_ref"] = snapshot.reference
+                    base_payload["version_path"] = version.logical_path.removeprefix("life_engine_workspace/")
+                    base_payload["current_path"] = snapshot.head.logical_path.removeprefix("life_engine_workspace/")
+                    base_payload["deleted"] = snapshot.head.deleted
+                    base_payload["_continuation_pin_reserve"] = f"mfc1.{version.version_id}."
             if start_idx > 0:
                 base_payload["remaining_lines_before"] = start_idx
             if end_idx < total_lines:
@@ -737,8 +1234,9 @@ class LifeEngineReadFileTool(BaseTool):
                 },
                 frontier={
                     "path": normalized_path,
-                    "size": stat.st_size,
-                    "mtime_ns": stat.st_mtime_ns,
+                    "size": source_size,
+                    "mtime_ns": source_mtime,
+                    "subject_version_id": version.version_id if version else "",
                     "content_sha256": file_sha256,
                 },
                 base_payload=base_payload,
@@ -746,8 +1244,14 @@ class LifeEngineReadFileTool(BaseTool):
                 content_ref=(
                     f"workspace-file:{normalized_path}:sha256:{file_sha256}"
                 ),
-                continuation=continuation,
+                continuation=inner_continuation,
             )
+            if version is not None:
+                result_data.pop("_continuation_pin_reserve", None)
+                result_data["continuation"] = pin_file_continuation(
+                    str(result_data.get("continuation") or ""), version.version_id,
+                )
+                _finalize_delivered_bytes(result_data)
             if len(str(result_data).encode("utf-8")) > result_data["budget_bytes"]:
                 return False, "read file projection exceeded its byte budget"
 
@@ -780,6 +1284,8 @@ class LifeEngineWriteFileTool(BaseTool):
         "**何时不用：**\n"
         "- ✗ 只想修改文件中的一小部分 → 用 nucleus_edit_file（更安全、更精准）\n"
         "- ✗ 不确定文件当前内容 → 先用 nucleus_read_file 确认\n"
+        "受管已有文件必须携带读取返回的 expected_version；commit_status=committed 表示已保存，"
+        "即使 projection 失败也不要改用新请求重复写入，先按 occurrence_id 查回执。\n"
         "\n"
         "**⚠️ 注意：** 如果文件已存在，其全部内容会被覆盖。"
         "修改文件的局部内容，优先使用 nucleus_edit_file。\n"
@@ -796,6 +1302,7 @@ class LifeEngineWriteFileTool(BaseTool):
         content: Annotated[str, "要写入的内容"],
         encoding: Annotated[str, "文件编码，默认utf-8"] = "utf-8",
         reason: Annotated[str, "可选：这次写入/覆盖文件的原因，便于未来追溯"] = "",
+        expected_version: Annotated[str, "覆盖已有文件必须原样传入最近读取返回的 expected_version；新文件可留空"] = "",
     ) -> tuple[bool, str | dict]:
         """写入文件（覆盖模式）。
 
@@ -814,11 +1321,17 @@ class LifeEngineWriteFileTool(BaseTool):
         reserved = _workspace_authority_mutation_path(self.plugin, target)
         if reserved is not None:
             return False, _workspace_authority_mutation_error(*reserved)
+        managed = await _execute_managed_write(
+            self, target, content=content, encoding=encoding, reason=reason,
+            expected_version=expected_version,
+        )
+        if managed is not None:
+            return managed
         existed = target.exists()
         before_content = _read_trace_before_content(target, encoding)
         occurrence_id = f"file-tool:{uuid4().hex}"
         committed, commit_error = await _commit_subject_authority_file_write(
-            self.plugin,
+            self,
             target,
             content,
             encoding=encoding,
@@ -891,6 +1404,7 @@ class LifeEngineEditFileTool(BaseTool):
         "\n"
         "**使用规则：**\n"
         "- 必须先用 nucleus_read_file 读取文件，确认要替换的内容\n"
+        "- 受管文件同时原样传 expected_version，陈旧读取会被拒绝\n"
         "- old_text 必须与文件中的内容完全一致（包括缩进），不要包含读结果里的行号前缀\n"
         "- 如果 old_text 在文件中出现多次且你只想改一处，提供更长的上下文使其唯一\n"
         "- 用 replace_all=True 可以替换所有出现位置（如重命名变量）\n"
@@ -910,6 +1424,7 @@ class LifeEngineEditFileTool(BaseTool):
         replace_all: Annotated[bool, "是否替换所有出现的位置（默认只替换第一处）"] = False,
         encoding: Annotated[str, "文件编码，默认utf-8"] = "utf-8",
         reason: Annotated[str, "可选：这次编辑文件的原因，便于未来追溯"] = "",
+        expected_version: Annotated[str, "原样传入最近读取返回的 expected_version，以拒绝陈旧覆盖"] = "",
     ) -> tuple[bool, str | dict]:
         """编辑文件中的特定内容。
 
@@ -925,13 +1440,25 @@ class LifeEngineEditFileTool(BaseTool):
         reserved = _workspace_authority_mutation_path(self.plugin, target)
         if reserved is not None:
             return False, _workspace_authority_mutation_error(*reserved)
-        if not target.exists():
-            return False, f"文件不存在: {path}"
-        if not target.is_file():
-            return False, f"路径不是文件: {path}"
+
+        managed = await _execute_managed_write(
+            self, target, content=new_text, encoding=encoding, reason=reason,
+            expected_version=expected_version, old_text=old_text,
+            replace_all=replace_all,
+        )
+        if managed is not None:
+            return managed
 
         try:
-            content = target.read_text(encoding=encoding)
+            version = await _read_selected_subject_file(self.plugin, target)
+            if version is not None:
+                content = version.content_bytes.decode(encoding)
+            else:
+                if not target.exists():
+                    return False, f"文件不存在: {path}"
+                if not target.is_file():
+                    return False, f"路径不是文件: {path}"
+                content = await asyncio.to_thread(target.read_text, encoding=encoding)
             search_text = old_text
             count = content.count(search_text)
             if count == 0:
@@ -973,7 +1500,7 @@ class LifeEngineEditFileTool(BaseTool):
                 return False, standing_error
             occurrence_id = f"file-tool:{uuid4().hex}"
             committed, commit_error = await _commit_subject_authority_file_write(
-                self.plugin,
+                self,
                 target,
                 new_content,
                 encoding=encoding,
@@ -1035,7 +1562,7 @@ class LifeEngineApplyPatchTool(BaseTool):
 
     tool_name: str = "nucleus_apply_patch"
     tool_description: str = (
-        "用 Codex apply_patch 格式一次精确改一个或多个文件（可多 hunk、可新增/删除/重命名）。"
+        "用 Codex apply_patch 格式一次精确改一个或多个文件（可多 hunk、可新增/删除/重命名/复制）。"
         "\n\n"
         "**何时使用：**\n"
         "- ✓ 同一文件改多处，或不连续片段\n"
@@ -1060,6 +1587,11 @@ class LifeEngineApplyPatchTool(BaseTool):
         "*** End Patch\n"
         "```\n"
         "每个 hunk 必须在文件中唯一匹配。不要把 nucleus_read_file 的行号前缀写进 patch。"
+        "受管已有文件需在 expected_versions 中提供路径到读取版本的映射。"
+        "*** Copy to: 与 *** Move to: 互斥；纯复制保留原作者来源并产生新文档身份。"
+        "一批路径必须互不重叠；权威提交是同一事务，文件/索引投影可逐项失败，须看每项回执。"
+        "受管批次最多8项。若原操作已提交而投影待恢复，可只传 recover_occurrence_id，input留空；"
+        "它只重试原投影，不追加文件版本。"
         "Add File 在目标已存在时会失败，应改用 Update File。"
         "删除和重命名只通过本工具（*** Delete File / *** Move to:）。"
     )
@@ -1067,10 +1599,29 @@ class LifeEngineApplyPatchTool(BaseTool):
 
     async def execute(
         self,
-        input: Annotated[str, "完整 patch，必须包含 *** Begin Patch 与 *** End Patch"],
+        input: Annotated[str, "完整 patch；仅恢复原投影时必须传空字符串"],
         reason: Annotated[str, "可选：这次改写的原因，便于未来追溯"] = "",
         encoding: Annotated[str, "文件编码，默认utf-8"] = "utf-8",
+        expected_versions: Annotated[dict[str, str] | None, "已有文件路径到最近读取 expected_version 的映射；新建可省略"] = None,
+        recover_occurrence_id: Annotated[str, "可选：只恢复已提交操作的投影，不重复提交内容；与input互斥"] = "",
     ) -> tuple[bool, str | dict]:
+        if recover_occurrence_id:
+            if input.strip() or expected_versions:
+                return False, "ManagedFileRecoveryCannotContainNewPatch"
+            try:
+                session = selected_file_session(self, _plugin_life_service(self.plugin))
+                if session is None:
+                    return False, "ManagedFileRecoveryRequiresSelectedStorage"
+                operation = await session.store.get_document_operation(recover_occurrence_id)
+                if operation is None:
+                    return False, "ManagedFileCommittedOperationNotFound"
+                relative = str(operation.result["logical_path"]).removeprefix("life_engine_workspace/")
+                valid, guarded = _guard_workspace_mutation(self.plugin, relative)
+                if not valid:
+                    return False, str(guarded)
+                return True, await session.recover_projection(recover_occurrence_id)
+            except Exception as exc:  # noqa: BLE001 - explicit recovery failure, never a new commit
+                return False, {"recovery_status": "failed", "error_type": type(exc).__name__}
         try:
             ops = parse_apply_patch(input)
         except ApplyPatchError as exc:
@@ -1081,6 +1632,8 @@ class LifeEngineApplyPatchTool(BaseTool):
             relative_paths.append(op.path)
             if op.move_to:
                 relative_paths.append(op.move_to)
+            if op.copy_to:
+                relative_paths.append(op.copy_to)
 
         resolved: dict[str, Path] = {}
         for relative in relative_paths:
@@ -1095,18 +1648,34 @@ class LifeEngineApplyPatchTool(BaseTool):
             )
             if op.kind == "delete" and structural is not None:
                 return False, structural
-            if op.move_to:
+            if op.move_to or op.copy_to:
                 source_error = _standing_prompt_structural_error(
                     self.plugin, resolved[op.path]
                 )
                 dest_error = _standing_prompt_structural_error(
-                    self.plugin, resolved[op.move_to]
+                    self.plugin, resolved[op.move_to or op.copy_to]
                 )
                 if source_error is not None or dest_error is not None:
                     return False, source_error or dest_error
 
+        managed = await _execute_managed_patch(
+            self, ops, resolved, input_text=input, reason=reason, encoding=encoding,
+            expected_versions=expected_versions,
+        )
+        if managed is not None:
+            return managed
+
         files: dict[str, str | None] = {}
         for relative, target in resolved.items():
+            try:
+                version = await _read_selected_subject_file(self.plugin, target)
+                if version is not None:
+                    files[relative] = version.content_bytes.decode(encoding)
+                    continue
+            except UnicodeDecodeError as exc:
+                return False, f"文件编码错误: {exc}"
+            except Exception as exc:  # noqa: BLE001 - selected authority fails closed
+                return False, f"读取主体文件失败: {exc}"
             if target.exists() and not target.is_file():
                 return False, f"路径不是文件: {relative}"
             if target.exists():
@@ -1134,7 +1703,7 @@ class LifeEngineApplyPatchTool(BaseTool):
                 return False, standing_error
             occurrence_id = f"file-tool:{uuid4().hex}"
             committed, commit_error = await _commit_subject_authority_file_write(
-                self.plugin,
+                self,
                 resolved[item.path],
                 item.content or "",
                 encoding=encoding,
@@ -1161,13 +1730,13 @@ class LifeEngineApplyPatchTool(BaseTool):
                 if target.exists():
                     await asyncio.to_thread(target.unlink)
         except Exception as exc:
-            logger.exception("应用 patch 失败")
+            logger.error(f"应用 patch 失败: error_type={type(exc).__name__}")
             return False, f"应用 patch 失败: {exc}"
 
         files_out: list[dict[str, Any]] = []
         for item in planned:
             before = files.get(item.path)
-            if item.action == "write" and item.operation == "move":
+            if item.action == "write" and item.operation in {"move", "copy"}:
                 before = files.get(item.source_path)
             after = item.content if item.action == "write" else ""
             trace_id = await _record_file_trace(
@@ -1278,9 +1847,13 @@ class LifeEngineListFilesTool(BaseTool):
             return False, str(result)
 
         target = result
-        if not target.exists():
+        try:
+            managed_session = selected_file_session(self, _plugin_life_service(self.plugin))
+        except Exception as exc:
+            return False, str(exc)
+        if not target.exists() and managed_session is None:
             return False, f"目录不存在: {path or '(root)'}"
-        if not target.is_dir():
+        if managed_session is None and target.exists() and not target.is_dir():
             return False, f"路径不是目录: {path}"
 
         workspace = _get_workspace(self.plugin)
@@ -1328,7 +1901,7 @@ class LifeEngineListFilesTool(BaseTool):
             return items
 
         try:
-            items = list_dir(target, 1)
+            items = list_dir(target, 1) if managed_session is None else []
 
             def flatten(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 flattened: list[dict[str, Any]] = []
@@ -1345,6 +1918,16 @@ class LifeEngineListFilesTool(BaseTool):
                 return flattened
 
             source_items = flatten(items)
+            if managed_session is not None:
+                from .managed_file_inventory import load_managed_inventory
+
+                source_items = await load_managed_inventory(
+                    managed_session, root=target,
+                    max_depth=max(1, max_depth) if recursive else 1,
+                    include_hidden=True,
+                )
+                for item in source_items:
+                    item.pop("_mtime", None)
             glob_filter = str(glob or "").strip()
             if glob_filter:
                 source_items = [
@@ -1520,15 +2103,29 @@ class LifeEngineGlobFileTool(BaseTool):
         if not valid:
             return False, str(result)
         search_root = result
-        if not search_root.exists():
+        try:
+            managed_session = selected_file_session(self, _plugin_life_service(self.plugin))
+        except Exception as exc:
+            return False, str(exc)
+        if not search_root.exists() and managed_session is None:
             return False, f"目录不存在: {path or '(root)'}"
-        if not search_root.is_dir():
+        if managed_session is None and search_root.exists() and not search_root.is_dir():
             return False, f"路径不是目录: {path}"
 
         workspace = _get_workspace_read_only(self.plugin)
         source_items: list[dict[str, Any]] = []
         try:
-            for root, dirs, filenames in os.walk(search_root):
+            if managed_session is not None:
+                from .managed_file_inventory import load_managed_inventory
+
+                source_items = [
+                    item for item in await load_managed_inventory(
+                        managed_session, root=search_root, include_hidden=False,
+                    )
+                    if item["type"] == "file"
+                    and _list_glob_matches(item["path"], item["name"], glob_filter)
+                ]
+            for root, dirs, filenames in (() if managed_session is not None else os.walk(search_root)):
                 dirs[:] = [
                     name
                     for name in dirs
@@ -1594,7 +2191,7 @@ class LifeEngineGlobFileTool(BaseTool):
         except BoundedContinuationError as exc:
             return False, f"查找文件失败: {exc}"
         except Exception as exc:
-            logger.exception("查找文件失败 %s", pattern)
+            logger.error(f"查找文件失败: error_type={type(exc).__name__}")
             return False, f"查找文件失败: {exc}"
 
 
@@ -1752,6 +2349,7 @@ class FetchLifeMemoryTool(BaseTool):
         "- 返回经过安全大小校验的完整文档，不会静默截断记忆\n"
         "- 如需控制上下文，应先缩小 file_paths，而不是切断文档内容\n"
         "- 文件路径必须是 life_memory_search 返回的路径"
+        "；受管文件请同时传搜索结果的 version_ids 固定版本，超预算时按返回提示用 read_file 续读"
     )
     chatter_allow: list[str] = ["life_engine_internal"]
 
@@ -1760,8 +2358,17 @@ class FetchLifeMemoryTool(BaseTool):
         file_paths: Annotated[list[str], "要读取的文件路径列表（来自 life_memory_search 的结果）"],
         max_length_per_file: Annotated[int, "兼容参数；记忆文档不再按字符数截断"] = 0,
         include_metadata: Annotated[bool, "是否包含文件元数据（大小、修改时间等）"] = True,
+        version_ids: Annotated[dict[str, str] | None, "路径到精确版本ID；按搜索结果固定内容，避免改名或路径复用串读"] = None,
     ) -> tuple[bool, dict]:
         """批量读取记忆文件的完整内容。"""
+        from .managed_memory_fetch import fetch_managed_memories
+
+        managed = await fetch_managed_memories(
+            self, file_paths, version_ids, include_metadata,
+            service=_get_life_engine_service(self.plugin),
+        )
+        if managed is not None:
+            return managed
         if not file_paths:
             return False, {"error": "file_paths 不能为空"}
 

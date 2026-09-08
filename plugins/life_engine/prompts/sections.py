@@ -393,6 +393,13 @@ class HeartbeatCapabilityCatalogSection(HeartbeatSectionProvider):
     _MAX_BYTES = 1024
 
     async def render(self, ctx: SectionContext) -> str | None:
+        if bool(getattr(ctx.service, "opportunity_managed", False)):
+            from ..opportunity.prompt import managed_capability_catalog
+
+            text = managed_capability_catalog()
+            if len(text.encode("utf-8")) > self._MAX_BYTES:
+                raise RuntimeError("ManagedCapabilityCatalogBudgetExceeded")
+            return text
         text = "\n".join(
             [
                 "### 能力目录（不是任务）",

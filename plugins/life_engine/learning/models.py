@@ -56,7 +56,7 @@ class EvidenceKind(str, Enum):
     EXTERNAL_FEEDBACK = "external_feedback"        # 外部反馈
     DREAM_INSIGHT = "dream_insight"                # 梦境启发
     VALIDATION_EXPERIMENT = "validation_experiment" # 验证实验：将预测转化为可测试的结果
-    EMBODIED_VALIDATION = "embodied_validation"    # 具身验证：Minecraft等环境中的实测
+    EMBODIED_VALIDATION = "embodied_validation"    # 具身验证：外部环境中的实测
 
 
 class AuditVerdict(str, Enum):

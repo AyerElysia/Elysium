@@ -91,9 +91,7 @@ class RouterContextProjection:
         self._stop_event = asyncio.Event()
         self._force_refresh = False
         self._running = False
-        self._last_stat_signature: (
-            tuple[tuple[str, int, int], ...] | str | None
-        ) = None
+        self._last_stat_signature: tuple[tuple[str, int, int], ...] | str | None = None
         self._current_source_digest = ""
         self._latest_source_digest = ""
         self._latest_rendered = ""
@@ -233,9 +231,9 @@ class RouterContextProjection:
             rendered = await self._restore_remote_version(sources, source_digest)
             if not rendered:
                 return None
-            record = await self.runtime_store.get_state(
-                "router_context_projection.version",
-                self._version_stem(source_digest, self.projection_version),
+            record = await self._get_remote_version_record(
+                source_digest,
+                self.projection_version,
             )
             if record is None:
                 return None
@@ -273,9 +271,9 @@ class RouterContextProjection:
         if version < 1:
             raise ValueError("projection_version must be a positive integer")
         if self.runtime_store is not None:
-            record = await self.runtime_store.get_state(
-                "router_context_projection.version",
-                self._version_stem(revision, version),
+            record = await self._get_remote_version_record(
+                revision,
+                version,
             )
             if record is None:
                 return None
@@ -471,14 +469,26 @@ class RouterContextProjection:
         self._validate_snapshot_manifest(manifest, rendered)
         return manifest
 
+    async def _get_remote_version_record(
+        self,
+        source_digest: str,
+        projection_version: int,
+    ) -> Any:
+        """Read one version using its selected-store identity."""
+
+        return await self.runtime_store.get_state(
+            "router_context_projection.version",
+            self._remote_version_key(source_digest, projection_version),
+        )
+
     async def _restore_remote_version(
         self,
         sources: tuple[RouterContextSource, ...],
         source_digest: str,
     ) -> str:
-        record = await self.runtime_store.get_state(
-            "router_context_projection.version",
-            self._version_stem(source_digest, self.projection_version),
+        record = await self._get_remote_version_record(
+            source_digest,
+            self.projection_version,
         )
         if record is None:
             return ""
@@ -505,7 +515,7 @@ class RouterContextProjection:
             source_digest,
             self.projection_version,
         )
-        state_key = self._version_stem(source_digest, self.projection_version)
+        state_key = self._remote_version_key(source_digest, self.projection_version)
         existing = await self.runtime_store.get_state(
             "router_context_projection.version",
             state_key,
@@ -520,7 +530,11 @@ class RouterContextProjection:
         if existing is not None:
             existing_payload = dict(existing.payload)
             self._validate_remote_snapshot(
-                {key: value for key, value in existing_payload.items() if key != "text"},
+                {
+                    key: value
+                    for key, value in existing_payload.items()
+                    if key != "text"
+                },
                 str(existing_payload.get("text", "")),
                 sources,
                 source_digest,
@@ -539,7 +553,9 @@ class RouterContextProjection:
                 "budget",
                 "text",
             )
-            if any(existing_payload.get(key) != payload.get(key) for key in immutable_keys):
+            if any(
+                existing_payload.get(key) != payload.get(key) for key in immutable_keys
+            ):
                 raise RuntimeError(
                     f"immutable router projection conflict for source {source_digest}"
                 )
@@ -589,9 +605,10 @@ class RouterContextProjection:
                 or size_bytes < 0
             ):
                 raise RuntimeError("projection manifest source metadata is invalid")
-        if manifest.get("projection_sha256") != hashlib.sha256(
-            rendered.encode("utf-8")
-        ).hexdigest():
+        if (
+            manifest.get("projection_sha256")
+            != hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+        ):
             raise RuntimeError("projection content hash mismatch")
         self._validate_rendered_projection(
             rendered,
@@ -616,9 +633,10 @@ class RouterContextProjection:
             raise RuntimeError("projection manifest source digest mismatch")
         if manifest.get("sources") != self._source_manifest_entries(sources):
             raise RuntimeError("projection manifest source coverage is invalid")
-        if manifest.get("projection_sha256") != hashlib.sha256(
-            rendered.encode("utf-8")
-        ).hexdigest():
+        if (
+            manifest.get("projection_sha256")
+            != hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+        ):
             raise RuntimeError("projection content hash mismatch")
         self._validate_rendered_projection(
             rendered,
@@ -795,6 +813,15 @@ class RouterContextProjection:
     def _version_stem(self, source_digest: str, projection_version: int) -> str:
         del projection_version
         return source_digest
+
+    def _remote_version_key(
+        self,
+        source_digest: str,
+        projection_version: int,
+    ) -> str:
+        """Keep file naming separate from the shared storage namespace."""
+
+        return self._version_stem(source_digest, projection_version)
 
     def _manifest_matches_profile(
         self,

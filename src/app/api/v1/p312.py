@@ -67,6 +67,46 @@ async def _call(provider: Any, method: str, *args: Any, **kwargs: Any) -> Any:
         raise APIError("resource_state_conflict", str(exc), status_code=409) from exc
 
 
+async def _search_memory(
+    provider: Any,
+    query: str,
+    *,
+    top_k: int,
+    enable_association: bool,
+    session: SessionRecord,
+) -> Any:
+    """Require providers to accept the explicit enhancement contract.
+
+    Dropping the flag for a legacy provider could silently enable extra reads
+    or pretend an explicitly requested enhancement succeeded. Reject before
+    invocation; errors raised inside the provider keep their normal semantics.
+    """
+    function = getattr(provider, "search", None)
+    if callable(function):
+        try:
+            inspect.signature(function).bind(
+                query,
+                top_k=top_k,
+                enable_association=enable_association,
+                session=session,
+            )
+        except (TypeError, ValueError) as exc:
+            raise APIError(
+                "component_unavailable",
+                "记忆检索提供者尚未支持显式关联开关。",
+                status_code=503,
+                retryable=False,
+            ) from exc
+    return await _call(
+        provider,
+        "search",
+        query,
+        top_k=top_k,
+        enable_association=enable_association,
+        session=session,
+    )
+
+
 def _admin_dependency(
     require_scope: Callable[..., Callable[[SessionRecord], SessionRecord]],
     *scopes: str,
@@ -221,14 +261,35 @@ def create_p312_router(
     memory_summary = _admin_dependency(require_scope, "memory:summary")
     memory_maintain = _admin_dependency(require_scope, "memory:maintain_projection")
 
-    @router.get("/admin/memory/search", response_model=P312Page, responses=ERROR_RESPONSES, operation_id="searchAdminMemory")
+    @router.get(
+        "/admin/memory/search",
+        response_model=P312Page,
+        responses={
+            **ERROR_RESPONSES,
+            503: {**ERROR_RESPONSES[500], "description": "记忆检索或所选关联能力不可用"},
+        },
+        operation_id="searchAdminMemory",
+    )
     async def memory_search(
         query: str = Query(min_length=1, max_length=2000),
         top_k: int = Query(default=20, ge=1, le=100),
+        enable_association: bool = Query(
+            default=False,
+            description="显式启用活体关联及记忆包；默认仅返回直接命中。",
+        ),
         session: SessionRecord = Depends(memory_read),
     ) -> P312Page:
         _audit(providers.auditor, session, "read_sensitive", "memory.search")
-        return _page(await _call(providers.memory, "search", query, top_k=top_k, session=session), limit=top_k)
+        return _page(
+            await _search_memory(
+                providers.memory,
+                query,
+                top_k=top_k,
+                enable_association=enable_association,
+                session=session,
+            ),
+            limit=top_k,
+        )
 
     @router.get("/admin/memory/experiences/{experience_id}", response_model=P312Envelope, responses=ERROR_RESPONSES, operation_id="getAdminMemoryExperience")
     async def memory_experience(experience_id: str, session: SessionRecord = Depends(memory_read)) -> P312Envelope:

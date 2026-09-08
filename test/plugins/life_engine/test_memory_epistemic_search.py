@@ -152,6 +152,14 @@ async def test_evidence_search_keeps_rank_and_confidence_separate(
                 "score_kind": "rank",
                 "association_path": [],
                 "association_reason": "",
+                "file_path": "notes/fact.md",
+                "node_id": "",
+                "document_id": "",
+                "version_id": "",
+                "document_revision": 0,
+                "binding_revision": 0,
+                "content_sha256": "",
+                "file_ref": "",
             },
         )
     ]

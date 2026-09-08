@@ -1180,6 +1180,7 @@ async def test_memory_integration_consumes_owner_runtime_without_opening_another
     from plugins.life_engine.service.integrations import MemoryIntegration
 
     runtime = _InjectedRuntime()
+    subject_store = SimpleNamespace(name="injected-subject-authority")
     captured: dict[str, Any] = {}
 
     class _MemoryService:
@@ -1194,6 +1195,7 @@ async def test_memory_integration_consumes_owner_runtime_without_opening_another
     class _Owner:
         _memory_service = None
         _selectable_storage_enabled = True
+        _subject_document_store = subject_store
 
         @property
         def storage_runtime(self) -> _InjectedRuntime:
@@ -1212,5 +1214,7 @@ async def test_memory_integration_consumes_owner_runtime_without_opening_another
 
     assert captured["storage_runtime"] is runtime
     assert captured["selectable_storage_enabled"] is True
+    assert captured["subject_document_store"] is subject_store
+    assert captured["subject_document_store_required"] is True
     assert captured["initialized"] is True
     assert runtime.close_calls == 0

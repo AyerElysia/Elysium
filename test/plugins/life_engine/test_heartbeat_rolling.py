@@ -202,7 +202,7 @@ async def test_heartbeat_request_is_prefix_tools_rolling_without_suffix(
     class _Request:
         def __init__(self) -> None:
             self.payloads: list[Any] = []
-            self.context_manager = None
+            self.context_manager = LLMContextManager()
 
         def add_payload(self, payload: Any) -> None:
             self.payloads.append(payload)
@@ -255,6 +255,7 @@ async def test_heartbeat_request_is_prefix_tools_rolling_without_suffix(
     )
 
     payloads = captured["payloads"]
+    assert prepared.content in request.context_manager.protected_exact_texts
     roles = [getattr(payload.role, "value", payload.role) for payload in payloads]
     assert roles[0] == ROLE.SYSTEM.value
     assert roles[1] == ROLE.TOOL.value
@@ -417,6 +418,16 @@ class _KernelLikeHeartbeatResponse:
 
     def register_context_delivery(self, *_args: object, **_kwargs: object) -> None:
         return None
+
+    def add_payload(self, payload: Any) -> None:
+        self.payloads = self.context_manager.add_payload(self.payloads, payload)
+
+    async def send(self, *, stream: bool = False) -> _KernelLikeHeartbeatResponse:
+        del stream
+        self.context_manager.validate_for_send(self.payloads)
+        response = _KernelLikeHeartbeatResponse(self.payloads, self.context_manager)
+        response.add_payload(LLMPayload(ROLE.ASSISTANT, [Text("quiet-reply")]))
+        return response
 
     def effective_context_receipt(self, delivery_id: str) -> object:
         return SimpleNamespace(
@@ -585,9 +596,14 @@ def test_over_trigger_appends_one_stable_compression_list() -> None:
     )
     assert has_compression_required_payload(first)
     assert second == first
-    assert first[-1].content[0].text.startswith(COMPRESSION_REQUIRED_OPEN)
-    assert "old-one" not in first[-1].content[0].text
-    assert first[:-1] == payloads
+    # The notice is a separate exact Text in the current USER frame, not a
+    # second adjacent USER turn. Original rolling contents remain untouched.
+    assert first[-1].role == ROLE.USER
+    assert first[-1].content[-1].text.startswith(COMPRESSION_REQUIRED_OPEN)
+    assert "old-one" not in first[-1].content[-1].text
+    assert first[:-1] == payloads[:-1]
+    assert first[-1].content[:-1] == payloads[-1].content
+    assert len(first) == len(payloads)
 
 
 def test_heartbeat_subject_checkpoint_keeps_continuity_text() -> None:
@@ -855,14 +871,15 @@ async def test_example_two_oversize_heartbeats_use_kernel_send_without_looping(
     created: list[str] = []
     clients: list[_RecordingHeartbeatClient] = []
 
-    def _create_request(**kwargs: Any) -> LLMRequest:
+    def _create_request(model_set: Any, **kwargs: Any) -> LLMRequest:
         name = str(kwargs.get("request_name") or "")
         created.append(name)
         client = _RecordingHeartbeatClient()
         clients.append(client)
         request = LLMRequest(
-            model_set=kwargs["model_set"],
+            model_set=model_set,
             request_name=name,
+            context_manager=kwargs.get("context_manager"),
             clients=ModelClientRegistry(openai=client),
         )
         request.enable_metrics = False
@@ -872,6 +889,9 @@ async def test_example_two_oversize_heartbeats_use_kernel_send_without_looping(
         "plugins.life_engine.service.core.create_llm_request",
         _create_request,
     )
+    # Response.send constructs its own request; keep maintenance follow-ups
+    # inside the same deterministic client boundary, with no network access.
+    monkeypatch.setattr("src.kernel.llm.request.LLMRequest", _create_request)
     monkeypatch.setattr(
         "plugins.life_engine.service.core.get_model_set_by_task",
         _tiny_window_model,
@@ -898,17 +918,23 @@ async def test_example_two_oversize_heartbeats_use_kernel_send_without_looping(
 
     results = []
     for beat in range(2):
+        first_client_index = len(clients)
         result = await service._run_heartbeat_model(
             "本拍新经历不能在压缩未完成时写入",
             heartbeat_run_id=f"example-beat-{beat}",
             heartbeat_deadline=None,
         )
         results.append(result)
-        sent = clients[beat].sent_payloads[0] if clients[beat].sent_payloads else []
+        beat_clients = clients[first_client_index:]
+        sent = beat_clients[0].sent_payloads[0]
+        assert 1 <= len(beat_clients) <= min(
+            service._cfg().settings.max_rounds_per_heartbeat,
+            service._cfg().settings.max_consecutive_tool_stalls_per_heartbeat,
+        )
         print(
             f"[example] beat {beat + 1}: "
             f"unresolved={result.compression_unresolved} "
-            f"client_calls={clients[beat].calls} "
+            f"client_calls={sum(client.calls for client in beat_clients)} "
             f"sent_payloads={len(sent)} "
             f"omitted_old_user_0={('old-user-0' not in str(sent))} "
             f"request_names={created}",
@@ -916,7 +942,7 @@ async def test_example_two_oversize_heartbeats_use_kernel_send_without_looping(
         )
 
     assert [item.compression_unresolved for item in results] == [True, True]
-    assert created == ["life_engine_heartbeat", "life_engine_heartbeat"]
+    assert created and set(created) == {"life_engine_heartbeat"}
     assert all(client.calls == 1 for client in clients)
     assert "old-user-0" not in str(clients[0].sent_payloads[0])
     assert has_compression_required_payload(clients[0].sent_payloads[0])

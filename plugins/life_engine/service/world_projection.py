@@ -63,9 +63,9 @@ def is_known_transport_echo_value(
     domain: str = "",
     predicate: str = "",
 ) -> bool:
-    """Recognize the exact legacy Minecraft intent-trace recursion shape."""
+    """Recognize the exact legacy scene intent-trace recursion shape."""
 
-    if str(domain or "") != "minecraft" or str(predicate or "") != "embodied_trace":
+    if str(predicate or "") != "embodied_trace":
         return False
     if not isinstance(value, dict) or value.get("trace_kind") != "intent.issued":
         return False
@@ -101,7 +101,7 @@ def reject_prompt_projection_persistence(
         predicate=predicate,
     ):
         raise PromptProjectionPersistenceError(
-            "known Minecraft transient perception echo cannot be persisted"
+            "known scene transient perception echo cannot be persisted"
         )
 
 
@@ -790,7 +790,7 @@ class WorldProjectionStore:
             )
         where = f" WHERE {' AND '.join(predicates)}" if predicates else ""
         transport_echo_sql = """
-            domain = 'minecraft' AND predicate = 'embodied_trace'
+            predicate = 'embodied_trace'
             AND json_extract(payload_json, '$.value.trace_kind') = 'intent.issued'
             AND json_type(
                 payload_json,
@@ -912,7 +912,7 @@ class WorldProjectionStore:
                 payload_json,
                 '$.assertion.value.trace_kind'
             ) = 'intent.issued'
-            AND json_extract(payload_json, '$.assertion.domain') = 'minecraft'
+
             AND json_extract(payload_json, '$.assertion.predicate') = 'embodied_trace'
             AND json_type(
                 payload_json,

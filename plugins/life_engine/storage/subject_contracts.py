@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, runtime_checkable
 
@@ -68,6 +69,17 @@ class SubjectDocumentHead:
     declared_owner: str | None
     current_version_id: str
     revision: int
+    binding_revision: int = 0
+    deleted: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class SubjectDocumentPathBinding:
+    """Current path generation; release retains its monotonic revision."""
+
+    logical_path: str
+    document_id: str | None
+    revision: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +127,8 @@ class AppendSubjectDocumentVersion:
     encoding: str | None = None
     newline_style: str | None = None
     change_context: dict[str, Any] | None = None
+    expected_document_id: str | None = None
+    expected_binding_revision: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +137,53 @@ class SubjectDocumentCommit:
 
     version: SubjectDocumentVersion
     head: SubjectDocumentHead
+
+
+@dataclass(frozen=True, slots=True)
+class SubjectDocumentMutation:
+    """Explicit identity- and path-fenced lifecycle command."""
+
+    operation: Literal["rename", "delete", "copy"]
+    logical_path: str
+    expected_document_id: str
+    expected_revision: int
+    expected_head_version_id: str
+    expected_binding_revision: int
+    occurrence_id: str
+    recorded_by: str
+    recorded_source: str
+    target_logical_path: str = ""
+    expected_target_binding_revision: int = 0
+    semantic_actor_id: str | None = None
+    semantic_source_id: str | None = None
+    occurred_at: str | None = None
+    change_context: dict[str, Any] | None = None
+    content_bytes: bytes | None = None
+    encoding: str | None = None
+    newline_style: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SubjectDocumentMutationCommit:
+    operation: str
+    occurrence_id: str
+    document_id: str
+    head: SubjectDocumentHead
+    version: SubjectDocumentVersion
+    idempotent_replay: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class SubjectDocumentOperation:
+    """Immutable receipt independent of subsequent path/head changes."""
+
+    occurrence_id: str
+    operation: str
+    document_id: str
+    command_digest: str
+    result: dict[str, Any]
+    change_context: dict[str, Any]
+    recorded_at: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,17 +263,100 @@ class SubjectProjectionTask:
     lease_owner: str
     lease_until: str
     revision: int
+    operation: str = "write"
+    previous_logical_path: str = ""
+    binding_revision: int = 0
+    previous_binding_revision: int = 0
+    previous_version_id: str = ""
+    previous_content_hash: str = ""
 
 
 @runtime_checkable
 class SubjectDocumentStorePort(SubjectAuthorityPort, Protocol):
     """Append-only subject history with a revision-CAS head projection."""
 
+    def workspace_projection_fence(self) -> AbstractAsyncContextManager[None]:
+        """LOCAL-only fence against document writes during filesystem projection.
+
+        Read methods remain available. Outbox confirmation/failure and every
+        other write must happen after leaving this context.
+        """
+
+    def workspace_namespace_fence(self) -> AbstractAsyncContextManager[None]:
+        """Serialize LOCAL/MySQL path inspection and authorized publication.
+
+        This does not enable a MySQL workspace projector or authorize file
+        writes. Callers own the filesystem action and confirm outside the fence.
+        """
+
     async def get_head(self, logical_path: str) -> SubjectDocumentHead | None:
         """Read one head without creating a document."""
 
+    async def get_path_binding(
+        self, logical_path: str,
+    ) -> SubjectDocumentPathBinding | None:
+        """Read a bound or released path generation."""
+
+    async def list_file_bindings(
+        self, *, logical_path_prefix: str = "", after_logical_path: str = "",
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        """Page current and released paths with metadata only, never blobs."""
+
+    async def get_document_head(
+        self, document_id: str,
+    ) -> SubjectDocumentHead | None:
+        """Read a stable identity, including its deletion tombstone."""
+
+    async def get_document_projection_frontier(
+        self, *, logical_path_prefix: str = "",
+    ) -> int:
+        """Read the latest immutable outbox identity, regardless of projection state."""
+
+    async def list_document_projection_changes(
+        self, *, after_outbox_id: int, through_outbox_id: int,
+        logical_path_prefix: str = "", limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        """Page changed document identities within a fixed, metadata-only frontier."""
+
+    async def get_document_operation(
+        self, occurrence_id: str,
+    ) -> SubjectDocumentOperation | None:
+        """Read committed receipt before resolving current head on retries."""
+
+    async def list_document_operations(
+        self, document_id: str, *, after_recorded_at: str = "",
+        after_occurrence_id: str = "", limit: int = 100,
+    ) -> list[SubjectDocumentOperation]:
+        """Read operation history, including rename/delete lifecycle facts."""
+
+    async def list_document_history(
+        self, document_id: str, *, after_recorded_at: str = "",
+        after_version_id: str = "", limit: int = 100,
+    ) -> list[SubjectDocumentVersion]:
+        """Read immutable versions across path changes and deletion."""
+
+    async def list_document_version_descriptors(
+        self, document_id: str, *, after_recorded_at: str = "",
+        after_version_id: str = "", limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Read bounded version metadata without loading any content blobs."""
+
+    async def mutate_document(
+        self, command: SubjectDocumentMutation,
+    ) -> SubjectDocumentMutationCommit:
+        """Atomically append a rename, tombstone, or exact-byte copy."""
+
+    async def apply_document_batch(
+        self, commands: list[AppendSubjectDocumentVersion | SubjectDocumentMutation],
+    ) -> list[SubjectDocumentCommit | SubjectDocumentMutationCommit]:
+        """Commit non-overlapping file commands in a single fenced transaction."""
+
     async def get_version(self, version_id: str) -> SubjectDocumentVersion:
         """Read one immutable version including exact content bytes."""
+
+    async def get_version_descriptor(self, version_id: str) -> dict[str, Any]:
+        """Read exact-version metadata without selecting its content blob."""
 
     async def list_heads(
         self,
@@ -259,6 +403,7 @@ class SubjectDocumentStorePort(SubjectAuthorityPort, Protocol):
         self,
         logical_path: str,
         version_id: str,
+        *, occurrence_id: str | None = None,
     ) -> SubjectProjectionTask | None:
         """Return the durable projection state for one exact version."""
 
@@ -317,8 +462,12 @@ __all__ = [
     "SubjectDocumentCommit",
     "SubjectDocumentConflict",
     "SubjectDocumentHead",
+    "SubjectDocumentMutation",
+    "SubjectDocumentMutationCommit",
     "SubjectDocumentNotFound",
+    "SubjectDocumentOperation",
     "SubjectDocumentPath",
+    "SubjectDocumentPathBinding",
     "SubjectDocumentStorePort",
     "SubjectDocumentVersion",
     "SubjectProjectionTask",

@@ -39,6 +39,7 @@ CONTENT_SECURITY_POLICY = (
 )
 ATTENTION_STATUSES_QUERY = Query(default=[])
 MINECRAFT_GOAL_QUERY = Query(default="", max_length=500)
+MINECRAFT_BODY_QUERY = Query(default="bot", pattern=r"^(bot|agent)$")
 MINECRAFT_ACTION_HEADER = "minecraft-control-v1"
 
 
@@ -253,17 +254,20 @@ class ElysiumConsoleRouter(BaseRouter):
             return await self._read(self._catalog.minecraft_status())
 
         @self.app.get("/api/v1/minecraft/preflight")
-        async def minecraft_preflight(request: Request) -> dict[str, Any]:
+        async def minecraft_preflight(
+            request: Request, body_name: str = MINECRAFT_BODY_QUERY,
+        ) -> dict[str, Any]:
             self._authorize(request)
-            return await self._read(self._catalog.minecraft_preflight())
+            return await self._read(self._catalog.minecraft_preflight(body_name=body_name))
 
         @self.app.post("/api/v1/minecraft/start")
         async def minecraft_start(
             request: Request,
             goal: str = MINECRAFT_GOAL_QUERY,
+            body_name: str = MINECRAFT_BODY_QUERY,
         ) -> dict[str, Any]:
             self._authorize_minecraft_action(request)
-            return await self._read(self._catalog.minecraft_start(goal=goal))
+            return await self._read(self._catalog.minecraft_start(goal=goal, body_name=body_name))
 
         @self.app.post("/api/v1/minecraft/stop")
         async def minecraft_stop(request: Request) -> dict[str, Any]:

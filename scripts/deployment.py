@@ -398,7 +398,6 @@ def _atomic_create_private_file(root: Path, relative: str, content: str) -> bool
 def _configuration_sources(root: Path) -> dict[str, str]:
     sources = {
         "config/elysium.toml": root / "config/elysium.toml.example",
-        "config/models.toml": root / "config/models.toml.example",
     }
     result: dict[str, str] = dict(PLUGIN_CONFIGS)
     for destination, source in sources.items():
@@ -412,6 +411,7 @@ def initialize_configuration(root: Path) -> tuple[list[str], list[str]]:
     """Create missing engineering configuration without overwriting files."""
 
     sources = _configuration_sources(root)
+    _inspect_config_target(root, "config/models.toml")
     for relative in sources:
         _inspect_config_target(root, relative)
     for relative in RUNTIME_DIRECTORIES:
@@ -419,6 +419,8 @@ def initialize_configuration(root: Path) -> tuple[list[str], list[str]]:
 
     created: list[str] = []
     preserved: list[str] = []
+    if _path_exists(root / "config/models.toml"):
+        preserved.append("config/models.toml")
     for relative, content in sources.items():
         if _atomic_create_private_file(root, relative, content):
             created.append(relative)
@@ -478,6 +480,7 @@ def bootstrap(
     _assert_python_version()
     _assert_repository(root)
     sources = _configuration_sources(root)
+    _inspect_config_target(root, "config/models.toml")
     for relative in sources:
         _inspect_config_target(root, relative)
     if not config_only:
@@ -1500,7 +1503,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             for relative in preserved:
                 print(f"[KEEP]   {relative}")
             print(
-                "基础设施准备完成；尚未启动 Elysium。恢复主体权威并通过 doctor 后，"
+                "基础设施准备完成；尚未启动 Elysium。请提供本机 config/models.toml，"
+                "恢复主体权威并通过 doctor 后，"
                 "由用户执行 run。"
             )
             return 0

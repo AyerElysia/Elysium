@@ -25,6 +25,8 @@ async def test_learning_consumes_only_explicit_close_statement(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     scheduler = LearningScheduler.__new__(LearningScheduler)
+    scheduler._opportunity_managed = False
+    scheduler._opportunity_quiesced = False
     captured: list[dict[str, Any]] = []
     heartbeat_calls = 0
 

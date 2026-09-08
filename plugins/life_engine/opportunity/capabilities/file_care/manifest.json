@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "capability_id": "life.file_care",
+  "package_version": "1.0.0",
+  "removability": "subject_removable",
+  "provider_kind": "file_care",
+  "manual": "CAPABILITY.md",
+  "default_skill": "DEFAULT_SKILL.md",
+  "operations": [
+    "nucleus_list_files",
+    "nucleus_glob_file",
+    "nucleus_read_file",
+    "nucleus_mkdir",
+    "nucleus_write_file",
+    "nucleus_edit_file",
+    "nucleus_apply_patch"
+  ],
+  "dependencies": [
+    "life.file_policy",
+    "life.timeline",
+    "life.workspace"
+  ]
+}

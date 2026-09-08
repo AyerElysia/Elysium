@@ -162,6 +162,7 @@ def test_compose_dedup_across_retries() -> None:
 
 async def test_delta_unread_native_image_is_restored_after_model_failure(
     monkeypatch,
+    synthetic_chatter_authority,
 ) -> None:
     """增量 unread 应走原生 compose，模型失败后同一图片仍可再次注入。"""
     LifeChatter.reset_global_runtime()
@@ -194,7 +195,10 @@ async def test_delta_unread_native_image_is_restored_after_model_failure(
         sender_role="other",
         stream_id="stream-a",
     )
-    response = FailingResponse([LLMPayload(ROLE.USER, Text("existing"))])
+    response = FailingResponse([
+        LLMPayload(ROLE.SYSTEM, Text("Synthetic engineering fixture.")),
+        LLMPayload(ROLE.USER, Text("existing")),
+    ])
     rt = _WorkflowRuntime(
         response=response,
         phase=_Phase.FOLLOW_UP,

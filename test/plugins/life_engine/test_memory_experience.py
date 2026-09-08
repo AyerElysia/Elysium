@@ -1096,8 +1096,10 @@ async def test_search_tool_uses_task_budget_and_deduplicates_content(
     monkeypatch.setattr(core, "_get_service", _service)
     monkeypatch.setattr(expression, "_get_service", _service)
 
-    core_ok, core_payload = await core.execute("同一内容")
-    expression_ok, expression_payload = await expression.execute("同一内容")
+    core_ok, core_payload = await core.execute("同一内容", enable_association=True)
+    expression_ok, expression_payload = await expression.execute(
+        "同一内容", enable_association=True
+    )
 
     assert core_ok is expression_ok is True
     assert core_payload["budget_bytes"] == MEMORY_SEARCH_CORE_MAX_BYTES

@@ -19,8 +19,13 @@ from src.kernel.storage.migration_runner import MySQLMigrationRunner, SchemaMigr
 from ..contracts import StorageBackendRuntime, StorageWriterRole
 from ..models import BackendKind
 
-MEMORY_SCHEMA_VERSION = 14
-MEMORY_IMMUTABILITY_SCHEMA_VERSION = 3
+MEMORY_SCHEMA_VERSION = 16
+MEMORY_IMMUTABILITY_SCHEMA_VERSION = 4
+
+_SEMANTIC_RELATION_REVISION_COLUMNS = (
+    "owner_subject_id", "root_relation_id", "parent_relation_id",
+    "revision", "operation",
+)
 
 # Database immutability follows the Memory Port contract, not a blanket
 # "nothing may change" rule.  These tables contain authoritative occurrences
@@ -969,6 +974,213 @@ _WITNESS_RECONCILIATION_CHECKSUM = SchemaMigration(
     ),
 )
 
+def _managed_document_identity_ddl() -> tuple[str, ...]:
+    """Resume each MySQL DDL step without rewriting prior migration checksums."""
+    columns = (
+        ("subject_document_id", "VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NULL"),
+        ("subject_version_id", "VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NULL"),
+        ("subject_document_revision", "BIGINT UNSIGNED NOT NULL DEFAULT 0"),
+        ("subject_binding_revision", "BIGINT UNSIGNED NOT NULL DEFAULT 0"),
+        ("subject_content_sha256", "CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL"),
+        ("subject_projection_sha256", "CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL"),
+        ("subject_projection_state", "VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT ''"),
+    )
+    steps: list[str] = []
+    for column, definition in columns:
+        ddl = f"ALTER TABLE memory_nodes ADD COLUMN {column} {definition}".replace("'", "''")
+        steps.extend((
+            (
+                "SET @memory_identity_ddl = IF(EXISTS (SELECT 1 FROM information_schema.COLUMNS "
+                f"WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'memory_nodes' AND COLUMN_NAME = '{column}'), "
+                f"'SELECT 1', '{ddl}')"
+            ),
+            "PREPARE memory_identity_step FROM @memory_identity_ddl",
+            "EXECUTE memory_identity_step",
+            "DEALLOCATE PREPARE memory_identity_step",
+        ))
+    steps.extend((
+        (
+            "SET @memory_identity_ddl = IF(EXISTS (SELECT 1 FROM information_schema.STATISTICS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'memory_nodes' "
+            "AND INDEX_NAME = 'uq_memory_nodes_subject_document'), 'SELECT 1', "
+            "'CREATE UNIQUE INDEX uq_memory_nodes_subject_document ON memory_nodes(subject_document_id)')"
+        ),
+        "PREPARE memory_identity_step FROM @memory_identity_ddl",
+        "EXECUTE memory_identity_step",
+        "DEALLOCATE PREPARE memory_identity_step",
+        # A path hash is a current index claim, not the identity of a historical
+        # node. Keep all old paths, node IDs, chunks, and relation endpoints.
+        "UPDATE memory_nodes SET file_path_sha256 = NULL WHERE is_deleted = TRUE",
+    ))
+    return tuple(steps)
+
+
+_MANAGED_DOCUMENT_IDENTITY = SchemaMigration(
+    version=15,
+    name="life_memory_managed_document_identity_v1",
+    statements=_managed_document_identity_ddl(),
+)
+
+
+def _semantic_relation_revision_ddl() -> tuple[str, ...]:
+    """Resume additive DDL while preserving all legacy rows and payload hashes."""
+    columns = (
+        ("owner_subject_id", "VARCHAR(128) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NULL"),
+        ("root_relation_id", "VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NULL"),
+        ("parent_relation_id", "VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NULL"),
+        ("revision", "BIGINT UNSIGNED NOT NULL DEFAULT 1"),
+        ("operation", "VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT 'add'"),
+    )
+    steps: list[str] = []
+    for column, definition in columns:
+        ddl = (
+            f"ALTER TABLE memory_semantic_relations ADD COLUMN {column} {definition}"
+        ).replace("'", "''")
+        steps.extend((
+            (
+                "SET @memory_relation_ddl = IF(EXISTS (SELECT 1 FROM information_schema.COLUMNS "
+                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'memory_semantic_relations' "
+                f"AND COLUMN_NAME = '{column}'), 'SELECT 1', '{ddl}')"
+            ),
+            "PREPARE memory_relation_step FROM @memory_relation_ddl",
+            "EXECUTE memory_relation_step",
+            "DEALLOCATE PREPARE memory_relation_step",
+        ))
+    constraints = (
+        (
+            "uq_semantic_relation_parent",
+            "UNIQUE (parent_relation_id)",
+        ),
+        (
+            "uq_semantic_relation_revision",
+            "UNIQUE (root_relation_id, revision)",
+        ),
+        (
+            "fk_semantic_relation_parent",
+            (
+                "FOREIGN KEY (parent_relation_id) "
+                "REFERENCES memory_semantic_relations(relation_id) ON DELETE RESTRICT"
+            ),
+        ),
+        ("chk_semantic_relation_revision", "CHECK (revision >= 1)"),
+        (
+            "chk_semantic_relation_operation",
+            "CHECK (operation IN ('add', 'revise', 'withdraw'))",
+        ),
+    )
+    for name, definition in constraints:
+        ddl = (
+            f"ALTER TABLE memory_semantic_relations ADD CONSTRAINT {name} {definition}"
+        ).replace("'", "''")
+        steps.extend((
+            (
+                "SET @memory_relation_ddl = IF(EXISTS (SELECT 1 FROM information_schema.TABLE_CONSTRAINTS "
+                "WHERE CONSTRAINT_SCHEMA = DATABASE() AND TABLE_NAME = 'memory_semantic_relations' "
+                f"AND CONSTRAINT_NAME = '{name}'), 'SELECT 1', '{ddl}')"
+            ),
+            "PREPARE memory_relation_step FROM @memory_relation_ddl",
+            "EXECUTE memory_relation_step",
+            "DEALLOCATE PREPARE memory_relation_step",
+        ))
+    return tuple(steps)
+
+
+def _semantic_relation_revision_completion_conditions() -> dict[str, str]:
+    """Named read-only conditions, also exposed to isolated test diagnostics."""
+    checks = {
+        "engine:memory_semantic_relations": (
+            "(SELECT COUNT(*) FROM information_schema.TABLES "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'memory_semantic_relations' "
+            "AND ENGINE = 'InnoDB') = 1"
+        ),
+    }
+    for name, sql_type, nullable, default_check, charset in (
+        ("owner_subject_id", "varchar(128)", "YES", "COLUMN_DEFAULT IS NULL", "utf8mb4_bin"),
+        ("root_relation_id", "varchar(255)", "YES", "COLUMN_DEFAULT IS NULL", "ascii_bin"),
+        ("parent_relation_id", "varchar(255)", "YES", "COLUMN_DEFAULT IS NULL", "ascii_bin"),
+        ("revision", "bigint unsigned", "NO", "COLUMN_DEFAULT = '1'", None),
+        ("operation", "varchar(16)", "NO", "COLUMN_DEFAULT = 'add'", "ascii_bin"),
+    ):
+        collation_check = f" AND COLLATION_NAME = '{charset}'" if charset else ""
+        checks[f"column:{name}"] = (
+            "(SELECT COUNT(*) FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'memory_semantic_relations' "
+            f"AND COLUMN_NAME = '{name}' AND COLUMN_TYPE = '{sql_type}' "
+            f"AND IS_NULLABLE = '{nullable}' AND {default_check}{collation_check}) = 1"
+        )
+    for name, columns in (
+        ("uq_semantic_relation_parent", ("parent_relation_id",)),
+        ("uq_semantic_relation_revision", ("root_relation_id", "revision")),
+    ):
+        positions = " AND ".join(
+            f"SUM(SEQ_IN_INDEX = {position} AND COLUMN_NAME = '{column}') = 1"
+            for position, column in enumerate(columns, start=1)
+        )
+        checks[f"index:{name}"] = (
+            "(SELECT COUNT(*) = " + str(len(columns))
+            + " AND MIN(NON_UNIQUE) = 0 AND MAX(NON_UNIQUE) = 0 "
+            + "AND SUM(SUB_PART IS NOT NULL) = 0 AND " + positions
+            + " FROM information_schema.STATISTICS "
+            + "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'memory_semantic_relations' "
+            + f"AND INDEX_NAME = '{name}')"
+        )
+    # MySQL reports an omitted referential action as NO ACTION. For InnoDB
+    # (required above) this is immediate rejection, equivalent to RESTRICT.
+    checks["foreign_key:fk_semantic_relation_parent"] = (
+        "(SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE k "
+        "JOIN information_schema.REFERENTIAL_CONSTRAINTS f "
+        "ON f.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA AND f.CONSTRAINT_NAME = k.CONSTRAINT_NAME "
+        "WHERE k.CONSTRAINT_SCHEMA = DATABASE() AND k.TABLE_NAME = 'memory_semantic_relations' "
+        "AND k.CONSTRAINT_NAME = 'fk_semantic_relation_parent' "
+        "AND k.COLUMN_NAME = 'parent_relation_id' AND k.ORDINAL_POSITION = 1 "
+        "AND k.REFERENCED_TABLE_SCHEMA = DATABASE() "
+        "AND k.REFERENCED_TABLE_NAME = 'memory_semantic_relations' "
+        "AND k.REFERENCED_COLUMN_NAME = 'relation_id' "
+        "AND f.DELETE_RULE IN ('RESTRICT', 'NO ACTION') "
+        "AND f.UPDATE_RULE IN ('RESTRICT', 'NO ACTION')) = 1"
+    )
+    # Match complete canonical metadata renderings, not normalized fragments:
+    # MySQL 8 can expose string delimiters as either ' or backslash-apostrophe.
+    # HEX avoids SQL-mode-dependent escaping and collation-insensitive matches.
+    operation_clauses = tuple(
+        "(`operation` in ("
+        + ",".join(prefix + quote + value + quote for value in ("add", "revise", "withdraw"))
+        + "))"
+        for prefix in ("", "_ascii", "_utf8mb4")
+        for quote in ("'", "\\'")
+    )
+    for name, expressions in (
+        ("chk_semantic_relation_revision", ("(`revision` >= 1)",)),
+        ("chk_semantic_relation_operation", operation_clauses),
+    ):
+        literals = ", ".join(
+            f"'{expression.encode('utf-8').hex().upper()}'" for expression in expressions
+        )
+        checks[f"check:{name}"] = (
+            "(SELECT COUNT(*) FROM information_schema.CHECK_CONSTRAINTS c "
+            "JOIN information_schema.TABLE_CONSTRAINTS t "
+            "ON t.CONSTRAINT_SCHEMA = c.CONSTRAINT_SCHEMA AND t.CONSTRAINT_NAME = c.CONSTRAINT_NAME "
+            "WHERE c.CONSTRAINT_SCHEMA = DATABASE() AND t.TABLE_NAME = 'memory_semantic_relations' "
+            f"AND c.CONSTRAINT_NAME = '{name}' AND t.ENFORCED = 'YES' "
+            f"AND HEX(c.CHECK_CLAUSE) IN ({literals})) = 1"
+        )
+    return checks
+
+
+def _semantic_relation_revision_completion_check() -> str:
+    """One complete postcondition lets additive DDL resume partial completion."""
+    conditions = _semantic_relation_revision_completion_conditions()
+    return "SELECT CASE WHEN " + " AND ".join(conditions.values()) + " THEN 1 ELSE 0 END"
+
+
+_SEMANTIC_RELATION_REVISIONS = SchemaMigration(
+    version=16,
+    name="life_memory_semantic_relation_revisions_v1",
+    statements=_semantic_relation_revision_ddl(),
+    completion_checks=(_semantic_relation_revision_completion_check(),),
+)
+
+
 MEMORY_MIGRATIONS = (
     _DOCUMENT_INDEX,
     _EXPERIENCE,
@@ -984,6 +1196,8 @@ MEMORY_MIGRATIONS = (
     _WITNESS_PIPELINE,
     _WITNESS_RECONCILIATION_CURSOR,
     _WITNESS_RECONCILIATION_CHECKSUM,
+    _MANAGED_DOCUMENT_IDENTITY,
+    _SEMANTIC_RELATION_REVISIONS,
 )
 
 
@@ -1060,6 +1274,11 @@ def _memory_immutability_trigger_contract() -> tuple[tuple[str, str, str], ...]:
             ),
         )
     )
+    triggers.append((
+        "memory_semantic_relation_revision_immutable_update",
+        "UPDATE",
+        "memory_semantic_relations",
+    ))
     return tuple(triggers)
 
 
@@ -1199,10 +1418,39 @@ _MEMORY_IMMUTABILITY_V3 = SchemaMigration(
     ),
 )
 
+def _semantic_relation_revision_immutability() -> tuple[str, ...]:
+    # A separate trigger protects only the added columns. Extending the v1
+    # column list would rewrite the checksum of an already applied migration.
+    predicate = "\n                    AND ".join(
+        f"OLD.`{column}` <=> NEW.`{column}`"
+        for column in _SEMANTIC_RELATION_REVISION_COLUMNS
+    )
+    return (
+        f"""CREATE TRIGGER IF NOT EXISTS memory_semantic_relation_revision_immutable_update
+        BEFORE UPDATE ON memory_semantic_relations FOR EACH ROW
+        BEGIN
+            IF NOT (
+                {predicate}
+            ) THEN
+                SIGNAL SQLSTATE '45000'
+                    SET MESSAGE_TEXT = 'MemoryAuthorityRecordImmutable';
+            END IF;
+        END""",
+    )
+
+
+_MEMORY_IMMUTABILITY_V4 = SchemaMigration(
+    version=4,
+    name="life_memory_semantic_relation_revision_immutability_v1",
+    statements=_semantic_relation_revision_immutability(),
+)
+
+
 MEMORY_IMMUTABILITY_MIGRATIONS = (
     _MEMORY_IMMUTABILITY_V1,
     _MEMORY_IMMUTABILITY_V2,
     _MEMORY_IMMUTABILITY_V3,
+    _MEMORY_IMMUTABILITY_V4,
 )
 
 
@@ -1309,7 +1557,9 @@ async def _verify_memory_database_immutability(
             continue
         if event != "UPDATE":
             continue
-        if table == "memory_witnesses":
+        if name == "memory_semantic_relation_revision_immutable_update":
+            protected_columns = _SEMANTIC_RELATION_REVISION_COLUMNS
+        elif table == "memory_witnesses":
             protected_columns = MEMORY_WITNESS_IMMUTABLE_COLUMNS
         elif table == "memory_witness_delivery_jobs":
             protected_columns = MEMORY_WITNESS_DELIVERY_IMMUTABLE_COLUMNS

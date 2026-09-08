@@ -22,7 +22,7 @@ from plugins.life_engine.memory.continuity_session import CandidateDeliveryRecei
 from src.core.components.base.chatter import Failure, Success
 from src.core.models.message import Message
 from src.kernel.llm.context_delivery import EffectiveContextReceipt
-from src.kernel.llm.payload import LLMPayload, ToolResult
+from src.kernel.llm.payload import LLMPayload, Text, ToolResult
 from src.kernel.llm.roles import ROLE
 
 
@@ -100,7 +100,10 @@ def _receipt(
 
 class _Response:
     def __init__(self, result: ToolResult, *, send_mode: str = "exact") -> None:
-        self.payloads = [LLMPayload(ROLE.TOOL_RESULT, result)]
+        self.payloads = [
+            LLMPayload(ROLE.SYSTEM, Text("Synthetic engineering fixture.")),
+            LLMPayload(ROLE.TOOL_RESULT, result),
+        ]
         self.registrations: dict[str, tuple[str, str, str]] = {}
         self.receipts: dict[str, EffectiveContextReceipt] = {}
         self.send_mode = send_mode
@@ -192,6 +195,7 @@ def test_chatter_registers_the_exact_serialized_candidate_tool_result(
 )
 async def test_chatter_commits_only_the_successful_final_attempt_receipt(
     monkeypatch: pytest.MonkeyPatch,
+    synthetic_chatter_authority,
     send_mode: str,
     result_type: type[Success | Failure],
     committed: bool,

@@ -98,9 +98,23 @@ def _create_source_schema(
         if schema_row is None or not str(schema_row[0] or "").strip():
             raise MemoryExportError(f"source schema missing table: {spec.name}")
         destination.execute(str(schema_row[0]))
+        if spec.name == "memory_nodes":
+            present = {str(row[1]) for row in destination.execute("PRAGMA table_info(memory_nodes)")}
+            for name, definition in (
+                ("document_content", "TEXT"),
+                ("subject_document_id", "TEXT"),
+                ("subject_version_id", "TEXT"),
+                ("subject_document_revision", "INTEGER NOT NULL DEFAULT 0"),
+                ("subject_binding_revision", "INTEGER NOT NULL DEFAULT 0"),
+                ("subject_content_sha256", "TEXT"),
+                ("subject_projection_sha256", "TEXT"),
+                ("subject_projection_state", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                if name not in present:
+                    destination.execute(f"ALTER TABLE memory_nodes ADD COLUMN {name} {definition}")
         columns[spec.name] = tuple(
             str(row["name"])
-            for row in template.execute(f"PRAGMA table_info({spec.name})")
+            for row in destination.execute(f"PRAGMA table_info({spec.name})")
         )
     for table in _FTS_TABLES:
         schema_row = template.execute(

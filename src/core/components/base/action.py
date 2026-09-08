@@ -7,7 +7,7 @@
 import hashlib
 import random
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any, ClassVar
 from uuid import uuid4
 
 from src.core.components.types import ChatType
@@ -54,6 +54,8 @@ class BaseAction(ABC, LLMUsable):
         plugin_name: 所属插件名称（由插件管理器在注册时注入，插件开发者无需填写）
         action_name: 动作名称
         action_description: 动作的功能描述
+        auto_reason_parameter: 是否允许 Provider 自动添加 reason 参数；仅 False 退出，
+            不删除 execute/schema 已明确声明的 reason，也不补全其他参数
         primary_action: 是否为主动作
         chatter_allow: 支持的 Chatter 列表
         chat_type: 支持的聊天类型
@@ -77,6 +79,7 @@ class BaseAction(ABC, LLMUsable):
     # 动作元数据
     action_name: str = ""
     action_description: str = ""
+    auto_reason_parameter: ClassVar[bool] = True
 
     primary_action: bool = False
     chatter_allow: list[str] = []

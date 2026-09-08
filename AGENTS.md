@@ -306,8 +306,8 @@ Elysium/
 │   ├── core/                # chatter、router、上下文与配置
 │   ├── learning/            # 反思、独立审计、整合与技能涌现
 │   ├── memory/              # 经历、认识论、版本、检索与活体关联
-│   ├── minecraft/           # 具身体验
 │   └── tools/               # 主体可调用能力
+├── plugins/minecraft/       # 独立游戏插件：身体、会话、场景意识与事件适配
 ├── plugins/skill_manager/   # 技能目录与渐进式披露
 ├── src/kernel/              # LLM、并发、数据库、调度与事件基座
 ├── src/core/                # 插件组件管理

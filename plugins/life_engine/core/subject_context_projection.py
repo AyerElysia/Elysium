@@ -134,45 +134,76 @@ class SubjectContextProjection(RouterContextProjection):
         # 提示词快照自此持续校验失败。键中加入 profile 前缀消除碰撞。
         return f"{self.projection_profile}.v{projection_version}-{source_digest}"
 
-    async def _restore_remote_version(
+    def _remote_version_key(
         self,
-        sources: tuple[SubjectContextSource, ...],
         source_digest: str,
+        projection_version: int,
     ) -> str:
-        restored = await super()._restore_remote_version(sources, source_digest)
-        if restored:
-            return restored
-        if self.runtime_store is None:
-            return ""
-        # 历史键没有 profile 前缀，可能已被别的 profile 覆盖；只有完整校验通过
-        # 才把它迁移到 profile 专属键，否则留给 refresh() 自然重新生成。
-        legacy_key = f"v{self.projection_version}-{source_digest}"
-        record = await self.runtime_store.get_state(
-            "router_context_projection.version",
-            legacy_key,
+        # Local directories already isolate budgets; the selected store shares
+        # one namespace, so its key must include both profile and byte budget.
+        return (
+            f"{self.projection_profile}.bytes-{self.max_bytes}."
+            f"v{projection_version}-{source_digest}"
         )
-        if record is None:
-            return ""
-        payload = dict(record.payload)
-        rendered = str(payload.pop("text", ""))
-        try:
-            self._validate_remote_snapshot(
-                payload,
-                rendered,
-                sources,
+
+    async def _get_remote_version_record(
+        self,
+        source_digest: str,
+        projection_version: int,
+    ) -> Any:
+        """Adopt only exact legacy snapshots, without rewriting their content.
+
+        Both current and pinned historical reads use this path. Old records
+        remain untouched; foreign profiles/budgets are not migration candidates.
+        Corrupt matching snapshots and uncertain failed writes remain errors.
+        """
+
+        record = await super()._get_remote_version_record(
+            source_digest,
+            projection_version,
+        )
+        if record is not None:
+            return record
+        namespace = "router_context_projection.version"
+        new_key = self._remote_version_key(source_digest, projection_version)
+        legacy_keys = (
+            self._version_stem(source_digest, projection_version),
+            f"v{projection_version}-{source_digest}",
+        )
+        for legacy_key in legacy_keys:
+            legacy = await self.runtime_store.get_state(namespace, legacy_key)
+            if legacy is None:
+                continue
+            payload = dict(legacy.payload)
+            if payload.get("projection_profile") != self.projection_profile:
+                continue
+            budget = payload.get("budget")
+            if (
+                isinstance(budget, dict)
+                and isinstance(budget.get("max_bytes"), int)
+                and budget["max_bytes"] != self.max_bytes
+            ):
+                continue
+            self._validate_remote_historical_snapshot(
+                {key: value for key, value in payload.items() if key != "text"},
+                str(payload.get("text", "")),
                 source_digest,
-                self.projection_version,
+                projection_version,
             )
-            await self.runtime_store.put_state(
-                namespace="router_context_projection.version",
-                state_key=self._version_stem(source_digest, self.projection_version),
-                expected_revision=0,
-                schema_version=ROUTER_CONTEXT_SCHEMA_VERSION,
-                payload={**payload, "text": rendered},
-            )
-        except Exception:  # noqa: BLE001 - adoption is best-effort recovery
-            return ""
-        return rendered
+            try:
+                return await self.runtime_store.put_state(
+                    namespace=namespace,
+                    state_key=new_key,
+                    expected_revision=0,
+                    schema_version=ROUTER_CONTEXT_SCHEMA_VERSION,
+                    payload=payload,
+                )
+            except Exception:  # noqa: BLE001 - resolve only proven exact replay
+                existing = await self.runtime_store.get_state(namespace, new_key)
+                if existing is not None and dict(existing.payload) == payload:
+                    return existing
+                raise
+        return None
 
     def notify_source_changed(self, path: str | Path) -> bool:
         """Mark on-demand freshness stale without creating a dormant watcher."""

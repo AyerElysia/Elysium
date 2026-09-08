@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 from src.app.api.v1.auth_store import AuthStore
 from src.app.api.v1.p312 import P312Providers
 from src.app.api.v1.policy import ADMIN_FRONTEND_AUDIENCE, USER_FRONTEND_AUDIENCE
-from src.app.api.v1.runtime import APIContext, create_api_app
+from src.app.api.v1.runtime import APIContext, APIError, create_api_app
 from src.app.api.v1.tokens import SignedValueCodec
 
 SECRET = "p" * 48
@@ -179,6 +179,7 @@ async def test_runtime_memory_search_never_enables_legacy_weighted_edges(
     values = await p312_runtime.RuntimeMemoryProvider().search(
         "continuity",
         top_k=7,
+        enable_association=True,
         session=SimpleNamespace(actor_id="admin-1"),  # type: ignore[arg-type]
     )
 
@@ -221,15 +222,14 @@ async def test_runtime_memory_search_fails_closed_without_canonical_facade(
         lambda: SimpleNamespace(memory_service=_LegacyOnlyMemory()),
     )
 
-    with pytest.raises(
-        RuntimeError,
-        match="canonical memory association facade is unavailable",
-    ):
+    with pytest.raises(APIError, match="component_unavailable") as error:
         await p312_runtime.RuntimeMemoryProvider().search(
             "continuity",
             top_k=7,
+            enable_association=True,
             session=SimpleNamespace(actor_id="admin-1"),  # type: ignore[arg-type]
         )
+    assert error.value.status_code == 503
 
 
 async def test_runtime_memory_get_experience_uses_lossless_composite_cursor(

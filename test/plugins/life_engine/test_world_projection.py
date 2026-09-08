@@ -595,9 +595,10 @@ def test_giant_world_value_is_referenced_and_utf8_chunked_without_loss(
     assert json.loads("".join(chunks)) == giant_value
 
 
+@pytest.mark.parametrize("domain", ["minecraft", "independent_scene"])
 @pytest.mark.asyncio
 async def test_prompt_projection_and_known_transport_echo_fail_closed(
-    tmp_path: Path,
+    tmp_path: Path, domain: str,
 ) -> None:
     """New recursive prompt echoes are rejected while historical evidence remains."""
 
@@ -621,7 +622,7 @@ async def test_prompt_projection_and_known_transport_echo_fail_closed(
             source_instance_id=observer.instance_id,
             subject="minecraft:trace",
             predicate="state",
-            domain="minecraft",
+            domain=domain,
             value=PromptProjectionValue(
                 delivery_id="delivery",
                 projection_sha256="a" * 64,
@@ -634,7 +635,7 @@ async def test_prompt_projection_and_known_transport_echo_fail_closed(
             source_instance_id=observer.instance_id,
             subject="minecraft:trace",
             predicate="embodied_trace",
-            domain="minecraft",
+            domain=domain,
             value=echo,
         )
     assert service.world_projection.list_assertions() == []
@@ -645,7 +646,7 @@ async def test_prompt_projection_and_known_transport_echo_fail_closed(
             "historical-echo",
             source_instance_id=observer.instance_id,
             value=echo,
-            domain="minecraft",
+            domain=domain,
             predicate="embodied_trace",
         )
     )

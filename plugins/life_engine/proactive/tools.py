@@ -93,6 +93,23 @@ def _source_occurrence(tool: BaseTool) -> str:
     raise RuntimeError("ProactiveSourceOccurrenceRequired")
 
 
+def _turn_scope_source_instance_id(extra: object) -> str:
+    """Read instance attribution already written onto this turn's trigger extra."""
+
+    if not isinstance(extra, dict):
+        return ""
+    turn_scope = extra.get("life_turn_scope")
+    if not isinstance(turn_scope, dict):
+        turn_scope = {}
+    return str(
+        extra.get("source_instance_id")
+        or extra.get("consciousness_instance_id")
+        or turn_scope.get("source_instance_id")
+        or turn_scope.get("consciousness_instance_id")
+        or ""
+    ).strip()
+
+
 def _source_instance(tool: BaseTool, actor: str) -> str:
     bound = str(
         getattr(tool, "_life_source_instance_id", "") or ""
@@ -101,12 +118,9 @@ def _source_instance(tool: BaseTool, actor: str) -> str:
         return bound
     trigger = tool.trigger_message
     extra = getattr(trigger, "extra", {}) or {}
-    if not isinstance(extra, dict):
-        extra = {}
     explicit = str(
         getattr(trigger, "source_instance_id", "")
-        or extra.get("source_instance_id")
-        or extra.get("consciousness_instance_id")
+        or _turn_scope_source_instance_id(extra)
         or ""
     ).strip()
     if explicit:
@@ -417,6 +431,12 @@ class LifeEngineProactiveCommandTool(BaseTool):
                 "inner.return",
             }:
                 raise ValueError("unsupported proactive command action")
+            from ..opportunity.legacy_gate import require_optional_capability
+
+            if action.startswith("initiative."):
+                await require_optional_capability(service, "life.initiative_reencounter")
+            elif action == "inner.return":
+                await require_optional_capability(service, "life.inner_return")
             source = _source_occurrence(self)
             occurrence = _decision_occurrence(self)
             occurred_at = _occurred_at(self)

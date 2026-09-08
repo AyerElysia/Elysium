@@ -24,8 +24,15 @@ def test_heartbeat_tool_round_safety_defaults() -> None:
 def test_background_cognition_uses_quality_first_total_deadlines() -> None:
     config = LifeEngineConfig()
 
+    assert config.memory_witness.enabled is False
     assert config.memory_witness.timeout_seconds == 600.0
     assert config.curiosity.timeout_seconds == 300.0
+
+
+def test_memory_witness_defaults_to_operator_retirement() -> None:
+    section = LifeEngineConfig.MemoryWitnessSection()
+
+    assert section.enabled is False
 
 
 def test_chatter_uses_subject_authored_context_stewardship_defaults() -> None:
@@ -159,7 +166,33 @@ recent_chat_messages = 7
         encoding="utf-8",
     )
 
-    LifeEngineConfig.load(config_path, auto_update=True)
+    loaded = LifeEngineConfig.load(config_path, auto_update=True)
+    assert loaded.opportunity.enabled is False
+    assert loaded.opportunity.poll_interval_seconds == 5.0
+    assert "poll_interval_seconds" not in loaded.learning.model_dump()
+    assert LifeEngineConfig.load(config_path).model_dump() == loaded.model_dump()
+
+
+def test_opportunity_config_round_trip_preserves_distinct_learning_values(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "opportunity.toml"
+    config_path.write_text(
+        "[opportunity]\nenabled = true\npoll_interval_seconds = 11.0\n"
+        "[learning]\nenabled = false\nllm_timeout_seconds = 777.0\n",
+        encoding="utf-8",
+    )
+
+    loaded = LifeEngineConfig.load(config_path, auto_update=True)
+    assert loaded.opportunity.enabled is True
+    assert loaded.opportunity.poll_interval_seconds == 11.0
+    assert loaded.learning.enabled is False
+    assert loaded.learning.llm_timeout_seconds == 777.0
+    assert "poll_interval_seconds" not in loaded.learning.model_dump()
+    generated = config_path.read_bytes()
+    assert LifeEngineConfig.load(config_path).model_dump() == loaded.model_dump()
+    assert LifeEngineConfig.load(config_path, auto_update=True) == loaded
+    assert config_path.read_bytes() == generated
 
 
 def test_sleep_time_format_validation() -> None:
@@ -310,3 +343,18 @@ def test_memory_archive_sync_exposes_every_operational_field() -> None:
     assert set(type(section).model_fields) <= visible
     assert section.mysql_ssl_mode == "verify-full"
     assert section.connect_timeout_seconds == 7
+
+
+def test_life_engine_toml_section_names_are_unique() -> None:
+    """learning and opportunity must remain distinct TOML tables."""
+
+    from src.kernel.config.core import _iter_sections
+
+    names = [section.name for section in _iter_sections(LifeEngineConfig)]
+    assert len(names) == len(set(names))
+    assert "learning" in names
+    assert "opportunity" in names
+
+
+def test_opportunity_runtime_defaults_disabled() -> None:
+    assert LifeEngineConfig().opportunity.enabled is False

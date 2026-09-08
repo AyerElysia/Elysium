@@ -181,6 +181,27 @@
 | DELETE | `/admin/chat/streams/{sid}/announcements/{id}` | `chat:admin` | ✔ |
 | POST | `/admin/chat/messages/{mid}:pin` / `:unpin` | `chat:admin` | ✔ |
 
+### Memory 检索与可选关联
+
+`GET /api/v1/admin/memory/search` 仍要求 `administrator` / `platform_service`
+身份及 `memory:read`，保留高敏读取审计、认证、速率/并发预算和既有响应分页；
+没有新增路由、原文读取权限或记忆写入能力。查询参数：
+
+- `query`：必填，1–2000 字符；`top_k`：默认 20，范围 1–100；
+- `enable_association`：布尔值，默认 `false`。省略或显式 `false` 仅执行直接检索，
+  不调用活体关联展开，也不构建会额外读取 lineage / 历史证据的记忆包；
+- 显式 `true` 才调用规范活体关联与记忆包能力，沿用 `top_k` 和确定性上下文种子。
+  直接检索始终显式关闭 legacy weighted-edge 扩散，不因这个开关恢复旧关联权威。
+
+结果仍以 `P312Page.items` 返回：关闭增强时为直接命中；启用时为既有记忆包。
+直接命中的路径、节点、文档、版本、revision 和内容 hash 原样保留；有明确文档与版本
+身份时同时提供 `file_ref=subject-file:document_id@version_id`，不从旧路径猜测身份。
+引用不等于授予读取权限，后续原文读取仍须经过各自合法能力和权限检查。
+
+无法解析的布尔查询值沿用 `422 validation_failed`；未接入 provider、provider 不接受
+显式开关，或启用时缺少规范关联能力，返回 `503 component_unavailable`，不静默丢弃
+开关或伪造空结果。领域执行失败仍按既有错误契约传播，不自动降级成检索成功。
+
 ### 10.1 管理中尚未实现（○ planned）
 
 - `/admin/chat/*` 查询与管理操作（members、requests、moderation、recall、mute 等）— 需封装 allowlist chat admin facade；

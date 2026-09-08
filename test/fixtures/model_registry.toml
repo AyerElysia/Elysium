@@ -1,0 +1,94 @@
+# Synthetic parser fixture only; never deploy or infer production routes from it.
+[providers.fixture]
+base_url = "http://127.0.0.1:9/v1"
+api_key = "${ELYSIUM_TEST_MODEL_KEY}"
+client_type = "openai"
+timeout = 120
+max_retry = 0
+retry_interval = 0
+
+[models.text]
+provider = "fixture"
+id = "synthetic-text"
+ctx = 1000000
+extra = { thinking = { type = "enabled" } }
+
+[models.vision]
+provider = "fixture"
+id = "synthetic-vision"
+ctx = 1000000
+vision = true
+extra = { reasoning_effort = "high" }
+
+[models.backup]
+provider = "fixture"
+id = "synthetic-backup"
+ctx = 1000000
+vision = true
+extra = { reasoning_effort = "high", enable_thinking = true }
+
+[tasks.core]
+models = ["text", "vision", "backup"]
+tokens = 32000
+context_tokens = 100000
+attempt_timeout_seconds = 180
+
+[tasks.learning]
+models = ["vision", "text"]
+tokens = 32000
+context_tokens = 100000
+attempt_timeout_seconds = 300
+
+[tasks.expression]
+models = ["text", "vision", "backup"]
+tokens = 32000
+context_tokens = 200000
+extra = { parallel_tool_calls = true }
+model_extra = { vision = { reasoning_effort = "low" }, backup = { reasoning_effort = "low" } }
+
+[tasks.witness]
+models = ["vision", "text"]
+tokens = 16000
+context_tokens = 100000
+attempt_timeout_seconds = 300
+
+[tasks.agent]
+models = ["vision", "text"]
+tokens = 32000
+context_tokens = 200000
+attempt_timeout_seconds = 300
+
+[tasks.utility]
+models = ["vision", "text"]
+tokens = 16000
+context_tokens = 64000
+attempt_timeout_seconds = 180
+
+[tasks.vision]
+models = ["vision", "backup"]
+tokens = 16000
+context_tokens = 100000
+
+[tasks.voice]
+models = ["text"]
+tokens = 8192
+
+[tasks.embedding]
+models = ["text"]
+tokens = 8192
+
+[tasks.router]
+models = ["text", "vision", "backup"]
+tokens = 8192
+context_tokens = 32000
+model_extra = { text = { thinking = { type = "disabled" } }, vision = { reasoning_effort = "low" }, backup = { enable_thinking = false } }
+
+[tasks.router_context_projection]
+models = ["vision", "text"]
+tokens = 16000
+context_tokens = 100000
+
+[tasks.live]
+models = ["vision", "backup"]
+tokens = 32000
+context_tokens = 100000

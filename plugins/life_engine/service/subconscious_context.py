@@ -12,9 +12,10 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from .event_builder import EventType, LifeEngineEvent
+from .historical_redelivery import format_historical_redelivery
 
 logger = logging.getLogger(__name__)
 
@@ -214,13 +215,24 @@ class EventGroup:
         return self.protected
 
 
+@dataclass(frozen=True, slots=True)
+class HeartbeatConsumptionReceipt:
+    """Content-free result issued only after a heartbeat consumption commit."""
+
+    heartbeat_run_id: str
+    event_ids: tuple[str, ...]
+    cursor_before: int
+    cursor_after: int
+
+
 @dataclass(slots=True)
 class PreparedHeartbeatContext:
-    """Character-bounded context plus state to retain after this snapshot."""
+    """Prepared candidates; only ``consumption_receipt`` proves a commit."""
 
     content: str
     snapshot_high_water: int
     selected_event_ids: list[str]
+    # Compatibility name: these are candidates, never a delivery/commit receipt.
     acknowledged_event_ids: list[str]
     summary_event_ids: list[str]
     before_chars: int
@@ -236,6 +248,9 @@ class PreparedHeartbeatContext:
     delivery_marker: str = ""
     delivery_sha256: str = ""
     delivery_bytes: int = 0
+    consumption_receipt: HeartbeatConsumptionReceipt | None = field(
+        default=None, init=False,
+    )
 
     @property
     def summary(self) -> SubconsciousSummary:
@@ -322,8 +337,15 @@ class SubconsciousContextManager:
         *,
         max_chars: int | None = None,
         recent_group_count: int | None = None,
+        event_renderer: Callable[[LifeEngineEvent], str] | None = None,
     ) -> PreparedHeartbeatContext:
-        """Prepare only events newer than ``cursor`` at the snapshot boundary."""
+        """Prepare one snapshot without treating candidates as consumed.
+
+        An explicit, call-local event renderer selects complete causal groups
+        against the exact visible projection returned in ``content``. This
+        does not claim that visible text is the full authoritative event body.
+        The default renderer retains the legacy summary projection contract.
+        """
 
         budget = self.max_chars if max_chars is None else max(0, int(max_chars))
         keep_recent = (
@@ -332,16 +354,27 @@ class SubconsciousContextManager:
             else max(0, int(recent_group_count))
         )
         sorted_events = self._sort_raw_events(events)
+        if event_renderer is not None:
+            identities = [event.event_id for event in sorted_events]
+            if any(
+                not isinstance(event_id, str) or not event_id.strip()
+                for event_id in identities
+            ) or len(set(identities)) != len(identities):
+                raise ValueError(
+                    "visible projection requires unique nonempty event identities"
+                )
         summary, recent_history, _ = self._compact_state(
             events,
             cursor=int(cursor or 0),
             existing_summary=existing_summary,
             keep_recent_groups=keep_recent,
         )
-        effective_cursor = max(
-            int(cursor or 0),
-            int(summary.covered_through_sequence or 0),
-        )
+        effective_cursor = int(cursor or 0)
+        if event_renderer is None:
+            effective_cursor = max(
+                effective_cursor,
+                int(summary.covered_through_sequence or 0),
+            )
         snapshot_high_water = max(
             [effective_cursor, *(int(event.sequence or 0) for event in events)],
         )
@@ -377,6 +410,18 @@ class SubconsciousContextManager:
             for group in groups
             if any(event.event_id in delta_ids for event in group.events)
         ]
+        if event_renderer is not None:
+            return self._prepare_visible_delta(
+                sorted_events=sorted_events,
+                delta_groups=delta_groups,
+                delta_ids=delta_ids,
+                budget=budget,
+                snapshot_high_water=snapshot_high_water,
+                summary=summary,
+                recent_history=recent_history,
+                summary_event=summary_event,
+                event_renderer=event_renderer,
+            )
         delta_group_ids = {group.group_id for group in delta_groups}
         old_groups = [
             group
@@ -498,6 +543,106 @@ class SubconsciousContextManager:
             after_chars=len(content),
             dropped_count=dropped_count,
             target_reached=delta_complete,
+            updated_summary=summary,
+            recent_history=recent_history,
+            summary_event=summary_event,
+        )
+
+    @staticmethod
+    def _prepare_visible_delta(
+        *,
+        sorted_events: list[LifeEngineEvent],
+        delta_groups: list[EventGroup],
+        delta_ids: set[str],
+        budget: int,
+        snapshot_high_water: int,
+        summary: SubconsciousSummary,
+        recent_history: list[LifeEngineEvent],
+        summary_event: LifeEngineEvent | None,
+        event_renderer: Callable[[LifeEngineEvent], str],
+    ) -> PreparedHeartbeatContext:
+        """Fit whole groups using one cached, sequence-ordered projection.
+
+        No summary, causal header, truncation, or semantic ranking is added.
+        Empty representations remain pending instead of acquiring invented
+        text. A closed group is only an acknowledgement candidate after every
+        member's exact visible representation fits; delivery and durable commit
+        still belong to the caller.
+        """
+
+        candidate_ids = {
+            event_id for group in delta_groups for event_id in group.event_ids
+        }
+        candidate_events = [
+            event for event in sorted_events if event.event_id in candidate_ids
+        ]
+        rendered: dict[str, str] = {}
+        for event in candidate_events:
+            text = event_renderer(event)
+            if not isinstance(text, str):
+                raise TypeError("visible event renderer must return text")
+            rendered[event.event_id] = text
+
+        def assemble(event_ids: set[str]) -> str:
+            # Causal groups can interleave. Joining group blocks would reorder
+            # the original snapshot, so always traverse its stable event order.
+            return "\n".join(
+                rendered[event.event_id]
+                for event in candidate_events
+                if event.event_id in event_ids
+            )
+
+        selected_ids: set[str] = set()
+        acknowledged_ids: set[str] = set()
+        budget_rejected_groups = 0
+        unrepresented_groups = 0
+        open_groups = 0
+        for group in delta_groups:
+            group_ids = set(group.event_ids)
+            if not group.closed:
+                open_groups += 1
+            if any(not rendered[event_id].strip() for event_id in group_ids):
+                unrepresented_groups += 1
+                continue
+            trial_ids = selected_ids | group_ids
+            if len(assemble(trial_ids)) > budget:
+                budget_rejected_groups += 1
+                continue
+            selected_ids = trial_ids
+            if group.closed:
+                # A cross-cursor group may include old members to retain
+                # causality, but only this snapshot's unconsumed delta can ack.
+                acknowledged_ids.update(group_ids & delta_ids)
+
+        content = assemble(selected_ids)
+        target_reached = delta_ids.issubset(acknowledged_ids)
+        dropped_count = len(candidate_ids - selected_ids)
+        logger.debug(
+            "潜意识可见投影 prepare: "
+            f"input_events={len(sorted_events)} delta_events={len(delta_ids)} "
+            f"groups={len(delta_groups)} selected={len(selected_ids)} "
+            f"ack_candidates={len(acknowledged_ids)} dropped={dropped_count} "
+            f"budget_rejected_groups={budget_rejected_groups} "
+            f"unrepresented_groups={unrepresented_groups} open_groups={open_groups} "
+            f"content_chars={len(content)}/{budget} "
+            f"target_reached={target_reached} high_water={snapshot_high_water}"
+        )
+        return PreparedHeartbeatContext(
+            content=content,
+            snapshot_high_water=snapshot_high_water,
+            selected_event_ids=[
+                event.event_id for event in candidate_events
+                if event.event_id in selected_ids
+            ],
+            acknowledged_event_ids=[
+                event.event_id for event in candidate_events
+                if event.event_id in acknowledged_ids
+            ],
+            summary_event_ids=[],
+            before_chars=len(assemble(candidate_ids)),
+            after_chars=len(content),
+            dropped_count=dropped_count,
+            target_reached=target_reached,
             updated_summary=summary,
             recent_history=recent_history,
             summary_event=summary_event,
@@ -689,7 +834,10 @@ class SubconsciousContextManager:
                 selected_reversed.append((group, block))
                 remaining -= separator_bytes + block_bytes
                 continue
-            if not selected_reversed and remaining > separator_bytes:
+            historical = any(
+                event.redelivery_operation_id is not None for event in group.events
+            )
+            if not historical and not selected_reversed and remaining > separator_bytes:
                 compact = self._fit_utf8(block, remaining - separator_bytes)
                 if compact:
                     selected_reversed.append((group, compact))
@@ -743,11 +891,18 @@ class SubconsciousContextManager:
             provenance = f"source={source}"
             if instance:
                 provenance += f" instance={instance}"
-            rendered = self._render_event(
-                event,
-                include_tool_payloads=include_tool_payloads,
-            )
-            lines.append(f"{rendered} [{provenance}]")
+            if event.redelivery_operation_id is not None:
+                body = self._render_event_body(
+                    event, include_tool_payloads=include_tool_payloads
+                )
+                lines.append(
+                    format_historical_redelivery(event, f"{body} [{provenance}]")
+                )
+            else:
+                rendered = self._render_event(
+                    event, include_tool_payloads=include_tool_payloads
+                )
+                lines.append(f"{rendered} [{provenance}]")
         return "\n".join(lines)
 
     @staticmethod
@@ -808,15 +963,35 @@ class SubconsciousContextManager:
             existing_summary,
             events,
         )
-        sorted_events = [
-            event
-            for event in self._sort_raw_events(events)
-            if int(event.sequence or 0) > summary.covered_through_sequence
+        raw_events = self._sort_raw_events(events)
+        first_pending_sequence = next(
+            (
+                int(event.sequence or 0)
+                for event in raw_events
+                if int(event.sequence or 0) > cursor
+                and not event.heartbeat_context_consumed
+            ),
+            None,
+        )
+        covered_frontier = int(summary.covered_through_sequence or 0)
+        if first_pending_sequence is not None:
+            # A prior summary is not proof that an extant raw gap was consumed.
+            # Preserve its text/metadata, but never use it to drop that gap.
+            covered_frontier = min(covered_frontier, first_pending_sequence - 1)
+        groups = [
+            group for group in self.group_events(raw_events)
+            if group.through_sequence > covered_frontier
         ]
-        groups = self.group_events(sorted_events)
 
         confirmed_prefix: list[EventGroup] = []
         for group in groups:
+            if (
+                first_pending_sequence is not None
+                and group.through_sequence >= first_pending_sequence
+            ):
+                # Group order alone is not a contiguous sequence frontier:
+                # an early group's later member may cross an unconsumed gap.
+                break
             if not group.closed:
                 break
             if group.through_sequence > cursor and not all(
@@ -1296,6 +1471,17 @@ class SubconsciousContextManager:
         return text, {event.event_id for event in represented}
 
     def _render_event(
+        self,
+        event: LifeEngineEvent,
+        *,
+        include_tool_payloads: bool = True,
+    ) -> str:
+        body = self._render_event_body(
+            event, include_tool_payloads=include_tool_payloads
+        )
+        return format_historical_redelivery(event, body)
+
+    def _render_event_body(
         self,
         event: LifeEngineEvent,
         *,

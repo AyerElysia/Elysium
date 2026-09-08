@@ -66,7 +66,6 @@ from .epistemic import (
     RetrievalFeedback,
     RetrievalPlasticity,
     create_epistemic_schema,
-    new_claim,
 )
 from .experience import (
     EvidenceAwareMemoryResult,
@@ -96,7 +95,6 @@ from .lineage import (
 from .living import (
     ArtifactHead,
     ArtifactHeadConflict,
-    AssociationEvidence,
     AssociationSelection,
     CoRecallEvent,
     InterpretationSearchResult,
@@ -107,6 +105,7 @@ from .living import (
     RecallEpisode,
     RecallEvent,
     SemanticRelation,
+    SemanticRelationPage,
     create_living_memory_schema,
     new_artifact_version,
 )
@@ -307,6 +306,8 @@ class LifeMemoryService:
         storage_runtime: StorageBackendRuntime | None = None,
         memory_storage: MemoryStorageBundle | None = None,
         selectable_storage_enabled: bool = False,
+        subject_document_store: Any = None,
+        subject_document_store_required: bool = False,
     ) -> None:
         """初始化记忆服务。
 
@@ -329,6 +330,8 @@ class LifeMemoryService:
         self._storage_runtime = storage_runtime
         self._provided_memory_storage = memory_storage
         self._selectable_storage_enabled = bool(selectable_storage_enabled)
+        self._subject_document_store = subject_document_store
+        self._subject_document_store_required = bool(subject_document_store_required)
         self._workspace_override: Path | None = None
         if isinstance(plugin, (str, Path)):
             self._workspace_override = Path(plugin)
@@ -402,6 +405,17 @@ class LifeMemoryService:
         self,
         snapshot: dict[str, Any],
     ) -> dict[str, Any]:
+        from .managed_documents import index_readiness
+
+        try:
+            subject_index = await index_readiness(self)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - health contains no document text
+            subject_index = {"status": "failed", "error_type": type(exc).__name__}
+        snapshot["subject_file_index"] = subject_index
+        if subject_index["status"] not in {"ready", "disabled"} and snapshot.get("status") in {"ok", "healthy"}:
+            snapshot["status"] = "degraded"
         provider = self._behavior_health_provider
         if provider is None:
             snapshot["behavior"] = {
@@ -1194,12 +1208,18 @@ class LifeMemoryService:
         projection_context = await self._prepare_workspace_projection(scan=scan)
         workspace_paths = {document.path for document in scan.documents}
         indexed_nodes = await storage.document_index.list_indexed_documents()
+        from .managed_documents import rebuild_managed_documents
+
+        registered_paths = await rebuild_managed_documents(self, indexed_nodes)
+        workspace_paths.difference_update(registered_paths)
         indexed = {
-            str(node.file_path): node for node in indexed_nodes if node.file_path
+            str(node.file_path): node for node in indexed_nodes
+            if node.file_path and str(node.file_path) not in registered_paths
+            and not getattr(node, "subject_document_id", "")
         }
         loaded: dict[str, tuple[str, float]] = {}
         mtimes = {document.path: document.source_mtime for document in scan.documents}
-        paths = [document.path for document in scan.documents]
+        paths = [document.path for document in scan.documents if document.path not in registered_paths]
         progress = self._startup_recovery_progress
         progress.phase = "document_index"
         progress.total_documents = len(paths)
@@ -1222,7 +1242,7 @@ class LifeMemoryService:
             digest = compute_content_hash(content) if content else ""
             node = indexed.get(path)
             if node is None:
-                await storage.document_index.upsert_document(
+                await self.upsert_document(
                     path,
                     content,
                     Path(path).stem,
@@ -1251,7 +1271,7 @@ class LifeMemoryService:
                     and str(node.embedding_content_hash or "") != digest
                 )
             ):
-                await storage.document_index.upsert_document(
+                await self.upsert_document(
                     path,
                     content,
                     Path(path).stem,
@@ -1433,8 +1453,11 @@ class LifeMemoryService:
         appended = 0
         for logical_key, (content, source_mtime) in loaded.items():
             current = heads.get(logical_key)
+            from .managed_documents import append_unregistered_observation
+
             appended += int(
-                await self._append_workspace_observation(
+                await append_unregistered_observation(
+                    self,
                     living=living,
                     logical_key=logical_key,
                     content=content,
@@ -1454,32 +1477,6 @@ class LifeMemoryService:
 
         return appended
 
-    async def _reconcile_workspace_artifact_versions(
-        self,
-        documents: Sequence[Any],
-        workspace_paths: set[str],
-        *,
-        indexed_hashes: dict[str, str] | None = None,
-    ) -> int:
-        """Append artifact history and refresh externally changed search rows."""
-
-        loaded: dict[str, tuple[str, float]] = {}
-        workspace = self._get_workspace_path()
-        for document in documents:
-            try:
-                content, source_mtime, _size = await asyncio.to_thread(
-                    read_workspace_document,
-                    workspace,
-                    document.path,
-                )
-            except (FileNotFoundError, OSError, ValueError):
-                continue
-            loaded[document.path] = (content, source_mtime)
-        return await self._reconcile_workspace_artifact_versions_via_ports(
-            loaded,
-            workspace_paths,
-        )
-
     def _require_local_db(self) -> sqlite3.Connection:
         if self._db is None or self._closing:
             raise RuntimeError("记忆服务尚未初始化或正在关闭")
@@ -1492,73 +1489,6 @@ class LifeMemoryService:
         return (
             self._memory_storage is not None and self._initialized and not self._closing
         )
-
-    async def read_graph_projection(
-        self,
-        *,
-        limit_nodes: int = 80,
-        min_weight: float = 0.15,
-        focus_id: str | None = None,
-    ) -> Dict[str, Any]:
-        """Return the rebuildable legacy graph through a public service boundary."""
-
-        return await self._require_memory_storage().document_index.graph_snapshot(
-            limit_nodes=max(10, min(int(limit_nodes), 200)),
-            min_weight=max(0.0, min(float(min_weight), 1.0)),
-            focus_id=focus_id,
-        )
-
-    async def read_file_lineage_projection(
-        self,
-        file_path: str,
-    ) -> Dict[str, Any] | None:
-        """Return file evolution through the public backend-neutral boundary."""
-
-        graph = self._require_memory_storage().legacy_graph
-        node = await graph.get_node_by_file_path(file_path)
-        if node is None:
-            return None
-        outgoing, incoming, corrections = await asyncio.gather(
-            graph.get_edges_from(node.node_id, 0.0),
-            graph.get_edges_to(node.node_id, 0.0),
-            graph.list_corrections(
-                related_node_ids=(node.node_id,),
-                limit=10,
-            ),
-        )
-        evolution_trace: list[dict[str, Any]] = []
-        for direction, edges in (("later", outgoing), ("earlier", incoming)):
-            for edge in edges:
-                related_id = edge.target_id if direction == "later" else edge.source_id
-                related = await graph.get_node_by_id(related_id)
-                if related is None or not related.file_path:
-                    continue
-                evolution_trace.append(
-                    {
-                        "direction": direction,
-                        "relation": edge.edge_type.value,
-                        "file_path": related.file_path,
-                        "title": related.title,
-                        "reason": edge.reason,
-                        "weight": round(edge.weight, 2),
-                    }
-                )
-        corrections_data = [
-            {
-                "topic": item.topic,
-                "message": item.message,
-                "source": item.source,
-                "created_at": item.created_at,
-            }
-            for item in corrections
-        ]
-        if not evolution_trace and not corrections_data:
-            return None
-        return {
-            "evolution_trace": evolution_trace,
-            "corrections": corrections_data,
-            "has_history": True,
-        }
 
     async def read_lineage_edges(
         self,
@@ -1654,7 +1584,10 @@ class LifeMemoryService:
         overlap_chars: int | None = None,
     ) -> DocumentIndexResult:
         """统一写入文档节点、分块 FTS 和待处理 outbox。"""
-        return await self._require_memory_storage().document_index.upsert_document(
+        from .managed_documents import upsert_document_projection
+
+        return await upsert_document_projection(
+            self,
             path,
             content,
             title,
@@ -1662,6 +1595,12 @@ class LifeMemoryService:
             max_chars=max_chars,
             overlap_chars=overlap_chars,
         )
+
+    async def project_managed_document(self, document_id: str) -> Any:
+        """Rebuild the current index from stable subject authority, never disk."""
+        from .managed_documents import project_current_document
+
+        return await project_current_document(self, document_id)
 
     async def get_document_metadata(
         self,
@@ -1891,25 +1830,6 @@ class LifeMemoryService:
 
         return await self._require_memory_storage().experiences.append(records)
 
-    async def record_memory_artifact_version(
-        self,
-        version: MemoryArtifactVersion,
-        *,
-        derivations: Sequence[MemoryDerivation] = (),
-        expected_head_revision: int | None = None,
-    ) -> MemoryArtifactVersion:
-        """Append one immutable memory artifact version and provenance."""
-
-        living = self._require_memory_storage().living
-        if expected_head_revision is None:
-            head = await living.get_artifact_head(version.logical_key)
-            expected_head_revision = head.revision if head is not None else 0
-        return await living.append_artifact(
-            version,
-            derivations=derivations,
-            expected_head_revision=expected_head_revision,
-        )
-
     async def version_memory_artifact(
         self,
         *,
@@ -2008,22 +1928,40 @@ class LifeMemoryService:
     async def list_memory_semantic_relations(
         self,
         entity_ref: str,
-    ) -> List[SemanticRelation]:
-        """Return every explicit relation touching one memory entity."""
-
-        return await self._require_memory_storage().living.list_relations(entity_ref)
-
-    async def list_memory_interpretations(
-        self,
-        subject_id: str,
         *,
-        recorded_as_of: str = "",
-    ) -> List[MemoryInterpretation]:
-        """Read the interpretation history available at a recorded time."""
+        current_only: bool = False,
+    ) -> List[SemanticRelation]:
+        """Read complete history or its rebuildable active-head projection."""
 
-        return await self._require_memory_storage().living.list_interpretations(
-            subject_id,
-            recorded_as_of=recorded_as_of,
+        return await self._require_memory_storage().living.list_relations(
+            entity_ref, current_only=current_only,
+        )
+
+    async def get_memory_semantic_relation(
+        self,
+        relation_id: str,
+    ) -> SemanticRelation | None:
+        """Read one immutable occurrence; absence is not a latest selector."""
+
+        return await self._require_memory_storage().living.get_relation(relation_id)
+
+    async def page_memory_semantic_relations(
+        self,
+        entity_ref: str,
+        *,
+        current_only: bool = False,
+        limit: int = 50,
+        offset: int = 0,
+        expected_frontier_count: int | None = None,
+    ) -> "SemanticRelationPage":
+        """Read one bounded row page against a checked append-only frontier."""
+
+        return await self._require_memory_storage().living.page_relations(
+            entity_ref,
+            current_only=current_only,
+            limit=limit,
+            offset=offset,
+            expected_frontier_count=expected_frontier_count,
         )
 
     async def search_memory_interpretations(
@@ -2098,19 +2036,6 @@ class LifeMemoryService:
 
         return await self._require_memory_storage().living.append_corecall(event)
 
-    async def list_memory_association_evidence(
-        self,
-        entity_ref: str,
-        *,
-        context_key: str | None = None,
-    ) -> List[AssociationEvidence]:
-        """Return separate contextual association dimensions."""
-
-        return await self._require_memory_storage().living.list_association_evidence(
-            entity_ref,
-            context_key=context_key,
-        )
-
     async def rebuild_memory_association_projection(self) -> int:
         """Rebuild derived pairwise accessibility from immutable hyperedges."""
 
@@ -2125,6 +2050,8 @@ class LifeMemoryService:
         context_key: str,
         random_seed: int,
         limit: int,
+        enable_semantic_relations: bool = True,
+        enable_corecall: bool = True,
     ) -> List[SearchResult]:
         """Add replayable neighbours from the canonical living-memory ledgers.
 
@@ -2132,9 +2059,27 @@ class LifeMemoryService:
         share this one read path.  Neither source is converted into a truth or
         importance score.  A deterministic hash selection makes a bounded
         page replayable without reviving the mutable legacy edge weights.
+        The two read-only controls separate subject assertions from co-recall
+        reachability for controlled evaluation. Neither switch writes history,
+        reinforces a relation, or authorizes access to a referenced document.
         """
 
-        seed_refs = [f"document:{item.file_path}" for item in results if item.file_path]
+        if type(enable_semantic_relations) is not bool or type(enable_corecall) is not bool:
+            raise TypeError("association source controls must be bools")
+        from .managed_documents import (
+            association_document_metadata, is_current_result, node_identity,
+        )
+
+        for result in results:
+            if not await is_current_result(self, result):
+                raise RuntimeError("ManagedIndexProjectionStale")
+        if int(limit) <= 0:
+            return list(results)
+        seed_refs = [
+            "subject-file:" + item.document_id
+            if getattr(item, "document_id", "") else f"document:{item.file_path}"
+            for item in results if item.file_path
+        ]
         corecall_selections = (
             await self._require_memory_storage().living.choose_association_neighbours(
                 seed_refs,
@@ -2142,20 +2087,44 @@ class LifeMemoryService:
                 random_seed=random_seed,
                 limit=max(0, int(limit)),
             )
+            if enable_corecall else []
         )
         living = self._require_memory_storage().living
         candidate_signals: dict[str, set[str]] = {}
         candidate_sources: dict[str, set[str]] = {}
         candidate_identities: dict[str, set[str]] = {}
-        for seed_ref in seed_refs:
-            relations = await living.list_relations(seed_ref)
-            for relation in relations:
+        relation_frontier: int | None = None
+        relation_page_limit = min(100, max(1, int(limit)))
+        for seed_ref in seed_refs if enable_semantic_relations else ():
+            page = await living.page_relations(
+                seed_ref,
+                current_only=True,
+                limit=relation_page_limit,
+                expected_frontier_count=relation_frontier,
+            )
+            relation_frontier = page.frontier_count
+            if page.matching_count > relation_page_limit:
+                # A recorded seed chooses a bounded window; tail relations
+                # remain reachable without materializing every historical row.
+                page_seed = hashlib.sha256(
+                    f"{context_key}\0{int(random_seed)}\0{seed_ref}".encode("utf-8")
+                ).digest()
+                offset = int.from_bytes(page_seed[:8], "big") % page.matching_count
+                if offset:
+                    page = await living.page_relations(
+                        seed_ref,
+                        current_only=True,
+                        limit=relation_page_limit,
+                        offset=offset,
+                        expected_frontier_count=relation_frontier,
+                    )
+            for relation in page.relations:
                 target_ref = (
                     relation.target_ref
                     if relation.source_ref == seed_ref
                     else relation.source_ref
                 )
-                if not target_ref.startswith("document:") or target_ref == seed_ref:
+                if not target_ref.startswith(("document:", "subject-file:")) or target_ref == seed_ref:
                     continue
                 candidate_signals.setdefault(target_ref, set()).add(
                     f"semantic_relation:{relation.predicate}"
@@ -2165,7 +2134,7 @@ class LifeMemoryService:
                     f"semantic_relation:{relation.relation_id}"
                 )
         for selection in corecall_selections:
-            if not selection.entity_ref.startswith("document:"):
+            if not selection.entity_ref.startswith(("document:", "subject-file:")):
                 continue
             candidate_signals.setdefault(selection.entity_ref, set()).update(
                 selection.signals
@@ -2202,12 +2171,7 @@ class LifeMemoryService:
         expanded = list(results)
         seen_paths = {item.file_path for item in expanded}
         for index, entity_ref in enumerate(selected_refs):
-            path = entity_ref.removeprefix("document:")
-            if not path or path in seen_paths:
-                continue
-            metadata = await self._require_memory_storage().document_index.get_document_metadata(
-                path
-            )
+            metadata = await association_document_metadata(self, entity_ref)
             if metadata is None or metadata.is_deleted:
                 continue
             path = metadata.file_path
@@ -2235,9 +2199,13 @@ class LifeMemoryService:
                         "living memory evidence: " + ", ".join(signals)
                     ),
                     score_kind="accessibility_rank_not_truth",
+                    **node_identity(metadata),
                 )
             )
             seen_paths.add(path)
+        for result in expanded:
+            if not await is_current_result(self, result):
+                raise RuntimeError("ManagedIndexProjectionStale")
         return expanded
 
     async def list_experiences_after(
@@ -2478,7 +2446,11 @@ class LifeMemoryService:
                     },
                 )
             )
+        from .managed_documents import is_current_result, result_identity
+
         for result in document_results:
+            if not await is_current_result(self, result):
+                raise RuntimeError("ManagedIndexProjectionStale")
             if result.file_path.startswith("diaries/witness/"):
                 projected = await self.get_witness_by_projection_path(result.file_path)
                 if projected is None:
@@ -2525,18 +2497,23 @@ class LifeMemoryService:
                 continue
             candidates.append(
                 EvidenceAwareMemoryResult(
-                    record_id=result.file_path,
+                    record_id=(
+                        "subject-file:" + result.document_id
+                        if getattr(result, "document_id", "") else result.file_path
+                    ),
                     kind="document_evidence",
                     content=result.snippet,
                     rank_score=float(result.relevance),
                     confidence=None,
                     source=f"document_{result.source}",
-                    provenance=(result.file_path,),
+                    provenance=(result_identity(result)["file_ref"] or result.file_path,),
                     metadata={
                         "title": result.title,
                         "score_kind": getattr(result, "score_kind", "rank"),
                         "association_path": list(result.association_path),
                         "association_reason": result.association_reason,
+                        "file_path": result.file_path,
+                        **result_identity(result),
                     },
                 )
             )
@@ -2746,12 +2723,6 @@ class LifeMemoryService:
                 **kwargs
             )
 
-    async def witness_migration_exists(self, migration_key: str) -> bool:
-        """检查旧日记迁移键，保证迁移幂等。"""
-        return await self._require_memory_storage().witnesses.migration_exists(
-            migration_key
-        )
-
     async def record_witness_migration(self, **kwargs: Any) -> None:
         """记录旧日记来源哈希与新见证 ID，不删除旧文件。"""
         async with self._index_write_lock:
@@ -2790,9 +2761,9 @@ class LifeMemoryService:
     ) -> Optional[MemoryNode]:
         """Read one canonical node without automatic identity migration."""
         del migrate_identity
-        return await self._require_memory_storage().legacy_graph.get_node_by_file_path(
-            file_path
-        )
+        from .managed_documents import current_node_for_path
+
+        return await current_node_for_path(self, file_path)
 
     async def migrate_file_path(self, old_path: str, new_path: str) -> bool:
         """Reject unaudited runtime re-keying of memory identities."""
@@ -2818,17 +2789,6 @@ class LifeMemoryService:
     async def _get_snippet_wrapper(self, node_id: str) -> str:
         """获取摘要的包装函数。"""
         return await self._require_memory_storage().document_index.get_snippet(node_id)
-
-    async def _filter_existing_scores_wrapper(
-        self,
-        scores: List[tuple],
-    ) -> tuple:
-        """过滤存在节点的包装函数。"""
-        return (
-            await self._require_memory_storage().document_index.filter_existing_scores(
-                scores
-            )
-        )
 
     # --------------------------------------------------------
     # 边操作（封装模块函数）
@@ -2917,21 +2877,20 @@ class LifeMemoryService:
             List[MemoryBundle]: 完整认知包（默认，包含演化历史）
             List[SearchResult]: 简单搜索结果（仅当 return_bundles=False）
         """
-        detailed = await self._require_memory_storage().document_index.search_detailed(
+        detailed = await self.search_memory_detailed(
             query,
-            collection=self._chroma_collection,
-            chunk_collection=self._chunk_collection,
             top_k=top_k,
             enable_association=enable_association,
             file_types=file_types,
             time_range_days=time_range_days,
-            emit_visual_event=None,
             now=self._clock if now is None else now,
             workspace_path=(
                 self._get_workspace_path() if workspace_path is None else workspace_path
             ),
         )
         simple_results = detailed.results
+        if detailed.diagnostics.error_types.get("subject_identity"):
+            raise RuntimeError("ManagedIndexProjectionStale")
 
         if not return_bundles:
             # 降级模式：返回简单结果列表
@@ -2956,7 +2915,7 @@ class LifeMemoryService:
         workspace_path: str | Path | None = None,
     ) -> DetailedSearchResult:
         """返回检索结果及各阶段只读诊断。"""
-        return await self._require_memory_storage().document_index.search_detailed(
+        detailed = await self._require_memory_storage().document_index.search_detailed(
             query,
             collection=self._chroma_collection,
             chunk_collection=self._chunk_collection,
@@ -2970,6 +2929,9 @@ class LifeMemoryService:
                 self._get_workspace_path() if workspace_path is None else workspace_path
             ),
         )
+        from .managed_documents import validate_search_results
+
+        return await validate_search_results(self, detailed)
 
     async def vector_search(self, query: str, top_k: int = 10) -> List[tuple]:
         """向量相似度检索，优先聚合 chunk 命中到节点。"""
@@ -3048,41 +3010,6 @@ class LifeMemoryService:
 
         del topic, message, related_paths, source, query, stream_id
         raise RuntimeError("LegacyCorrectionMutationRetired")
-
-    async def _record_correction_claims(
-        self,
-        corrections: List[MemoryCorrection],
-    ) -> None:
-        """把旧 correction 兼容记录投影到新本体；候选来源不获确认权。
-
-        同一逻辑修正可能绑定多个文件节点（多行 correction），但认识论层
-        只需一条 claim。按 (topic, message) 去重。
-        """
-        seen_claims: set[tuple[str, str]] = set()
-        for correction in corrections:
-            dedup_key = (correction.topic, correction.message)
-            if dedup_key in seen_claims:
-                continue
-            seen_claims.add(dedup_key)
-            source = str(correction.source or "unknown").strip().lower()
-            claim = new_claim(
-                claim_id=f"correction_{correction.correction_id}",
-                subject_key=f"correction:{correction.topic}",
-                content=correction.message,
-                claim_kind="correction_candidate",
-                source=source,
-                authority="unasserted",
-                stream_scope=correction.stream_id or "",
-                metadata={
-                    "legacy_correction_id": correction.correction_id,
-                    "related_node_id": correction.related_node_id or "",
-                    "query": correction.query,
-                },
-                recorded_at=datetime.fromtimestamp(correction.created_at)
-                .astimezone()
-                .isoformat(),
-            )
-            await self.append_memory_claim(claim)
 
     async def resolve_canonical_path(
         self,
@@ -3228,16 +3155,28 @@ class LifeMemoryService:
         for result in results:
             if len(bundles) >= max(1, top_k):
                 break
+            from .managed_documents import is_current_result
+
+            if not await is_current_result(self, result):
+                raise RuntimeError("ManagedIndexProjectionStale")
+            if getattr(result, "document_id", ""):
+                from .managed_documents import build_managed_bundle
+
+                bundles.append(await build_managed_bundle(self, query, result))
+                continue
             source_path = _memory_path(result.file_path)
             if source_path is None:
                 continue
-            node = await self.get_node_by_file_path(
-                source_path,
-                migrate_identity=False,
-            )
+            if getattr(result, "node_id", ""):
+                node = await self._get_node_by_id_wrapper(result.node_id)
+            else:
+                node = await self.get_node_by_file_path(source_path, migrate_identity=False)
             if node is None:
                 continue
 
+            from .managed_documents import is_current_node, node_reference, result_identity
+
+            primary_node = node
             evidence = [
                 MemoryEvidence(
                     file_path=source_path,
@@ -3246,6 +3185,7 @@ class LifeMemoryService:
                     relevance=result.relevance,
                     source=result.source,
                     exists=_path_exists(result.file_path),
+                    **result_identity(result),
                 )
             ]
             trace: list[MemoryTrace] = []
@@ -3253,7 +3193,7 @@ class LifeMemoryService:
 
             outgoing, incoming = await self.read_lineage_edges(node.node_id)
             # 两个方向的邻居一次取全：节点与摘要来自同一批查询，路径判定来自
-            # 同一次线程调用。循环体内因此不再有 await。
+            # 同一次线程调用；另按精确节点核对当前绑定，历史路径不认领新文件。
             lineage_ids = list(
                 dict.fromkeys(
                     [edge.target_id for edge in outgoing]
@@ -3265,6 +3205,10 @@ class LifeMemoryService:
                 lineage_ids
             )
             await _resolve_paths([view.file_path for view in lineage_views.values()])
+            current_lineage_nodes = {
+                identity: await is_current_node(self, view)
+                for identity, view in lineage_views.items()
+            }
 
             for edge, direction in (
                 *((edge, "later") for edge in outgoing),
@@ -3276,11 +3220,15 @@ class LifeMemoryService:
                 neighbour = lineage_views.get(neighbour_id)
                 if neighbour is None or not neighbour.file_path:
                     continue
-                neighbour_path = _memory_path(neighbour.file_path)
-                if neighbour_path is None:
+                eligibility = assess_indexed_document_path(neighbour.file_path)
+                if not eligibility.eligible:
                     continue
+                neighbour_path = eligibility.path
                 related_node_ids.append(neighbour.node_id)
-                exists = _path_exists(neighbour.file_path)
+                exists = current_lineage_nodes[neighbour_id] and (
+                    bool(getattr(neighbour, "subject_document_id", ""))
+                    or _path_exists(neighbour.file_path)
+                )
                 trace.append(
                     MemoryTrace(
                         relation=edge.edge_type.value,
@@ -3290,6 +3238,7 @@ class LifeMemoryService:
                         reason=edge.reason,
                         direction=direction,
                         exists=exists,
+                        **node_reference(neighbour),
                     )
                 )
                 evidence.append(
@@ -3302,6 +3251,7 @@ class LifeMemoryService:
                         relation=edge.edge_type.value,
                         relation_reason=edge.reason,
                         exists=exists,
+                        **node_reference(neighbour),
                     )
                 )
 
@@ -3332,27 +3282,30 @@ class LifeMemoryService:
                 continue
             seen_primary_paths.add(primary_path)
 
-            if primary_path != source_path and not any(
-                item.file_path == primary_path for item in evidence
-            ):
-                primary_node = await self.get_node_by_file_path(
-                    primary_path,
-                    migrate_identity=False,
+            if primary_path != source_path:
+                canonical_id = str(canonical.get("node_id") or "") if canonical else ""
+                primary_node = (
+                    await self._get_node_by_id_wrapper(canonical_id) if canonical_id
+                    else await self.get_node_by_file_path(primary_path, migrate_identity=False)
                 )
-                if primary_node is not None:
+                if primary_node is None or primary_node.file_path != primary_path or not await is_current_node(self, primary_node):
+                    raise RuntimeError("ManagedIndexProjectionStale")
+                if not any(item.node_id == primary_node.node_id for item in evidence):
                     related_node_ids.append(primary_node.node_id)
+                    canonical_snippet = await self._get_snippet_wrapper(primary_node.node_id)
+                    if not await is_current_node(self, primary_node):
+                        raise RuntimeError("ManagedIndexProjectionStale")
                     evidence.append(
                         MemoryEvidence(
                             file_path=primary_path,
                             title=primary_node.title,
-                            snippet=await self._get_snippet_wrapper(
-                                primary_node.node_id
-                            ),
+                            snippet=canonical_snippet,
                             relevance=result.relevance,
                             source="lineage",
                             relation="canonical",
                             relation_reason=str(resolution.get("note") or ""),
                             exists=_path_exists(resolved_raw),
+                            **node_reference(primary_node),
                         )
                     )
 
@@ -3381,6 +3334,9 @@ class LifeMemoryService:
                     history_trace=trace,
                     corrections=corrections,
                     uncertainty=uncertainty,
+                    primary_node_id=primary_node.node_id,
+                    primary_document_id=getattr(primary_node, "subject_document_id", ""),
+                    primary_version_id=getattr(primary_node, "subject_version_id", ""),
                 )
             )
 
@@ -3408,76 +3364,6 @@ class LifeMemoryService:
             return_bundles=True,
         )
 
-    async def search_memory_simple(
-        self,
-        query: str,
-        top_k: int = 5,
-        enable_association: bool = True,
-        file_types: Optional[List[str]] = None,
-        time_range_days: int = 0,
-        *,
-        now: Any = None,
-        workspace_path: str | Path | None = None,
-    ) -> List[SearchResult]:
-        """简单检索模式，返回无演化历史的搜索结果列表。
-
-        警告：这是降级版本，仅用于特殊场景（如性能敏感的内部操作）。
-        正常情况下应该使用 search_memory()，它默认返回完整记忆包。
-        """
-        return await self.search_memory(
-            query=query,
-            top_k=top_k,
-            enable_association=enable_association,
-            file_types=file_types,
-            time_range_days=time_range_days,
-            now=now,
-            workspace_path=workspace_path,
-            return_bundles=False,
-        )
-
-    async def _get_or_create_file_node_from_workspace(
-        self, file_path: str
-    ) -> MemoryNode:
-        """Load an eligible workspace document, or reuse an indexed historical node.
-
-        This helper is used by explicit lineage and correction writes.  It must
-        never turn a typo or an internal runtime path into a new empty memory
-        node.  A missing file is only valid when the node already exists as
-        historical lineage evidence.
-        """
-        path_eligibility = assess_document_path(file_path)
-        if not path_eligibility.eligible:
-            raise ValueError(f"不支持索引的记忆文档路径: {path_eligibility.reason}")
-
-        workspace = self._get_workspace_path()
-        eligibility = assess_workspace_document(workspace, path_eligibility.path)
-        if eligibility.eligible:
-            try:
-                content, source_mtime, _ = read_workspace_document(
-                    workspace,
-                    eligibility.path,
-                )
-            except (OSError, UnicodeError, ValueError) as exc:
-                raise ValueError(f"无法读取记忆文档: {eligibility.path}") from exc
-            await self.upsert_document(
-                eligibility.path,
-                content,
-                title=Path(eligibility.path).stem,
-                source_mtime=source_mtime,
-            )
-            node = await self.get_node_by_file_path(eligibility.path)
-            if node is None:
-                raise RuntimeError(f"记忆文档写入后未找到节点: {eligibility.path}")
-            return node
-
-        if eligibility.reason == "stat_error":
-            historical_node = await self.get_node_by_file_path(path_eligibility.path)
-            if historical_node is not None:
-                return historical_node
-            raise ValueError(f"记忆文档不存在或不可访问: {path_eligibility.path}")
-
-        raise ValueError(f"不支持索引的记忆文档路径: {eligibility.reason}")
-
     async def _resolve_canonical_from_node(
         self,
         node: MemoryNode,
@@ -3498,7 +3384,7 @@ class LifeMemoryService:
             ]
         ] = [(node, [], frozenset({node.node_id}), 0.0, 0.0, ())]
         resolved: list[
-            tuple[int, float, float, tuple[str, ...], str, list[dict[str, str]]]
+            tuple[int, float, float, tuple[str, ...], str, list[dict[str, str]], str]
         ] = []
 
         for depth in range(1, max_depth + 1):
@@ -3533,6 +3419,10 @@ class LifeMemoryService:
                 ):
                     target = await self._get_node_by_id_wrapper(edge.target_id)
                     if target is None or not target.file_path:
+                        continue
+                    from .managed_documents import is_current_node
+
+                    if not await is_current_node(self, target):
                         continue
                     target_eligibility = assess_indexed_document_path(target.file_path)
                     if not target_eligibility.eligible:
@@ -3575,6 +3465,7 @@ class LifeMemoryService:
                                 target_edge_ids,
                                 target_path,
                                 target_lineage,
+                                target.node_id,
                             )
                         )
 
@@ -3584,11 +3475,11 @@ class LifeMemoryService:
 
         if not resolved:
             return None
-        _, _, _, _, path, lineage = sorted(
+        _, _, _, _, path, lineage, node_id = sorted(
             resolved,
             key=lambda item: (-item[0], -item[1], -item[2], item[3], item[4]),
         )[0]
-        return {"path": path, "lineage": lineage}
+        return {"path": path, "lineage": lineage, "node_id": node_id}
 
     def _find_missing_file_candidate(self, requested_path: str) -> str | None:
         """Find one eligible same-stem candidate without traversing runtime storage."""

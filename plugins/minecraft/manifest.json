@@ -1,0 +1,37 @@
+{
+  "name": "minecraft",
+  "version": "0.1.0",
+  "description": "Independent Minecraft embodiment and scene consciousness plugin",
+  "author": "Elysium",
+  "license": "GPL-3.0",
+  "dependencies": {
+    "plugins": [
+      "life_engine"
+    ],
+    "components": [
+      "life_engine:service:life_engine"
+    ]
+  },
+  "include": [
+    {
+      "component_type": "service",
+      "component_name": "minecraft",
+      "dependencies": [
+        "life_engine:service:life_engine"
+      ],
+      "enabled": true
+    },
+    {
+      "component_type": "tool",
+      "component_name": "nucleus_minecraft",
+      "dependencies": [
+        "minecraft:service:minecraft"
+      ],
+      "enabled": true
+    }
+  ],
+  "entry_point": "plugin.py",
+  "min_core_version": "1.0.0",
+  "python_dependencies": [],
+  "dependencies_required": true
+}
