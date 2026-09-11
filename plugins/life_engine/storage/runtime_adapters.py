@@ -28,7 +28,7 @@ _MAX_NAMESPACE_CHARS = 128
 _MAX_STATE_KEY_CHARS = 255
 _MAX_EVENT_KIND_CHARS = 128
 _MAX_OCCURRENCE_CHARS = 255
-_MAX_PAYLOAD_BYTES = 16 * 1024 * 1024
+_MAX_PAYLOAD_BYTES = 512 * 1024 * 1024
 
 
 def _identity(value: Any, *, field: str, maximum: int) -> str:
