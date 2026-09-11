@@ -41,7 +41,7 @@ _READ_ONLY_TOOL_NAMES: frozenset[str] = frozenset({
     "nucleus_list_files",
     "nucleus_glob_file",
     "nucleus_grep_file",
-    "nucleus_grep_events",
+    "recall_context",
     "nucleus_search_memory",
     "nucleus_relations",
     "nucleus_memory_stats",

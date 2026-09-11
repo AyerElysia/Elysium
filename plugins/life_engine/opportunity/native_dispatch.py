@@ -60,7 +60,7 @@ _NATIVE_TOOL_OPERATIONS = frozenset(
         "nucleus_browser_fetch",
         "nucleus_edit_file",
         "nucleus_glob_file",
-        "nucleus_grep_events",
+        "recall_context",
         "nucleus_learn",
         "nucleus_list_files",
         "nucleus_memory_continuity_review",

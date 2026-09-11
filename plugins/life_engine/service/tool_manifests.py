@@ -42,7 +42,7 @@ CONSCIOUSNESS_TOOL_MANIFESTS: dict[str, list[str]] = {
         "tool-read_context_group",
         "tool-recognize_voice",
         "tool-nucleus_save_media",
-        "tool-nucleus_grep_events",
+        "tool-recall_context",
         "tool-nucleus_read_event",
         "tool-nucleus_search_memory",
         "tool-nucleus_read_memory_boundary",
@@ -147,7 +147,7 @@ HEARTBEAT_TOOL_NAMES: tuple[str, ...] = (
     "nucleus_list_files",
     "nucleus_mkdir",
     "nucleus_grep_file",
-    "nucleus_grep_events",
+    "recall_context",
     "nucleus_read_event",
     "nucleus_search_memory",
     "nucleus_read_memory_boundary",
@@ -191,7 +191,7 @@ def heartbeat_tool_classes() -> list[type[Any]]:
         LifeEngineProactiveQueryTool,
     )
     from ..tools.event_grep_tools import (
-        LifeEngineGrepEventsTool,
+        LifeEngineRecallContextTool,
         LifeEngineReadEventTool,
     )
     from ..tools.file_tools import (
@@ -220,7 +220,7 @@ def heartbeat_tool_classes() -> list[type[Any]]:
         LifeEngineListFilesTool,
         LifeEngineMakeDirectoryTool,
         LifeEngineGrepFileTool,
-        LifeEngineGrepEventsTool,
+        LifeEngineRecallContextTool,
         LifeEngineReadEventTool,
         LifeEngineSearchMemoryTool,
         LifeReadMemoryBoundaryTool,

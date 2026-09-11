@@ -3,5 +3,6 @@
 # user-owned lifecycle action; an unexpected exit must remain visible.
 set -euo pipefail
 
-cd /root/Elysia/Elysium
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 exec .venv/bin/python main.py

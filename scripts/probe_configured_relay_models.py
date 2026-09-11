@@ -11,6 +11,7 @@ two candidates run concurrently. No retries, redirects or credential rotation.
 from __future__ import annotations
 
 import asyncio
+import argparse
 import hashlib
 import json
 import os
@@ -200,6 +201,12 @@ async def probe(name, model, provider, semaphore):
 
 
 async def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", action="append", help="one current expression candidate; at most four")
+    args = parser.parse_args()
+    names = tuple(args.model or NAMES)
+    if not 1 <= len(names) <= 4 or len(set(names)) != len(names):
+        raise ValueError("invalid_bounded_candidate_set")
     root = Path(__file__).resolve().parents[1]
     raw = (root / "config/models.toml").read_bytes()
     config = tomllib.loads(raw.decode("utf-8"))
@@ -218,7 +225,7 @@ async def main():
         raise ValueError("configured_relay_identity_mismatch")
     if not provider["api_key"] or provider.get("client_type", "openai") != "openai":
         raise ValueError("configured_relay_auth_or_protocol_missing")
-    candidates = {name: config["models"][name] for name in NAMES}
+    candidates = {name: config["models"][name] for name in names}
     expression = config["tasks"]["expression"]["models"]
     if any(model["provider"] != "NexusAI" or name not in expression for name, model in candidates.items()):
         raise ValueError("candidate_not_in_current_expression_route")

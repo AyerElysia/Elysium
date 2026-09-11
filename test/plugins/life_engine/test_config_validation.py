@@ -38,6 +38,7 @@ def test_memory_witness_defaults_to_operator_retirement() -> None:
 def test_chatter_uses_subject_authored_context_stewardship_defaults() -> None:
     chatter = LifeEngineConfig.ChatterSection()
 
+    assert chatter.max_rounds_per_chat == 0
     assert chatter.context_stewardship_enabled is True
     assert chatter.context_pressure_ratio == 0.75
     assert chatter.context_pressure_max_groups == 24
@@ -45,10 +46,24 @@ def test_chatter_uses_subject_authored_context_stewardship_defaults() -> None:
     assert chatter.context_emergency_reference_max_bytes == 8 * 1024
 
 
+@pytest.mark.parametrize("limit", [0, 1, 5, 100])
+def test_chatter_round_limit_explicit_values(limit: int) -> None:
+    assert LifeEngineConfig.ChatterSection(max_rounds_per_chat=limit).max_rounds_per_chat == limit
+
+
+def test_chatter_round_limit_toml_round_trip(tmp_path: Path) -> None:
+    config_path = tmp_path / "rounds.toml"
+    config_path.write_text("[chatter]\nmax_rounds_per_chat = 0\n", encoding="utf-8")
+    config = LifeEngineConfig.load(config_path, auto_update=True)
+    assert config.chatter.max_rounds_per_chat == 0
+    assert LifeEngineConfig.load(config_path).chatter.max_rounds_per_chat == 0
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
         ("context_pressure_ratio", 0.09),
+        ("max_rounds_per_chat", -1),
         ("context_pressure_ratio", 1.0),
         ("context_pressure_max_groups", 0),
         ("context_pressure_max_groups", 65),

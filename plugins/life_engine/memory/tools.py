@@ -2131,6 +2131,35 @@ class NucleusRelationsTool(BaseTool):
 
             # The append frontier counts ALL relations, not this endpoint's rows.
             matching_count = relation_page.matching_count
+            stable_relation_hint: dict[str, Any] | None = None
+            if (
+                not semantic_payloads
+                and center_ref.startswith("subject-file:")
+                and "@" in center_ref
+            ):
+                # Exact-version references intentionally remain exact and must not
+                # silently broaden to a document head.  A bounded, read-only hint
+                # lets the subject choose relations anchored directly to the
+                # stable document endpoint, not relations on sibling versions.
+                stable_ref = center_ref.split("@", 1)[0]
+                stable_page = await service.page_memory_semantic_relations(
+                    stable_ref,
+                    current_only=current_only,
+                    limit=1,
+                    offset=0,
+                    expected_frontier_count=relation_page.frontier_count,
+                )
+                if authority_binding != _relation_view_authority(service):
+                    raise RuntimeError("SemanticRelationContinuationAuthorityChanged")
+                if stable_page.matching_count:
+                    stable_relation_hint = {
+                        "entity_ref": stable_ref,
+                        "matching_relation_count": stable_page.matching_count,
+                        "reason": (
+                            "ExactVersionHasNoAnchoredRelations; "
+                            "stable document endpoint is available by explicit choice"
+                        ),
+                    }
             payload = {
                 "action": "view",
                 "entity_ref": center_ref,
@@ -2149,6 +2178,7 @@ class NucleusRelationsTool(BaseTool):
                 ),
                 "current_relation_ids": list(relation_page.current_relation_ids),
                 "current_relation_ids_scope": "this_storage_page",
+                "stable_relation_hint": stable_relation_hint,
                 "storage_page": {
                     "offset": relation_page.offset,
                     "limit": 50,

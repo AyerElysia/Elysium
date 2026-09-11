@@ -239,6 +239,11 @@ class Messages(Base):
         nullable=False,
         comment="消息原始内容"
     )
+    media_attachments: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="版本化媒体附件描述 JSON；仅稳定引用与元数据，不含原始字节"
+    )
     processed_plain_text: Mapped[str | None] = mapped_column(
         Text,
         nullable=True,

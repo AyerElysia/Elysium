@@ -53,6 +53,7 @@ from src.kernel.llm import (
     UnsupportedModalityError,
     Video,
 )
+from src.kernel.llm.attempt_budget import model_turn_attempt_budget
 from src.kernel.llm.media_capabilities import normalize_media_capabilities
 from src.kernel.logger import COLOR, get_logger
 from src.kernel.storage import canonical_json_sha256
@@ -3455,14 +3456,14 @@ class LifeChatter(BaseChatter):
             logger.warning(f"记录纯文本内心独白失败: {exc}")
 
     def _get_max_rounds(self) -> int:
-        """获取单轮最大工具调用轮数。"""
+        """获取显式工具轮数上限；0 表示不限轮数。"""
         cfg = self._get_config()
         if cfg is None:
-            return 5
+            return 0
         chatter_cfg = getattr(cfg, "chatter", None)
         if chatter_cfg is not None:
-            return int(getattr(chatter_cfg, "max_rounds_per_chat", 5))
-        return 5
+            return int(getattr(chatter_cfg, "max_rounds_per_chat", 0))
+        return 0
 
     @staticmethod
     def _get_watchdog_keepalive_interval() -> float:
@@ -3541,8 +3542,9 @@ class LifeChatter(BaseChatter):
             return await keepalive_awaitable
         deadline = asyncio.timeout(timeout)
         try:
-            async with deadline:
-                return await keepalive_awaitable
+            with model_turn_attempt_budget(timeout):
+                async with deadline:
+                    return await keepalive_awaitable
         except TimeoutError as exc:
             if not deadline.expired():
                 raise
@@ -6677,7 +6679,7 @@ class LifeChatter(BaseChatter):
                     if compression_turn_required:
                         rt.follow_up_rounds += 1
                         if (
-                            rt.follow_up_rounds >= max_rounds
+                            (max_rounds > 0 and rt.follow_up_rounds >= max_rounds)
                             or source_response_before_model is None
                         ):
                             if source_response_before_model is not None:
@@ -6742,7 +6744,7 @@ class LifeChatter(BaseChatter):
                         logger.debug("life_chatter 本轮空响应，继续 loop")
 
                     rt.follow_up_rounds += 1
-                    if rt.follow_up_rounds >= max_rounds:
+                    if max_rounds > 0 and rt.follow_up_rounds >= max_rounds:
                         logger.warning(
                             f"已达最大轮数 ({max_rounds})，未产生可见回复，收束本轮"
                         )
@@ -7423,7 +7425,7 @@ class LifeChatter(BaseChatter):
                         return Success("subject context checkpoint installed")
 
                     rt.follow_up_rounds += 1
-                    if rt.follow_up_rounds >= max_rounds:
+                    if max_rounds > 0 and rt.follow_up_rounds >= max_rounds:
                         # This branch really ends the maintenance attempt, so a
                         # TOOL_RESULT tail needs a closing assistant frame.
                         # Continuing rounds deliberately keep TOOL_RESULT as
@@ -7531,9 +7533,9 @@ class LifeChatter(BaseChatter):
                     await self._save_rolling_context_snapshot(llm_response)
                     return Wait()
 
-                # 默认继续 loop：检查 max_rounds 安全阀
+                # 默认继续 loop；仅在运维显式配置正数时执行轮数上限。
                 rt.follow_up_rounds += 1
-                if rt.follow_up_rounds >= max_rounds:
+                if max_rounds > 0 and rt.follow_up_rounds >= max_rounds:
                     logger.warning(f"已达最大轮数 ({max_rounds})，收束本轮")
                     await complete_active_autonomy_as_failed(
                         "life_chatter reached max rounds without a terminal choice"

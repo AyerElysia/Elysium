@@ -424,6 +424,43 @@ async def test_verified_certificate_allows_explicit_backend_rebinding(
 
 
 @pytest.mark.asyncio
+async def test_full_bound_database_relocation_gets_fresh_certificate_and_replays(tmp_path: Path) -> None:
+    """The Spark case keeps the full old chain, not only copied domain rows."""
+    from scripts.relocate_local_storage import certify_relocation
+
+    snapshot, source_workspace = await _frozen_source(tmp_path)
+    frozen = snapshot / "sqlite" / PROACTIVE_SNAPSHOT_SOURCE
+    before_sha = hashlib.sha256(frozen.read_bytes()).hexdigest()
+    target_workspace = tmp_path / "relocated-workspace"
+    database = target_workspace / "runtime/proactive/proactive.sqlite3"
+    database.parent.mkdir(parents=True)
+    shutil.copyfile(frozen, database)
+    shutil.copyfile(
+        source_workspace / "runtime/proactive/backend-binding.json",
+        target_workspace / "runtime/proactive/backend-binding.json",
+    )
+    for original in (source_workspace / "runtime/proactive").glob("authority.json*"):
+        shutil.copyfile(original, database.parent / original.name)
+    evidence = tmp_path / "relocation-evidence"
+    evidence.mkdir()
+    kwargs = dict(
+        snapshot=snapshot, database=database, workspace=target_workspace,
+        authority=target_workspace / "runtime/proactive/authority.json",
+        evidence=evidence, generation_id="spark-relocation-test", schema_version=1,
+        registry_id="life-proactive-local", source_relative=PROACTIVE_SNAPSHOT_SOURCE,
+    )
+    result = await certify_relocation(**kwargs)
+    assert result["verified"]
+    assert result["binding"]["binding_epoch"] == 2
+    assert result["binding"]["previous_binding_sha256"]
+    assert result["binding_health"]["status"] == "healthy"
+    replay = await certify_relocation(**kwargs)
+    assert replay["binding"] == result["binding"]
+    assert replay["copy"]["idempotent_replay"] is True
+    assert hashlib.sha256(frozen.read_bytes()).hexdigest() == before_sha
+
+
+@pytest.mark.asyncio
 async def test_generation_repair_is_audited_idempotent_and_recovers_cache_write(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -726,6 +763,88 @@ async def test_generation_repair_rejects_empty_chain(tmp_path: Path) -> None:
                 ),
                 repair_id="repair-empty-chain",
             )
+    finally:
+        await active.revoke_authority()
+        await active.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("history_advanced", [False, True])
+async def test_bound_endpoint_relocation_does_not_reuse_old_copy_certificate(
+    tmp_path: Path, history_advanced: bool,
+) -> None:
+    """A bound runtime may advance normally, but cannot silently move identity."""
+    snapshot, source_workspace = await _frozen_source(tmp_path / "source")
+    workspace = tmp_path / "bound-workspace"
+    active, _copied = await _activate_migrated_runtime(
+        snapshot, workspace, migration_id="already-bound-relocation",
+    )
+    binding_path = "runtime/proactive/backend-binding.json"
+    cache = workspace / binding_path
+    cache.write_bytes((source_workspace / binding_path).read_bytes())
+    try:
+        bound = await ensure_proactive_backend_binding(
+            workspace_path=workspace, binding_path=binding_path, runtime=active,
+        )
+        if history_advanced:
+            # This is synthetic temporary-database activity, not subject data.
+            raw = backend_binding.canonical_json({"test": "after-copy"})
+            async with active.unit_of_work() as uow:
+                await uow.session.execute(
+                    text(
+                        "INSERT INTO runtime_events (namespace, occurrence_id, "
+                        "event_kind, payload_json, payload_sha256, occurred_at, "
+                        "recorded_at) VALUES ('life_proactive.decision_guards', "
+                        "'test:after-copy', 'test_activity', :payload, :digest, "
+                        "'2026-09-09T00:00:00+00:00', '2026-09-09T00:00:00+00:00')"
+                    ),
+                    {"payload": raw, "digest": hashlib.sha256(raw.encode()).hexdigest()},
+                )
+        # The generation root is a copy-time proof, not a constantly refreshed
+        # history head. Ordinary activity on the already-bound endpoint is valid.
+        assert await ensure_proactive_backend_binding(
+            workspace_path=workspace, binding_path=binding_path, runtime=active,
+        ) == bound
+        cache_before = cache.read_bytes()
+        async with active.unit_of_work() as uow:
+            history_before = await backend_binding.read_proactive_history_in_session(uow.session)
+            chain_before = await backend_binding._load_chain(uow.session)
+            head_before = await backend_binding._load_head(uow.session)
+        assert active.generation is not None
+        assert (
+            history_before.root_sha256
+            != active.generation.root_hashes["local:proactive_authority"]
+        ) is history_advanced
+
+        # Only simulate the endpoint-identity branch; no real database is moved,
+        # no second writer is activated, and the fixture keeps its original fence.
+        relocated = replace(
+            active,
+            backend_identity=f"sqlite:///{tmp_path / 'other-host/local.sqlite3'}",
+        )
+        expected = (
+            "ProactiveMigrationGenerationRootMismatch" if history_advanced
+            else "ProactiveMigrationCertificateBackendIdentityMismatch"
+        )
+        with pytest.raises(ProactiveBackendBindingConflict, match=expected):
+            await ensure_proactive_backend_binding(
+                workspace_path=workspace, binding_path=binding_path, runtime=relocated,
+            )
+        # The initial-bind repair is deliberately not a relocation escape hatch
+        # for a database that already has authoritative binding history.
+        with pytest.raises(
+            ProactiveBackendBindingConflict, match="ProactiveBackendBindingChainAlreadyPresent",
+        ):
+            await complete_proactive_initial_binding(
+                workspace_path=workspace, binding_path=binding_path, runtime=relocated,
+                source_binding=bound, repair_id="must-not-rebind-live-history",
+            )
+        async with active.unit_of_work() as uow:
+            history_after = await backend_binding.read_proactive_history_in_session(uow.session)
+            assert await backend_binding._load_chain(uow.session) == chain_before
+            assert await backend_binding._load_head(uow.session) == head_before
+        assert history_after == history_before
+        assert cache.read_bytes() == cache_before
     finally:
         await active.revoke_authority()
         await active.close()

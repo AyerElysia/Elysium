@@ -87,8 +87,3 @@ model_extra = { text = { thinking = { type = "disabled" } }, vision = { reasonin
 models = ["vision", "text"]
 tokens = 16000
 context_tokens = 100000
-
-[tasks.live]
-models = ["vision", "backup"]
-tokens = 32000
-context_tokens = 100000

@@ -317,9 +317,12 @@ class StorageBackendRuntime:
 
         if self._singleton_writer_claims is None:
             return
-        for key, (claim, lease_seconds) in tuple(
-            self._managed_singleton_claims.items()
-        ):
+
+        async def renew_one(
+            key: tuple[str, str],
+            claim: SingletonWriterClaim,
+            lease_seconds: int,
+        ) -> None:
             try:
                 renewed = await self._singleton_writer_claims.renew(
                     claim,
@@ -328,6 +331,22 @@ class StorageBackendRuntime:
             except (SingletonWriterClaimLost, SingletonWriterClaimConflict) as exc:
                 raise ManagedSingletonWriterClaimLost(claim, exc) from exc
             self._managed_singleton_claims[key] = (renewed, lease_seconds)
+
+        # These claims guard independent technical domains.  Renewing them
+        # serially lets one SQLite transaction (or its busy timeout) consume
+        # the whole lease interval and falsely expire the remaining claims.
+        # Keep the failures individually attributable while allowing the
+        # backend to schedule each short transaction concurrently.
+        renewals = [
+            renew_one(key, claim, lease_seconds)
+            for key, (claim, lease_seconds) in tuple(
+                self._managed_singleton_claims.items()
+            )
+        ]
+        failures = await asyncio.gather(*renewals, return_exceptions=True)
+        for failure in failures:
+            if isinstance(failure, BaseException):
+                raise failure
 
     async def _release_managed_singleton_writers(self) -> None:
         if self._singleton_writer_claims is None:

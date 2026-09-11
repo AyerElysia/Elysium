@@ -40,7 +40,6 @@ REQUIRED_MODEL_TASKS = frozenset(
         "embedding",
         "router",
         "router_context_projection",
-        "live",
     }
 )
 SUBJECT_FILES = ("SOUL.md", "USER.md", "MEMORY.md")

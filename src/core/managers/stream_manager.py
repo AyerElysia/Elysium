@@ -13,6 +13,7 @@
 """
 
 import asyncio
+import json
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -20,13 +21,14 @@ from async_lru import alru_cache
 from sqlalchemy import update as sa_update
 
 from src.core.config import get_core_config
-from src.core.models.media import redact_media_sources
+from src.core.models.media import MediaAttachment, redact_media_sources
 from src.kernel.db import (
     CRUDBase,
     QueryBuilder,
     get_db_session,
     is_database_disconnect,
 )
+from src.kernel.llm.exceptions import MediaValidationError
 from src.kernel.logger import get_logger
 
 if TYPE_CHECKING:
@@ -59,6 +61,41 @@ def _serialize_content_for_db(content: Any, message_type: Any = None) -> str:
         source_value=is_media_message,
     )
     return str(safe_content)
+
+
+def _serialize_attachments_for_db(attachments: list[MediaAttachment]) -> str | None:
+    """Persist versioned descriptors separately from arbitrary message content."""
+    if not attachments:
+        return None
+    envelope = {
+        "version": 1,
+        "attachments": [attachment.to_descriptor() for attachment in attachments],
+    }
+    return json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+
+
+def _deserialize_attachments_from_db(stored: str | None) -> list[MediaAttachment]:
+    """Restore descriptors; only SQL NULL means legacy/no recorded attachments.
+
+    Corrupt or unsupported non-null records fail explicitly without copying
+    private stored data into the error. Never interpret message text as metadata.
+    """
+    if stored is None:
+        return []
+    try:
+        envelope = json.loads(stored)
+    except (TypeError, json.JSONDecodeError):
+        raise ValueError("消息附件描述不是有效 JSON") from None
+    if not isinstance(envelope, dict) or set(envelope) != {"version", "attachments"}:
+        raise ValueError("消息附件描述结构无效")
+    if type(envelope["version"]) is not int or envelope["version"] != 1:
+        raise ValueError("消息附件描述版本不受支持")
+    if not isinstance(envelope["attachments"], list):
+        raise ValueError("消息附件描述列表无效")
+    try:
+        return [MediaAttachment.from_descriptor(item) for item in envelope["attachments"]]
+    except MediaValidationError:
+        raise ValueError("消息附件描述内容无效") from None
 
 
 class StreamManager:
@@ -296,7 +333,9 @@ class StreamManager:
         query = QueryBuilder(self._Messages).filter(stream_id=stream_id)
         if stream_record.context_cleared_at is not None:
             query = query.filter(time__gt=stream_record.context_cleared_at)
-        query = query.order_by("-id")
+        # Migration/backfill can assign a new local row ID to an old message.
+        # Context chronology follows occurrence time; ID only breaks ties.
+        query = query.order_by("-time", "-id")
         if max_messages is not None:
             query = query.limit(max_messages)
         
@@ -452,6 +491,7 @@ class StreamManager:
                     message.content,
                     message.message_type,
                 ),
+                "media_attachments": _serialize_attachments_for_db(message.attachments),
                 "processed_plain_text": message.processed_plain_text,
                 "reply_to": message.reply_to,
                 "platform": message.platform,
@@ -526,6 +566,7 @@ class StreamManager:
                     message.content,
                     message.message_type,
                 ),
+                "media_attachments": _serialize_attachments_for_db(message.attachments),
                 "processed_plain_text": message.processed_plain_text,
                 "reply_to": message.reply_to,
                 "platform": message.platform,
@@ -681,7 +722,7 @@ class StreamManager:
 
         messages_records = (
             await query
-            .order_by("-id")
+            .order_by("-time", "-id")
             .limit(limit)
             .offset(offset)
             .all()
@@ -1010,6 +1051,9 @@ class StreamManager:
                 sender_id = "bot"
                 sender_name = "爱莉"
 
+        persisted_attachments = _deserialize_attachments_from_db(
+            getattr(db_message, "media_attachments", None)
+        )
         normalized_plain_text = db_message.processed_plain_text
         if defer_content and normalized_plain_text is not None:
             content = "[Content deferred]"
@@ -1036,6 +1080,7 @@ class StreamManager:
             ),
             stream_id=db_message.stream_id,
             raw_data=None,
+            attachments=persisted_attachments,
             extra={},
         )
 

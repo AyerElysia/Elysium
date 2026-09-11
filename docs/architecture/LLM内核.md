@@ -48,7 +48,7 @@ LLM 内核是所有模型调用的统一基础设施：负责模型注册与任�
 
 `config/models.toml` 是生产环境自动任务路由的唯一权威，定义 Provider、模型注册和每个任务的有序主备链。它由部署者维护且不进入 Git；仓库不再提供模型路由示例，也不在 bootstrap 时生成它。`test/fixtures/model_registry.toml` 只含虚拟模型，用于验证解析与继承，禁止部署或视为生产路由基线。
 
-旧 `config/model.toml` 只保留给显式迁移工具和独立旧 API，生产启动流程不再读取它；运行时组件、快捷 `chat()/stream()` 以及插件任务 API 全部直接使用 `models.toml`，不得在新注册表出错时静默切换到旧文件。缺文件、TOML 非法、未知字段、Provider/模型引用错误、重复候选、预算非法或缺少生产任务都会让启动显式失败。
+旧 `config/model.toml` 只保留给显式迁移工具和独立旧 API，生产启动流程不再读取它；运行时组件、快捷 `chat()/stream()` 以及插件任务 API 全部直接使用 `models.toml`，不得在新注册表出错时静默切换到旧文件。缺文件、TOML 非法、未知字段、Provider/模型引用错误、重复候选、预算非法或缺少生产任务都会让启动显式失败。生产强制任务不含 `live`：直播场景复用 `expression`（`actor` 别名），不得再登记一条平行的直播模型链。
 
 ### 2.2 解析链
 
@@ -108,13 +108,13 @@ class ModelEntry(TypedDict):
 
 并发能力遵循“最大安全并发”，而不是全局串行。LLM 请求层没有读取旧 `model.toml` 的 `concurrency_count`，也不使用全局单并发信号量；独立任务可同时进行。`expression` 显式传递 `parallel_tool_calls=true`，Life Chatter 将同一模型响应中连续的、互不依赖的安全只读工具并发执行，并按原顺序回收结果；写入、发送、操作和其他有副作用的调用仍严格串行。主意识运行锁只保护同一主体的因果顺序，不得扩展成对心跳、记忆见证、路由或其他实例的全局限流。
 
-自动任务的首选与后备顺序只由 `config/models.toml` 决定，本文不复制当前生产名单。若任务数组包含 `deepseek-v4-flash`，本地中转站必须把该公共别名映射到火山方舟 Coding Plan 的 `ark-code-latest`；直接请求上游同名模型得到的是预览版，禁止当作正式路由。`expression` 承载聊天表达并可接收图像，其自动候选必须显式声明视觉能力；纯文本模型不得单独承担表达层。`vision` 任务同样继续使用多模态候选。
+自动任务的首选与后备顺序只由 `config/models.toml` 决定，本文不复制当前生产名单。当前 DeepSeek flash 走 A6 的 `deepseek-v4.1-flash`（V4.1 Flash，原生视觉），不要把它映射成已删除的 OpenCode `deepseek-v4-flash`。若任务数组再次使用旧公共别名 `deepseek-v4-flash`，本地中转站必须把它映射到火山方舟 Coding Plan 的 `ark-code-latest`；直接请求上游同名模型得到的是预览版，禁止当作正式路由。`expression` 承载聊天表达并可接收图像，其自动候选必须显式声明视觉能力；纯文本模型不得单独承担表达层。`vision` 任务同样继续使用多模态候选。
 
 具体 GPT 后备优先级与跨模型族回退顺序同样只由 `config/models.toml` 决定。候选模型必须通过本地中转站的模型列表、真实 completion、格式遵循、工具调用与重复转发探针；中转站内部只启用通过验收的渠道，固定失败或客户端不兼容的渠道不得为了“全部打开”而进入生产路由。
 
 **MiMo 渠道不变量：** `mimo-v2.5` 与 `mimo-v2.5-pro` 只能由小米 / MiMoCN 渠道提供 ability（当前生产为 New API channel `MiMoCN-2`，上游 `xiaomimimo.com`）。OpenCode、Console Go、Zen Go 渠道禁止登记这两个模型名。同名模型在 OpenCode 上会在小米限流时被 Retry 打到 Console Go，并触发 `MissingSessionID`。运维脚本：`scripts/pin_mimo_to_xiaomi_channel.py`。
 
-**OpenCode 会话头不变量：** Console Go 上游要求 `x-opencode-session`。该头只允许写在 OpenCode 渠道（当前为 New API channel 48）的 `header_override`，供 Qwen/GLM 等只挂在该渠道的模型使用。禁止加到小米渠道，禁止用它把 MiMo 接回 OpenCode。
+**OpenCode 会话头不变量：** Console Go 上游要求 `x-opencode-session`。2026-09-11 已删除 New API 渠道 48（`OpenCode-Go-New-1`），生产不再走 OpenCode。若再接入 Console Go / Zen Go，该头只允许写在那个 OpenCode 渠道的 `header_override`。禁止加到小米渠道，禁止用它把 MiMo 接回 OpenCode。
 
 真实心跳和记忆见证曾产生约 53 万与 99 万 prompt tokens 的单条聚合载荷，超过当前 GPT 注册的 30 万上下文窗口，并造成三个 GPT 候选连续 500/503/504 或超时。根因是心跳的潜意识正文先经过字符预算，随后追加的 `transient_world_perception` 没有共享同一总预算；两部分又被合并成唯一一条 user 消息，旧裁剪器只会删除较早的完整问答组，最后一组因此被原样发送。现在 `core` 以 100000 tokens 为硬任务预算，`expression` 使用 200000 tokens 保留主意识长对话；`witness` 同样按 100000 tokens 限制输入，因此无需为此前的超窗故障永久移除 GPT。历史组裁剪后若最后一条普通文本仍超限，内核会保留指令头与最新尾部并插入明确省略标记；若超限来自不可切断的 system、tool 或结构化结果，则请求显式失败，不再静默发送巨型载荷。
 

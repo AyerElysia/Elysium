@@ -236,7 +236,10 @@ class LivestreamConfig(BaseConfig):
         model_task: str = Field(
             default="actor",
             min_length=1,
-            description="复用项目模型配置中的任务名，不单独配置模型或密钥",
+            description=(
+                "复用项目模型配置中的任务名，不单独配置模型或密钥。"
+                "`actor` 解析为 `expression`。仓库不再提供独立的 `live` 模型任务。"
+            ),
             label="模型任务",
             tag="ai",
             order=0,

@@ -239,11 +239,13 @@ async def rebuild_managed_documents(memory: Any, indexed_nodes: list[Any]) -> se
         logical_path_prefix=_PREFIX
     )
     registered: set[str] = set()
-    document_ids = {
-        str(node.subject_document_id)
+    indexed_by_document = {
+        str(node.subject_document_id): node
         for node in indexed_nodes
         if getattr(node, "subject_document_id", "")
     }
+    document_ids = set(indexed_by_document)
+    authority_by_document: dict[str, dict[str, Any]] = {}
     cursor = ""
     while True:
         rows = await store.list_file_bindings(
@@ -260,13 +262,46 @@ async def rebuild_managed_documents(memory: Any, indexed_nodes: list[Any]) -> se
             cursor = logical
             registered.add(logical.removeprefix(_PREFIX))
             if row["document_id"]:
-                document_ids.add(str(row["document_id"]))
+                document_id = str(row["document_id"])
+                document_ids.add(document_id)
+                authority_by_document[document_id] = row
         if len(registered) > _MAX_BINDINGS or len(document_ids) > _MAX_BINDINGS:
             raise RuntimeError("ManagedIndexRecoveryBudgetExceeded")
+
+    # The legacy index stores the exact subject pin that produced each row.
+    # On a normal restart, comparing that pin with the authoritative binding
+    # is enough to prove the projection is current; re-reading and rewriting
+    # every document would otherwise turn startup into an O(all history) job.
+    # A missing row, changed revision/version/hash, or released binding still
+    # takes the conservative rebuild path.
+    to_project: list[str] = []
     for document_id in sorted(document_ids):
+        node = indexed_by_document.get(document_id)
+        authority = authority_by_document.get(document_id)
+        if node is None or authority is None:
+            to_project.append(document_id)
+            continue
+        expected_path = str(authority["logical_path"]).removeprefix(_PREFIX)
+        if (
+            str(getattr(node, "file_path", "")) != expected_path
+            or str(getattr(node, "subject_version_id", ""))
+            != str(authority["current_version_id"] or "")
+            or int(getattr(node, "subject_document_revision", 0) or 0)
+            != int(authority["document_revision"] or 0)
+            or int(getattr(node, "subject_binding_revision", 0) or 0)
+            != int(authority["binding_revision"] or 0)
+            or str(getattr(node, "subject_content_sha256", ""))
+            != str(authority["content_hash"] or "")
+        ):
+            to_project.append(document_id)
+
+    for document_id in to_project:
         async with store.workspace_namespace_fence():
             await _project_locked(memory, store, document_id)
     async with store.workspace_namespace_fence():
+        # All authority rows at the starting frontier are now either proven
+        # current or projected from their exact head. _sync_index_locked still
+        # catches changes committed concurrently while recovery was running.
         memory._managed_index_frontier = start_frontier
         await _sync_index_locked(memory, store)
     return registered

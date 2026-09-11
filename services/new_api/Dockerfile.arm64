@@ -1,0 +1,10 @@
+# Build from the already verified ARM64 relay runtime bundle. The CA file is
+# copied from this deployment host's /etc/ssl/certs/ca-certificates.crt.
+FROM scratch
+COPY new-api-arm64 /usr/local/bin/new-api
+COPY libc.so.6 /lib/aarch64-linux-gnu/libc.so.6
+COPY ld-linux-aarch64.so.1 /lib/ld-linux-aarch64.so.1
+COPY ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+ENV LD_LIBRARY_PATH=/lib:/lib/aarch64-linux-gnu
+USER 1000:1000
+ENTRYPOINT ["/usr/local/bin/new-api"]

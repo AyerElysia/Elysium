@@ -277,6 +277,85 @@ async def test_stable_and_exact_endpoints_stay_distinct_and_do_not_adopt_legacy_
     assert ok and other["semantic_relation_count"] == 0
 
 
+async def test_exact_version_without_relation_offers_explicit_stable_endpoint_hint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    memory, _ = _reference_runtime(tmp_path, monkeypatch)
+    await _add(
+        _tool(NucleusRelationsTool),
+        source_ref="subject-file:doc_a",
+        target_ref="subject-file:doc_b",
+    )
+
+    ok, result = await _tool(NucleusRelationsTool).execute(
+        action="view", entity_ref="subject-file:doc_a@ver_a1",
+    )
+    assert ok and result["semantic_relation_count"] == 0
+    assert result["stable_relation_hint"] == {
+        "entity_ref": "subject-file:doc_a",
+        "matching_relation_count": 1,
+        "reason": (
+            "ExactVersionHasNoAnchoredRelations; "
+            "stable document endpoint is available by explicit choice"
+        ),
+    }
+
+
+async def test_sibling_version_relation_is_not_a_stable_endpoint_hint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    memory, store = _reference_runtime(tmp_path, monkeypatch)
+    await _add(
+        _tool(NucleusRelationsTool),
+        source_ref="subject-file:doc_a@ver_a1",
+        target_ref="subject-file:doc_b",
+    )
+    ok, sibling = await _tool(NucleusRelationsTool).execute(
+        action="view", entity_ref="subject-file:doc_a@ver_a2",
+    )
+    assert ok and sibling["matching_relation_count"] == 0
+    assert sibling["stable_relation_hint"] is None
+    ok, anchored = await _tool(NucleusRelationsTool).execute(
+        action="view", entity_ref="subject-file:doc_a@ver_a1",
+    )
+    assert ok and anchored["matching_relation_count"] == 1
+    assert anchored["stable_relation_hint"] is None
+    assert len(memory.recorded) == 1
+    store.get_version.assert_not_called()
+
+
+@pytest.mark.parametrize("has_stable_relation", [False, True])
+async def test_stable_hint_rechecks_authority_after_second_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    has_stable_relation: bool,
+) -> None:
+    memory, store = _reference_runtime(tmp_path, monkeypatch)
+    if has_stable_relation:
+        await _add(
+            _tool(NucleusRelationsTool),
+            source_ref="subject-file:doc_a",
+            target_ref="subject-file:doc_b",
+        )
+    read_page = memory.page_memory_semantic_relations
+
+    async def change_source_after_read(entity_ref: str, **kwargs: Any) -> Any:
+        result = await read_page(entity_ref, **kwargs)
+        if entity_ref == "subject-file:doc_a":
+            memory._memory_storage = object()
+        return result
+
+    monkeypatch.setattr(
+        memory, "page_memory_semantic_relations", change_source_after_read,
+    )
+    ok, result = await _tool(NucleusRelationsTool).execute(
+        action="view", entity_ref="subject-file:doc_a@ver_a1",
+    )
+    assert not ok
+    assert result["error"] == "SemanticRelationContinuationAuthorityChanged"
+    assert len(memory.recorded) == int(has_stable_relation)
+    store.get_version.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "bad_ref",
     [

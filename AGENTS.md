@@ -221,7 +221,7 @@ Elysium 中所有 `ConsciousnessInstance` 都是同一持续主体的局部运�
 
 这是当前部署的明确运维不变量：
 
-- Elysium 必须由用户手动启动；禁止为 Elysium 创建、启用或恢复 systemd、cron、登录脚本、Windows 启动项或其他自动拉起机制；
+- Elysium 默认由用户手动启动；禁止 cron、登录脚本、Windows 启动项或其他自动拉起机制。2026-09-09 用户明确要求 Spark 支持 `systemctl restart elysium`：仅该节点允许安装不启用自启动、`Restart=no` 的手工 systemd 控制单元；不得据此恢复其他节点服务或故障重拉；
 - Elysium 启动脚本必须是一次性前台入口，主进程退出后脚本必须同时退出并保留原始退出状态；禁止 `while` 重拉、tmux/supervisor 自恢复或其他隐式重启循环；
 - NapCat/QQNT 允许由具有明确 owner 的部署机制自动启动和自动恢复，不属于 Elysium 的手工启动禁令；
 - NapCat 自动恢复必须先用复合证据确认故障并核对准确 PID、父进程、运行目录、监听端口和现存实例；禁止仅凭单次状态异常重启、制造重复实例或形成无界重启循环；

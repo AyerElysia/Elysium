@@ -28,7 +28,6 @@ EXPECTED_TASK_BUDGETS = {
     "embedding": 8192,
     "router": 8192,
     "router_context_projection": 16000,
-    "live": 32000,
 }
 EXPECTED_CONTEXT_BUDGETS = {
     "core": 100000,
@@ -40,7 +39,6 @@ EXPECTED_CONTEXT_BUDGETS = {
     "vision": 100000,
     "router": 32000,
     "router_context_projection": 100000,
-    "live": 100000,
 }
 EXPECTED_ATTEMPT_TIMEOUTS = {
     "core": 180,
@@ -94,6 +92,7 @@ def test_fixture_defines_background_attempt_timeout_policy() -> None:
     fixture = ModelsConfig(Path(__file__).parents[1] / "fixtures" / "model_registry.toml")
 
     assert "learning" in PRODUCTION_MODEL_TASKS
+    assert "live" not in PRODUCTION_MODEL_TASKS
     assert {
         task_name: fixture.tasks[task_name].get("attempt_timeout_seconds")
         for task_name in EXPECTED_ATTEMPT_TIMEOUTS

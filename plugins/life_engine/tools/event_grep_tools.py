@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, Literal
 
 from src.app.plugin_system.api import log_api
 from src.app.plugin_system.base import BaseTool
+from src.core.models.media import MediaAttachment
 
 from ..service import LifeEngineService
 from ..service.event_builder import EventType
@@ -242,6 +244,11 @@ def _expand_event_types(event_types: list[str] | None) -> tuple[set[str], set[st
 
 
 def _is_life_internal_payload(payload: dict[str, Any]) -> bool:
+    # A named stream remains scoped even when its producer is life_chatter.
+    # The include_life_internal exception only adds unscoped global activity;
+    # it must not import another stream's tools, model turns or neighbors.
+    if str(payload.get("stream_id") or "").strip():
+        return False
     event_type = str(payload.get("event_type") or "").strip().lower()
     if event_type in {
         "heartbeat",
@@ -253,10 +260,9 @@ def _is_life_internal_payload(payload: dict[str, Any]) -> bool:
         return True
     source = str(payload.get("source") or "").strip().lower()
     content_type = str(payload.get("content_type") or "").strip().lower()
-    stream_id = str(payload.get("stream_id") or "").strip()
     if source in {"life_engine", "life_chatter"}:
         return True
-    return not stream_id and content_type in {
+    return content_type in {
         "proactive_opportunity",
         "dfc_message",
         "direct_message",
@@ -801,6 +807,8 @@ class LifeEngineGrepEventsTool(BaseTool):
         "时间：after/before（ISO）、last_hours/last_days、after_position/before_position、"
         "around_occurrence_id。扫不全时 stats.scan_truncated=true，用 scan.next_before_position 继续。\n"
         "窗口：source_instance_ids、stream_ids、cross_stream、channels、sources、chat_types。\n"
+        "限定 stream 时，include_life_internal 只附加无 stream_id 的全局内部活动；"
+        "其他具名流须显式列入 stream_ids 或使用 cross_stream。相邻上下文也遵守此范围。\n"
         "种类：event_types 接受原名或别名 thought/tool/chat 或事件源命名空间；"
         "content_types/kinds；exclude_event_types/exclude_sources。\n"
         "人：person（sender/sender_id/canonical_person_key/actor_id）、sender_ids、senders。\n"
@@ -824,7 +832,9 @@ class LifeEngineGrepEventsTool(BaseTool):
         ] = None,
         fields: Annotated[list[str] | None, "搜索字段；空则常用文本字段"] = None,
         include_pending: Annotated[bool, "是否包含尚未 checkpoint 的 pending"] = True,
-        include_life_internal: Annotated[bool | None, "限定 stream 时是否仍含 life 内部事件"] = None,
+        include_life_internal: Annotated[
+            bool | None, "限定 stream 时是否附加无 stream_id 的全局内部事件"
+        ] = None,
         limit: Annotated[int, "最大返回命中数"] = _DEFAULT_LIMIT,
         context_before: Annotated[int, "每条命中前带几条相邻事件"] = 1,
         context_after: Annotated[int, "每条命中后带几条相邻事件"] = 1,
@@ -1009,6 +1019,55 @@ class LifeEngineGrepEventsTool(BaseTool):
             return False, f"搜索事件流失败: {type(exc).__name__}: {exc}"
 
 
+class LifeEngineRecallContextTool(BaseTool):
+    """Retrieve relevant historical context through one small, stable tool schema.
+
+    The broad filtering implementation remains private so its options do not
+    consume context on every model request.  The exact event reader remains a
+    separate tool for deliberate full-content reads.
+    """
+
+    tool_name: str = "recall_context"
+    tool_description: str = (
+        "按需回查当前聊天流或明确指定范围内的历史事件。"
+        "默认只返回有界节选和 occurrence 引用；需要完整内容时用 nucleus_read_event。"
+        "历史账本只读，结果带分页 continuation；不会按相似度替主体裁决事实。"
+    )
+    chatter_allow: list[str] = ["life_engine_internal", "life_chatter"]
+
+    async def execute(
+        self,
+        query: Annotated[str, "关键词；留空表示按过滤条件浏览"] = "",
+        stream_id: Annotated[str | None, "限定一个聊天流；留空使用当前流"] = None,
+        cross_stream: Annotated[bool, "是否明确跨所有聊天流搜索"] = False,
+        event_types: Annotated[list[str] | None, "事件类型或 thought/tool/chat 别名"] = None,
+        after: Annotated[str | None, "ISO 时间或上一页之后的时间"] = None,
+        before: Annotated[str | None, "ISO 时间上界"] = None,
+        occurrence_id: Annotated[str | None, "围绕一个 occurrence 取邻域"] = None,
+        include_pending: Annotated[bool, "是否包含尚未 checkpoint 的事件"] = True,
+        limit: Annotated[int, "最多返回多少条，默认 8"] = 8,
+        continuation: Annotated[str, "上一页返回的 continuation"] = "",
+        max_bytes: Annotated[int | None, "结果 UTF-8 字节预算"] = None,
+    ) -> tuple[bool, dict[str, Any] | str]:
+        legacy = LifeEngineGrepEventsTool(plugin=getattr(self, "plugin", None))
+        legacy.chat_stream = getattr(self, "chat_stream", None)
+        return await legacy.execute(
+            query=query,
+            cross_stream=bool(cross_stream),
+            stream_ids=[stream_id] if str(stream_id or "").strip() else None,
+            event_types=event_types,
+            after=after,
+            before=before,
+            around_occurrence_id=occurrence_id,
+            include_pending=include_pending,
+            limit=max(1, min(int(limit or 8), 24)),
+            context_before=1,
+            context_after=1,
+            continuation=continuation,
+            max_bytes=max_bytes,
+        )
+
+
 async def _read_authoritative_event(
     service: LifeEngineService,
     occurrence_id: str,
@@ -1067,13 +1126,49 @@ async def _read_authoritative_event(
     }
 
 
+def _event_attachment_descriptors(event: Any) -> tuple[str, list[dict[str, Any]]]:
+    """Read only recorded chat descriptors, without fetching or granting media.
+
+    Missing historical metadata is not evidence of an attachment-free message.
+    Malformed recorded metadata fails rather than becoming a successful empty
+    view. Internal storage locators are excluded from the model projection;
+    the authoritative event remains unchanged.
+    """
+    metadata = getattr(event, "metadata", None)
+    if metadata is None:
+        return "not_recorded", []
+    if not isinstance(metadata, dict):
+        raise TypeError("invalid event metadata")
+    if "chat" not in metadata:
+        return "not_recorded", []
+    chat = metadata["chat"]
+    if not isinstance(chat, dict):
+        raise TypeError("invalid chat metadata")
+    if "attachments" not in chat:
+        return "not_recorded", []
+    attachments = chat["attachments"]
+    if not isinstance(attachments, list):
+        raise TypeError("invalid recorded attachment list")
+    descriptors: list[dict[str, Any]] = []
+    for item in attachments:
+        descriptor = MediaAttachment.from_descriptor(item).to_descriptor()
+        public_metadata = descriptor.get("metadata", {})
+        public_metadata.pop("storage_key", None)
+        if not public_metadata:
+            descriptor.pop("metadata", None)
+        descriptors.append(descriptor)
+    return "recorded", descriptors
+
+
 class LifeEngineReadEventTool(BaseTool):
-    """Read one complete immutable Life Event through stable UTF-8 chunks."""
+    """Read an immutable event body or attachment references in UTF-8 chunks."""
 
     tool_name: str = "nucleus_read_event"
     tool_description: str = (
-        "按潜意识投影给出的 occurrence_id 精确读取一条完整 Life Event。"
+        "按潜意识投影给出的 occurrence_id 精确读取 Life Event 正文。"
         "当事件投影显示 excerpt_ref、content_ref 或原文过长时使用；"
+        "view=attachments 分页读取已记录的附件描述符 JSON，不返回媒体原件，"
+        "不表示原件仍可用，也不授予媒体访问权限。"
         "continuation 用于继续读取同一不可变事件，不能跨事件复用。"
     )
     chatter_allow: list[str] = ["life_engine_internal", "life_chatter"]
@@ -1092,8 +1187,14 @@ class LifeEngineReadEventTool(BaseTool):
             int | None,
             "可选结果字节预算；不能突破当前任务硬上限",
         ] = None,
+        view: Annotated[
+            Literal["content", "attachments"],
+            "content 读取正文；attachments 读取附件描述符 JSON，分段内容须拼接后解析",
+        ] = "content",
     ) -> tuple[bool, dict[str, Any] | str]:
         try:
+            if view not in {"content", "attachments"}:
+                raise ValueError("unsupported event read view")
             service = LifeEngineService.get_instance()
             if service is None:
                 raise RuntimeError("life_engine 服务不可用")
@@ -1104,6 +1205,34 @@ class LifeEngineReadEventTool(BaseTool):
             if event is None:
                 return False, "未找到对应的 Life Event occurrence"
             identity = str(getattr(event, "occurrence_id", "") or occurrence_id)
+            if view == "attachments":
+                state, descriptors = _event_attachment_descriptors(event)
+                content = json.dumps(descriptors, ensure_ascii=False, sort_keys=True)
+                return True, project_bounded_text(
+                    projection_name="life-event-attachment-read",
+                    task_name=getattr(self, "_runtime_task_name", ""),
+                    requested_max_bytes=max_bytes,
+                    binding={"occurrence_id": identity, "view": view},
+                    frontier={
+                        **frontier,
+                        "attachment_state": state,
+                        "attachments_sha256": sha256_json(descriptors),
+                    },
+                    base_payload={
+                        "action": "read_life_event",
+                        "view": view,
+                        "occurrence_id": identity,
+                        "content_format": "application/json",
+                        "attachment_state": state,
+                        "attachment_count": len(descriptors),
+                        "original_bytes_included": False,
+                        "reference_resolution": "not_attempted",
+                        "excluded_fields": ["metadata.storage_key"],
+                    },
+                    content=content,
+                    content_ref=f"life-event-occurrence:{identity}",
+                    continuation=continuation,
+                )
             content = _authoritative_event_content(event)
             projected = project_bounded_text(
                 projection_name="life-event-authority-read",
@@ -1113,6 +1242,7 @@ class LifeEngineReadEventTool(BaseTool):
                 frontier=frontier,
                 base_payload={
                     "action": "read_life_event",
+                    "attachments_read_view": "attachments",
                     "occurrence_id": identity,
                     "event_id": str(getattr(event, "event_id", "") or ""),
                     "event_type": str(getattr(event, "event_type", "") or ""),
@@ -1146,6 +1276,6 @@ class LifeEngineReadEventTool(BaseTool):
 
 
 EVENT_GREP_TOOLS = [
-    LifeEngineGrepEventsTool,
+    LifeEngineRecallContextTool,
     LifeEngineReadEventTool,
 ]

@@ -1049,7 +1049,11 @@ class LifeEngineReadFileTool(BaseTool):
         "- 日记、追加记录看最新一段：`from_end=true`。\n"
         "- 已经知道大概位置：`offset` 从第几行起，`limit` 读几行。\n"
         "- 先 `nucleus_grep_file` 要命中行，再按行号读周围。\n"
-        "- 确实要全文：`limit=0`。被截断时看 remaining_lines / next_offset 再续。\n"
+        "- 确实要全文：`limit=0`，此时忽略 offset / from_end 并选择整份文件。\n"
+        "- source_selection_truncated 表示行窗口是否遗漏文件开头或结尾；"
+        "truncated/continuation 只描述该窗口的传输分页，不能单独证明全文已读。\n"
+        "- 全文核验需同一版本、完整行范围及完整传输页；用 remaining_lines_before "
+        "/ remaining_lines / next_offset 定位未选行，续传页保持原参数与引用。\n"
         "\n"
         "**注意：** 结果每行是 `行号<TAB>正文`。行号只用于定位。"
         "`nucleus_edit_file` / `nucleus_apply_patch` 的文本必须是去掉行号之后的原文，"
@@ -1199,6 +1203,7 @@ class LifeEngineReadFileTool(BaseTool):
                 "size_human": _format_size(source_size),
                 "source_file_bytes": source_size,
                 "file_content_sha256": file_sha256,
+                "source_selection_truncated": start_idx > 0 or end_idx < total_lines,
                 **({"subject_version_id": version.version_id,
                     "source_authority": "subject_document_store"} if version else {}),
             }
@@ -1217,7 +1222,6 @@ class LifeEngineReadFileTool(BaseTool):
             if start_idx > 0:
                 base_payload["remaining_lines_before"] = start_idx
             if end_idx < total_lines:
-                base_payload["source_selection_truncated"] = True
                 base_payload["remaining_lines"] = total_lines - end_idx
                 base_payload["next_offset"] = end_idx + 1
 

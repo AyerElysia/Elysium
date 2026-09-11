@@ -192,7 +192,7 @@ class TestModelTasksSection:
         assert hasattr(tasks, "voice")
         assert hasattr(tasks, "embedding")
         assert hasattr(tasks, "router")
-        assert hasattr(tasks, "live")
+        assert not hasattr(tasks, "live")
 
     def test_get_legacy_alias_resolves_canonical_task(self):
         """旧任务名应解析到对应的 canonical 配置。"""

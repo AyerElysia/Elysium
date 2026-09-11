@@ -5077,7 +5077,13 @@ class LifeEngineService(BaseService):
             # Pre-refactor rows were an atomic pair. Reuse their exact chat
             # evidence, without rewriting it or appending a third occurrence.
             comparable = replace(
-                previous, sequence=0, source_sequence=0, recorded_at=""
+                previous,
+                sequence=0,
+                source_sequence=0,
+                recorded_at="",
+                # 重复投递（KOOK 重连补发）会重新生成 timestamp；内容一致即视为
+                # 同一条消息，不应判为 occurrence 冲突。比较时对齐时间戳。
+                timestamp=chat_fact.timestamp,
             )
             if comparable != chat_fact:
                 raise LifeEventOccurrenceConflict(chat_fact.occurrence_id)
@@ -6507,6 +6513,11 @@ class LifeEngineService(BaseService):
         if queued:
             async with self._get_lock():
                 unlocked_self_pause = _apply_inbound_runtime_side_effects()
+            # 有新的入站事件入队时必须唤醒消费者；否则心跳循环会一直阻塞在
+            # _opportunity_wake_event.wait() 上（该事件此前只在启动/关闭时 set），
+            # 导致消息被积压、永不处理、爱莉不回复。
+            if self._opportunity_runtime is not None:
+                self._opportunity_wake_event.set()
         _phase_enqueue = time.monotonic() - _phase_start
         if self._message_persist_async_enabled():
             self._schedule_message_persist(event, chat_fact)
@@ -9468,7 +9479,7 @@ class LifeEngineService(BaseService):
             if omitted_event_count:
                 event_text = (
                     f"（潜意识已压缩 {omitted_event_count} 条低显著 life 事件；"
-                    "需要时用 grep_life_events 检索历史事件。）\n"
+                    "需要时用 recall_context 检索历史事件。）\n"
                     f"{event_text}"
                 )
             sections.append(f"### 新增 life 事件流\n{event_text}")

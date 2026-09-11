@@ -1180,9 +1180,9 @@ class LifeEngineConfig(BaseConfig):
         )
 
         max_rounds_per_chat: int = Field(
-            default=5,
-            ge=1,
-            description="对话模式单轮最大工具调用轮数。",
+            default=0,
+            ge=0,
+            description="对话模式单轮最大工具调用轮数；0 表示不限轮数，正数保留显式上限。",
         )
 
         initial_history_messages: int = Field(

@@ -7,7 +7,13 @@
 # port 9880 and GPU memory after the plugin reports a successful shutdown.
 set -euo pipefail
 
-gpt_sovits_root="${GPT_SOVITS_ROOT:-/root/GPT-SoVITS}"
+# The plugin starts this script inside its configured server_dir. Honour that
+# verified runtime directory on migrated hosts; retain the legacy WSL default.
+default_gpt_sovits_root=/root/GPT-SoVITS
+if [[ -f "$PWD/api_v2.py" && -d "$PWD/GPT_SoVITS" ]]; then
+  default_gpt_sovits_root="$PWD"
+fi
+gpt_sovits_root="${GPT_SOVITS_ROOT:-$default_gpt_sovits_root}"
 listen_address="${GPT_SOVITS_ADDRESS:-127.0.0.1}"
 listen_port="${GPT_SOVITS_PORT:-9880}"
 approved_gpt_checkpoint="${GPT_SOVITS_GPT_CHECKPOINT:-$gpt_sovits_root/GPT_weights_v2ProPlus/hiely-e25.ckpt}"

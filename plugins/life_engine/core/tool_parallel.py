@@ -12,7 +12,7 @@ _PARALLEL_SAFE_TOOL_NAMES: frozenset[str] = frozenset(
         "grep_life_events",
         "nucleus_browser_fetch",
         "tool-nucleus_browser_fetch",
-        "nucleus_grep_events",
+        "recall_context",
         "nucleus_grep_file",
         "nucleus_list_files",
         "nucleus_list_schedules",

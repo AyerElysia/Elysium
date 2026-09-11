@@ -329,7 +329,13 @@ MySQL 模式并不意味着把 Chroma 或媒体字节强行塞入关系表：Lif
 
 同一本地后端、同一 SQLite 端点、同一 authority registry 上只更换 verified generation identity（例如 `local-selectable-20260823-v2` → `local-selectable-20260824-v3`）时，这不是后端迁移。启动路径必须失败关闭并报告 `ProactiveGenerationRepairRequired`，不得把残留的后端迁移证书解读成新 generation 的证明。运维窗口使用 `scripts/repair_proactive_generation_binding.py --apply` 追加无内容 repair 证书并改绑 cache；该命令不改写主体文件或主动历史行。根哈希或后端端点不一致时必须拒绝，改走完整冻结复制。
 
-引导 copy 只写入历史和 copy 证书，不写入 binding 链。若生产 sqlite 是从候选文件搬过来的，证书仍记录候选路径 identity，JSON cache 也不是权威。此时启动必须失败关闭；运维使用 `scripts/repair_proactive_generation_binding.py --complete-initial-binding --apply --certificate-backend-identity-sha256 <证书中的旧路径哈希>`，以 leftover 源 sqlite 的 certified binding 完成首次生产绑定。禁止把 workspace JSON cache 提升成 chain。
+引导 copy 只写入历史和 copy 证书，不写入 binding 链。仅当 chain 仍空且 copy 证书证明当前历史时，才可进行首次生产绑定；若此时生产 sqlite 从候选文件搬来，证书仍记录候选路径 identity，JSON cache 也不是权威。启动必须失败关闭；运维在满足这些前提后使用 `scripts/repair_proactive_generation_binding.py --complete-initial-binding --apply --certificate-backend-identity-sha256 <证书中的旧路径哈希>`，以 leftover 源 sqlite 的 certified binding 完成首次生产绑定。禁止把 workspace JSON cache 提升成 chain。
+
+已经完成绑定并继续产生历史的库换主机/绝对路径时，不属于上述首次绑定，也不属于同端点 generation 修复。SQLite identity 及 file authority identity 含解析后的路径；即使文件原样复制，它们也会变化。旧 generation 的 proactive root 是当次冻结复制的证明，不应随日常活动改写；同一绑定端点允许历史继续增长，但重绑定不能拿旧复制证书证明新历史。此时可能先报 `ProactiveMigrationGenerationRootMismatch`，不能据此把 registered root 改成当前 root、删链、改 marker 或套用 `--complete-initial-binding`。先保全两端完整数据和新增历史、确认唯一 writer，再做经核验的新迁移。09-09 Spark 的具体证据见 [迁移位置与运行入口复核](../report/Spark迁移位置与运行入口复核_2026-09-09.md)。
+
+跨机比较不能把 Core `messages.id` 等本地自增编号当作全局消息身份或唯一复制前沿。先比较共同区间的稳定 `message_id`、内容与元数据；若同号记录分叉，沿稳定身份检查双方整表是否已有，并保全两端独有记录。只看行数、max(id) 或某一生命账本的领先关系，不足以授权全项目单向覆盖。合并/重放还须验证依赖引用、归属、冲突与跨域一致性，不能以重编号或覆盖来掩盖缺口。
+
+对于已接入统一聊天事件协议的 Core 消息，应按该协议的 `metadata.chat.message_id`、`metadata.provider_identity.message_id` 及明确登记的等价映射核对来源。未命中 ID 时先标记“尚未建立该映射”，不能仅凭字符串扫描就断言所有历史归因不存在；旧协议、嵌入式序列化、其它表/归档与不同通道仍须按实际合同检查。不得把看似相近的正文、时间或本地编号自动合并成同一经历。保全两端原记录和映射证据后，由明确的迁移步骤处理重复、冲突和回放顺序。
 
 `action-report_state` 的提交目标是不可变 Life Event 与 World assertion，用于记录有来源的场景、关系或状态观察；它不是 `MEMORY.md` 主体文档写入。要修改 MySQL 中的 `MEMORY.md` current head，聊天意识必须走下述主体候选复盘与明确接受流程，不能把 World assertion 回执表述为主体文档已更新。
 
@@ -529,12 +535,11 @@ temp = 0.7
 - `tasks.expression`：Life Chatter 对话表达模型。文本请求优先使用 `config/models.toml` 任务列表的首个模型；聊天请求可能直接携带图片/表情，`LLMRequest` 会在发送前按 payload 媒体模态把 `models` 列表过滤到支持对应模态的成员，因此列表内**必须至少保留一个声明并真实支持 `vision = true` 的模型**承接识图，不能换成纯文本单模型。
 - `witness`、`agent`、`utility`、`router`、`router_context_projection` 等任务：根据能力和成本选择纯文本模型。
 - `vision`：显式图片/视频观察任务，只能绑定经过媒体协议验收的多模态模型。
-- `live`：场景任务可能携带多模态感知；没有完成场景级媒体路由核对前，按多模态任务管理，不随纯文本模型批量切换。
 - `voice`：ASR 任务。
 - `tts`：TTS 任务。
 - `embedding`：向量模型；当前生产注册表要求任务非空，暂不启用时应配置一个经过验证的模型或显式关闭其消费子系统，不能留下空路由。
 
-切换文本 Provider 时应按任务逐项变更，不能全局替换现有模型别名。尤其要保留 `expression`、`vision`、`live`、`voice`、`tts` 和 `embedding` 的能力边界，除非新 Provider 已分别完成图片、场景媒体、ASR、TTS 与 Embeddings 契约验收。Provider 套餐若限制调用场景（例如仅授权 AI 编程工具），部署者还必须先核对服务条款；配置可解析不代表业务用途已获授权。
+切换文本 Provider 时应按任务逐项变更，不能全局替换现有模型别名。尤其要保留 `expression`、`vision`、`voice`、`tts` 和 `embedding` 的能力边界，除非新 Provider 已分别完成图片、ASR、TTS 与 Embeddings 契约验收。直播场景复用 `expression`（导演配置默认 `actor`），不再使用独立的 `tasks.live`。Provider 套餐若限制调用场景（例如仅授权 AI 编程工具），部署者还必须先核对服务条款；配置可解析不代表业务用途已获授权。
 
 示例：
 
@@ -651,10 +656,12 @@ chatter_task_name = "expression"
 [chatter]
 enabled = true
 mode = "enhanced"
-max_rounds_per_chat = 5
+max_rounds_per_chat = 0 # 不因工具轮数强制收束
 ```
 
 Windows 下建议在 TOML 路径中使用正斜杠；若使用反斜杠，则需在双引号字符串中转义。`workspace_path` 应替换为当前部署环境的实际绝对路径。
+
+`max_rounds_per_chat` 默认 `0`，表示不设置累计表达／工具轮数上限，包括同一表达链的上下文维护轮；仍逐轮保存并让出调度，不启动无等待忙循环。正数保留显式运维上限，负数配置非法。取消、模型请求超时、上下文硬预算、主体检查点、主动 `pass_and_wait`、可见回复后的去重收束与未知投递阻断均不因此取消。它不改变潜意识心跳或独立子代理的预算。已有部署不会静默覆盖旧的正数配置；需显式设为 `0` 并在授权的重启后核验。不限轮数可能增加请求次数、费用及单链占用时间。
 
 ### 8.1 `SOUL.md` 是表达硬前提
 
@@ -1072,6 +1079,29 @@ PowerShell：
 .\deploy.ps1 run
 ```
 
+### 11.1.1 Spark 迁移实例（当前现场）
+
+Spark 主机 `spark-f3b0` 的正式目录是 `/home/ayerelysia/Elysia/Elysium`。2026-09-09 晚用户明确要求补充 `elysia-attach` 和手动 `systemctl restart elysium`。截至 2026-09-10 00:10，`ayerelysia` 的 `~/.local/bin/elysia-attach` 已安装，自动识别原有 `elysium` tmux 会话或系统服务专属会话；不会启动、重启或创建第二个本体。`elysium.service` 与安装器已准备并通过临时服务测试，但管理员认证尚未完成，系统级单元仍为 `not-found`，不可宣称已安装。
+
+```bash
+cd /home/ayerelysia/Elysia/Elysium
+elysia-attach             # 本体控制台；Ctrl+B 后按 D 只断开查看
+elysia-attach heartbeat   # 独立心跳查看，不启动本体
+elysia-attach status      # 系统服务状态与实际控制台 PID
+```
+
+若当前 shell 尚未加载 `~/.local/bin`，可以重新登录，或直接运行 `/home/ayerelysia/.local/bin/elysia-attach`。系统级入口需操作者在 Spark 终端执行一次（密码只输入当地 sudo 提示，不发送给 agent）：
+
+```bash
+sudo bash /home/ayerelysia/Elysia/Elysium/scripts/install_spark_controls.sh
+```
+
+安装器只注册系统服务和全局连接命令，不 start/restart/enable，不修改运行数据库或停止现有实例。原 tmux 实例仍运行时，第一次切换必须先 `elysia-attach`，在该控制台按 `Ctrl+C` 并等待完整关闭，然后执行 `sudo systemctl restart elysium`。之后按需使用 `sudo systemctl start/stop/restart elysium`；root shell 可省略 sudo。不要在仍有旧实例时启动第二个服务，启动前置锁检查会明确拒绝。
+
+服务设置 `Restart=no`、无 `[Install]` 段，无开机/登录自启动和故障重拉。系统追踪一个前台退出状态转发器，它只启动一次 tmux 主进程，使用 pidfd 将停止信号传给准确子进程；主进程退出后返回真实退出码。tmux 专属 socket 是 `/run/elysium/tmux.sock`，停止超时不强杀未知进程，不复用其他 tmux server。`systemctl active` 仅说明进程运行，初始化和应用健康仍需分别核验。
+
+WSL 的 `/root/Elysia/Elysium` 是保留源副本，不与 Spark 同时启动，也不能把其健康状态当作 Spark 验收。实施记录见 [Spark 手工控制入口](../report/Spark手工控制入口_2026-09-10.md)。
+
 Linux / WSL / Git Bash：
 
 ```bash
@@ -1083,7 +1113,7 @@ Linux / WSL / Git Bash：
 
 ### 11.2 Elysium 只允许手工前台启动
 
-Elysium 主进程必须由用户在可观察的终端或 VS Code 终端手工启动。当前部署明确禁止为 Elysium 配置 systemd、Windows 服务、计划任务、登录启动项、shell profile 自动命令或其他守护拉起。某些临时后台方式还会因 stdin EOF 或会话退出造成“看似启动、很快消失”，同样不作为 Elysium 的正式启动方式。
+Elysium 默认由用户在可观察的终端或 VS Code 终端手工启动。Spark 已获用户明确批准使用上述手工 systemd 控制入口，这不是自动拉起授权；其他节点仍不得擅自恢复 systemd。Windows 服务、计划任务、登录启动项、shell profile 自动命令和故障重拉继续禁止。入口必须保留前台生命周期与真实退出结果。
 
 NapCat/QQNT 可以由具有明确 owner 的部署机制自动启动和自动恢复。自动恢复必须使用持续的复合故障证据，核对 PID、父进程、运行目录、监听端口和现存实例，并采用有界退避；禁止仅凭单次 `online=false`、单次心跳异常或本地端口状态形成重启循环。
 
@@ -1319,7 +1349,7 @@ uv: command not found
 - 本地中转站若只有某个渠道持续返回固定 403，应先确认渠道协议或客户端限制；确认永久不兼容后只停用该渠道并保留其他同模型渠道，不要靠延长超时或无限重试掩盖错误。
 - New API 同时维护 `channels` 与派生 `abilities` 路由；停用渠道时必须让对应 ability 一并失效并验证真实请求不再选中它。没有任何健康 ability 的模型应暂时移出自动任务候选，但可继续保留注册信息用于恢复探针。
 - **MiMo 只能走小米渠道。** `mimo-v2.5` / `mimo-v2.5-pro` 不得出现在 OpenCode / Console Go / Zen 渠道的 `models` 或 `abilities` 中。检查与修复：`python scripts/pin_mimo_to_xiaomi_channel.py --db /root/Elysia/new-api/one-api.db`（只读），确认后加 `--apply`，再按运维规范重载 New API。不要为此重启 Elysium。
-- **OpenCode 渠道必须自带 `x-opencode-session`。** Console Go 缺该头会 400 `MissingSessionID`，Qwen/GLM 等只挂在该渠道的模型会全部失败。会话头只写在 New API 渠道 48 的 `header_override`，不要加到小米渠道，也不要借此把 MiMo 加回 OpenCode。
+- **OpenCode 渠道已删除。** 2026-09-11 删除 New API 渠道 48（`OpenCode-Go-New-1`，上游 `opencode.ai/zen/go`），因其月度额度 429。DeepSeek flash 改走 A6 的 `deepseek-v4.1-flash`。若再接入 Console Go，必须在该渠道 `header_override` 自带 `x-opencode-session`，不要加到小米渠道，也不要借此把 MiMo 加回 OpenCode。
 
 ### 14.6 429/502/超时
 
@@ -1530,3 +1560,4 @@ config/
 | 2026-08-09 | 阶段三 P3-11/P3-12/P3-13 | 接入管理总览/访问/集成/jobs 与 consciousness/world/memory/commitments/autonomy/surfaces/abilities 端点，补全 scope×resource 权限矩阵、限流与并发/上传/WS 预算、秘密扫描与故障恢复测试；管理路由要求全能管理员身份；明确部分管理领域（chat 管理、voice 监督、media 管理、tabletop 裁判台、memory 详情）仍为 planned/experimental |
 | 2026-08-09 | 阶段三 P3-14 | 旧插件路由声明弃用并附加 Deprecation/Sunset/Link 头（迁移期至 2027-02-01，不自动删除）；生成完整 OpenAPI（134 操作、无重复 operation id）与事件目录/错误码/权限矩阵/前端示例文档；本轮仅离线契约与文档，未做真实前端/Provider E2E |
 | 2026-08-11 | 依赖修复 | `life_engine` 加载失败修复：SQLAlchemy 2.0.46 的 asyncmy pre-ping 缺参 bug（issue #13306）已通过升级到 2.0.51 解决；在 4.2 补充 SQLAlchemy ≥2.0.50 版本要求与脏 pymysql 环境说明 |
+| 2026-09-10 | Spark 启动优化 | life_engine 启动恢复按主体版本/绑定版本/内容哈希跳过已一致投影，仅重建变化文档；避免 Spark 每次启动逐个重建全部历史文档。 |

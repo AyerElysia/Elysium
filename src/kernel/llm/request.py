@@ -17,12 +17,12 @@ import json
 import math
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from typing import Any, Self
 
 from src.kernel.llm.payload.tooling import LLMUsable
 from src.kernel.logger import get_logger
 
+from .attempt_budget import effective_attempt_timeout, mark_attempt_started
 from .context import LLMContextManager
 from .context_delivery import (
     ContextDeliveryExpectation,
@@ -778,12 +778,19 @@ class LLMRequest:
             assert self.clients is not None
             client = self.clients.get_client_for_model(model)
 
+            # Bound each transport attempt by the caller-owned model-turn budget.
+            # If the budget is already exhausted, fail before contacting or
+            # cooling an untouched fallback model.
+            timeout_seconds = effective_attempt_timeout(
+                model.get("timeout"), model_count=len(model_set)
+            )
+            mark_attempt_started()
+
             # 开始计时
             timer = RequestTimer()
 
             try:
                 with timer:
-                    timeout_seconds = model.get("timeout")
                     force_stream_mode = bool(model.get("force_stream_mode", False))
                     effective_stream = stream or force_stream_mode
                     attempt_deadline = _new_attempt_deadline(timeout_seconds)
@@ -929,12 +936,6 @@ class LLMRequest:
                     if _state.get("recorded"):
                         return
                     _state["recorded"] = True
-                    if stream_error is None:
-                        # Public, content-free identity of this completed attempt.
-                        # A failed stream never supplies a success identity.
-                        response_obj.final_request_id = request_id
-                        response_obj.final_attempt_id = _attempt_id
-                        response_obj.final_completed_at = datetime.now(UTC).isoformat()
                     record_attempt(
                         attempt_id=_attempt_id,
                         parent_attempt_id=_parent_attempt_id,

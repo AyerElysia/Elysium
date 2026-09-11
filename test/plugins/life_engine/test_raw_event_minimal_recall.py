@@ -8,7 +8,7 @@ The shared lab never starts Elysium and forbids external network connections.
 from __future__ import annotations
 
 import asyncio
-
+import json
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
@@ -18,16 +18,21 @@ import pytest
 from plugins.life_engine.service.chat_events import build_chat_message_event
 from plugins.life_engine.service.core import LifeEngineService
 from plugins.life_engine.service.event_handler import LifeEngineMessageCollectorHandler
-from plugins.life_engine.service.subconscious_ingest import SUBCONSCIOUS_INGEST_CONSUMER_ID
+from plugins.life_engine.service.subconscious_ingest import (
+    SUBCONSCIOUS_INGEST_CONSUMER_ID,
+)
 from plugins.life_engine.tools.event_grep_tools import (
     LifeEngineGrepEventsTool,
     LifeEngineReadEventTool,
     grep_life_events,
 )
 from src.core.components.types import EventType as TransportEventType
+from src.core.models.media import MediaAttachment, MediaSegmentType
 from src.kernel.event import EventDecision
+from src.kernel.llm.payload.media import MediaRef
 
-from .test_event_stream_simulation import InteractionLab, _message, lab as lab
+from .test_event_stream_simulation import InteractionLab, _message
+from .test_event_stream_simulation import lab as lab
 
 
 def _bind_service(monkeypatch: pytest.MonkeyPatch, service: Any) -> None:
@@ -41,11 +46,15 @@ def _bind_service(monkeypatch: pytest.MonkeyPatch, service: Any) -> None:
 
 @pytest.mark.parametrize("store", [None, SimpleNamespace()])
 async def test_unavailable_ledger_does_not_masquerade_as_complete_empty_history(
-    monkeypatch, store,
+    monkeypatch,
+    store,
 ):
     service = SimpleNamespace(
-        _life_event_store=store, _event_bus=None, _event_history=[],
-        _pending_events=[], _lock=asyncio.Lock(),
+        _life_event_store=store,
+        _event_bus=None,
+        _event_history=[],
+        _pending_events=[],
+        _lock=asyncio.Lock(),
     )
     service._get_lock = lambda: service._lock
     _bind_service(monkeypatch, service)
@@ -55,7 +64,9 @@ async def test_unavailable_ledger_does_not_masquerade_as_complete_empty_history(
     assert result["stats"]["retrieval_scope"] == "runtime_only_incomplete"
 
 
-def _recall_tools(service: Any) -> tuple[LifeEngineGrepEventsTool, LifeEngineReadEventTool]:
+def _recall_tools(
+    service: Any,
+) -> tuple[LifeEngineGrepEventsTool, LifeEngineReadEventTool]:
     grep = LifeEngineGrepEventsTool(plugin=service.plugin)
     reader = LifeEngineReadEventTool(plugin=service.plugin)
     grep._runtime_task_name = "core"
@@ -90,7 +101,9 @@ async def test_recent_raw_event_recalled_after_restart_without_witness(
     lab: InteractionLab,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    content = "  RAW-RECENT-FIXTURE: engineering evidence only.\n" + "细节🪷" * 600 + "\n "
+    content = (
+        "  RAW-RECENT-FIXTURE: engineering evidence only.\n" + "细节🪷" * 600 + "\n "
+    )
     message = _message("raw-recent", content=content)
     service = lab.service
     assert service.plugin.config.memory_witness.enabled is False
@@ -141,6 +154,36 @@ async def test_recent_raw_event_recalled_after_restart_without_witness(
     assert len(await lab.store.read_since(0)) == 1
 
 
+async def test_media_attachment_descriptor_enters_ledger_and_survives_replay(
+    lab: InteractionLab,
+) -> None:
+    attachment = MediaAttachment(
+        MediaSegmentType.IMAGE,
+        MediaRef.from_bytes(
+            b"\x89PNG\r\n\x1a\nRAW-BYTES-NOT-IN-DESCRIPTOR",
+            kind="image",
+            mime_type="image/png",
+            source_message_id="ledger-media-message",
+        ),
+        resource_id="media-ledger-1",
+    )
+    message = _message("ledger-media-message", attachments=[attachment])
+    await lab.service.record_message(message)
+    await lab.flush()
+
+    rows = await lab.store.read_since(0)
+    assert len(rows) == 1
+    row = rows[0]
+    descriptor = row.metadata["chat"]["attachments"][0]
+    assert descriptor["metadata"]["resource_id"] == "media-ledger-1"
+    assert "RAW-BYTES-NOT-IN-DESCRIPTOR" not in json.dumps(descriptor)
+    assert "base64" not in json.dumps(descriptor).lower()
+
+    replayed = await lab.store.get_by_occurrence_id(row.occurrence_id)
+    assert replayed is not None
+    assert replayed.metadata["chat"]["attachments"][0] == descriptor
+
+
 async def test_raw_grep_keeps_distinct_occurrences_with_same_source_event_id(
     lab: InteractionLab,
     monkeypatch: pytest.MonkeyPatch,
@@ -179,9 +222,10 @@ async def test_raw_grep_keeps_distinct_occurrences_with_same_source_event_id(
     assert ok is True, result
     assert isinstance(result, dict)
     assert result["stats"]["matched_events"] == 2
-    assert {
-        match["event"]["occurrence_id"] for match in result["matches"]
-    } == {first.occurrence_id, second.occurrence_id}
+    assert {match["event"]["occurrence_id"] for match in result["matches"]} == {
+        first.occurrence_id,
+        second.occurrence_id,
+    }
     assert await _read_complete(reader, first.occurrence_id) == first.content
     assert await _read_complete(reader, second.occurrence_id) == second.content
 
@@ -235,7 +279,9 @@ async def test_legacy_read_alias_cannot_return_a_different_occurrence(
     )
     _bind_service(monkeypatch, service)
     _, reader = _recall_tools(service)
-    ok, failure = await reader.execute(occurrence_id="wanted-occurrence", max_bytes=4096)
+    ok, failure = await reader.execute(
+        occurrence_id="wanted-occurrence", max_bytes=4096
+    )
     assert ok is False
     assert failure == "读取 Life Event 失败: RuntimeError"
     assert "PRIVATE-WRONG-EVENT" not in failure

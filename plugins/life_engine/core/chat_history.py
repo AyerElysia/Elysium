@@ -271,7 +271,7 @@ async def collect_global_chat_history_entries_from_db(
     excluded = {str(item) for item in (exclude_message_ids or set()) if str(item)}
 
     try:
-        records = await QueryBuilder(Messages).order_by("-id").limit(scan_limit).all()
+        records = await QueryBuilder(Messages).order_by("-time", "-id").limit(scan_limit).all()
     except Exception:
         return []
     if not records:

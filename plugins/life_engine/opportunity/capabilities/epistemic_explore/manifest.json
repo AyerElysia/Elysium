@@ -8,7 +8,7 @@
   "default_skill": "DEFAULT_SKILL.md",
   "operations": [
     "nucleus_search_memory",
-    "nucleus_grep_events",
+    "recall_context",
     "nucleus_web_search",
     "nucleus_browser_fetch"
   ],

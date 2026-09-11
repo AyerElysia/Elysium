@@ -5,8 +5,6 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-import pytest
-
 from src.core.managers.stream_manager import _serialize_content_for_db
 from src.core.models.message import Message
 from src.core.models.stream import ChatStream
@@ -164,6 +162,7 @@ async def test_db_message_to_runtime_fallback_to_content_when_plain_text_missing
         time=1700000000.0,
         reply_to=None,
         content="bot reply",
+        media_attachments=None,
         processed_plain_text=None,
         message_type="text",
         platform="qq",
@@ -213,6 +212,7 @@ async def test_db_message_to_runtime_uses_bot_name_for_bot_message(monkeypatch) 
         time=1700000001.0,
         reply_to=None,
         content="bot self message",
+        media_attachments=None,
         processed_plain_text="bot self message",
         message_type="text",
         platform="qq",
@@ -363,15 +363,15 @@ async def test_load_stream_context_respects_context_cleared_at(monkeypatch) -> N
     class _FakeQuery:
         def __init__(self) -> None:
             self.filters: list[dict[str, object]] = []
-            self.order: str | None = None
+            self.order: tuple[str, ...] | None = None
             self.limit_value: int | None = None
 
         def filter(self, **kwargs):
             self.filters.append(kwargs)
             return self
 
-        def order_by(self, value: str):
-            self.order = value
+        def order_by(self, *values: str):
+            self.order = values
             return self
 
         def limit(self, value: int):
@@ -392,7 +392,7 @@ async def test_load_stream_context_respects_context_cleared_at(monkeypatch) -> N
     assert context.stream_id == "stream-clear-002"
     assert {"stream_id": "stream-clear-002"} in fake_query.filters
     assert {"time__gt": 50.0} in fake_query.filters
-    assert fake_query.order == "-id"
+    assert fake_query.order == ("-time", "-id")
     assert fake_query.limit_value == 20
 
 
@@ -417,6 +417,7 @@ async def test_load_stream_context_bulk_hydrates_repeated_senders(monkeypatch) -
             time=float(index),
             reply_to=None,
             content=f"content-{index}",
+            media_attachments=None,
             processed_plain_text=f"text-{index}",
             message_type="text",
             platform=platform,
@@ -433,7 +434,7 @@ async def test_load_stream_context_bulk_hydrates_repeated_senders(monkeypatch) -
         def filter(self, **_kwargs):
             return self
 
-        def order_by(self, _value: str):
+        def order_by(self, *_values: str):
             return self
 
         def limit(self, _value: int):

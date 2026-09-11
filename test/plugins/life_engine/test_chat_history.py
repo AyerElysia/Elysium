@@ -62,6 +62,7 @@ async def test_global_history_batches_metadata_without_per_message_queries(
             return self
 
         def order_by(self, *_args: object) -> _QueryBuilder:
+            assert _args == ("-time", "-id")
             return self
 
         def limit(self, *_args: object) -> _QueryBuilder:

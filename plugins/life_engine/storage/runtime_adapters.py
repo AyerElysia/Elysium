@@ -42,8 +42,12 @@ def _payload_json(payload: dict[str, Any]) -> tuple[str, str]:
     if not isinstance(payload, dict):
         raise TypeError("runtime payload must be an object")
     encoded = canonical_json(payload)
-    if len(encoded.encode("utf-8")) > _MAX_PAYLOAD_BYTES:
-        raise ValueError("runtime payload exceeds explicit storage limit")
+    _size = len(encoded.encode("utf-8"))
+    if _size > _MAX_PAYLOAD_BYTES:
+        raise ValueError(
+            "runtime payload exceeds explicit storage limit "
+            f"(actual={_size} bytes, limit={_MAX_PAYLOAD_BYTES} bytes)"
+        )
     return encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 

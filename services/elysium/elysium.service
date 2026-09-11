@@ -1,0 +1,22 @@
+[Unit]
+Description=Elysium on Spark (manual start; elysia-attach console)
+After=network.target
+
+[Service]
+Type=exec
+User=ayerelysia
+Group=ayerelysia
+WorkingDirectory=/home/ayerelysia/Elysia/Elysium
+Environment=TZ=Asia/Shanghai
+RuntimeDirectory=elysium
+RuntimeDirectoryMode=0700
+ExecStart=/usr/bin/python3 /home/ayerelysia/Elysia/Elysium/scripts/start_elysium_service.py
+Restart=no
+KillSignal=SIGINT
+KillMode=mixed
+TimeoutStartSec=30
+TimeoutStopSec=120
+SendSIGKILL=no
+UMask=0077
+
+# Intentionally no [Install] section: no boot/login autostart.

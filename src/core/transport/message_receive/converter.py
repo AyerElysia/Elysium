@@ -421,7 +421,22 @@ class MessageConverter:
         if not target_user_id and not message.extra.get("is_life_engine_wake"):
             fallback_sender_id = str(message.sender_id or "").strip()
             if not _is_internal_target_id(fallback_sender_id):
-                target_user_id = fallback_sender_id
+                # 出站消息的 sender 是 bot 自身；把自己当投递目标会被平台拒绝
+                # （KOOK: 40000 不能是自己），故在此排除 bot 自身 id。
+                _bot_self_id = ""
+                try:
+                    from src.core.managers.adapter_manager import (
+                        get_adapter_manager,
+                    )
+
+                    _bot_info = await get_adapter_manager().get_bot_info_by_platform(
+                        str(message.platform or "")
+                    )
+                    _bot_self_id = str((_bot_info or {}).get("bot_id") or "").strip()
+                except Exception:  # noqa: BLE001 - 兜底失败不应阻断发送
+                    _bot_self_id = ""
+                if not _bot_self_id or fallback_sender_id != _bot_self_id:
+                    target_user_id = fallback_sender_id
         if not target_user_name:
             target_user_name = message.sender_name
         user_info_dict: dict[str, Any] = {

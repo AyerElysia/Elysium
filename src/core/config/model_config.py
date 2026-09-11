@@ -303,12 +303,6 @@ class ModelTasksSection(SectionBase):
         ),
         description="本地路由决策模型",
     )
-    live: TaskConfigSection = Field(
-        default_factory=lambda: TaskConfigSection(
-            model_list=["siliconflow-deepseek-ai/DeepSeek-V3.2"]
-        ),
-        description="实时通话桥接（外部 live server）",
-    )
 
     def get_task(self, task_name: str) -> TaskConfigSection:
         """获取指定任务的配置
