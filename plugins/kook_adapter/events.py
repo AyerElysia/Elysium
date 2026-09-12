@@ -26,6 +26,66 @@ from .config import KookAdapterConfig
 
 logger = get_logger("kook_adapter")
 
+
+def rest_direct_message_to_person_event(
+    message: dict[str, Any],
+    *,
+    target_id: str,
+) -> dict[str, Any]:
+    """Map one REST private-message row onto the Gateway PERSON event shape."""
+
+    author = message.get("author") if isinstance(message.get("author"), dict) else {}
+    msg_id = str(message.get("id") or message.get("msg_id") or "").strip()
+    author_id = str(message.get("author_id") or author.get("id") or "").strip()
+    return {
+        "channel_type": "PERSON",
+        "type": message.get("type", 1),
+        "target_id": str(target_id or "").strip(),
+        "author_id": author_id,
+        "content": str(message.get("content") or ""),
+        "msg_id": msg_id,
+        "extra": {"author": author},
+    }
+
+
+def select_unread_direct_messages(
+    messages: list[dict[str, Any]],
+    *,
+    bot_id: str,
+    seen_ids: set[str],
+    unread_count: int,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Pick the newest unread user DMs; never walk older history on later polls.
+
+    KOOK last_read_time is not a reliable unread watermark. unread_count names
+    the newest window. Already-seen ids are dropped inside that window only.
+    """
+
+    user_messages: list[dict[str, Any]] = []
+    for message in messages:
+        msg_id = str(message.get("id") or "").strip()
+        author = message.get("author") if isinstance(message.get("author"), dict) else {}
+        author_id = str(message.get("author_id") or author.get("id") or "").strip()
+        if not msg_id:
+            continue
+        if bot_id and author_id == bot_id:
+            continue
+        user_messages.append(message)
+    user_messages.sort(key=lambda item: int(item.get("create_at") or 0))
+    window_size = min(max(unread_count, 0), limit, len(user_messages))
+    if window_size <= 0:
+        return []
+    window = user_messages[-window_size:]
+    pending: list[dict[str, Any]] = []
+    for message in window:
+        msg_id = str(message.get("id") or "").strip()
+        if msg_id in seen_ids:
+            continue
+        pending.append(message)
+    return pending
+
+
 # KMarkdown 内嵌媒体语法: (img)/(video)/(audio)/(file)[url]
 _KMD_MEDIA_RE = re.compile(r"\((img|video|audio|file)\)\[([^\]]+)\]")
 # KMarkdown 提及语法: (met)用户ID/here/all(met)

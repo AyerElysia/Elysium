@@ -220,6 +220,29 @@ class KookAPIClient:
         """获取当前 Bot 信息。"""
         return await self._request("GET", "/user/me")
 
+    async def list_user_chats(self) -> list[dict[str, Any]]:
+        """列出私信会话（含未读计数）。"""
+
+        data = await self._request("GET", "/user-chat/list")
+        items = data.get("items") if isinstance(data, dict) else data
+        return [item for item in items or [] if isinstance(item, dict)]
+
+    async def list_direct_messages(
+        self,
+        chat_code: str,
+        *,
+        page_size: int = 20,
+    ) -> list[dict[str, Any]]:
+        """按会话拉取私信，默认最近一页。"""
+
+        data = await self._request(
+            "GET",
+            "/direct-message/list",
+            params={"chat_code": chat_code, "page_size": page_size},
+        )
+        items = data.get("items") if isinstance(data, dict) else data
+        return [item for item in items or [] if isinstance(item, dict)]
+
     async def get_channel_list(self, guild_id: str) -> list[dict[str, Any]]:
         """获取服务器频道列表。"""
         data = await self._request("GET", "/channel/list", params={"guild_id": guild_id})

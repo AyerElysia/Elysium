@@ -56,6 +56,7 @@ class KookGateway:
         self._running = False
         self._heartbeat_task_info: Any | None = None
         self._listen_task_info: Any | None = None
+        self._pong_event = asyncio.Event()
         self._lifecycle_lock = asyncio.Lock()
 
     @property
@@ -217,11 +218,21 @@ class KookGateway:
                 return  # 已处理过的 sn，丢弃
             self._sn = sn
             event_data = msg.get("d", {})
+            channel_type = event_data.get("channel_type", "")
+            if channel_type == "PERSON":
+                logger.info(
+                    f"KOOK 私信事件 sn={sn} type={event_data.get('type')}"
+                )
+            else:
+                logger.info(
+                    f"KOOK 事件 sn={sn} channel={channel_type or '-'} "
+                    f"type={event_data.get('type')}"
+                )
             await self._on_event(event_data)
 
         elif signal == 3:
-            # PONG — 心跳回复，无需处理
-            pass
+            # PONG — 应用层心跳回复；超时则视为半开连接并重连
+            self._pong_event.set()
 
         elif signal == 5:
             # RECONNECT — 服务端要求重连
@@ -246,7 +257,19 @@ class KookGateway:
                 interval = _HEARTBEAT_INTERVAL + random.randint(-5, 5)
                 await asyncio.sleep(interval)
                 ping = json.dumps({"s": 2, "sn": self._sn})
+                self._pong_event.clear()
                 await ws.send(ping)
+                try:
+                    await asyncio.wait_for(
+                        self._pong_event.wait(),
+                        timeout=_HEARTBEAT_TIMEOUT,
+                    )
+                except TimeoutError:
+                    logger.warning(
+                        f"KOOK PONG 超时（{_HEARTBEAT_TIMEOUT}s），关闭连接以重连"
+                    )
+                    await ws.close()
+                    break
         except asyncio.CancelledError:
             pass
         except Exception as exc:
