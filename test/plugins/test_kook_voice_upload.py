@@ -67,3 +67,49 @@ async def test_voice_fallback_uploads_unique_mp3_not_voice_mp3() -> None:
     assert names[0] != names[1]
     assert all(name.startswith("elysia-voice-") and name.endswith(".mp3") for name in names)
     assert all(content_type == "audio/mpeg" for _name, _size, content_type in client.uploads)
+
+
+class _CaptureClient:
+    def __init__(self) -> None:
+        self.direct: list[dict[str, Any]] = []
+
+    async def send_direct_message(self, **kwargs: Any) -> dict[str, Any]:
+        self.direct.append(kwargs)
+        return {}
+
+
+@pytest.mark.asyncio
+async def test_private_send_rejects_empty_target() -> None:
+    client = _CaptureClient()
+    sender = KookSender(client, lambda: None)  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="私信目标为空"):
+        await sender._send_text("PERSON", "", "", "hi", 9, None)
+    assert client.direct == []
+
+
+@pytest.mark.asyncio
+async def test_private_send_drops_internal_quote_ids() -> None:
+    from plugins.kook_adapter.config import KookAdapterConfig
+    from plugins.kook_adapter.sender import _kook_native_quote_id
+
+    assert _kook_native_quote_id("msg_03070545-d524-45fc-9ed3-501d6bb1a660") is None
+    assert _kook_native_quote_id("action_life_send_text_abc") is None
+    assert _kook_native_quote_id("5b50cfb5-bf8e-4ab0-9d2a-80e3156410ed") == (
+        "5b50cfb5-bf8e-4ab0-9d2a-80e3156410ed"
+    )
+
+    config = KookAdapterConfig()
+    config.features.reply_with_quote = True
+    config.features.use_kmarkdown = True
+    client = _CaptureClient()
+    sender = KookSender(client, lambda: config)
+    envelope = {
+        "kook_channel_type": "PERSON",
+        "message_info": {"user_info": {"user_id": "1370110560"}},
+        "reply_to_message_id": "msg_03070545-d524-45fc-9ed3-501d6bb1a660",
+        "message_segment": [{"type": "text", "data": "hi"}],
+    }
+    await sender.send(envelope)
+    assert client.direct == [
+        {"target_id": "1370110560", "content": "hi", "msg_type": 9, "quote": None}
+    ]

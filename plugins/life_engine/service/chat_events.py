@@ -40,6 +40,35 @@ def with_legacy_message_view(fact: LifeEvent, legacy: LifeEngineEvent) -> LifeEv
     )
 
 
+def same_chat_message_evidence(stored: LifeEvent, incoming: LifeEvent) -> bool:
+    """Same occurrence identity and message body, ignoring replay wrappers.
+
+    KOOK unread catch-up after restart rebuilds the envelope with a new receive
+    time and REST author fields. That is not new evidence and must not conflict.
+    """
+
+    if stored.occurrence_id != incoming.occurrence_id:
+        return False
+    if stored.event_type != incoming.event_type:
+        return False
+    if str(stored.stream_id or "") != str(incoming.stream_id or ""):
+        return False
+    if str(stored.content or "") != str(incoming.content or ""):
+        return False
+    stored_meta = stored.metadata if isinstance(stored.metadata, dict) else {}
+    incoming_meta = incoming.metadata if isinstance(incoming.metadata, dict) else {}
+    stored_chat = stored_meta.get("chat") if isinstance(stored_meta.get("chat"), dict) else {}
+    incoming_chat = incoming_meta.get("chat") if isinstance(incoming_meta.get("chat"), dict) else {}
+    for key in ("message_id", "stream_id", "direction", "platform"):
+        if str(stored_chat.get(key) or "") != str(incoming_chat.get(key) or ""):
+            return False
+    stored_sender = stored_chat.get("sender") if isinstance(stored_chat.get("sender"), dict) else {}
+    incoming_sender = (
+        incoming_chat.get("sender") if isinstance(incoming_chat.get("sender"), dict) else {}
+    )
+    return str(stored_sender.get("id") or "") == str(incoming_sender.get("id") or "")
+
+
 _NOTICE_FACTS: dict[str, str] = {
     "friend_recall": "chat.message.recalled",
     "group_recall": "chat.message.recalled",
@@ -463,4 +492,8 @@ def _notice_provider_identity(
     return {key: value for key, value in identity.items() if value not in {None, ""}}
 
 
-__all__ = ["build_chat_message_event", "build_chat_provider_notice_event"]
+__all__ = [
+    "build_chat_message_event",
+    "build_chat_provider_notice_event",
+    "same_chat_message_evidence",
+]

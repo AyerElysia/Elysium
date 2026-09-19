@@ -357,6 +357,21 @@ async def test_legacy_pair_replay_does_not_rewrite_or_add_history(
     assert await lab.store.read_since(0) == before
 
 
+async def test_restart_catchup_with_new_timestamp_is_idempotent(
+    lab: InteractionLab,
+) -> None:
+    await lab.service.record_message(_message())
+    before = await lab.store.read_since(0)
+    await lab.service.record_message(
+        _message(
+            time=datetime(2026, 9, 17, 0, 37, tzinfo=UTC),
+            sender_name="REST nickname",
+        )
+    )
+    assert await lab.store.read_since(0) == before
+    assert len(lab.service._pending_events) == 1
+
+
 async def test_occurrence_time_is_not_ingest_order(lab: InteractionLab) -> None:
     later = build_chat_message_event(_message("later"), direction="received")
     earlier = replace(

@@ -28,6 +28,21 @@ _QQ_FACE_TO_KOOK: dict[str, str] = {
 }
 
 
+def _kook_native_quote_id(value: str | None) -> str | None:
+    """Keep only KOOK native message ids; drop Elysium internal ids.
+
+    Internal ids such as ``msg_<uuid>`` / ``action_life_send_text_*`` make
+    ``/direct-message/create`` return 40000 (私信不存在或者你没有权限操作).
+    """
+    quote = str(value or "").strip()
+    if not quote:
+        return None
+    lowered = quote.lower()
+    if lowered.startswith(("msg_", "action_")):
+        return None
+    return quote
+
+
 class KookSender:
     """KOOK 出站消息发送器。"""
 
@@ -70,7 +85,7 @@ class KookSender:
         config = self._config()
         quote_msg_id: str | None = None
         if config and config.features.reply_with_quote:
-            quote_msg_id = (
+            quote_msg_id = _kook_native_quote_id(
                 envelope.get("reply_to_message_id")
                 or self._extract_reply_id(envelope)
                 or None
@@ -148,8 +163,11 @@ class KookSender:
     ) -> None:
         try:
             if channel_type == "PERSON":
+                dest = str(user_id or "").strip()
+                if not dest:
+                    raise RuntimeError("KOOK 私信目标为空，已拒绝发送")
                 await self._client.send_direct_message(
-                    target_id=user_id, content=content, msg_type=msg_type, quote=quote
+                    target_id=dest, content=content, msg_type=msg_type, quote=quote
                 )
             else:
                 await self._client.send_channel_message(
@@ -235,8 +253,11 @@ class KookSender:
         quote: str | None,
     ) -> None:
         if channel_type == "PERSON":
+            dest = str(user_id or "").strip()
+            if not dest:
+                raise RuntimeError("KOOK 私信目标为空，已拒绝发送")
             await self._client.send_direct_message(
-                target_id=user_id, content=content, msg_type=msg_type, quote=quote
+                target_id=dest, content=content, msg_type=msg_type, quote=quote
             )
         else:
             await self._client.send_channel_message(

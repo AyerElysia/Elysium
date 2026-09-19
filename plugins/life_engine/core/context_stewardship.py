@@ -81,8 +81,8 @@ HEARTBEAT_CHECKPOINT_FEEDBACK_TEXT = (
     "本轮没有工具调用，当前压缩维护尚未完成。"
     "普通独白不能完成上下文容量维护；已耐久保存的滚动链仍保留，"
     "本拍待处理经历尚未消费。请根据压缩清单选择释放边界，"
-    "调用 author_self_continuity_checkpoint 并亲自书写 "
-    "continuity_text；需要原文时可先 read_context_group。"
+    "调用 action-author_self_continuity_checkpoint 并亲自书写 "
+    "continuity_text；需要原文时可先 tool-read_context_group。"
     "系统不会代写、挑选或删除记忆。若本拍预算内仍未完成，"
     "维护会保留为未完成，普通安静结束不视为压缩成功。\n"
     "</context_checkpoint_feedback>"
@@ -555,13 +555,42 @@ def is_compression_required_part(part: object) -> bool:
 
 
 def is_context_stewardship_tool_name(call_name: str) -> bool:
-    """Allow only exact-group reads and the subject checkpoint in a compact turn."""
+    """Allow only exact-group reads and the subject checkpoint in a compact turn.
+
+    A call arrives with the name as it appears on the wire, which carries a
+    transport prefix ("action-"/"tool-") and may carry a namespace prefix
+    ("nucleus_") that the registered manifest does not show.  Both are
+    addressing, not identity.  Matching the bare allowlist against the raw name
+    refused a legitimate exact-group read as an ordinary heartbeat action, so
+    the maintenance turn could never read the groups it was asked to judge and
+    could not be completed; only a blind checkpoint write ever got through.
+    Strip every addressing prefix before matching.
+    """
 
     normalized = str(call_name or "").strip().lower()
-    if normalized.startswith("action-"):
-        normalized = normalized[7:]
-    elif normalized.startswith("tool-"):
-        normalized = normalized[5:]
+    # Addressing prefixes stack on a single wire name. A real call arrived as
+    # "tool-nucleus_action_author_self_continuity_checkpoint": a transport
+    # prefix ("tool-"), a namespace segment ("nucleus_") and the checkpoint's
+    # own "action_" segment. Stripping each prefix at most once reduced that
+    # name only to "action_author_self_continuity_checkpoint", which is not on
+    # the allowlist, so a legitimate checkpoint write was refused as an ordinary
+    # heartbeat action and the maintenance turn burned every remaining round
+    # retrying it. Strip until the name is stable, then match; no allowlisted
+    # entry carries a prefix itself, so this cannot admit an unrelated tool.
+    while True:
+        for prefix in (
+            "tool-",
+            "action-",
+            "tool_",
+            "action_",
+            "nucleus-",
+            "nucleus_",
+        ):
+            if normalized.startswith(prefix):
+                normalized = normalized[len(prefix) :]
+                break
+        else:
+            break
     return normalized in {
         "author_self_continuity_checkpoint",
         "read_context_group",
@@ -795,7 +824,7 @@ def build_context_pressure_notice(
             ],
             "subject_contract": (
                 "这只是容量事实，不判断哪些经历有意义，也不要求你压缩。"
-                "只有你能决定是否调用 author_self_continuity_checkpoint、"
+                "只有你能决定是否调用 action-author_self_continuity_checkpoint、"
                 "释放到哪个 group_ref、保留哪些 exact refs，以及给未来的自己写什么。"
                 "如本轮还要回应或行动，可以把检查点动作与其他独立动作放在同一次响应中。"
             ),
@@ -988,8 +1017,17 @@ def build_compression_required_payload(
     max_bytes: int = DEFAULT_EMERGENCY_REFERENCE_MAX_BYTES,
     estimated_chars: int | None = None,
     trigger_chars: int | None = None,
+    host_extra_parts: int = 0,
 ) -> LLMPayload | None:
-    """Build one durable USER list of releasable groups; no message or tool bodies."""
+    """Build one durable USER list of releasable groups; no message or tool bodies.
+
+    ``host_extra_parts`` records how many parts the turn that will carry this
+    envelope already held when the manifest was taken.  Request-only frames
+    (the beat's wake projection) are attached to that same open USER turn after
+    the fact and are rebuilt every beat; the checkpoint verifier must rebuild
+    the manifest from the recorded shape or it would add a group the
+    advertisement never contained and reject every submission as stale.
+    """
 
     typed = [payload for payload in payloads if isinstance(payload, LLMPayload)]
     manifest = build_group_manifest(typed)
@@ -1003,6 +1041,7 @@ def build_compression_required_payload(
             "schema": COMPRESSION_REQUIRED_SCHEMA,
             "technical_only": True,
             "estimated_chars": int(estimated_chars or 0),
+            "host_extra_part_count": int(host_extra_parts),
             "trigger_chars": int(trigger_chars or 0),
             "source_manifest_sha256": manifest.source_manifest_sha256,
             "current_checkpoint_revision": manifest.current_checkpoint_revision,
@@ -1015,9 +1054,9 @@ def build_compression_required_payload(
             "subject_contract": (
                 "滚动上下文已超过容量触发阈值。这只是组身份清单，不含正文，"
                 "也不判断哪些经历有意义。在恢复普通工作之前，必须由你调用 "
-                "author_self_continuity_checkpoint，自己选择释放到哪个 group_ref、"
+                "action-author_self_continuity_checkpoint，自己选择释放到哪个 group_ref、"
                 "保留哪些 exact refs，并亲自写下 continuity_text。"
-                "需要先看原文时用 read_context_group。"
+                "需要先看原文时用 tool-read_context_group。"
                 "系统不会代写摘要，也不会丢掉旧组来硬塞进窗口。"
             ),
         }
@@ -1046,21 +1085,42 @@ def ensure_compression_required_appended(
     max_groups: int = DEFAULT_PRESSURE_MAX_GROUPS,
     max_bytes: int = DEFAULT_EMERGENCY_REFERENCE_MAX_BYTES,
     force: bool = False,
+    budget_payloads: Sequence[LLMPayload] | None = None,
 ) -> list[LLMPayload]:
-    """Append the compression list once. Existing list bytes are not rewritten."""
+    """Append the compression list once. Existing list bytes are not rewritten.
+
+    ``budget_payloads`` names the payloads the char budget is measured against.
+    A heartbeat request carries request-only frames (the wake context and the
+    transport quiet-turn frame) that are rebuilt every beat and never persisted;
+    charging those against the budget would demand compression for a chain that
+    already fits, and the checkpoint requirement could then only be discharged
+    by releasing real history.  Defaults to ``payloads`` so every other caller
+    keeps its existing behaviour.
+    """
 
     typed = [payload for payload in payloads if isinstance(payload, LLMPayload)]
     if has_compression_required_payload(typed):
         return typed
-    estimated = rolling_char_estimate(typed, estimate)
+    budget_typed = (
+        [payload for payload in budget_payloads if isinstance(payload, LLMPayload)]
+        if budget_payloads is not None
+        else typed
+    )
+    estimated = rolling_char_estimate(budget_typed, estimate)
     if not force and estimated <= max(1, int(trigger_chars)):
         return typed
+    merge_host_parts = (
+        len(list(typed[-1].content or []))
+        if typed and typed[-1].role == ROLE.USER
+        else 0
+    )
     notice = build_compression_required_payload(
         typed,
         max_groups=max_groups,
         max_bytes=max_bytes,
         estimated_chars=estimated,
         trigger_chars=trigger_chars,
+        host_extra_parts=merge_host_parts,
     )
     if notice is None:
         return typed
@@ -1388,9 +1448,37 @@ def prepare_subject_checkpoint(
         # USER input arriving later must survive the checkpoint, but it must
         # not retroactively change which old groups that existing command was
         # authorized to release.
-        manifest_payloads = strip_compression_required_payloads(
-            typed[: control_indexes[0] + 1]
-        )
+        #
+        # The envelope records how many parts its host turn carried when it was
+        # written (``host_extra_part_count``).  Request-only frames such as the
+        # beat's wake projection are attached to that same open USER turn
+        # afterwards and are rebuilt every beat; counting them here would add a
+        # group the advertisement never saw, and every submission would then be
+        # rejected as stale for reasons the subject cannot influence.  Rebuild
+        # only what the control was actually written against.
+        control_index = control_indexes[0]
+        host = typed[control_index]
+        host_extra_parts = 0
+        for part in list(getattr(host, "content", None) or []):
+            data = _compression_required_part_data(part)
+            if data is None:
+                continue
+            recorded = data.get("host_extra_part_count")
+            if isinstance(recorded, int) and recorded >= 0:
+                host_extra_parts = recorded
+            break
+        manifest_payloads = list(typed[:control_index])
+        if host_extra_parts:
+            retained = [
+                part
+                for part in list(getattr(host, "content", None) or [])
+                if not is_compression_required_part(part)
+            ][:host_extra_parts]
+            if retained:
+                manifest_payloads.append(
+                    LLMPayload(host.role, retained)  # type: ignore[arg-type]
+                )
+        manifest_payloads = strip_compression_required_payloads(manifest_payloads)
     else:
         manifest_payloads = semantic_payloads
     manifest = build_group_manifest(manifest_payloads)
@@ -1871,6 +1959,42 @@ def _live_window_payloads(runtime_key: str) -> list[LLMPayload] | None:
     return None
 
 
+def _normalize_group_ref_list(value: Any) -> tuple[str, ...]:
+    """Return a clean tuple of group refs from a loosely typed subject argument.
+
+    Weak models often emit a JSON-encoded list as a string ("[]" or
+    '["ctxg_.."]').  Iterating that raw string would split it into single
+    characters, so the submission would be rejected with a message about a
+    group ref the subject never named.  Decode the obvious shapes instead of
+    guessing what the subject meant.
+    """
+
+    if value is None:
+        return ()
+    items: Any = value
+    if isinstance(items, str):
+        raw = items.strip()
+        if not raw:
+            return ()
+        try:
+            decoded = json.loads(raw)
+        except (TypeError, ValueError):
+            decoded = None
+        if isinstance(decoded, list):
+            items = decoded
+        elif isinstance(decoded, str) and not decoded.strip():
+            return ()
+        else:
+            items = [raw]
+    if not isinstance(items, (list, tuple, set, frozenset)):
+        items = [items]
+    # Order and duplicates are preserved on purpose: the caller still owns the
+    # "must not contain duplicates" guard, this helper only fixes the shape.
+    return tuple(
+        text for text in (str(item or "").strip() for item in items) if text
+    )
+
+
 def _live_context_group(
     group_ref: str,
     *,
@@ -1953,11 +2077,7 @@ class LifeAuthorSelfContinuityCheckpointAction(BaseAction):
             source_manifest_sha256=source_manifest_sha256,
             expected_revision=int(expected_revision),
             release_through_group_ref=str(release_through_group_ref or "").strip(),
-            retain_exact_group_refs=tuple(
-                str(item or "").strip()
-                for item in (retain_exact_group_refs or [])
-                if str(item or "").strip()
-            ),
+            retain_exact_group_refs=_normalize_group_ref_list(retain_exact_group_refs),
         )
         try:
             payloads = _live_window_payloads(runtime_key)

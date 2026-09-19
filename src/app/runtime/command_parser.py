@@ -34,6 +34,7 @@ class CommandParser:
     - /stop:   停止 Bot
     - /plugins: 列出所有插件及状态
     - /tasks:  显示当前任务统计
+    - /model [task] [model|clear]: 查看或热切换任务模型
     - /ui level [minimal|standard|verbose]: 调整 UI 级别
 
     Attributes:
@@ -121,6 +122,11 @@ class CommandParser:
         self.register_command("stop", self.cmd_stop, "停止 Bot")
         self.register_command("plugins", self.cmd_plugins, "列出所有插件及状态")
         self.register_command("tasks", self.cmd_tasks, "显示当前任务统计")
+        self.register_command(
+            "model",
+            self.cmd_model,
+            "查看或热切换任务模型: /model [task] [model|clear]",
+        )
         self.register_command(
             "ui", self.cmd_ui, "调整 UI 级别 (minimal|standard|verbose)"
         )
@@ -264,6 +270,74 @@ class CommandParser:
         }
 
         self.bot.ui.display_status(status)
+
+    async def cmd_model(self, args: list[str]) -> None:
+        """查看或热切换任务模型。
+
+        ``/model`` 列出全部任务；``/model core`` 查看单个任务；
+        ``/model core MiMo-V2.5-Pro`` 在后续请求中提升指定候选；
+        ``/model core clear`` 恢复配置文件中的优先级。
+        """
+
+        from rich.table import Table
+
+        from src.kernel.config.models_loader import (
+            clear_task_model_override,
+            get_task_model_state,
+            list_task_model_states,
+            switch_task_model,
+        )
+
+        if len(args) > 2:
+            self.bot.ui.console.print(
+                "[yellow]用法: /model | /model <task> | "
+                "/model <task> <model|clear>[/yellow]"
+            )
+            return
+
+        if not args:
+            table = Table(title="任务模型（运行时）")
+            table.add_column("任务", style="cyan")
+            table.add_column("当前模型", style="green")
+            table.add_column("配置首选", style="dim")
+            table.add_column("运行时覆盖", style="yellow")
+            for state in list_task_model_states():
+                table.add_row(
+                    state["task"],
+                    str(state["active_model"] or "-"),
+                    str(state["configured_model"] or "-"),
+                    str(state["override_model"] or "-")
+                    + (f" (g{state['generation']})" if state["override_model"] else ""),
+                )
+            self.bot.ui.console.print(table)
+            return
+
+        if len(args) == 1:
+            state = get_task_model_state(args[0])
+            self.bot.ui.console.print(
+                f"[cyan]{state['task']}[/cyan] 当前模型: "
+                f"[green]{state['active_model']}[/green]；"
+                f"候选: {', '.join(state['candidates'])}"
+            )
+            return
+
+        task_name, selection = args
+        if selection.casefold() == "clear":
+            changed = clear_task_model_override(task_name)
+            state = get_task_model_state(task_name)
+            message = "已恢复配置首选" if changed else "没有运行时覆盖"
+            self.bot.ui.console.print(
+                f"[green]{state['task']}[/green] {message}：{state['active_model']}"
+            )
+            return
+
+        override = switch_task_model(task_name, selection)
+        state = get_task_model_state(task_name)
+        self.bot.ui.console.print(
+            f"[green]{state['task']}[/green] 已热切换到 "
+            f"[green]{override.model}[/green]（generation={override.generation}）；"
+            "正在执行的请求保持不变，新请求使用该模型。"
+        )
 
     async def cmd_reload(self, args: list[str]) -> None:
         """重新加载插件

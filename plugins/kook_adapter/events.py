@@ -27,6 +27,27 @@ from .config import KookAdapterConfig
 logger = get_logger("kook_adapter")
 
 
+def _kook_event_unix_seconds(event: dict[str, Any]) -> float | None:
+    """Normalize KOOK create_at / msg_timestamp to unix seconds."""
+
+    raw = event.get("msg_timestamp")
+    if raw in {None, ""}:
+        raw = event.get("create_at")
+    if raw in {None, ""}:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if value > 1e17:
+        value /= 1e9
+    elif value > 1e14:
+        value /= 1e6
+    elif value > 1e11:
+        value /= 1e3
+    return value
+
+
 def rest_direct_message_to_person_event(
     message: dict[str, Any],
     *,
@@ -37,7 +58,8 @@ def rest_direct_message_to_person_event(
     author = message.get("author") if isinstance(message.get("author"), dict) else {}
     msg_id = str(message.get("id") or message.get("msg_id") or "").strip()
     author_id = str(message.get("author_id") or author.get("id") or "").strip()
-    return {
+    create_at = message.get("create_at") or message.get("msg_timestamp")
+    event = {
         "channel_type": "PERSON",
         "type": message.get("type", 1),
         "target_id": str(target_id or "").strip(),
@@ -46,6 +68,10 @@ def rest_direct_message_to_person_event(
         "msg_id": msg_id,
         "extra": {"author": author},
     }
+    if create_at not in {None, ""}:
+        event["msg_timestamp"] = create_at
+        event["create_at"] = create_at
+    return event
 
 
 def select_unread_direct_messages(
@@ -233,8 +259,15 @@ class KookEventHandler:
                 "kook_target_id": target_id,
             }
         )
+        occurred_at = _kook_event_unix_seconds(event)
+        if occurred_at is not None:
+            builder.timestamp_ms(int(occurred_at * 1000))
 
         envelope = builder.build()
+        if occurred_at is not None:
+            message_info = envelope.get("message_info")
+            if isinstance(message_info, dict):
+                message_info["time"] = occurred_at
         # 顶层快捷字段（兼容旧消费方）+ 原始事件
         envelope["raw_message"] = event
         envelope["kook_guild_id"] = guild_id

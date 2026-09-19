@@ -125,7 +125,10 @@ def test_learning_rejects_out_of_range_llm_timeout(timeout: float) -> None:
     ("field", "value"),
     [
         ("max_rounds_per_heartbeat", 0),
-        ("max_rounds_per_heartbeat", 6),
+        # 上界已由 5 放宽到 20：压缩维护回合要「读 N 组 + 写检查点」，
+        # 而 read_context_group 一次一组一页，5 轮必然 max_model_turns。
+        # 默认值仍是 5，只有需要时才发现层上调。
+        ("max_rounds_per_heartbeat", 21),
         ("max_consecutive_tool_stalls_per_heartbeat", 0),
         ("max_consecutive_tool_stalls_per_heartbeat", 6),
     ],

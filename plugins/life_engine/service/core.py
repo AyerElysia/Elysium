@@ -14,7 +14,7 @@ import json
 import os
 import time
 import traceback
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from datetime import time as dtime
@@ -473,7 +473,9 @@ class HeartbeatModelResult:
     final_completed_at: str = ""
 
 
-HEARTBEAT_TOTAL_BUDGET_MAX_SECONDS = 300.0
+HEARTBEAT_TOTAL_BUDGET_MAX_SECONDS = 900.0
+# 900s 与 _resolve_heartbeat_total_budget(= min(上限, timeout*2+60)) 配合：
+# heartbeat_timeout_seconds=420 时恰好给出 900s，覆盖压缩维护回合逐组分页读取
 HEARTBEAT_FINALIZE_RESERVE_SECONDS = 5.0
 
 
@@ -5066,32 +5068,24 @@ class LifeEngineService(BaseService):
     ) -> None:
         """Append one message occurrence; legacy pending is only its view."""
 
-        from .chat_events import with_legacy_message_view
+        from .chat_events import same_chat_message_evidence, with_legacy_message_view
         from ..storage.event_contracts import LifeEventOccurrenceConflict
 
         bus = self._get_event_bus()
         candidate = with_legacy_message_view(chat_fact, legacy_event)
         previous = await bus.store.get_by_occurrence_id(chat_fact.occurrence_id)
         workset_occurrence = chat_fact.occurrence_id
-        if previous is not None and "legacy_event_type" not in previous.metadata:
-            # Pre-refactor rows were an atomic pair. Reuse their exact chat
-            # evidence, without rewriting it or appending a third occurrence.
-            comparable = replace(
-                previous,
-                sequence=0,
-                source_sequence=0,
-                recorded_at="",
-                # 重复投递（KOOK 重连补发）会重新生成 timestamp；内容一致即视为
-                # 同一条消息，不应判为 occurrence 冲突。比较时对齐时间戳。
-                timestamp=chat_fact.timestamp,
-            )
-            if comparable != chat_fact:
+        if previous is not None:
+            # Restart/unread catch-up rebuilds the envelope (new receive time,
+            # REST author fields). Same message body is replay, not a conflict.
+            if not same_chat_message_evidence(previous, chat_fact):
                 raise LifeEventOccurrenceConflict(chat_fact.occurrence_id)
-            old_view = await bus.store.get_by_occurrence_id(
-                str(legacy_event.occurrence_id or "")
-            )
-            if old_view is not None:
-                workset_occurrence = old_view.occurrence_id
+            if "legacy_event_type" not in previous.metadata:
+                old_view = await bus.store.get_by_occurrence_id(
+                    str(legacy_event.occurrence_id or "")
+                )
+                if old_view is not None:
+                    workset_occurrence = old_view.occurrence_id
         else:
             await bus.publish(candidate)
         legacy_event.occurrence_id = workset_occurrence
@@ -9798,7 +9792,7 @@ class LifeEngineService(BaseService):
             "- `SOUL.md`、`USER.md`、`MEMORY.md`、`EXISTENCE.md` 会固定进入提示词；改它们和改日记一样，由你判断。不要清空 `SOUL.md`，也不要删除或改名身份文件",
             "- 机会页邀请栏只给到期事实。学习操作说明在 learning skill，用 `nucleus_learn action=help` 读取后再决定是否动手；`nucleus_memory_continuity_review` 仍可用于结构化整理 MEMORY，但不是唯一写法。后台只提供机会，保持原样、稍后再看和安静结束都有效",
             "- 本窗口可调用的工具以 ROLE.TOOL 为准。未注入本拍的能力仍存在于聊天或其他意识窗口；没出现在本轮 schema 不等于主体不想用",
-            "- 滚动上下文超过容量阈值时会出现一次压缩清单；必须由你调用 `author_self_continuity_checkpoint` 亲自写下 continuity_text。系统不会代写摘要，也不会丢掉旧组。`[观察]/[感受]/[意图]/[内在动作]` 不能代替这个工具",
+            "- 滚动上下文超过容量阈值时会出现一次压缩清单；必须由你调用 `action-author_self_continuity_checkpoint` 亲自写下 continuity_text。系统不会代写摘要，也不会丢掉旧组。`[观察]/[感受]/[意图]/[内在动作]` 不能代替这个工具",
             "",
             "### `nucleus_rest_heartbeat` — 主动休息一段时间",
             "",
@@ -9817,7 +9811,7 @@ class LifeEngineService(BaseService):
             "",
             "然后按需要调用工具。",
             "若滚动里已经出现 `<context_compression_required>`，本拍必须先调用 "
-            "`author_self_continuity_checkpoint`（可先 `read_context_group`）；"
+            "`action-author_self_continuity_checkpoint`（可先 `tool-read_context_group`）；"
             "观察/感受正文不能代替该工具。未完成则本拍新经历不会进入滚动、游标也不会前进。",
             "",
             "### 原则",
@@ -10298,7 +10292,12 @@ class LifeEngineService(BaseService):
             raise cancelled
         return True
 
-    def _ensure_heartbeat_compression_turn(self, response: Any) -> None:
+    def _ensure_heartbeat_compression_turn(
+        self,
+        response: Any,
+        *,
+        budget_payloads: Sequence[LLMPayload] | None = None,
+    ) -> None:
         payloads = getattr(response, "payloads", None)
         if not isinstance(payloads, list):
             return
@@ -10309,6 +10308,7 @@ class LifeEngineService(BaseService):
             trigger_chars=self._heartbeat_compaction_trigger_chars(),
             max_groups=max_groups,
             max_bytes=max_bytes,
+            budget_payloads=budget_payloads,
         )
         response.payloads = updated
         self._register_heartbeat_live_context(updated)
@@ -10335,9 +10335,10 @@ class LifeEngineService(BaseService):
             tool_name
         ):
             return (
-                "当前是主体连续性维护回合；普通心跳动作均未执行。"
-                "请先用 read_context_group 阅读需要的精确旧组，或调用 "
-                "author_self_continuity_checkpoint 亲自写下检查点。",
+                "执行失败: 当前是主体连续性维护回合；"
+                "普通心跳动作均未执行。"
+                "请先用 tool-read_context_group 阅读需要的精确旧组，或调用 "
+                "action-author_self_continuity_checkpoint 亲自写下检查点。",
                 False,
             )
         usable_cls = self._resolve_heartbeat_tool_class(registry, tool_name)
@@ -11122,6 +11123,7 @@ class LifeEngineService(BaseService):
             trigger_chars=self._heartbeat_compaction_trigger_chars(),
             max_groups=max_groups,
             max_bytes=max_bytes,
+            budget_payloads=baseline_rolling,
         )
         for payload in rolling:
             request.add_payload(payload)
@@ -11281,10 +11283,16 @@ class LifeEngineService(BaseService):
             )
 
             if not call_list:
+                # The contract tracks the durable rolling chain.  Request-only
+                # frames (wake context) ride along on response.payloads but are
+                # rebuilt every beat and never persisted, so they must not decide
+                # whether this beat still owes a compression round.
                 pending_compression = payloads_require_compression(
-                    rolling_payloads_only(list(response.payloads)),
+                    list(baseline_rolling),
                     estimate=estimate_payload_chars,
                     trigger_chars=self._heartbeat_compaction_trigger_chars(),
+                ) or has_compression_required_payload(
+                    rolling_payloads_only(list(response.payloads))
                 )
                 if not pending_compression:
                     last_text = turn_text
@@ -11360,7 +11368,10 @@ class LifeEngineService(BaseService):
                 baseline_rolling = copy_rolling_payloads(
                     rolling_payloads_only(list(response.payloads))
                 )
-            self._ensure_heartbeat_compression_turn(response)
+            self._ensure_heartbeat_compression_turn(
+                response,
+                budget_payloads=baseline_rolling,
+            )
             last_round_outcomes = _heartbeat_tool_round_outcomes(
                 call_list, round_results
             )
@@ -11600,11 +11611,13 @@ class LifeEngineService(BaseService):
         final_payloads = rolling_payloads_only(
             list(getattr(response, "payloads", None) or [])
         )
+        # Compression is a property of the durable rolling chain, not of the
+        # request-only frames (wake context) that ride along on this beat.
         still_requires_compression = payloads_require_compression(
-            final_payloads,
+            list(baseline_rolling),
             estimate=estimate_payload_chars,
             trigger_chars=self._heartbeat_compaction_trigger_chars(),
-        )
+        ) or has_compression_required_payload(final_payloads)
         # A valid partial release can still leave another maintenance notice.
         # Installing one checkpoint is not proof that this beat now fits.
         compression_unresolved = still_requires_compression

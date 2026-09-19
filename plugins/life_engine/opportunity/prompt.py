@@ -53,7 +53,7 @@ def managed_heartbeat_header() -> list[str]:
         "内心回声通过 life.inner_return 查询原 receipt 并选择是否交还，不猜一个聊天窗口。",
         "周期自唤醒也只是可管理的安排，不是不可删除的后台特权。"
         "nucleus_rest_heartbeat 可按当前工具协议暂时休息。",
-        "滚动上下文需要连续性检查点时，由你通过 author_self_continuity_checkpoint 亲自写下；"
+        "滚动上下文需要连续性检查点时，由你通过 action-author_self_continuity_checkpoint 亲自写下；"
         "系统不代写身份摘要，也不删除原始活动。",
         "遵守本轮实际工具预算。可以分轮查询和决定，不需要为了用工具而制造工作。",
         "",
