@@ -49,17 +49,28 @@ These commands belong to the operator console, not a public QQ chat command.
 - A broader lint check found existing unused imports in unchanged
   `media_capabilities.py` and `trajectory_types.py`; those files were not edited.
 
-## Pending acceptance and push gate
+## Operator acceptance (2026-09-21, Spark CST)
 
-The service was active with a start time of 2026-09-19 15:00:06 CST, predating the
-runtime-switch changes. This is not startup acceptance for this batch. Earlier
-conversation claims of a completed implementation mean code plus isolated tests,
-not production activation or end-to-end model-response acceptance.
+The operator restarted the running instance. The live process started at
+2026-09-21 17:47:49 CST from `/home/ayerelysia/Elysia/Elysium`, loaded all 15
+plugins, and reported `Elysium 已苏醒`. Its console then exercised the installed
+command handler:
 
-Per AGENTS.md, the operator must manually restart Elysium before push. The agent
-must not restart it. After the operator restart, verify initialization and plugin
-logs, run `/model core`, temporarily promote a candidate, inspect a new request's
-route and successful response, and clear the override. Preserve the original
-configuration and ensure QQ/KOOK connectivity is healthy. Record observed results
-without copying private messages or credentials. Until then keep commits local;
-do not represent the batch as production-accepted or pushed.
+1. `/model` listed the configured task routes.
+2. `/model core MiMo-V2.5-Pro` returned `generation=1` and stated that new
+   requests use the selected model while in-flight requests remain unchanged.
+3. `/model core` immediately reported `MiMo-V2.5-Pro` as active and retained the
+   original candidate fallback list.
+4. `/model core clear` restored `qwen3.8-flash-next` and left no runtime override.
+
+The request inspector remained empty during the observation window, so this is
+live startup and routing-command acceptance, not proof of a completed upstream
+model response. No synthetic chat message was injected, no QQ/KOOK message was
+sent, and no subject or diary content was changed. The runtime override is
+process-local and is now cleared.
+
+The live process was PID 2201942, owned by the `tmux -L elysium` session,
+not `elysium.service` (which was inactive). Service status alone would have
+incorrectly implied that Elysium was stopped. A NapCat heartbeat timeout was
+visible at 18:07:05; this check did not establish subsequent QQ recovery and
+must not be cited as acceptance of overall messaging health.
