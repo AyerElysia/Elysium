@@ -284,8 +284,13 @@ class LifeEngineConfig(BaseConfig):
         max_rounds_per_heartbeat: int = Field(
             default=5,
             ge=1,
-            le=5,
-            description="单次心跳内允许的模型轮数硬上限；独立工具优先在同一轮并行调用。",
+            le=20,
+            description=(
+                "单次心跳内允许的模型轮数上限；独立工具优先在同一轮并行调用。"
+                "默认 5 适合常规心跳。压缩维护回合必须逐组分页读取旧组"
+                "（read_context_group 一次一组一页），再亲自书写检查点，"
+                "此时需要更多轮次；超过 5 轮不改变默认行为，只打开调优空间。"
+            ),
         )
 
         max_consecutive_tool_stalls_per_heartbeat: int = Field(

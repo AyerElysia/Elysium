@@ -161,7 +161,13 @@ def is_transient_llm_error(error: BaseException) -> bool:
         return True
     if isinstance(error, LLMAPIError):
         status_code = error.status_code
-        return status_code is None or status_code == 429 or status_code >= 500
+        # 403：上游分组/包池拒绝。配置修好前会稳定复现，必须冷却，
+        # 否则故障转移链每次都会先付一次 ERROR 再落到后备模型。
+        return (
+            status_code is None
+            or status_code in (403, 429)
+            or status_code >= 500
+        )
     return False
 
 

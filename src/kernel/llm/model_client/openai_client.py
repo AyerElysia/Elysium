@@ -10,6 +10,7 @@ from __future__ import annotations
 import inspect
 import json
 import threading
+from types import SimpleNamespace
 from typing import Any, AsyncIterator
 
 from json_repair import repair_json
@@ -22,6 +23,7 @@ from src.kernel.llm.tool_call_compat import (
 )
 
 from ..exceptions import (
+    LLMAPIError,
     LLMConfigurationError,
     LLMContentFilterError,
     UnsupportedModalityError,
@@ -671,6 +673,255 @@ def _extract_usage_payload(resp: Any) -> dict[str, Any] | None:
     return data or None
 
 
+_MAX_MALFORMED_COMPLETION_CHARS = 500
+_STRUCTURED_CLIENT_ERROR_CODES = frozenset(
+    {
+        "insufficient_user_quota",
+        "capability_not_supported",
+        "invalid_request_error",
+        "model_not_found",
+    }
+)
+
+
+def _truncate_for_error(value: Any, *, limit: int = _MAX_MALFORMED_COMPLETION_CHARS) -> str:
+    """把异常正文压成单行，避免把整段网关垃圾写进日志。"""
+    text = value if isinstance(value, str) else repr(value)
+    text = " ".join(text.split())
+    if len(text) > limit:
+        return text[:limit] + "…"
+    return text
+
+
+def _llm_api_error_from_provider_payload(
+    payload: dict[str, Any], *, model_name: str
+) -> LLMAPIError | None:
+    """从兼容网关的 error 对象构造 LLMAPIError；没有 error 字段则返回 None。"""
+    error = payload.get("error")
+    if error is None:
+        return None
+    if isinstance(error, str):
+        return LLMAPIError(
+            error,
+            status_code=502,
+            error_code="malformed_chat_completion",
+            model=model_name,
+        )
+    if isinstance(error, dict):
+        message = str(error.get("message") or error)
+        code = error.get("code") or error.get("type")
+        code_text = str(code).strip().lower() if code else ""
+        status_code = 400 if code_text in _STRUCTURED_CLIENT_ERROR_CODES else 502
+        return LLMAPIError(
+            message,
+            status_code=status_code,
+            error_code=str(code) if code else "malformed_chat_completion",
+            model=model_name,
+        )
+    return LLMAPIError(
+        _truncate_for_error(error),
+        status_code=502,
+        error_code="malformed_chat_completion",
+        model=model_name,
+    )
+
+
+def _malformed_chat_completion_error(resp: Any, *, model_name: str) -> LLMAPIError:
+    return LLMAPIError(
+        f"模型返回非 ChatCompletion 响应: {_truncate_for_error(resp)}",
+        status_code=502,
+        error_code="malformed_chat_completion",
+        model=model_name,
+    )
+
+
+def _objectify_completion(value: Any) -> Any:
+    """把 dict completion 收成可用属性访问的对象。"""
+    if isinstance(value, dict):
+        return SimpleNamespace(**{key: _objectify_completion(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return [_objectify_completion(item) for item in value]
+    return value
+
+
+def _iter_sse_json_payloads(text: str) -> list[Any]:
+    """从 SSE 或粘连的 ``data:`` 事件中抽出 JSON 对象。"""
+    decoder = json.JSONDecoder()
+    payloads: list[Any] = []
+    idx = 0
+    while True:
+        pos = text.find("data:", idx)
+        if pos < 0:
+            break
+        cursor = pos + 5
+        while cursor < len(text) and text[cursor] in " \t":
+            cursor += 1
+        if text.startswith("[DONE]", cursor):
+            idx = cursor + 6
+            continue
+        try:
+            obj, end = decoder.raw_decode(text, cursor)
+        except Exception:
+            idx = cursor + 1
+            continue
+        payloads.append(obj)
+        idx = end
+    return payloads
+
+
+def _assemble_chat_completion_from_sse(text: str) -> Any | None:
+    """把误当作非流式返回的 SSE chunk 拼回 ChatCompletion 形态。"""
+    if "data:" not in text and "chat.completion.chunk" not in text:
+        return None
+
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    tool_acc: dict[int, dict[str, str | None]] = {}
+    finish_reason: str | None = None
+    usage: Any = None
+    model: Any = None
+    completion_id: Any = None
+    saw_chunk = False
+
+    for obj in _iter_sse_json_payloads(text):
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("object") == "chat.completion" and "choices" in obj:
+            return _objectify_completion(obj)
+        if obj.get("object") != "chat.completion.chunk" and "choices" not in obj:
+            continue
+        saw_chunk = True
+        model = obj.get("model") or model
+        completion_id = obj.get("id") or completion_id
+        if obj.get("usage") is not None:
+            usage = obj["usage"]
+        for choice in obj.get("choices") or []:
+            if not isinstance(choice, dict):
+                continue
+            if choice.get("finish_reason"):
+                finish_reason = str(choice["finish_reason"])
+            delta = choice.get("delta") or choice.get("message") or {}
+            if not isinstance(delta, dict):
+                continue
+            content = delta.get("content")
+            if isinstance(content, str) and content:
+                content_parts.append(content)
+            reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+            if isinstance(reasoning, str) and reasoning:
+                reasoning_parts.append(reasoning)
+            for tool_call in delta.get("tool_calls") or []:
+                if not isinstance(tool_call, dict):
+                    continue
+                index = tool_call.get("index", 0)
+                try:
+                    slot_index = int(index)
+                except (TypeError, ValueError):
+                    slot_index = 0
+                slot = tool_acc.setdefault(
+                    slot_index, {"id": None, "name": "", "arguments": ""}
+                )
+                if tool_call.get("id"):
+                    slot["id"] = str(tool_call["id"])
+                function = tool_call.get("function") or {}
+                if isinstance(function, dict):
+                    if function.get("name"):
+                        slot["name"] = str(function["name"])
+                    arguments = function.get("arguments")
+                    if isinstance(arguments, str) and arguments:
+                        slot["arguments"] = str(slot["arguments"] or "") + arguments
+
+    if not saw_chunk:
+        return None
+
+    tool_calls = []
+    for slot_index in sorted(tool_acc):
+        slot = tool_acc[slot_index]
+        name = slot.get("name") or ""
+        arguments = slot.get("arguments") or ""
+        if not name and not arguments:
+            continue
+        tool_calls.append(
+            SimpleNamespace(
+                id=slot.get("id"),
+                function=SimpleNamespace(name=name, arguments=arguments),
+            )
+        )
+
+    message = SimpleNamespace(
+        content="".join(content_parts) or None,
+        tool_calls=tool_calls or None,
+        function_call=None,
+        reasoning_content="".join(reasoning_parts) or None,
+        role="assistant",
+    )
+    logger.warning(
+        "网关在非流式聊天请求中返回了 SSE chunk，已在本地拼回 ChatCompletion"
+    )
+    return SimpleNamespace(
+        id=completion_id,
+        model=model,
+        choices=[SimpleNamespace(message=message, finish_reason=finish_reason)],
+        usage=usage,
+    )
+
+
+def _require_chat_completion(resp: Any, *, model_name: str) -> Any:
+    """确保非流式 chat.completions 返回带 choices 的对象。
+
+    部分兼容网关在额度耗尽、或 thinking+tools 时仍回 HTTP 200，body 却是
+    SSE chunk、JSON 字符串或纯错误对象。openai SDK 默认不严格校验时会把
+    解析结果原样交给调用方，随后访问 ``resp.choices`` 会变成 AttributeError。
+    """
+    if (
+        resp is not None
+        and not isinstance(resp, (str, bytes, bytearray, dict))
+        and hasattr(resp, "choices")
+    ):
+        return resp
+
+    parsed: Any = resp
+    if isinstance(resp, (bytes, bytearray)):
+        try:
+            parsed = resp.decode("utf-8")
+        except UnicodeDecodeError:
+            raise _malformed_chat_completion_error(resp, model_name=model_name) from None
+
+    if isinstance(parsed, str):
+        assembled = _assemble_chat_completion_from_sse(parsed)
+        if assembled is not None:
+            return assembled
+        stripped = parsed.strip()
+        loaded: Any = None
+        if stripped:
+            try:
+                loaded = json.loads(stripped)
+            except Exception:
+                loaded = None
+        if isinstance(loaded, str):
+            assembled = _assemble_chat_completion_from_sse(loaded)
+            if assembled is not None:
+                return assembled
+            raise _malformed_chat_completion_error(loaded, model_name=model_name)
+        if isinstance(loaded, dict):
+            parsed = loaded
+        else:
+            raise _malformed_chat_completion_error(
+                stripped or parsed, model_name=model_name
+            )
+
+    if isinstance(parsed, dict):
+        if "choices" in parsed:
+            return _objectify_completion(parsed)
+        structured = _llm_api_error_from_provider_payload(
+            parsed, model_name=model_name
+        )
+        if structured is not None:
+            raise structured
+        raise _malformed_chat_completion_error(parsed, model_name=model_name)
+
+    raise _malformed_chat_completion_error(resp, model_name=model_name)
+
+
 # _ClientCacheKey: (api_key, base_url, loop_id, timeout, trust_env, force_ipv4)
 _ClientCacheKey = tuple[str, str | None, int, float | None, bool, bool]
 
@@ -946,6 +1197,7 @@ class OpenAIChatClient:
         Raises:
             TypeError: model_set 不是 dict 时抛出。
             ValueError: api_key 为空或 extra_params 非 dict 时抛出。
+            LLMAPIError: 网关返回非 ChatCompletion 正文时抛出。
             LLMContentFilterError: 模型返回空 choices 时抛出。
         """
         del tools  # 通过 payloads 中 ROLE.TOOL 传入，此参数保持协议兼容
@@ -1092,6 +1344,8 @@ class OpenAIChatClient:
         model_name: str,
     ) -> tuple[str | None, list[dict[str, Any]] | None, None, str | None]:
         """执行非流式聊天请求并返回解析结果。"""
+        params = dict(params)
+        params["stream"] = False
         try:
             resp = await client.chat.completions.create(**params)
         except Exception as e:
@@ -1115,6 +1369,7 @@ class OpenAIChatClient:
                         pass
             raise
 
+        resp = _require_chat_completion(resp, model_name=model_name)
         self._set_last_usage(_extract_usage_payload(resp))
         if not resp.choices:
             raise LLMContentFilterError(
@@ -1142,6 +1397,12 @@ class OpenAIChatClient:
     ) -> tuple[None, None, AsyncIterator[StreamEvent], None]:
         """执行流式聊天请求并返回事件迭代器。"""
         stream_resp = await client.chat.completions.create(**params, stream=True)
+        if isinstance(stream_resp, (str, bytes, bytearray, dict)) or not hasattr(
+            stream_resp, "__aiter__"
+        ):
+            raise _malformed_chat_completion_error(
+                stream_resp, model_name=str(params.get("model") or "")
+            )
 
         async def iter_events() -> AsyncIterator[StreamEvent]:
             """逐块迭代流式响应，产出 StreamEvent。
@@ -1153,7 +1414,7 @@ class OpenAIChatClient:
 
             try:
                 async for chunk in stream_resp:
-                    if not chunk.choices:
+                    if not hasattr(chunk, "choices") or not chunk.choices:
                         continue
                     choice = chunk.choices[0]
                     delta = choice.delta

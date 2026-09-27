@@ -71,6 +71,31 @@ logger = get_logger("kernel.llm.request", display="LLM 请求")
 _monotonic = time.monotonic
 
 
+# 上游网关有时把错误说明直接写进 assistant content 返回（HTTP 200、
+# finish_reason=stop），对调用方表现为「成功」，但正文其实是网关错误语。
+# 这类尝试必须按软失败处理，否则英文错误会被当成模型的正式输出
+# （实测 2026-09-19 表达层出现 3 次，正文为 reduce the request parameters/content）。
+_UPSTREAM_ERROR_TEXT_MAX_CHARS = 400
+_UPSTREAM_ERROR_TEXT_EXACT = frozenset({
+    "the request could not be completed. please retry later, or reduce the request parameters/content.",
+})
+_UPSTREAM_ERROR_TEXT_MARKERS = (
+    ("could not be completed", "reduce the request parameters"),
+    ("could not be completed", "please retry later"),
+)
+
+
+def _is_upstream_error_text(text: str) -> bool:
+    """判断助手正文是否其实是上游返回的错误说明。"""
+    stripped = text.strip()
+    if not stripped or len(stripped) > _UPSTREAM_ERROR_TEXT_MAX_CHARS:
+        return False
+    lowered = stripped.lower()
+    if lowered in _UPSTREAM_ERROR_TEXT_EXACT:
+        return True
+    return any(all(m in lowered for m in group) for group in _UPSTREAM_ERROR_TEXT_MARKERS)
+
+
 def _new_attempt_deadline(timeout_seconds: object) -> float | None:
     """Return one monotonic deadline for all transport phases of an attempt."""
     if isinstance(timeout_seconds, (int, float)) and timeout_seconds > 0:
@@ -961,6 +986,14 @@ class LLMRequest:
                             f"empty assistant content from model={model_identifier}",
                             model=model_identifier,
                         )
+                    if _is_upstream_error_text(str(resp.message or "")):
+                        # 上游把网关错误写进正文并返回 200：不能当成功。
+                        raise LLMEmptyResponseError(
+                            "upstream returned error text as assistant content "
+                            f"from model={model_identifier}: "
+                            f"{str(resp.message or '').strip()[:160]}",
+                            model=model_identifier,
+                        )
                     _record_success(resp)
                 else:
                     resp._on_complete = _record_success
@@ -1001,12 +1034,20 @@ class LLMRequest:
                     or _5xx_status_code is not None
                     or (
                         isinstance(classified_error, LLMAPIError)
-                        and classified_error.status_code is None
+                        and (
+                            classified_error.status_code is None
+                            or classified_error.status_code == 403
+                        )
                     )
                 ):
                     _status_hint = (
-                        f", status_code={_5xx_status_code}"
-                        if _5xx_status_code is not None
+                        f", status_code={classified_error.status_code}"
+                        if isinstance(classified_error, LLMAPIError)
+                        and isinstance(classified_error.status_code, int)
+                        and (
+                            classified_error.status_code >= 500
+                            or classified_error.status_code == 403
+                        )
                         else ""
                     )
                     logger.warning(

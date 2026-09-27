@@ -3894,9 +3894,9 @@ class LifeChatter(BaseChatter):
             "- `nucleus_view_screen`：查看 Ayer 当前屏幕。\n"
             "- `nucleus_todo`：写入或查看 TODO 板（整组 `{id, content, status}`，可 merge）。\n"
             "- `inner_dialogue`：把念头沉进心里慢慢想（异步；允许浮回后需心跳 inner.return 显式交还）。\n"
-            "- `author_self_continuity_checkpoint`：滚动超过容量阈值后必须由你亲自写给未来自己的连续性说明；"
+            "- `action-author_self_continuity_checkpoint`：滚动超过容量阈值后必须由你亲自写给未来自己的连续性说明；"
             "系统不会替你总结，也不会丢掉旧组来硬塞进窗口。\n"
-            "- `read_context_group`：按检查点或压缩清单里的 ctxg_ 引用，分页读取精确旧组。\n"
+            "- `tool-read_context_group`：按检查点或压缩清单里的 ctxg_ 引用，分页读取精确旧组。\n"
             "- `tool-inspect_media`：把图片/视频/语音提升为原生多模态输入。\n"
             "- **工具名不带 `tool-` 前缀**（`tool-` 前缀仅限 `tool-inspect_media` 等平台工具）；普通工具直接使用 `nucleus_bash`、`nucleus_grep_file` 这类名字，不要加前缀。\n"
             "- 不要把 `reason`、`thought` 等元信息写进 `content`。"
@@ -7055,9 +7055,9 @@ class LifeChatter(BaseChatter):
                                 ToolResult(
                                     value=(
                                         "当前是主体连续性维护回合；普通表达和其他动作"
-                                        "均未执行。请先用 read_context_group 阅读需要的"
+                                        "均未执行。请先用 tool-read_context_group 阅读需要的"
                                         "精确旧组，或调用 "
-                                        "author_self_continuity_checkpoint 亲自写下检查点。"
+                                        "action-author_self_continuity_checkpoint 亲自写下检查点。"
                                     ),
                                     call_id=action_id,
                                     name=call_name,

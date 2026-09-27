@@ -26,6 +26,92 @@ from .config import KookAdapterConfig
 
 logger = get_logger("kook_adapter")
 
+
+def _kook_event_unix_seconds(event: dict[str, Any]) -> float | None:
+    """Normalize KOOK create_at / msg_timestamp to unix seconds."""
+
+    raw = event.get("msg_timestamp")
+    if raw in {None, ""}:
+        raw = event.get("create_at")
+    if raw in {None, ""}:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if value > 1e17:
+        value /= 1e9
+    elif value > 1e14:
+        value /= 1e6
+    elif value > 1e11:
+        value /= 1e3
+    return value
+
+
+def rest_direct_message_to_person_event(
+    message: dict[str, Any],
+    *,
+    target_id: str,
+) -> dict[str, Any]:
+    """Map one REST private-message row onto the Gateway PERSON event shape."""
+
+    author = message.get("author") if isinstance(message.get("author"), dict) else {}
+    msg_id = str(message.get("id") or message.get("msg_id") or "").strip()
+    author_id = str(message.get("author_id") or author.get("id") or "").strip()
+    create_at = message.get("create_at") or message.get("msg_timestamp")
+    event = {
+        "channel_type": "PERSON",
+        "type": message.get("type", 1),
+        "target_id": str(target_id or "").strip(),
+        "author_id": author_id,
+        "content": str(message.get("content") or ""),
+        "msg_id": msg_id,
+        "extra": {"author": author},
+    }
+    if create_at not in {None, ""}:
+        event["msg_timestamp"] = create_at
+        event["create_at"] = create_at
+    return event
+
+
+def select_unread_direct_messages(
+    messages: list[dict[str, Any]],
+    *,
+    bot_id: str,
+    seen_ids: set[str],
+    unread_count: int,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Pick the newest unread user DMs; never walk older history on later polls.
+
+    KOOK last_read_time is not a reliable unread watermark. unread_count names
+    the newest window. Already-seen ids are dropped inside that window only.
+    """
+
+    user_messages: list[dict[str, Any]] = []
+    for message in messages:
+        msg_id = str(message.get("id") or "").strip()
+        author = message.get("author") if isinstance(message.get("author"), dict) else {}
+        author_id = str(message.get("author_id") or author.get("id") or "").strip()
+        if not msg_id:
+            continue
+        if bot_id and author_id == bot_id:
+            continue
+        user_messages.append(message)
+    user_messages.sort(key=lambda item: int(item.get("create_at") or 0))
+    window_size = min(max(unread_count, 0), limit, len(user_messages))
+    if window_size <= 0:
+        return []
+    window = user_messages[-window_size:]
+    pending: list[dict[str, Any]] = []
+    for message in window:
+        msg_id = str(message.get("id") or "").strip()
+        if msg_id in seen_ids:
+            continue
+        pending.append(message)
+    return pending
+
+
 # KMarkdown 内嵌媒体语法: (img)/(video)/(audio)/(file)[url]
 _KMD_MEDIA_RE = re.compile(r"\((img|video|audio|file)\)\[([^\]]+)\]")
 # KMarkdown 提及语法: (met)用户ID/here/all(met)
@@ -173,8 +259,15 @@ class KookEventHandler:
                 "kook_target_id": target_id,
             }
         )
+        occurred_at = _kook_event_unix_seconds(event)
+        if occurred_at is not None:
+            builder.timestamp_ms(int(occurred_at * 1000))
 
         envelope = builder.build()
+        if occurred_at is not None:
+            message_info = envelope.get("message_info")
+            if isinstance(message_info, dict):
+                message_info["time"] = occurred_at
         # 顶层快捷字段（兼容旧消费方）+ 原始事件
         envelope["raw_message"] = event
         envelope["kook_guild_id"] = guild_id

@@ -357,6 +357,50 @@ async def test_gateway_resource_overload_cools_endpoint_across_request_names():
     assert client.calls == ["a"]
 
 
+async def test_group_forbidden_enters_transient_cooldown():
+    """Upstream 403 包池/分组拒绝应冷却，避免每轮表达都先撞一次死渠道。"""
+
+    model_set = [_model("a", max_retry=0), _model("b", max_retry=0)]
+
+    class ForbiddenThenOkClient:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def create(
+            self,
+            *,
+            model_name: str,
+            payloads,
+            tools,
+            request_name: str,
+            model_set,
+            stream: bool,
+        ):
+            self.calls.append(model_name)
+            if model_name == "a":
+                raise LLMAPIError("无权访问 包池分组 分组", status_code=403)
+            return "ok", [], None
+
+    client = ForbiddenThenOkClient()
+    clients = ModelClientRegistry(openai=client)
+    first = LLMRequest(
+        model_set,
+        request_name="life_chatter",
+        clients=clients,
+        policy=FailoverPolicy(),
+    )
+    assert (await first.send(stream=False)).message == "ok"
+
+    second = LLMRequest(
+        model_set,
+        request_name="life_chatter",
+        clients=clients,
+        policy=FailoverPolicy(),
+    )
+    assert (await second.send(stream=False)).message == "ok"
+    assert client.calls == ["a", "b", "b"]
+
+
 async def test_permanent_failure_does_not_enter_transient_cooldown():
     """Configuration and authentication faults must remain visible every time."""
 

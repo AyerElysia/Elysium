@@ -27,6 +27,7 @@ class ReachabilityRow:
     user_label: str = ""
     group_id: str = ""
     group_name: str = ""
+    person_record_present: bool = True
 
 
 def _opaque_ref(prefix: str, *parts: str) -> str:
@@ -48,6 +49,10 @@ def project_reachable_surfaces(
         if not stream_id or not platform or chat_type not in {"private", "group"}:
             continue
         if chat_type == "private":
+            # A stream whose person_id no longer resolves cannot be delivered
+            # to (KOOK 40000: empty/self target). Keep it out of outreach.
+            if not row.person_record_present:
+                continue
             canonical = str(row.canonical_person_key or "").strip()
             person_id = str(row.person_id or "").strip()
             if canonical:
@@ -117,6 +122,7 @@ async def load_reachable_surfaces() -> tuple[ReachableSurface, ...]:
                 ChatStreams.person_id.label("person_id"),
                 ChatStreams.group_id.label("group_id"),
                 ChatStreams.group_name.label("group_name"),
+                PersonInfo.person_id.label("resolved_person_id"),
                 PersonInfo.canonical_person_key.label("canonical_person_key"),
                 PersonInfo.nickname.label("nickname"),
                 PersonInfo.cardname.label("cardname"),
@@ -141,6 +147,9 @@ async def load_reachable_surfaces() -> tuple[ReachableSurface, ...]:
                 ),
                 group_id=str(_row_value(row, "group_id") or ""),
                 group_name=str(_row_value(row, "group_name") or ""),
+                person_record_present=bool(
+                    str(_row_value(row, "resolved_person_id") or "").strip()
+                ),
             )
         )
     return project_reachable_surfaces(projected)

@@ -64,6 +64,29 @@ def test_received_chat_fact_keeps_reply_media_and_provider_identity() -> None:
     assert "base64" not in str(descriptor).lower()
 
 
+def test_same_chat_message_evidence_ignores_replay_time_and_display_name() -> None:
+    from dataclasses import replace
+
+    from plugins.life_engine.service.chat_events import same_chat_message_evidence
+
+    original = build_chat_message_event(_message(), direction="received")
+    replay = replace(
+        original,
+        timestamp="2026-09-17T00:37:09+08:00",
+        metadata={
+            **original.metadata,
+            "chat": {
+                **original.metadata["chat"],
+                "sender": {**original.metadata["chat"]["sender"], "name": "REST name"},
+            },
+            "source_connection": "kook-rest-catchup",
+        },
+    )
+    assert same_chat_message_evidence(original, replay) is True
+    changed = replace(original, content="different body")
+    assert same_chat_message_evidence(original, changed) is False
+
+
 def test_voice_message_keeps_safe_attachment_for_history_projection() -> None:
     voice = MediaAttachment(
         MediaSegmentType.VOICE,

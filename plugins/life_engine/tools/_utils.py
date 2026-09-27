@@ -18,10 +18,17 @@ from ..core.config import LifeEngineConfig
 
 
 def resolve_registry_tool(registry: Any, name: str) -> Any | None:
-    """Look up a tool by schema name, with `tool-` prefix added or stripped.
+    """Look up a tool by schema name, tolerating transport and namespace prefixes.
 
-    BaseTool schemas register as ``tool-{tool_name}``. Models often call the
-    bare name. Heartbeat, chatter, and sub-agents must all tolerate both.
+    BaseTool schemas register as ``tool-{tool_name}``. Models often call the bare
+    name, so both spellings must resolve. Two further spellings matter: most
+    heartbeat tools carry a ``nucleus_`` namespace segment (``tool-nucleus_foo``)
+    while a minority register without it (``tool-read_context_group``), and a
+    model that has just called twenty namespaced tools routinely prefixes the
+    bare ones too. Refusing that spelling reported a real tool as unknown and
+    made the maintenance turn impossible to complete. Every addressing prefix is
+    therefore optional, and a stripped name is re-expanded with each transport
+    prefix so the lookup is symmetric.
     """
 
     raw_name = str(name or "").strip()
@@ -30,21 +37,63 @@ def resolve_registry_tool(registry: Any, name: str) -> Any | None:
     getter = getattr(registry, "get", None)
     if not callable(getter):
         return None
-    found = getter(raw_name)
-    if found is not None:
-        return found
-    alternatives: list[str] = []
-    if raw_name.startswith("tool-"):
-        alternatives.append(raw_name[len("tool-") :])
-        alternatives.append("action-" + raw_name[len("tool-") :])
-    elif raw_name.startswith("action-"):
-        alternatives.append(raw_name[len("action-") :])
-        alternatives.append("tool-" + raw_name[len("action-") :])
-    else:
-        alternatives.append(f"tool-{raw_name}")
-        alternatives.append(f"action-{raw_name}")
-    for alt_name in alternatives:
-        found = getter(alt_name)
+
+    candidates: list[str] = []
+
+    def _add(value: str) -> None:
+        if value and value not in candidates:
+            candidates.append(value)
+
+    _add(raw_name)
+    bare = raw_name
+    for prefix in ("tool-", "action-"):
+        if bare.startswith(prefix):
+            bare = bare[len(prefix) :]
+            break
+    _add(bare)
+    if bare.startswith("nucleus_"):
+        _add(bare[len("nucleus_") :])
+    for value in list(candidates):
+        if value in {"tool", "action"}:
+            continue
+        _add(f"tool-{value}")
+        _add(f"action-{value}")
+        if not value.startswith("nucleus_") and value not in {"tool", "action"}:
+            _add(f"tool-nucleus_{value}")
+            _add(f"action-nucleus_{value}")
+
+    # A model that has just called twenty "tool-nucleus_*" tools routinely
+    # addresses the one tool that registers in another convention the same way:
+    # "tool-nucleus_action_author_self_continuity_checkpoint". Reduction to the
+    # bare identity yields "author_self_continuity_checkpoint"; re-expanding it
+    # in every registered convention recovers
+    # "action-author_self_continuity_checkpoint". The reduction must be
+    # exhaustive because the prefixes stack and the model also swaps the "-"
+    # separator for "_" inside the identity, so one pass over the transport
+    # prefixes cannot reach it.
+    identity = raw_name
+    while True:
+        for prefix in (
+            "tool-",
+            "action-",
+            "tool_",
+            "action_",
+            "nucleus-",
+            "nucleus_",
+        ):
+            if identity.startswith(prefix):
+                identity = identity[len(prefix) :]
+                break
+        else:
+            break
+    if identity and identity != raw_name:
+        _add(identity)
+        for transport in ("tool-", "action-"):
+            _add(f"{transport}{identity}")
+            _add(f"{transport}nucleus_{identity}")
+
+    for candidate in candidates:
+        found = getter(candidate)
         if found is not None:
             return found
     return None

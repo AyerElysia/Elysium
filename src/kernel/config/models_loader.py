@@ -47,7 +47,6 @@ PRODUCTION_MODEL_TASKS = frozenset(
         "core",
         "learning",
         "expression",
-        "witness",
         "agent",
         "utility",
         "vision",
@@ -76,7 +75,6 @@ _TASK_ALIASES: dict[str, str] = {
     "life": "core",
     "actor": "expression",
     "sub_actor": "agent",
-    "diary": "witness",
     "vlm": "vision",
     "video": "vision",
     "utils": "utility",
@@ -125,6 +123,59 @@ _READY_CLIENT_TYPES = frozenset({"openai", "anthropic"})
 _NON_GENERATIVE_TASKS = frozenset({"voice", "embedding"})
 _UNRESOLVED_ENV_PATTERN = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")
 _KNOWN_API_KEY_PLACEHOLDER_PREFIXES = ("replace-with",)
+
+
+@dataclass(frozen=True, slots=True)
+class TaskModelOverride:
+    """One runtime-only task model selection."""
+
+    task: str
+    model: str
+    generation: int
+
+
+class _RuntimeTaskModelOverrides:
+    """Thread-safe runtime selections applied only to new requests.
+
+    The authoritative TOML registry remains immutable.  An override merely
+    promotes one already-validated candidate in a task's existing route.
+    """
+
+    def __init__(self) -> None:
+        self._items: dict[str, TaskModelOverride] = {}
+        self._generation = 0
+        self._lock = threading.Lock()
+
+    def set(self, task: str, model: str) -> TaskModelOverride:
+        with self._lock:
+            self._generation += 1
+            override = TaskModelOverride(task, model, self._generation)
+            self._items[task] = override
+            return override
+
+    def get(self, task: str) -> TaskModelOverride | None:
+        with self._lock:
+            return self._items.get(task)
+
+    def clear(self, task: str) -> bool:
+        with self._lock:
+            existed = task in self._items
+            if existed:
+                self._generation += 1
+                self._items.pop(task, None)
+            return existed
+
+    def snapshot(self) -> dict[str, TaskModelOverride]:
+        with self._lock:
+            return dict(self._items)
+
+    def reset(self) -> None:
+        with self._lock:
+            self._items.clear()
+            self._generation = 0
+
+
+_RUNTIME_TASK_MODEL_OVERRIDES = _RuntimeTaskModelOverrides()
 
 
 class ModelsConfig:
@@ -697,7 +748,15 @@ class ModelsConfig:
                 f"任务 '{task_name}' 未找到。可用: {list(self._tasks.keys())}"
             )
 
-        model_names = task.get("models", ())
+        model_names = list(task.get("models", ()))
+        override = get_task_model_override(resolved)
+        routing_snapshot = self._snapshot.digest
+        if override is not None:
+            model_names = [
+                override.model,
+                *[name for name in model_names if name != override.model],
+            ]
+            routing_snapshot = f"{routing_snapshot}:hot-{override.generation}"
         max_tokens = int(task.get("tokens", _DEFAULTS["tokens"]))
         temperature = float(task.get("temp", _DEFAULTS["temp"]))
         context_tokens = task.get("context_tokens")
@@ -715,6 +774,7 @@ class ModelsConfig:
                 ),
                 routing_task=resolved,
                 routing_priority=priority,
+                routing_snapshot=routing_snapshot,
             )
             if entry is not None:
                 if attempt_timeout_seconds is not None:
@@ -773,6 +833,7 @@ class ModelsConfig:
         context_tokens: int | None = None,
         routing_task: str | None = None,
         routing_priority: int | None = None,
+        routing_snapshot: str | None = None,
     ) -> dict[str, Any] | None:
         model = self._models.get(model_name)
         if model is None:
@@ -818,7 +879,7 @@ class ModelsConfig:
                     "routing_task": routing_task,
                     "routing_model_alias": model_name,
                     "routing_priority": routing_priority,
-                    "routing_snapshot": self._snapshot.digest,
+                    "routing_snapshot": routing_snapshot or self._snapshot.digest,
                 }
             )
             if context_tokens is not None:
@@ -865,3 +926,105 @@ def get_models_config() -> ModelsConfig:
             _models_config = existing
     existing.log_snapshot()
     return existing
+
+
+def _canonical_task_name(task_name: str) -> str:
+    """Resolve legacy task aliases used by public callers."""
+
+    return _TASK_ALIASES.get(task_name, task_name)
+
+
+def switch_task_model(
+    task_name: str,
+    model_name: str,
+    *,
+    registry: ModelsConfig | None = None,
+) -> TaskModelOverride:
+    """Promote one existing task candidate for subsequent requests.
+
+    This is deliberately narrower than editing ``models.toml``: only models
+    already present in the task's validated candidate list may be selected.
+    Existing ``LLMRequest`` instances keep their immutable model set; the
+    next request observes the new priority immediately.
+    """
+
+    if not isinstance(task_name, str) or not task_name.strip():
+        raise ValueError("task_name 必须是非空字符串")
+    if not isinstance(model_name, str) or not model_name.strip():
+        raise ValueError("model_name 必须是非空字符串")
+
+    registry = registry or get_models_config()
+    resolved = _canonical_task_name(task_name.strip())
+    task = registry.tasks.get(resolved)
+    if task is None:
+        raise ValueError(f"任务 '{task_name}' 未找到。可用: {list(registry.tasks)}")
+
+    candidates = [str(name) for name in task.get("models", ())]
+    model_name = model_name.strip()
+    if model_name not in registry.models:
+        raise ValueError(f"模型 '{model_name}' 未在权威模型注册表中登记")
+    if model_name not in candidates:
+        raise ValueError(
+            f"模型 '{model_name}' 不是任务 '{resolved}' 的候选模型；"
+            f"可选: {candidates}"
+        )
+
+    return _RUNTIME_TASK_MODEL_OVERRIDES.set(resolved, model_name)
+
+
+def clear_task_model_override(task_name: str) -> bool:
+    """Remove a runtime override and restore the configured route order."""
+
+    if not isinstance(task_name, str) or not task_name.strip():
+        raise ValueError("task_name 必须是非空字符串")
+    return _RUNTIME_TASK_MODEL_OVERRIDES.clear(_canonical_task_name(task_name.strip()))
+
+
+def get_task_model_override(task_name: str) -> TaskModelOverride | None:
+    """Return the active runtime override for a task, if any."""
+
+    return _RUNTIME_TASK_MODEL_OVERRIDES.get(_canonical_task_name(task_name))
+
+
+def get_task_model_state(
+    task_name: str,
+    *,
+    registry: ModelsConfig | None = None,
+) -> dict[str, Any]:
+    """Return a secret-free, user-facing state description for one task."""
+
+    registry = registry or get_models_config()
+    resolved = _canonical_task_name(task_name)
+    task = registry.tasks.get(resolved)
+    if task is None:
+        raise ValueError(f"任务 '{task_name}' 未找到。可用: {list(registry.tasks)}")
+    candidates = [str(name) for name in task.get("models", ())]
+    override = get_task_model_override(resolved)
+    return {
+        "task": resolved,
+        "candidates": candidates,
+        "configured_model": candidates[0] if candidates else None,
+        "active_model": override.model if override else (candidates[0] if candidates else None),
+        "override_model": override.model if override else None,
+        "generation": override.generation if override else 0,
+        "routing_snapshot": registry.snapshot.digest,
+    }
+
+
+def list_task_model_states(
+    *,
+    registry: ModelsConfig | None = None,
+) -> list[dict[str, Any]]:
+    """Return model-selection state for every configured task."""
+
+    registry = registry or get_models_config()
+    return [
+        get_task_model_state(task_name, registry=registry)
+        for task_name in registry.list_task_names()
+    ]
+
+
+def _reset_task_model_overrides_for_tests() -> None:
+    """Reset process-local selections for deterministic tests."""
+
+    _RUNTIME_TASK_MODEL_OVERRIDES.reset()

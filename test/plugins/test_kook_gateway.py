@@ -55,3 +55,25 @@ async def test_gateway_start_is_idempotent_and_stop_awaits_listener() -> None:
     assert gateway._listen_task_info is None
     assert gateway.connected is False
     assert gateway.alive is False
+
+
+def test_rest_direct_message_keeps_create_at_as_msg_timestamp() -> None:
+    from plugins.kook_adapter.events import (
+        _kook_event_unix_seconds,
+        rest_direct_message_to_person_event,
+    )
+
+    event = rest_direct_message_to_person_event(
+        {
+            "id": "msg-1",
+            "type": 9,
+            "author_id": "1370110560",
+            "content": "hi",
+            "create_at": 1789562229000,
+            "author": {"id": "1370110560", "username": "user"},
+        },
+        target_id="1370110560",
+    )
+    assert event["msg_id"] == "msg-1"
+    assert event["msg_timestamp"] == 1789562229000
+    assert _kook_event_unix_seconds(event) == 1789562229.0

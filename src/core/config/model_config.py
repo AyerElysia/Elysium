@@ -228,7 +228,6 @@ _TASK_ALIASES: dict[str, str] = {
     "life": "core",
     "actor": "expression",
     "sub_actor": "agent",
-    "diary": "witness",
     "vlm": "vision",
     "video": "vision",
     "utils": "utility",

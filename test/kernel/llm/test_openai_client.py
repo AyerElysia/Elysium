@@ -15,8 +15,8 @@ import pytest
 from src.kernel.llm import (
     Audio,
     Image,
+    LLMAPIError,
     LLMPayload,
-    MediaValidationError,
     UnsupportedModalityError,
     ReasoningText,
     ROLE,
@@ -592,6 +592,87 @@ class TestSchemaNormalization:
         assert "reason" not in required
 
 
+class TestRequireChatCompletion:
+    """网关返回非 ChatCompletion 正文时必须升为 LLMAPIError。"""
+
+    def test_passes_through_object_with_choices(self):
+        from src.kernel.llm.model_client.openai_client import _require_chat_completion
+
+        resp = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))])
+        assert _require_chat_completion(resp, model_name="m") is resp
+
+    def test_string_body_becomes_502(self):
+        from src.kernel.llm.model_client.openai_client import _require_chat_completion
+
+        with pytest.raises(LLMAPIError) as exc_info:
+            _require_chat_completion("可用额度不足", model_name="deepseek-v4.1-flash")
+        assert exc_info.value.status_code == 502
+        assert exc_info.value.error_code == "malformed_chat_completion"
+        assert "可用额度不足" in str(exc_info.value)
+
+    def test_json_error_object_keeps_quota_code(self):
+        from src.kernel.llm.model_client.openai_client import _require_chat_completion
+
+        body = json.dumps(
+            {
+                "error": {
+                    "message": "可用额度不足",
+                    "type": "insufficient_user_quota",
+                    "code": "insufficient_user_quota",
+                }
+            },
+            ensure_ascii=False,
+        )
+        with pytest.raises(LLMAPIError) as exc_info:
+            _require_chat_completion(body, model_name="deepseek-v4.1-flash")
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.error_code == "insufficient_user_quota"
+        assert "可用额度不足" in str(exc_info.value)
+
+    def test_dict_without_choices_is_malformed(self):
+        from src.kernel.llm.model_client.openai_client import _require_chat_completion
+
+        with pytest.raises(LLMAPIError) as exc_info:
+            _require_chat_completion({"id": "cmpl-x"}, model_name="m")
+        assert exc_info.value.status_code == 502
+        assert exc_info.value.error_code == "malformed_chat_completion"
+
+    def test_assembles_sse_chunks_into_completion(self):
+        from src.kernel.llm.model_client.openai_client import _require_chat_completion
+
+        sse = (
+            'data: {"object":"chat.completion.chunk","choices":[{"delta":{"content":"你"}}]}\n'
+            'data: {"object":"chat.completion.chunk","choices":[{"delta":{"content":"好","reasoning_content":"想"},"finish_reason":"stop"}]}\n'
+            "data: [DONE]\n"
+        )
+        resp = _require_chat_completion(sse, model_name="deepseek-v4.1-flash")
+        assert resp.choices[0].message.content == "你好"
+        assert resp.choices[0].message.reasoning_content == "想"
+        assert resp.choices[0].finish_reason == "stop"
+
+    def test_assembles_concatenated_sse_tool_calls(self):
+        from src.kernel.llm.model_client.openai_client import _require_chat_completion
+
+        sse = (
+            'data: {"object":"chat.completion.chunk","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"send","arguments":"{\\"a\\""}}]}}]}'
+            'data: {"object":"chat.completion.chunk","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":":1}"}}]},"finish_reason":"tool_calls"}]}'
+        )
+        resp = _require_chat_completion(sse, model_name="m")
+        tool = resp.choices[0].message.tool_calls[0]
+        assert tool.id == "call_1"
+        assert tool.function.name == "send"
+        assert tool.function.arguments == '{"a":1}'
+
+    def test_objectifies_dict_completion(self):
+        from src.kernel.llm.model_client.openai_client import _require_chat_completion
+
+        resp = _require_chat_completion(
+            {"choices": [{"message": {"content": "pong", "tool_calls": None}}]},
+            model_name="m",
+        )
+        assert resp.choices[0].message.content == "pong"
+
+
 class TestOpenAIChatClient:
     """测试OpenAIChatClient类。"""
 
@@ -672,6 +753,81 @@ class TestOpenAIChatClient:
         assert stream_iter is None
         assert reasoning_content is None
         assert isinstance(request_record_id, int)
+
+    async def test_create_raises_api_error_for_string_completion(self):
+        """网关 HTTP 200 但正文是字符串时，应升为可故障转移的 LLMAPIError。"""
+        from src.kernel.llm.model_client.openai_client import OpenAIChatClient
+
+        mock_openai_client = MagicMock()
+        mock_openai_client.chat.completions.create = AsyncMock(
+            return_value="可用额度不足"
+        )
+
+        client = OpenAIChatClient()
+        client._clients = {}
+        client._get_client = MagicMock(return_value=mock_openai_client)
+
+        payloads = [LLMPayload(ROLE.USER, Text("Hi"))]
+        model_set = {
+            "api_key": "test-key",
+            "base_url": "https://api.test.com",
+            "timeout": 30.0,
+            "max_tokens": 100,
+            "temperature": 0.7,
+            "extra_params": {},
+        }
+
+        with pytest.raises(LLMAPIError) as exc_info:
+            await client.create(
+                model_name="deepseek-v4.1-flash",
+                payloads=payloads,
+                tools=[],
+                request_name="test",
+                model_set=model_set,
+                stream=False,
+            )
+
+        error = exc_info.value
+        assert error.status_code == 502
+        assert error.error_code == "malformed_chat_completion"
+        assert error.model == "deepseek-v4.1-flash"
+        assert "可用额度不足" in str(error)
+
+    async def test_create_non_stream_sends_stream_false(self):
+        """非流式路径必须显式带 stream=false，避免 thinking 网关默认改推 SSE。"""
+        from src.kernel.llm.model_client.openai_client import OpenAIChatClient
+
+        mock_completion = MagicMock()
+        mock_completion.choices = [MagicMock()]
+        mock_completion.choices[0].message.content = "ok"
+        mock_completion.choices[0].message.tool_calls = None
+
+        mock_openai_client = MagicMock()
+        mock_openai_client.chat.completions.create = AsyncMock(return_value=mock_completion)
+
+        client = OpenAIChatClient()
+        client._clients = {}
+        client._get_client = MagicMock(return_value=mock_openai_client)
+
+        await client.create(
+            model_name="deepseek-v4.1-flash",
+            payloads=[LLMPayload(ROLE.USER, Text("Hi"))],
+            tools=[],
+            request_name="test",
+            model_set={
+                "api_key": "test-key",
+                "base_url": "https://api.test.com",
+                "timeout": 30.0,
+                "max_tokens": 100,
+                "temperature": 0.7,
+                "extra_params": {"thinking": {"type": "enabled"}},
+            },
+            stream=False,
+        )
+
+        kwargs = mock_openai_client.chat.completions.create.await_args.kwargs
+        assert kwargs["stream"] is False
+        assert kwargs["extra_body"]["thinking"] == {"type": "enabled"}
 
     async def test_create_stores_usage_with_cache_fields(self):
         """测试非流式请求会记录 usage，并包含缓存相关字段。"""

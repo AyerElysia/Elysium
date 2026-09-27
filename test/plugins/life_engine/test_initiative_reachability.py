@@ -111,7 +111,27 @@ def test_projection_order_is_stable_and_not_current_or_recent_order() -> None:
     assert not hasattr(first[0], "is_current")
 
 
-def test_groups_are_places_and_never_people() -> None:
+def test_dangling_private_stream_is_not_reachable() -> None:
+    surfaces = project_reachable_surfaces(
+        [
+            ReachabilityRow(
+                stream_id="ghost-kook",
+                platform="kook",
+                chat_type="private",
+                person_id="missing-person",
+                person_record_present=False,
+            ),
+            ReachabilityRow(
+                stream_id="live-kook",
+                platform="kook",
+                chat_type="private",
+                person_id="account-kook",
+                user_label="小希",
+            ),
+        ]
+    )
+    assert [item.stream_id for item in surfaces] == ["live-kook"]
+
     surfaces = project_reachable_surfaces(
         [
             ReachabilityRow(
