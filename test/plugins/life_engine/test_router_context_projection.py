@@ -626,7 +626,7 @@ async def test_projection_watcher_retries_provider_failure_without_source_edit(
 
 
 @pytest.mark.asyncio
-async def test_projection_author_tries_next_cloud_model_after_empty_final(
+async def test_projection_author_packages_authority_without_a_model(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -647,44 +647,18 @@ async def test_projection_author_tries_next_cloud_model_after_empty_final(
         author=service._author_router_context_projection,
     )
     sources, source_digest = projection._read_sources()
-    requested_models: list[str] = []
 
-    class _ProjectionRequest:
-        def __init__(self, model_identifier: str) -> None:
-            self.model_identifier = model_identifier
-            self.payloads: list[object] = []
+    def fail_model(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("router projection must not call a model")
 
-        def add_payload(self, payload: object) -> None:
-            self.payloads.append(payload)
-
-        async def send(self, *, stream: bool = False) -> _Response:
-            assert stream is False
-            requested_models.append(self.model_identifier)
-            if self.model_identifier == "thinking-empty":
-                return _Response("", reasoning="long reasoning without final")
-            return _Response("compact projection")
-
-    monkeypatch.setattr(
-        service_core,
-        "get_model_set_by_task",
-        lambda task: [
-            {"model_identifier": "thinking-empty"},
-            {"model_identifier": "cloud-second"},
-        ],
-    )
-    monkeypatch.setattr(
-        service_core,
-        "create_llm_request",
-        lambda model_set, request_name: _ProjectionRequest(
-            model_set[0]["model_identifier"]
-        ),
-    )
+    monkeypatch.setattr(service_core, "create_llm_request", fail_model)
 
     draft = await service._author_router_context_projection(
         source_digest,
         sources,
     )
 
-    assert draft.text == "compact projection"
-    assert draft.generator.endswith("model:cloud-second")
-    assert requested_models == ["thinking-empty", "cloud-second"]
+    for source in sources:
+        assert source.path in draft.text
+        assert source.text.strip() in draft.text
+    assert draft.generator == "local:authority_verbatim"

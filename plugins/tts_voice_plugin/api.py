@@ -20,6 +20,7 @@ class LocalTTSService(Protocol):
         text: str,
         style_hint: str = "default",
         language_hint: str | None = None,
+        expression_instruction: str | None = None,
     ) -> str | None: ...
 
 

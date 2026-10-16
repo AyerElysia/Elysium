@@ -91,7 +91,7 @@ class SubjectContextProjection(RouterContextProjection):
     component_name = "subject_context_projection"
     projection_kind = "derived_subject_context_projection"
     projection_title = "Subject Context Projection"
-    projection_algorithm = "llm_semantic_subject_continuity"
+    projection_algorithm = "authority_verbatim_v1"
     projection_version = SUBJECT_CONTEXT_PROJECTION_VERSION
 
     def __init__(

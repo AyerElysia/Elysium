@@ -20,17 +20,6 @@ from plugins.life_engine.service.core import LifeEngineService
 from src.core.config.core_config import CoreConfig
 
 
-class _Response:
-    def __init__(self, message: str) -> None:
-        self.message = message
-
-    def __await__(self):
-        async def collect() -> str:
-            return self.message
-
-        return collect().__await__()
-
-
 def _write_authorities(workspace: Path) -> None:
     (workspace / "SOUL.md").write_text("soul-v1", encoding="utf-8")
     (workspace / "USER.md").write_text("user-v1", encoding="utf-8")
@@ -113,7 +102,7 @@ async def test_each_authority_changes_revision_and_per_source_hash(
         previous = current
 
     assert first["projection_profile"] == "voice_live"
-    assert first["projection_algorithm"] == "llm_semantic_subject_continuity"
+    assert first["projection_algorithm"] == "authority_verbatim_v1"
     assert first["projection_version"] == SUBJECT_CONTEXT_PROJECTION_VERSION
     assert first["authority"] == "derived_non_authoritative"
     assert set(first["budget"]["sources"]) == {
@@ -482,7 +471,7 @@ async def test_missing_or_corrupt_manifest_never_gets_silently_reconstructed(
 
 
 @pytest.mark.asyncio
-async def test_subject_author_tries_next_model_after_per_source_budget_failure(
+async def test_subject_author_packages_authority_without_a_model(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -512,43 +501,11 @@ async def test_subject_author_tries_next_model_after_per_source_budget_failure(
         author=unused_author,
     )
     sources, source_digest = reader._read_sources()
-    oversized = (
-        '<subject-source path="SOUL.md">\n' + ("世" * 800) + "\n</subject-source>\n"
-        '<subject-source path="USER.md">\nuser\n</subject-source>\n'
-        '<subject-source path="MEMORY.md">\nmemory\n</subject-source>'
-    )
-    valid = _draft_from_sources(sources).text
-    requested_models: list[str] = []
 
-    class _ProjectionRequest:
-        def __init__(self, model_identifier: str) -> None:
-            self.model_identifier = model_identifier
+    def fail_model(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("subject projection must not call a model")
 
-        def add_payload(self, _payload: object) -> None:
-            return
-
-        async def send(self, *, stream: bool = False) -> _Response:
-            assert stream is False
-            requested_models.append(self.model_identifier)
-            return _Response(
-                oversized if self.model_identifier == "oversized" else valid
-            )
-
-    monkeypatch.setattr(
-        service_core,
-        "get_model_set_by_task",
-        lambda _task: [
-            {"model_identifier": "oversized"},
-            {"model_identifier": "valid-second"},
-        ],
-    )
-    monkeypatch.setattr(
-        service_core,
-        "create_llm_request",
-        lambda model_set, request_name: _ProjectionRequest(
-            model_set[0]["model_identifier"]
-        ),
-    )
+    monkeypatch.setattr(service_core, "create_llm_request", fail_model)
 
     draft = await service._author_subject_context_projection(
         source_digest,
@@ -558,9 +515,10 @@ async def test_subject_author_tries_next_model_after_per_source_budget_failure(
         max_bytes=reader.max_bytes,
     )
 
-    assert draft.text == valid
-    assert draft.generator.endswith("model:valid-second")
-    assert requested_models == ["oversized", "valid-second"]
+    for source in sources:
+        assert f'<subject-source path="{source.path}">' in draft.text
+        assert source.text in draft.text
+    assert draft.generator == "local:authority_verbatim"
 
 
 _VERSION_NAMESPACE = "router_context_projection.version"

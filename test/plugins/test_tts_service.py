@@ -452,6 +452,53 @@ def test_breeze_fields_bind_trusted_style_and_reproducible_seed(
     assert 0 <= int(first["seed"]) <= 2_147_483_647
 
 
+def test_breeze_expression_instruction_is_dynamic_and_reference_locked(
+    tmp_path: Path,
+) -> None:
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"RIFF-reference")
+    config = TTSVoiceConfig()
+    config.tts.backend = "breeze_tts2"
+    config.tts_styles[0].refer_wav_path = str(reference)
+    config.tts_styles[0].prompt_text = "逐字准确的参考文本。"
+    config.tts_styles[0].breeze_instruction = "保持爱莉的参考音色。"
+    service = TTSService(SimpleNamespace(config=config))  # type: ignore[arg-type]
+
+    fields = service._build_breeze_tts2_fields(
+        server_config=service.tts_styles["default"],
+        text="今晚见。",
+        expression_instruction="像刚松了一口气，温柔地说，句尾带一点笑意。",
+    )
+
+    assert fields["text"] == "今晚见。"
+    assert fields["ref_text"] == "逐字准确的参考文本。"
+    assert "本次表达控制：像刚松了一口气，温柔地说，句尾带一点笑意。" in fields["instruction"]
+    assert "不改变参考音色" in fields["instruction"]
+    assert service.tts_styles["default"]["refer_wav_path"] == str(reference)
+
+
+def test_breeze_projection_preserves_native_vocal_events(
+    tmp_path: Path,
+) -> None:
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"RIFF-reference")
+    config = TTSVoiceConfig()
+    config.tts.backend = "breeze_tts2"
+    config.tts_styles[0].refer_wav_path = str(reference)
+    service = TTSService(SimpleNamespace(config=config))  # type: ignore[arg-type]
+
+    projected = service._clean_text_for_tts(
+        "[叹气] 你好……(sigh)",
+        preserve_breeze_vocal_events=True,
+    )
+    legacy_projected = service._clean_text_for_tts("[叹气] 你好……(sigh)")
+
+    assert "[叹气]" in projected
+    assert "(sigh)" in projected
+    assert "[叹气]" not in legacy_projected
+    assert "(sigh)" not in legacy_projected
+
+
 async def test_breeze_call_uses_multipart_and_wraps_streamed_pcm_as_wav(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

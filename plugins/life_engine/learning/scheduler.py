@@ -2004,12 +2004,12 @@ class LearningScheduler:
             [
                 "- 你可以保持原样、稍后再看，或安静结束；后台不能替你解释或改写。",
                 "- 复盘 SOUL.md 或 USER.md 时也可以用 `nucleus_learn`（操作说明在 learning skill）；"
-                "MEMORY.md 的结构化整理仍可用 `nucleus_memory_continuity_review`。普通改写可以直接用文件工具。",
+                "MEMORY.md 的结构化整理仍可用 `nucleus_capability_call(capability_id=life.memory_review, operation=nucleus_memory_continuity_review)`。普通改写可以直接用文件工具。",
             ]
         )
         if any(item["target_path"] == "MEMORY.md" for item in due):
             lines.append(
-                "- 用 `nucleus_memory_continuity_review` 的 open/read_source 固定统一"
+                "- 用 `nucleus_capability_call(capability_id=life.memory_review, operation=nucleus_memory_continuity_review)` 的 open/read_source 固定统一"
                 " SOUL+USER+MEMORY revision 并分页读完当前 MEMORY；在同一个"
                 " prepare_candidate 中，把仍重要的长原文按精确 UTF-8 范围保存成"
                 "不可变 Boundary 并替换为索引，也可用 text_edits 明确新增、修订或"
@@ -2024,7 +2024,7 @@ class LearningScheduler:
                 lines.append(
                     "- 若这是统一会话上线前遗留的 MEMORY 通用候选，只能用 "
                     "`nucleus_learn` 按 learning skill 作只读迁移审计；通用决定/接受入口会明确拒绝，不会自动转换或写入主体。"
-                    "新的 MEMORY 候选与决定只能重新从 `nucleus_memory_continuity_review` "
+                    "新的 MEMORY 候选与决定只能重新从 `nucleus_capability_call(capability_id=life.memory_review, operation=nucleus_memory_continuity_review)` "
                     "开始，并完成精确全文投递证明。"
                 )
         if any(

@@ -11,7 +11,7 @@ from ..core.config import LifeEngineConfig
 from .store import LifeTraceRecord, LifeTraceStore
 
 
-_TRACE_CHATTER_ALLOW = ["life_engine_internal", "life_chatter", "default_chatter"]
+_TRACE_CHATTER_ALLOW = ["life_engine_internal", "life_chatter"]
 
 
 def _store(plugin: Any) -> Any:

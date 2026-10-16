@@ -67,6 +67,15 @@ _SEMANTIC_BOUNDARY_RE = re.compile(
 )
 
 
+# Breeze TTS 2 natively interprets these inline vocal events. They are protected
+# only for the Breeze transport; legacy providers keep their historical cleanup.
+_BREEZE_VOCAL_EVENT_RE = re.compile(
+    r"\((?:laugh|cough|clears\s+throat|sigh)\)"
+    r"|\[(?:笑|咳嗽|清嗓子|叹气)\]",
+    re.IGNORECASE,
+)
+
+
 class TTSService(BaseService):
     """本地 TTS 核心服务。"""
 
@@ -678,7 +687,12 @@ class TTSService(BaseService):
 
         return "".join(projected)
 
-    def _clean_text_for_tts(self, text: str) -> str:
+    def _clean_text_for_tts(
+        self,
+        text: str,
+        *,
+        preserve_breeze_vocal_events: bool = False,
+    ) -> str:
         """清洗文本以适合 TTS 合成。
 
         Args:
@@ -687,6 +701,14 @@ class TTSService(BaseService):
         Returns:
             清洗后的文本
         """
+        protected_events: list[str] = []
+        if preserve_breeze_vocal_events:
+            def _protect_event(match: re.Match[str]) -> str:
+                protected_events.append(match.group(0))
+                return f"BreezeEventToken{len(protected_events) - 1}"
+
+            text = _BREEZE_VOCAL_EVENT_RE.sub(_protect_event, text)
+
         # 0. 移除 Higgs 风格控制标记（<|emotion:...|> / <|style:...|> / <|sfx:...|> 等）。
         #    GPT-SoVITS 不理解这类标记，若不先剥离，后续字符过滤会把尖括号和竖线删掉，
         #    只留下 "emotion:affection" 这类裸文本被当成正文念出来。
@@ -730,7 +752,11 @@ class TTSService(BaseService):
         if text and not text.endswith(tuple("，。！？、；：,.!?;:~～…")):
             text += "。"
 
-        return text.strip()
+        text = text.strip()
+        if protected_events:
+            for index, event in enumerate(protected_events):
+                text = text.replace(f"BreezeEventToken{index}", event)
+        return text
 
     @staticmethod
     def _estimate_synthesis_units(text: str) -> int:
@@ -1415,9 +1441,19 @@ class TTSService(BaseService):
         *,
         server_config: dict[str, Any],
         text: str,
+        expression_instruction: str | None = None,
     ) -> dict[str, str]:
         """Build trusted multipart fields for one Breeze transport segment."""
         instruction = str(server_config.get("breeze_instruction") or "").strip()
+        expression_instruction = str(expression_instruction or "").strip()
+        if len(expression_instruction) > 1000:
+            raise ValueError("Breeze expression instruction is too long")
+        if expression_instruction:
+            instruction = (
+                f"{instruction}\n"
+                "本次只调整表达方式，不改变参考音色、年龄感、身份或声线。\n"
+                f"本次表达控制：{expression_instruction}"
+            )
         ref_text = str(server_config.get("prompt_text") or "").strip()
         style_name = str(server_config.get("style_name") or "default").strip()
         try:
@@ -1498,6 +1534,9 @@ class TTSService(BaseService):
             fields = self._build_breeze_tts2_fields(
                 server_config=server_config,
                 text=text,
+                expression_instruction=kwargs.get(
+                    "breeze_expression_instruction"
+                ),
             )
         except ValueError as exc:
             logger.error(
@@ -2043,6 +2082,7 @@ class TTSService(BaseService):
         text: str,
         style_hint: str = "default",
         language_hint: str | None = None,
+        expression_instruction: str | None = None,
     ) -> str | None:
         """生成语音并返回 Base64 编码。
 
@@ -2050,6 +2090,7 @@ class TTSService(BaseService):
             text: 要合成的文本
             style_hint: 风格名称提示
             language_hint: 语言提示 (优先级最高)
+            expression_instruction: 本次表达的情绪、语气、语速和停顿指导；只影响 Breeze 表达，不改变参考音色
 
         Returns:
             Base64 编码的音频数据，失败返回 None
@@ -2076,7 +2117,14 @@ class TTSService(BaseService):
                 return None
 
         server_config = self.tts_styles[style]
-        clean_text = self._clean_text_for_tts(text)
+        backend = self._backend_name()
+        breeze_expression_instruction = str(expression_instruction or "").strip()
+        if len(breeze_expression_instruction) > 1000:
+            raise ValueError("TTS expression instruction exceeds 1000 characters")
+        clean_text = self._clean_text_for_tts(
+            text,
+            preserve_breeze_vocal_events=backend == "breeze_tts2",
+        )
         if not clean_text:
             return None
         if len(clean_text) > self.max_text_length:
@@ -2121,6 +2169,7 @@ class TTSService(BaseService):
             "sovits_weights": server_config.get("sovits_weights"),
             "gpt_weights_sha256": server_config.get("gpt_weights_sha256"),
             "sovits_weights_sha256": server_config.get("sovits_weights_sha256"),
+            "breeze_expression_instruction": breeze_expression_instruction,
         }
         final_media_type = self._config.tts_advanced.media_type
         spatial_enabled = self._config.spatial_effects.enabled

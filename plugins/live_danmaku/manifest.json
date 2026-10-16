@@ -1,0 +1,32 @@
+{
+  "name": "live_danmaku",
+  "version": "0.1.0",
+  "description": "手动连接 B 站房间并显示新弹幕",
+  "author": "Elysium",
+  "license": "GPL-3.0",
+  "min_core_version": "1.0.0",
+  "entry_point": "plugin.py",
+  "keywords": ["bilibili", "danmaku"],
+  "categories": ["entertainment"],
+  "dependencies": {
+    "plugins": [],
+    "components": []
+  },
+  "python_dependencies": ["brotli", "httpx", "websockets"],
+  "include": [
+    {
+      "component_type": "router",
+      "component_name": "live_danmaku",
+      "dependencies": [],
+      "enabled": true
+    },
+    {
+      "component_type": "event_handler",
+      "component_name": "live_danmaku_reply",
+      "dependencies": [],
+      "enabled": true
+    }
+  ],
+  "dependencies_required": true,
+  "enabled": true
+}

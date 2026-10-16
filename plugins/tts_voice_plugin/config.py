@@ -35,30 +35,7 @@ class PluginSection(SectionBase):
 class ComponentsSection(SectionBase):
     """组件启用控制。"""
 
-    action_enabled: bool = Field(default=True, description="是否启用 Action 组件")
-    action_always_available: bool = Field(
-        default=True,
-        description=(
-            "是否让 tts_voice_action 始终可用。"
-            "开启后不会依赖随机/关键词/LLM 判定，适合 default_chatter 稳定调用 TTS。"
-        ),
-    )
     command_enabled: bool = Field(default=True, description="是否启用 Command 组件")
-
-
-@config_section("prompt")
-class PromptSection(SectionBase):
-    """自定义提示词配置。"""
-
-    custom_instructions: str = Field(
-        default="",
-        description=(
-            "追加到 tts_voice_action action 描述末尾的自定义指令。\n"
-            "可描述希望 AI 主动使用语音功能的具体场景，"
-            "例如：在表达亲密感、讲故事或用户明确要求听声音时主动使用。\n"
-            "不会覆盖已有的触发条件，只是扩充场景说明。"
-        ),
-    )
 
 
 @config_section("tts")
@@ -324,7 +301,6 @@ class TTSVoiceConfig(BaseConfig):
 
     plugin: PluginSection = Field(default_factory=PluginSection)
     components: ComponentsSection = Field(default_factory=ComponentsSection)
-    prompt: PromptSection = Field(default_factory=PromptSection)
     tts: TTSSection = Field(default_factory=TTSSection)
     tts_styles: list[TTSStyle] = Field(
         default_factory=lambda: [TTSStyle()],

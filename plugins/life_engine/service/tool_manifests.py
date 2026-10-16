@@ -46,7 +46,6 @@ CONSCIOUSNESS_TOOL_MANIFESTS: dict[str, list[str]] = {
         "tool-nucleus_read_event",
         "tool-nucleus_search_memory",
         "tool-nucleus_read_memory_boundary",
-        "tool-nucleus_memory_continuity_review",
         "tool-nucleus_relations",
         "tool-nucleus_memory_stats",
         "action-send_emoji_meme",
@@ -151,7 +150,6 @@ HEARTBEAT_TOOL_NAMES: tuple[str, ...] = (
     "nucleus_read_event",
     "nucleus_search_memory",
     "nucleus_read_memory_boundary",
-    "nucleus_memory_continuity_review",
     "nucleus_proactive_query",
     "nucleus_proactive_command",
     "nucleus_todo",
@@ -183,7 +181,6 @@ def heartbeat_tool_classes() -> list[type[Any]]:
     from ..learning.learn_tool import NucleusLearnTool
     from ..opportunity.tools import OPPORTUNITY_TOOLS
     from ..memory.boundary_tools import LifeReadMemoryBoundaryTool
-    from ..memory.continuity_tools import LifeMemoryContinuityReviewSessionTool
     from ..memory.tools import LifeEngineSearchMemoryTool
     from ..narrative.tools import LifeEngineWriteNarrativeTool
     from ..proactive.tools import (
@@ -224,7 +221,6 @@ def heartbeat_tool_classes() -> list[type[Any]]:
         LifeEngineReadEventTool,
         LifeEngineSearchMemoryTool,
         LifeReadMemoryBoundaryTool,
-        LifeMemoryContinuityReviewSessionTool,
         LifeEngineProactiveQueryTool,
         LifeEngineProactiveCommandTool,
         NucleusTodoTool,

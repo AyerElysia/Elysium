@@ -158,6 +158,10 @@ plugins/livestream/**/*.py[cod]
 !plugins/voice_live/**
 plugins/voice_live/**/__pycache__/
 plugins/voice_live/**/*.py[cod]
+!plugins/live_danmaku/
+!plugins/live_danmaku/**
+plugins/live_danmaku/**/__pycache__/
+plugins/live_danmaku/**/*.py[cod]
 !plugins/commands_plugin/
 !plugins/commands_plugin/**
 plugins/commands_plugin/**/__pycache__/

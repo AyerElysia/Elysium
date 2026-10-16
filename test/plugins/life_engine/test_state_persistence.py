@@ -355,9 +355,36 @@ async def test_shared_mode_conflict_retry_conflict_recoverable_false_still_raise
     assert persistence._runtime_state_revision == 3
 
 
-async def test_single_writer_mode_conflict_raises_without_merge(tmp_path: Path) -> None:
-    """单写者模式：CAS 冲突是真实错误，直接 PersistenceError，不触发共享合并。"""
+async def test_single_writer_stale_revision_retries_local_snapshot(
+    tmp_path: Path,
+) -> None:
+    """单写者修订号滞后时采纳 actual，用本地快照重试一次，不合并远端字段。"""
     store = _SharedConflictStore(remote_revision=3)
+    claim = SimpleNamespace(lease_token="writer-1")
+    state = LifeEngineState(heartbeat_count=1)
+    persistence = StatePersistence(
+        str(tmp_path),
+        lambda: 100,
+        runtime_store=store,
+        runtime_writer_claim=claim,
+    )
+
+    assert await persistence.save_runtime_context(state, [], []) is True
+
+    assert len(store.put_state_calls) == 2
+    assert store.put_state_calls[0]["expected_revision"] == 0
+    assert store.put_state_calls[1]["expected_revision"] == 3
+    assert store.get_state_calls == 0
+    assert store.put_state_calls[1]["payload"]["state"]["heartbeat_count"] == 1
+    assert persistence._runtime_state_revision == 4
+
+
+async def test_single_writer_retry_conflict_adopts_revision_for_next_save(
+    tmp_path: Path,
+) -> None:
+    """重试仍冲突时保持失败，但本地修订号前进，下一次保存不再用旧 expected。"""
+    store = _SharedConflictStore(remote_revision=3)
+    store.conflict_on_retry = True
     claim = SimpleNamespace(lease_token="writer-1")
     state = LifeEngineState(heartbeat_count=1)
     persistence = StatePersistence(
@@ -370,5 +397,41 @@ async def test_single_writer_mode_conflict_raises_without_merge(tmp_path: Path) 
     with pytest.raises(PersistenceError):
         await persistence.save_runtime_context(state, [], [])
 
-    assert len(store.put_state_calls) == 1
+    assert persistence._runtime_state_revision == 3
     assert store.get_state_calls == 0
+    store.conflict_on_retry = False
+
+    assert await persistence.save_runtime_context(state, [], []) is True
+    assert store.put_state_calls[-1]["expected_revision"] == 3
+    assert persistence._runtime_state_revision == 4
+
+
+async def test_single_writer_conflict_without_actual_stays_a_hard_error(
+    tmp_path: Path,
+) -> None:
+    """冲突信息里没有 actual、远端也读不到时，仍直接失败且不改本地修订号。"""
+
+    class _OpaqueConflictStore(_SharedConflictStore):
+        async def put_state(self, **kwargs):
+            self.put_state_calls.append(kwargs)
+            raise RuntimeStateConflict("RuntimeStateRevisionConflict:opaque")
+
+        async def get_state(self, namespace: str, state_key: str):
+            self.get_state_calls += 1
+            raise RuntimeError("remote unavailable")
+
+    store = _OpaqueConflictStore()
+    claim = SimpleNamespace(lease_token="writer-1")
+    persistence = StatePersistence(
+        str(tmp_path),
+        lambda: 100,
+        runtime_store=store,
+        runtime_writer_claim=claim,
+    )
+
+    with pytest.raises(PersistenceError):
+        await persistence.save_runtime_context(LifeEngineState(), [], [])
+
+    assert len(store.put_state_calls) == 1
+    assert store.get_state_calls == 1
+    assert persistence._runtime_state_revision == 0
