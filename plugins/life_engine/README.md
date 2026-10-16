@@ -127,7 +127,7 @@ Life Event
 
 主意识可以使用有界语义检索、显式关系历史、Memory Boundary 和记忆健康；所有工具结果保留来源、hash 与 continuation，只有最终成功 attempt 的 exact delivery 才留下 Recall/co-recall。
 
-`MEMORY.md` 只承载当前连续性文字与显式长记忆索引。唯一 authoring 入口是 `nucleus_memory_continuity_review` 加 selected Subject Authority：会话固定 active actor、统一 revision 和 MEMORY version/hash；可精确读取当前 MEMORY，也可只读固定 `diaries/...` / `life_engine_workspace/diaries/...` Subject 版本（优先 Witness）。模型只选择 logical path、version/hash、UTF-8 ranges、Boundary 语义与 `SubjectTextEdit`；正文、source refs、occurrence 和完整 candidate 均由服务端构造。辅助长记忆可用 zero-length MEMORY anchor 插入 URI。
+`MEMORY.md` 只承载当前连续性文字与显式长记忆索引。唯一 authoring 入口是 `nucleus_capability_call(capability_id=life.memory_review, operation=nucleus_memory_continuity_review)` 加 selected Subject Authority：会话固定 active actor、统一 revision 和 MEMORY version/hash；可精确读取当前 MEMORY，也可只读固定 `diaries/...` / `life_engine_workspace/diaries/...` Subject 版本（优先 Witness）。模型只选择 logical path、version/hash、UTF-8 ranges、Boundary 语义与 `SubjectTextEdit`；正文、source refs、occurrence 和完整 candidate 均由服务端构造。辅助长记忆可用 zero-length MEMORY anchor 插入 URI。
 
 `prepare_candidate` 只机械生成 open candidate，不修改主体文件；全部 candidate 页经内核证明 exact delivery 后，活动意识才另行接受、拒绝或保持开放。commit 通过 Subject Authority 原子 CAS；索引移除不删除正文和历史，commit 后 projection 可从不可变事件恢复。selected authority 不可用时，Boundary、candidate、`unchanged`、`snooze` 全部 fail closed，不先存一半。完整长记忆通过 `nucleus_read_memory_boundary` 的 overview/context/provenance/segment/history 有界读取。
 

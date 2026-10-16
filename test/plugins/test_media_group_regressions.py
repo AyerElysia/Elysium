@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import builtins
+import time
 from typing import Any
 
 import httpx
@@ -201,3 +203,40 @@ async def test_napcat_fetch_exhausts_retries_then_raises_runtime_error(
 
     assert len(_FakeAsyncClient.calls) == 3
     assert all("trust_env" not in call for call in _FakeAsyncClient.calls)
+    assert _FakeAsyncClient.calls[0]["transport"]._pool._local_address == "0.0.0.0"
+    assert _FakeAsyncClient.calls[1]["transport"]._pool._local_address == "0.0.0.0"
+    assert "transport" not in _FakeAsyncClient.calls[2]
+
+
+async def test_slow_image_body_hits_attempt_deadline_and_retries_ipv4(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(napcat_utils, "_IMAGE_ATTEMPT_DEADLINE_SECONDS", 0.05)
+    calls = {"n": 0}
+
+    class _SlowThenOkClient:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+        async def __aenter__(self) -> "_SlowThenOkClient":
+            return self
+
+        async def __aexit__(self, *args: Any) -> bool:
+            return False
+
+        async def get(self, url: str) -> _FakeResponse:
+            del url
+            calls["n"] += 1
+            if calls["n"] == 1:
+                await asyncio.sleep(30)
+            return _FakeResponse(b"image-bytes")
+
+    monkeypatch.setattr(napcat_utils.httpx, "AsyncClient", _SlowThenOkClient)
+    monkeypatch.setattr(napcat_utils, "get_task_manager", lambda: _InlineTaskManager())
+
+    started = time.perf_counter()
+    encoded = await napcat_utils.download_image_base64("https://example.invalid/slow.gif")
+
+    assert encoded == base64.b64encode(b"image-bytes").decode("utf-8")
+    assert calls["n"] == 2
+    assert time.perf_counter() - started < 2

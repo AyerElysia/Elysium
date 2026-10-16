@@ -213,12 +213,12 @@ def test_pick_tavily_target_keeps_legacy_single_value_compatible(
 
 
 def test_web_tools_allow_default_and_life_chatter() -> None:
-    """网络工具应允许 life_engine_internal、default_chatter、life_chatter 调用。"""
+    """网络工具应允许 life_engine_internal、life_chatter 调用，不再包含已退役的 default_chatter。"""
     assert "life_engine_internal" in LifeEngineWebSearchTool.chatter_allow
-    assert "default_chatter" in LifeEngineWebSearchTool.chatter_allow
+    assert "default_chatter" not in LifeEngineWebSearchTool.chatter_allow
     assert "life_chatter" in LifeEngineWebSearchTool.chatter_allow
     assert "life_engine_internal" in LifeEngineBrowserFetchTool.chatter_allow
-    assert "default_chatter" in LifeEngineBrowserFetchTool.chatter_allow
+    assert "default_chatter" not in LifeEngineBrowserFetchTool.chatter_allow
     assert "life_chatter" in LifeEngineBrowserFetchTool.chatter_allow
 
 

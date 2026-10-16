@@ -10,11 +10,6 @@
   },
   "include": [
     {
-      "component_type": "action",
-      "component_name": "tts_voice_action",
-      "dependencies": []
-    },
-    {
       "component_type": "service",
       "component_name": "tts",
       "dependencies": []

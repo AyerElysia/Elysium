@@ -9,6 +9,7 @@ and emits source observations without assigning response priority.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import random
 import struct
@@ -17,6 +18,7 @@ import zlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote
 from uuid import uuid4
 
 import brotli
@@ -41,7 +43,18 @@ _OP_AUTH = 7
 _OP_AUTH_REPLY = 8
 _DANMU_INFO_URL = "https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo"
 _DANMU_CONF_URL = "https://api.live.bilibili.com/room/v1/Danmu/getConf"
+_SPI_URL = "https://api.bilibili.com/x/frontend/finger/spi"
+_NAV_URL = "https://api.bilibili.com/x/web-interface/nav"
 _MAX_DANMU_INFO_BYTES = 1024 * 1024
+# Bilibili's public WBI mixin order. An unsigned getDanmuInfo call is rejected
+# with -352; the legacy getConf token can still authenticate without delivering
+# this room's danmaku.
+_WBI_MIXIN = (
+    46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49,
+    33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61,
+    26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36,
+    20, 34, 44, 52,
+)
 
 
 class BilibiliProtocolError(RuntimeError):
@@ -213,6 +226,45 @@ def _connection_info_from_payload(payload: dict[str, Any]) -> BilibiliConnection
     )
 
 
+def _wbi_mixin_key(img_url: str, sub_url: str) -> str:
+    """Reorder the nav image and sub keys into Bilibili's 32-character mixin."""
+
+    raw = f"{_url_filename(img_url)}{_url_filename(sub_url)}"
+    return "".join(raw[index] if index < len(raw) else "" for index in _WBI_MIXIN)[:32]
+
+
+def _wbi_query(
+    params: dict[str, str | int],
+    mixin: str,
+    *,
+    now: int | None = None,
+) -> str:
+    """Return a WBI query string, including ``wts`` and ``w_rid``."""
+
+    if len(mixin) != 32:
+        raise BilibiliProtocolError("WBI mixin key must be 32 characters")
+    signed: dict[str, str | int] = {
+        **params,
+        "wts": int(time.time() if now is None else now),
+    }
+    query = "&".join(
+        f"{_wbi_escape(key)}={_wbi_escape(str(signed[key]))}"
+        for key in sorted(signed)
+    )
+    digest = hashlib.md5(f"{query}{mixin}".encode()).hexdigest()
+    return f"{query}&w_rid={digest}"
+
+
+def _url_filename(url: str) -> str:
+    name = url.rsplit("/", 1)[-1]
+    return name.split(".", 1)[0]
+
+
+def _wbi_escape(value: str) -> str:
+    cleaned = "".join(char for char in value if char not in "!'()*")
+    return quote(cleaned, safe="-_.~")
+
+
 def _legacy_connection_info_from_payload(
     payload: dict[str, Any],
 ) -> BilibiliConnectionInfo:
@@ -359,6 +411,7 @@ class BilibiliAdapter(BasePlatformAdapter):
         self._room_id = str(int(room_id))
         self._sessdata = sessdata
         self._buvid3 = buvid3
+        self._auth_buvid = buvid3
         self._reconnect_interval = reconnect_interval
         self._max_reconnect_interval = max_reconnect_interval
         self._heartbeat_interval = heartbeat_interval
@@ -519,44 +572,74 @@ class BilibiliAdapter(BasePlatformAdapter):
         if self._http is None:
             raise RuntimeError("Bilibili HTTP client is not started")
         if self._prefer_legacy_connection_info:
-            payload = await self._fetch_connection_payload(
-                _DANMU_CONF_URL,
-                {"room_id": self._room_id, "platform": "pc", "player": "web"},
-            )
-            return _legacy_connection_info_from_payload(payload)
+            return await self._fetch_legacy_connection_info()
         try:
-            payload = await self._fetch_connection_payload(
-                _DANMU_INFO_URL,
-                {"id": self._room_id, "type": 0},
-            )
-            return _connection_info_from_payload(payload)
+            return await self._fetch_signed_connection_info()
         except (httpx.HTTPError, BilibiliProtocolError) as exc:
             self._prefer_legacy_connection_info = True
             logger.warning(
-                "B站主弹幕信息接口不可用，尝试兼容入口: "
+                "B站签名弹幕信息接口不可用，尝试兼容入口: "
                 f"room={self._room_id} error={exc}"
             )
+        return await self._fetch_legacy_connection_info()
+
+    async def _fetch_signed_connection_info(self) -> BilibiliConnectionInfo:
+        """Take a room token the way the web player does: buvid, WBI, then getDanmuInfo."""
+
+        spi = await self._fetch_connection_payload(_SPI_URL)
+        spi_data = spi.get("data")
+        spi_data = spi_data if isinstance(spi_data, dict) else {}
+        buvid = str(spi_data.get("b_3") or "").strip() or self._buvid3
+        if not buvid:
+            raise BilibiliProtocolError("finger/spi returned no buvid3")
+        self._auth_buvid = buvid
+        cookie = self._cookie_header(buvid)
+        nav = await self._fetch_connection_payload(_NAV_URL, cookie=cookie)
+        nav_data = nav.get("data")
+        nav_data = nav_data if isinstance(nav_data, dict) else {}
+        wbi = nav_data.get("wbi_img")
+        wbi = wbi if isinstance(wbi, dict) else {}
+        mixin = _wbi_mixin_key(str(wbi.get("img_url") or ""), str(wbi.get("sub_url") or ""))
+        query = _wbi_query({"id": self._room_id, "type": 0}, mixin)
+        payload = await self._fetch_connection_payload(
+            f"{_DANMU_INFO_URL}?{query}",
+            cookie=cookie,
+        )
+        return _connection_info_from_payload(payload)
+
+    async def _fetch_legacy_connection_info(self) -> BilibiliConnectionInfo:
         payload = await self._fetch_connection_payload(
             _DANMU_CONF_URL,
             {"room_id": self._room_id, "platform": "pc", "player": "web"},
         )
         return _legacy_connection_info_from_payload(payload)
 
+    def _cookie_header(self, buvid: str) -> str:
+        parts = [f"buvid3={buvid}"] if buvid else []
+        if self._sessdata:
+            parts.append(f"SESSDATA={self._sessdata}")
+        return "; ".join(parts)
+
     async def _fetch_connection_payload(
         self,
         url: str,
-        params: dict[str, Any],
+        params: dict[str, Any] | None = None,
+        *,
+        cookie: str = "",
     ) -> dict[str, Any]:
         if self._http is None:
             raise RuntimeError("Bilibili HTTP client is not started")
+        headers = {
+            "Referer": f"https://live.bilibili.com/{self._room_id}",
+            "Origin": "https://live.bilibili.com",
+        }
+        if cookie:
+            headers["Cookie"] = cookie
         async with self._http.stream(
             "GET",
             url,
             params=params,
-            headers={
-                "Referer": f"https://live.bilibili.com/{self._room_id}",
-                "Origin": "https://live.bilibili.com",
-            },
+            headers=headers,
         ) as response:
             response.raise_for_status()
             body = bytearray()
@@ -587,7 +670,7 @@ class BilibiliAdapter(BasePlatformAdapter):
                         "uid": 0,
                         "roomid": int(self._room_id),
                         "protover": 3,
-                        "buvid": self._buvid3,
+                        "buvid": self._auth_buvid,
                         "platform": "web",
                         "type": 2,
                         "key": info.token,

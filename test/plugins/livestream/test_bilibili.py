@@ -14,6 +14,7 @@ from plugins.livestream.platform.bilibili import (
     _decode_packets,
     _legacy_connection_info_from_payload,
     _pack_packet,
+    _wbi_query,
     event_from_command,
 )
 
@@ -147,12 +148,87 @@ def test_legacy_connection_info_uses_the_same_trusted_host_boundary() -> None:
     assert info.websocket_url.endswith(":443/sub")
 
 
+def test_wbi_query_matches_the_web_player_signature() -> None:
+    query = _wbi_query({"id": 6, "type": 0}, "a" * 32, now=1000)
+    assert query == "id=6&type=0&wts=1000&w_rid=545abef419b123cf588e76124ecbd7e3"
+
+
+@pytest.mark.asyncio
+async def test_adapter_signs_getdanmuinfo_before_connecting() -> None:
+    calls: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.url.path.endswith("/spi"):
+            return httpx.Response(200, json={"code": 0, "data": {"b_3": "buvid-test"}})
+        if request.url.path.endswith("/nav"):
+            assert request.headers["cookie"] == "buvid3=buvid-test"
+            return httpx.Response(
+                200,
+                json={
+                    "code": -101,
+                    "data": {
+                        "wbi_img": {
+                            "img_url": "https://i0.hdslb.com/bfs/wbi/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png",
+                            "sub_url": "https://i0.hdslb.com/bfs/wbi/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.png",
+                        }
+                    },
+                },
+            )
+        assert "w_rid=" in request.url.query.decode()
+        assert "wts=" in request.url.query.decode()
+        return httpx.Response(
+            200,
+            json={
+                "code": 0,
+                "data": {
+                    "token": "signed-token",
+                    "host_list": [
+                        {"host": "zj-cn-live-comet.chat.bilibili.com", "wss_port": 443}
+                    ],
+                },
+            },
+        )
+
+    adapter = BilibiliAdapter("31581575")
+    adapter._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        info = await adapter._fetch_connection_info()
+    finally:
+        await adapter._http.aclose()
+        adapter._http = None
+
+    assert info.token == "signed-token"
+    assert info.websocket_url == "wss://zj-cn-live-comet.chat.bilibili.com:443/sub"
+    assert adapter._auth_buvid == "buvid-test"
+    assert calls == [
+        "/x/frontend/finger/spi",
+        "/x/web-interface/nav",
+        "/xlive/web-room/v1/index/getDanmuInfo",
+    ]
+
+
 @pytest.mark.asyncio
 async def test_adapter_sticks_to_legacy_endpoint_after_primary_risk_control() -> None:
     calls: list[str] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
         calls.append(request.url.path)
+        if request.url.path.endswith("/spi"):
+            return httpx.Response(200, json={"code": 0, "data": {"b_3": "buvid-test"}})
+        if request.url.path.endswith("/nav"):
+            return httpx.Response(
+                200,
+                json={
+                    "code": -101,
+                    "data": {
+                        "wbi_img": {
+                            "img_url": "https://i0.hdslb.com/bfs/wbi/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png",
+                            "sub_url": "https://i0.hdslb.com/bfs/wbi/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.png",
+                        }
+                    },
+                },
+            )
         if request.url.path.endswith("getDanmuInfo"):
             return httpx.Response(200, json={"code": -352, "message": "-352"})
         return httpx.Response(
@@ -182,6 +258,8 @@ async def test_adapter_sticks_to_legacy_endpoint_after_primary_risk_control() ->
 
     assert first == second
     assert calls == [
+        "/x/frontend/finger/spi",
+        "/x/web-interface/nav",
         "/xlive/web-room/v1/index/getDanmuInfo",
         "/room/v1/Danmu/getConf",
         "/room/v1/Danmu/getConf",

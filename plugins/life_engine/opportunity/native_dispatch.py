@@ -18,6 +18,7 @@ from typing import Any, Protocol
 from src.app.plugin_system.base import BaseTool
 
 from ..service.tool_manifests import heartbeat_tool_classes
+from ..memory.continuity_tools import LifeMemoryContinuityReviewSessionTool
 from ..tools.web_tools import LifeEngineBrowserFetchTool, LifeEngineWebSearchTool
 from . import tools as opportunity_tools
 from .catalog import CapabilityDescriptor
@@ -189,6 +190,7 @@ class NativeCapabilityExecutor(CapabilityExecutor):
 def _fixed_tool_classes() -> dict[str, type[BaseTool]]:
     classes = [
         *heartbeat_tool_classes(),
+        LifeMemoryContinuityReviewSessionTool,
         LifeEngineWebSearchTool,
         LifeEngineBrowserFetchTool,
     ]

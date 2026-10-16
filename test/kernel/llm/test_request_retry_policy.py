@@ -608,6 +608,46 @@ async def test_forced_stream_precollection_keeps_response_awaitable():
     assert await resp == "hello world"
 
 
+async def test_forced_stream_tool_call_with_blank_content_is_not_retried():
+    """强制流式响应带工具调用但正文为空时，不得误判为空回复。"""
+
+    model_set = [
+        {**_model("a", max_retry=0), "force_stream_mode": True},
+        _model("b", max_retry=0),
+    ]
+
+    async def stream_tool_call():
+        yield StreamEvent(
+            tool_call_id="call_1",
+            tool_name="lookup",
+            tool_args_delta='{"query":"neo"}',
+        )
+
+    class ToolCallClient:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def create(self, *, model_name, stream, **kwargs):
+            self.calls.append(model_name)
+            if model_name == "a":
+                return None, None, stream_tool_call()
+            return "fallback", [], None
+
+    client = ToolCallClient()
+    req = LLMRequest(
+        model_set,
+        request_name="forced_stream_tool_call",
+        clients=ModelClientRegistry(openai=client),
+    )
+
+    resp = await req.send(stream=False)
+
+    assert client.calls == ["a"]
+    assert resp.message == ""
+    assert resp.call_list and resp.call_list[0].name == "lookup"
+    assert resp.call_list[0].args == {"query": "neo"}
+
+
 def test_attempt_deadline_reports_only_monotonic_remaining_budget(monkeypatch):
     moments = iter((100.0, 103.5, 109.0, 110.0))
     monkeypatch.setattr(request_module, "_monotonic", lambda: next(moments))

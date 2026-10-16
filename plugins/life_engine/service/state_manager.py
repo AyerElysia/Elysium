@@ -45,6 +45,22 @@ _CONTEXT_COMPRESSION_MARKERS = (
 )
 
 
+def _actual_revision_from_conflict(exc: BaseException) -> int | None:
+    """Read ``actual=<revision>`` from a CAS conflict, if the message has it."""
+
+    text = str(exc)
+    marker = "actual="
+    index = text.rfind(marker)
+    if index < 0:
+        return None
+    raw = text[index + len(marker) :].split(":", 1)[0].strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value >= 0 else None
+
+
 def _safe_int(value: Any, default: int = 0) -> int:
     try:
         if value is None or (isinstance(value, str) and not value.strip()):
@@ -746,15 +762,24 @@ class StatePersistence:
                             self._on_persisted()
                         return True
                     except RuntimeStateConflict as exc:
-                        # 单写者模式：CAS 冲突是真实错误，保持原行为。
+                        # 单写者模式：不把远端业务字段合并进来。但本地修订号
+                        # 一旦落后，每次保存都会用同一个 expected 去撞已经
+                        # 前进的行，进程会永远写不进去。采纳 actual 后用
+                        # 当前内存快照重试一次；再冲突才视为真实错误。
                         # shared 多写者模式：另一个实例推进了 global revision，
                         # 重读最新并基于最新 revision 合并重试一次，避免心跳
                         # 因并发提交反复崩溃（global 是技术 checkpoint，heartbeat
                         # 等已通过 operation 持久化，冲突可恢复）。
                         if self._runtime_writer_claim is not None:
-                            logger.error(f"life_engine 远端上下文持久化失败: {exc}")
+                            recovered = await self._retry_single_writer_after_conflict(
+                                payload,
+                                exc,
+                            )
+                            if recovered:
+                                return True
                             raise PersistenceError(
-                                f"Failed to persist selected runtime context: {exc}"
+                                "Failed to persist selected runtime context: "
+                                f"{exc}"
                             ) from exc
                         merged = await self._merge_shared_global(payload)
                         if merged is None:
@@ -821,6 +846,63 @@ class StatePersistence:
                     f"Failed to persist runtime context: {exc}"
                 ) from exc
             return False
+
+    async def _retry_single_writer_after_conflict(
+        self,
+        payload: dict[str, Any],
+        exc: RuntimeStateConflict,
+    ) -> bool:
+        """Adopt a newer stored revision and retry the local snapshot once.
+
+        Single-writer mode does not merge remote business fields. A stale
+        local cursor must still move forward, otherwise every later save
+        repeats the same expected/actual pair and replies never persist.
+        """
+
+        actual = await self._read_conflict_revision(exc)
+        if actual is None or actual == self._runtime_state_revision:
+            logger.error(f"life_engine 远端上下文持久化失败: {exc}")
+            return False
+        logger.warning(
+            "life_engine 单写者运行上下文修订号滞后，采纳远端修订并重试一次: "
+            f"local={self._runtime_state_revision} actual={actual}"
+        )
+        self._runtime_state_revision = actual
+        try:
+            record = await self._runtime_store.put_state(
+                namespace="life_engine.runtime_context",
+                state_key="global",
+                expected_revision=actual,
+                schema_version=2,
+                payload=payload,
+                writer_claim=self._runtime_writer_claim,
+            )
+        except RuntimeStateConflict as retry_exc:
+            adopted = _actual_revision_from_conflict(retry_exc)
+            if adopted is not None:
+                self._runtime_state_revision = adopted
+            logger.error(f"life_engine 远端上下文持久化失败: {retry_exc}")
+            return False
+        self._runtime_state_revision = int(record.revision)
+        if self._on_persisted is not None:
+            self._on_persisted()
+        return True
+
+    async def _read_conflict_revision(self, exc: RuntimeStateConflict) -> int | None:
+        parsed = _actual_revision_from_conflict(exc)
+        if parsed is not None:
+            return parsed
+        try:
+            record = await self._runtime_store.get_state(
+                "life_engine.runtime_context",
+                "global",
+            )
+        except Exception as read_exc:  # noqa: BLE001
+            logger.warning(f"life_engine 单写者冲突后重读修订号失败: {read_exc}")
+            return None
+        if record is None:
+            return None
+        return int(record.revision)
 
     async def _merge_shared_global(
         self,

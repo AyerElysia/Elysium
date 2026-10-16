@@ -161,14 +161,11 @@ from ..core.router_context_projection import (
     RouterContextDraft,
     RouterContextProjection,
     RouterContextSource,
-    build_router_context_projection_prompt,
 )
 from ..core.subject_context_projection import (
     SubjectContextDraft,
     SubjectContextProjection,
     SubjectContextSource,
-    build_subject_context_projection_prompt,
-    validate_subject_projection_text,
 )
 from ..core.tool_parallel import (
     is_life_tool_call_parallel_safe,
@@ -729,6 +726,71 @@ def _heartbeat_tool_round_progress(
         has_successful_mutation=has_successful_mutation,
         has_protocol_failure=has_protocol_failure,
     )
+
+
+def _trim_utf8(text: str, max_bytes: int) -> str:
+    raw = text.encode("utf-8")
+    if max_bytes <= 0 or not raw:
+        return ""
+    if len(raw) <= max_bytes:
+        return text
+    end = max_bytes
+    while end > 0 and raw[end] & 0xC0 == 0x80:
+        end -= 1
+    return raw[:end].decode("utf-8")
+
+
+def _verbatim_router_text(
+    sources: tuple[RouterContextSource, ...],
+    *,
+    max_chars: int,
+) -> str:
+    parts = [f"## {source.path}\n{source.text.strip()}" for source in sources]
+    text = "\n\n".join(part for part in parts if part.strip())
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip()
+
+
+def _verbatim_subject_blocks(
+    sources: tuple[SubjectContextSource, ...],
+    *,
+    max_chars: int,
+    max_bytes: int,
+) -> str:
+    per_source_max_bytes = max(256, (max_bytes - 2048) // 3)
+    content_byte_budget = max(1, max_bytes - 2048)
+    bodies = {source.path: source.text.strip() for source in sources}
+
+    def render() -> str:
+        return "\n".join(
+            f'<subject-source path="{source.path}">\n'
+            f"{bodies[source.path]}\n"
+            "</subject-source>"
+            for source in sources
+        )
+
+    content = render()
+    while (
+        len(content) > max_chars or len(content.encode("utf-8")) > content_byte_budget
+    ):
+        longest = max(sources, key=lambda source: len(bodies[source.path].encode("utf-8")))
+        current = bodies[longest.path]
+        if not current:
+            break
+        bodies[longest.path] = _trim_utf8(
+            current,
+            max(0, len(current.encode("utf-8")) - 64),
+        )
+        content = render()
+
+    for source in sources:
+        wrapper = (
+            f'<subject-source path="{source.path}">\n\n</subject-source>'
+        )
+        body_budget = per_source_max_bytes - len(wrapper.encode("utf-8"))
+        bodies[source.path] = _trim_utf8(bodies[source.path], body_budget)
+    return render()
 
 
 class LifeEngineService(BaseService):
@@ -5966,89 +6028,16 @@ class LifeEngineService(BaseService):
         source_digest: str,
         sources: tuple[RouterContextSource, ...],
     ) -> RouterContextDraft:
-        """Use cloud models in configured order and reject reasoning-only output."""
+        """Assemble authority text locally. This path never calls a model."""
 
+        del source_digest
         chatter_cfg = self._cfg().chatter
-        task_name = str(
-            getattr(
-                chatter_cfg,
-                "router_context_projection_task_name",
-                "router_context_projection",
-            )
-            or "router_context_projection"
-        ).strip()
         max_chars = int(
             getattr(chatter_cfg, "router_context_projection_max_chars", 6000) or 6000
         )
-        timeout_seconds = float(
-            getattr(chatter_cfg, "router_context_projection_timeout_seconds", 90.0)
-            or 90.0
-        )
-        system_prompt, user_prompt = build_router_context_projection_prompt(
-            source_digest,
-            sources,
-            max_chars=max_chars,
-        )
-        try:
-            model_set = get_model_set_by_task(task_name)
-        except (KeyError, ValueError):
-            fallback_task = "utility"
-            logger.warning(
-                f"Router 上下文投影任务 {task_name!r} 未配置，"
-                f"回退到云端任务 {fallback_task!r}"
-            )
-            task_name = fallback_task
-            model_set = get_model_set_by_task(task_name)
-        if not model_set:
-            raise RuntimeError(f"model task '{task_name}' has no models")
-
-        errors: list[str] = []
-        for configured_model in model_set:
-            if not isinstance(configured_model, dict):
-                continue
-            model_identifier = str(
-                configured_model.get("model_identifier") or "unknown"
-            )
-            request = create_llm_request(
-                model_set=[dict(configured_model)],
-                request_name="life_router_context_projection",
-            )
-            request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
-            request.add_payload(LLMPayload(ROLE.USER, Text(user_prompt)))
-            try:
-                response = await asyncio.wait_for(
-                    request.send(stream=False),
-                    timeout=timeout_seconds,
-                )
-                awaited_text = await asyncio.wait_for(
-                    response,
-                    timeout=timeout_seconds,
-                )
-                content = str(response.message or awaited_text or "").strip()
-                if content and len(content) <= max_chars:
-                    return RouterContextDraft(
-                        text=content,
-                        generator=f"task:{task_name}/model:{model_identifier}",
-                    )
-                if not content:
-                    errors.append(f"{model_identifier}: empty final content")
-                else:
-                    errors.append(
-                        f"{model_identifier}: final content exceeded budget "
-                        f"({len(content)} > {max_chars})"
-                    )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"{model_identifier}: {type(exc).__name__}: {exc}")
-                logger.warning(
-                    "Router 上下文投影云端模型失败，尝试下一模型: "
-                    f"model={model_identifier} error={type(exc).__name__}: {exc}"
-                )
-
-        detail = "; ".join(errors[-3:]) or "no valid model entry"
-        raise RuntimeError(
-            f"router context projection exhausted cloud models: {detail}"
+        return RouterContextDraft(
+            text=_verbatim_router_text(sources, max_chars=max_chars),
+            generator="local:authority_verbatim",
         )
 
     async def _author_subject_context_projection(
@@ -6060,122 +6049,16 @@ class LifeEngineService(BaseService):
         max_chars: int,
         max_bytes: int,
     ) -> SubjectContextDraft:
-        """Author one structured projection without creating a second persona."""
+        """Package authority text locally. This path never calls a model."""
 
-        chatter_cfg = self._cfg().chatter
-        task_name = str(
-            getattr(
-                chatter_cfg,
-                "subject_context_projection_task_name",
-                "router_context_projection",
-            )
-            or "router_context_projection"
-        ).strip()
-        timeout_seconds = float(
-            getattr(
-                chatter_cfg,
-                "subject_context_projection_timeout_seconds",
-                90.0,
-            )
-            or 90.0
-        )
-        system_prompt, user_prompt = build_subject_context_projection_prompt(
-            source_digest,
-            sources,
-            projection_profile=projection_kind,
-            max_chars=max_chars,
-            max_bytes=max_bytes,
-        )
-        try:
-            model_set = get_model_set_by_task(task_name)
-        except (KeyError, ValueError):
-            fallback_task = "utility"
-            logger.warning(
-                f"Subject context projection task {task_name!r} is not configured; "
-                f"falling back to cloud task {fallback_task!r}"
-            )
-            task_name = fallback_task
-            model_set = get_model_set_by_task(task_name)
-        if not model_set:
-            raise RuntimeError(f"model task '{task_name}' has no models")
-
-        errors: list[str] = []
-        content_byte_budget = max(1, max_bytes - 2048)
-        for configured_model in model_set:
-            if not isinstance(configured_model, dict):
-                continue
-            model_identifier = str(
-                configured_model.get("model_identifier") or "unknown"
-            )
-            request = create_llm_request(
-                model_set=[dict(configured_model)],
-                request_name="life_subject_context_projection",
-            )
-            request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
-            request.add_payload(LLMPayload(ROLE.USER, Text(user_prompt)))
-            try:
-                response = await asyncio.wait_for(
-                    request.send(stream=False),
-                    timeout=timeout_seconds,
-                )
-                awaited_text = await asyncio.wait_for(
-                    response,
-                    timeout=timeout_seconds,
-                )
-                content = str(response.message or awaited_text or "").strip()
-                if not content:
-                    errors.append(f"{model_identifier}: empty final content")
-                    continue
-                if len(content) > max_chars:
-                    errors.append(
-                        f"{model_identifier}: final content exceeded char budget "
-                        f"({len(content)} > {max_chars})"
-                    )
-                    continue
-                content_bytes = len(content.encode("utf-8"))
-                if content_bytes > content_byte_budget:
-                    errors.append(
-                        f"{model_identifier}: final content exceeded byte budget "
-                        f"({content_bytes} > {content_byte_budget})"
-                    )
-                    continue
-                try:
-                    sections = validate_subject_projection_text(content)
-                except RuntimeError as exc:
-                    errors.append(f"{model_identifier}: invalid coverage: {exc}")
-                    continue
-                per_source_max_bytes = max(256, (max_bytes - 2048) // 3)
-                oversized_source = next(
-                    (
-                        (path, len(section.encode("utf-8")))
-                        for path, section in sections.items()
-                        if len(section.encode("utf-8")) > per_source_max_bytes
-                    ),
-                    None,
-                )
-                if oversized_source is not None:
-                    path, delivered_bytes = oversized_source
-                    errors.append(
-                        f"{model_identifier}: source block exceeded byte budget "
-                        f"({path}: {delivered_bytes} > {per_source_max_bytes})"
-                    )
-                    continue
-                return SubjectContextDraft(
-                    text=content,
-                    generator=f"task:{task_name}/model:{model_identifier}",
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"{model_identifier}: {type(exc).__name__}: {exc}")
-                logger.warning(
-                    "Subject context projection model failed; trying next model: "
-                    f"model={model_identifier} error={type(exc).__name__}: {exc}"
-                )
-
-        detail = "; ".join(errors[-3:]) or "no valid model entry"
-        raise RuntimeError(
-            f"subject context projection exhausted cloud models: {detail}"
+        del source_digest, projection_kind
+        return SubjectContextDraft(
+            text=_verbatim_subject_blocks(
+                sources,
+                max_chars=max_chars,
+                max_bytes=max_bytes,
+            ),
+            generator="local:authority_verbatim",
         )
 
     async def search_actor_memory(
@@ -9790,7 +9673,7 @@ class LifeEngineService(BaseService):
             "- `nucleus_search_memory` 是历史检索，不要反复重搜同一主题",
             "- 本地 file 工具只用于私有工作区中的日记、笔记和普通文件，不用于替用户查项目或改项目",
             "- `SOUL.md`、`USER.md`、`MEMORY.md`、`EXISTENCE.md` 会固定进入提示词；改它们和改日记一样，由你判断。不要清空 `SOUL.md`，也不要删除或改名身份文件",
-            "- 机会页邀请栏只给到期事实。学习操作说明在 learning skill，用 `nucleus_learn action=help` 读取后再决定是否动手；`nucleus_memory_continuity_review` 仍可用于结构化整理 MEMORY，但不是唯一写法。后台只提供机会，保持原样、稍后再看和安静结束都有效",
+            "- 机会页邀请栏只给到期事实。学习操作说明在 learning skill，用 `nucleus_learn action=help` 读取后再决定是否动手；`nucleus_capability_call(operation=nucleus_memory_continuity_review, capability_id=life.memory_review)` 仍可用于结构化整理 MEMORY，但不是唯一写法。后台只提供机会，保持原样、稍后再看和安静结束都有效",
             "- 本窗口可调用的工具以 ROLE.TOOL 为准。未注入本拍的能力仍存在于聊天或其他意识窗口；没出现在本轮 schema 不等于主体不想用",
             "- 滚动上下文超过容量阈值时会出现一次压缩清单；必须由你调用 `action-author_self_continuity_checkpoint` 亲自写下 continuity_text。系统不会代写摘要，也不会丢掉旧组。`[观察]/[感受]/[意图]/[内在动作]` 不能代替这个工具",
             "",
@@ -12101,43 +11984,6 @@ class LifeEngineService(BaseService):
                     "life_engine unified memory archive initialization failed: "
                     f"{self._memory_archive_sync_error}"
                 )
-
-        chatter_cfg = getattr(cfg, "chatter", None)
-        projection_enabled = self._should_start_router_context_projection(
-            chatter_cfg
-        )
-        if projection_enabled:
-            self._router_context_projection = RouterContextProjection(
-                self._workspace_dir(),
-                author=self._author_router_context_projection,
-                max_chars=int(
-                    getattr(
-                        chatter_cfg,
-                        "router_context_projection_max_chars",
-                        6000,
-                    )
-                    or 6000
-                ),
-                poll_interval_seconds=float(
-                    getattr(
-                        chatter_cfg,
-                        "router_context_projection_poll_seconds",
-                        1.0,
-                    )
-                    or 1.0
-                ),
-                # When a selected store is bound it becomes the only authority
-                # source for SOUL/USER/MEMORY; local Markdown is never read as
-                # a fallback and a remote gap fails closed instead.
-                subject_store=self._subject_document_store,
-                runtime_store=self._runtime_state_store,
-            )
-            projection_task = get_task_manager().create_task(
-                self._router_context_projection.run(),
-                name="life_engine_router_context_projection",
-                daemon=True,
-            )
-            self._router_context_projection_task_id = projection_task.task_id
 
         if self._subject_workspace_projector is not None:
             subject_task = get_task_manager().create_task(

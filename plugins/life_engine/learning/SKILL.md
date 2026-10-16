@@ -4,7 +4,7 @@
 
 心跳把到期事实放在机会页邀请栏。是否动手由当前意识决定。忽略、安静结束、不调用工具都完整，不等于拒绝。系统不会因为到期而自动 `get_skill`、自动调用本 skill，或把「本轮没注入某张 schema」解释成主体不想用。
 
-MEMORY.md 不走本 skill 的主体文档复盘入口。长期记忆的结构化读取、短文字整理和索引仍可用常驻工具 `nucleus_memory_continuity_review`；普通改写也可以直接用文件工具。
+MEMORY.md 不走本 skill 的主体文档复盘入口。长期记忆的结构化读取、短文字整理和索引仍可用常驻工具 `nucleus_capability_call(capability_id=life.memory_review, operation=nucleus_memory_continuity_review)`；普通改写也可以直接用文件工具。
 
 ## 入口
 

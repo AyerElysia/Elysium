@@ -3622,7 +3622,7 @@ async def test_life_chatter_live_system_prompt_adds_broadcast_guidance(tmp_path)
 
     assert "直播弹幕场景" in prompt
     assert "不要机械复述观众原文" in prompt
-    assert "不要调用 action-tts_voice_action" in prompt
+    assert "不要调用语音动作" in prompt
     assert "SOUL_CONTENT" in prompt
     assert "USER_CONTENT" in prompt
 

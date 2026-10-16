@@ -124,12 +124,6 @@
     },
     {
       "component_type": "tool",
-      "component_name": "nucleus_memory_continuity_review",
-      "dependencies": [],
-      "enabled": true
-    },
-    {
-      "component_type": "tool",
       "component_name": "nucleus_web_search",
       "dependencies": [],
       "enabled": true

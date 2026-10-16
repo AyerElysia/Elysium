@@ -5,7 +5,6 @@ Elysium 的本地消息 TTS Service。它用一个稳定接口支持 **IndexTTS2
 ## 责任边界
 
 - `tts_voice_plugin:service:tts`：把已经决定表达的文本合成为 Base64 音频；
-- `tts_voice_action`：供非 Life Chatter 场景显式发送语音；
 - Life Chatter 使用自己的 `life_send_voice`，通过 Service 签名调用本插件，不再经过 `tasks.tts`；
 - 直播与 Voice Live 有独立运行合同，不由本 Action 冒充。
 
@@ -21,8 +20,18 @@ TTS 不决定正文、情绪或是否表达。Service 缺失、合成失败、�
 - 参考音频、多风格、语言检测与文本清洗；
 - vLLM-Omni 对长表达做有界运输切分；GPT-SoVITS 每条表达只请求一次并由后端原生切分；
 - 可选空间音效；
-- Action 与 `/tts` Command；
+- `/tts` Command；
 - 插件自有后端按最后一条完整表达结束时间做闲置释放，下一次语音按需重启；外部服务永不被接管或关闭。
+
+## Breeze TTS 2 表达控制
+
+当配置 backend 为 breeze_tts2 时，爱莉的 life_send_voice 支持可选参数 expression_instruction。它只描述本次如何说，不负责改写正文：
+
+- 可描述情绪、语气、速度、音量、停顿、呼吸和内心感受；
+- 例如“像刚松了一口气，温柔地说，句尾带一点笑意”；
+- 参考音频、参考文字稿和默认音色路径仍由部署配置固定，Action 不提供替换参考音频的参数；
+- 中文可在正文中使用 [叹气]、[笑]、[咳嗽]、[清嗓子]，Breeze 会把它们作为原生声音事件处理；其他后端仍按各自的清洗规则处理；
+- expression_instruction 留空时使用对应风格的 breeze_instruction 基线。
 
 ## 配置
 
@@ -41,7 +50,7 @@ TTS 不决定正文、情绪或是否表达。Service 缺失、合成失败、�
 - `[tts].long_text_split_enabled`、`segment_max_units`、`segment_min_units`：不具备原生切分合同的 transport 的外层切句开关和片段预算；默认单段 24 个近似单位；
 - `[tts].segment_concurrency`：同一长表达在 vLLM-Omni 中的有界并发，默认 2、硬上限 4；Breeze 固定串行，GPT-SoVITS 不使用外层片段并发；
 - `[tts].phrase_pause_ms`、`clause_pause_ms`、`sentence_pause_ms`、`paragraph_pause_ms`：拼接时按原标点追加的停顿；
-- `[[tts_styles]]`：必须至少有 `default`，包含参考音频、逐字准确的提示文本、语言、速度，以及成对的 GPT/SoVITS 权重路径与 SHA-256；Breeze 另消费可信 `breeze_instruction`、`breeze_cfg_scale` 与 `breeze_seed`；默认 `speed_factor=0.90`，部署值仍须试听验收；
+- `[[tts_styles]]`：必须至少有 `default`，包含参考音频、逐字准确的提示文本、语言、速度，以及成对的 GPT/SoVITS 权重路径与 SHA-256；Breeze 以 `breeze_instruction` 为风格基线，并接受动作级 `expression_instruction`，另消费 `breeze_cfg_scale` 与 `breeze_seed`；默认 `speed_factor=0.90`，部署值仍须试听验收；
 - `[tts_advanced].text_split_method`、`seed`：GPT-SoVITS 原生切分与语义采样合同；`seed=-1` 表示随机，生产固定值必须来自成对试听。`sample_steps/super_sampling` 是 V3 参数，当前 v2ProPlus 不以它们调清晰度；
 - `[spatial_effects]`：可选混响与卷积。
 

@@ -981,7 +981,11 @@ class LLMRequest:
                     # 流式响应被中途截断（如 reason=eof）的典型症状。把它当作
                     # 本次尝试失败抛出，交由重试链切换下一个模型，而不是把空
                     # 文本当成功返回给调用方。
-                    if not tool_calls and not str(resp.message or "").strip():
+                    # 强制流式路径会在 precollect_stream_for_non_stream() 中将
+                    # 工具调用写入 resp.call_list，而 client.create() 返回的
+                    # tool_calls 仍为 None；两者都要纳入判断。
+                    has_tool_calls = bool(tool_calls) or bool(resp.call_list)
+                    if not has_tool_calls and not str(resp.message or "").strip():
                         raise LLMEmptyResponseError(
                             f"empty assistant content from model={model_identifier}",
                             model=model_identifier,

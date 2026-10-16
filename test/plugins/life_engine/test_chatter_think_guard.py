@@ -617,6 +617,41 @@ async def test_life_send_voice_action_uses_local_tts_service(
     assert sent["processed_plain_text"] == "[语音:晚上好。]"
 
 
+async def test_life_send_voice_action_forwards_expression_instruction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    action = LifeSendVoiceAction.__new__(LifeSendVoiceAction)
+    action.chat_stream = SimpleNamespace(stream_id="stream-1", platform="feishu")
+    service = SimpleNamespace(
+        generate_voice=AsyncMock(return_value="LOCAL_AUDIO_BASE64"),
+    )
+
+    async def fake_send_voice(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(
+        "plugins.tts_voice_plugin.api.get_local_tts_service",
+        lambda: service,
+    )
+    monkeypatch.setattr(
+        "src.app.plugin_system.api.send_api.send_voice",
+        fake_send_voice,
+    )
+
+    ok, _result = await action.execute(
+        text="今晚辛苦了。",
+        expression_instruction="像刚松了一口气，温柔地说，句尾带一点笑意。",
+    )
+
+    assert ok is True
+    service.generate_voice.assert_awaited_once_with(
+        text="今晚辛苦了。",
+        style_hint="default",
+        language_hint=None,
+        expression_instruction="像刚松了一口气，温柔地说，句尾带一点笑意。",
+    )
+
+
 async def test_life_send_voice_action_fails_closed_without_local_tts_service(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -654,7 +689,7 @@ def test_life_send_voice_schema_contains_only_local_tts_parameters() -> None:
     schema = LifeSendVoiceAction.to_schema()["function"]
     properties = schema["parameters"]["properties"]
 
-    assert set(properties) == {"path", "text", "voice_style", "text_language"}
+    assert set(properties) == {"path", "text", "voice_style", "text_language", "expression_instruction"}
     assert "voice" not in properties
     assert "instructions" not in properties
     assert "model_tasks.tts" not in schema["description"]

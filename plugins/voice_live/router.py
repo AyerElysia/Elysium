@@ -510,11 +510,6 @@ class VoiceLiveRouter(BaseRouter):
         )
 
     async def startup(self) -> None:
-        if self._subject_prewarm_task is None or self._subject_prewarm_task.done():
-            self._subject_prewarm_task = asyncio.create_task(
-                self._prewarm_subject_context(),
-                name="voice-subject-context-prewarm",
-            )
         logger.info(
             f"Voice Live 路由已启动: provider={self.plugin.config.full_duplex.provider_type}"
         )

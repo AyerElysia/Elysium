@@ -76,7 +76,7 @@ GPT-SoVITS 的 `text_split_method`、`speed_factor`、`seed`、参考音频与�
 
 IndexTTS2.5 的标准 vLLM-Omni 配置不是即时音频分块流式：Stage 0 先完成当前片段的语义序列，Stage 1 再产生音频。因此项目把加速边界放在“句段级有界并行”，而不是把半段音频提前冒充一条已经完成的表达。默认并发为 2，硬上限为 4；生产值必须依据端到端延迟、RTF、显存峰值与段间韵律一致性实测，不能仅凭吞吐提高就扩大。
 
-Breeze 的 `/v1/audio/speech` 接收可信 `instruction`、`cfg_scale`、`seed` 与成对的 `ref_audio/ref_text`，返回 24 kHz、单声道、s16le 流式 PCM。消息 TTS 仍须收到完整片段、核对响应媒体类型/采样格式/采样率并封装为 WAV 后才可进入原子拼接与平台发送，首包到达不等于整条表达已经说出口。`instruction` 只能来自部署风格配置，不能由用户正文覆盖；`seed=-1` 时由风格键与发音投影稳定派生，便于重现后训练样本。当前研究基线 `cfg_scale=3.8` 只是一组可配置起点，最终音色仍需按参考资产和真实平台链试听。
+Breeze 的 `/v1/audio/speech` 接收可信 `instruction`、`cfg_scale`、`seed` 与成对的 `ref_audio/ref_text`，返回 24 kHz、单声道、s16le 流式 PCM。消息 TTS 仍须收到完整片段、核对响应媒体类型/采样格式/采样率并封装为 WAV 后才可进入原子拼接与平台发送，首包到达不等于整条表达已经说出口。`instruction` 由部署风格的 breeze_instruction 基线与可选的单次 expression_instruction 组成；单次指令只能调整表达方式，不能覆盖参考音色、身份或参考音频。`seed=-1` 时由风格键与发音投影稳定派生，便于重现后训练样本。Breeze 原生声音事件在 Breeze transport 中保留。当前研究基线 `cfg_scale=3.8` 只是一组可配置起点，最终音色仍需按参考资产和真实平台链试听。
 
 ## 3. 本地服务与生命周期
 

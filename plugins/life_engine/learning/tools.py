@@ -781,7 +781,7 @@ class LifeReviewSubjectDocumentTool(BaseTool):
         "精确内容哈希，并可按 UTF-8 字节窗口返回目标文档原文；unchanged 明确记录当前版本"
         "保持不变；snooze 表示稍后再看；propose 只提交完整新版本候选，绝不会自动接受。"
         "MEMORY.md 的读取、短文字整理、长记忆索引、候选核对和决定统一使用 "
-        "nucleus_memory_continuity_review。"
+        "nucleus_capability_call(life.memory_review, nucleus_memory_continuity_review)。"
     )
     chatter_allow = ["life_engine_internal", "life_chatter"]
 
@@ -838,7 +838,7 @@ class LifeReviewSubjectDocumentTool(BaseTool):
             if selected_path == "MEMORY.md":
                 return False, (
                     "MemoryContinuityReviewRequired: MEMORY.md 只通过 "
-                    "nucleus_memory_continuity_review 读取和治理。"
+                    "nucleus_capability_call(life.memory_review, nucleus_memory_continuity_review) 读取和治理。"
                 )
             if selected_path:
                 documents = [
@@ -887,7 +887,7 @@ class LifeReviewSubjectDocumentTool(BaseTool):
         if target == "MEMORY.md":
             return False, (
                 "MemoryContinuityReviewRequired: MEMORY.md 只通过 "
-                "nucleus_memory_continuity_review 读取和治理。"
+                "nucleus_capability_call(life.memory_review, nucleus_memory_continuity_review) 读取和治理。"
             )
         if target not in {"SOUL.md", "USER.md"}:
             return False, "target_path 必须是 SOUL.md/USER.md。"
@@ -1089,7 +1089,7 @@ class LifeListSubjectCandidatesTool(BaseTool):
         "查看学习系统整理出的 SOUL/USER/MEMORY 修改候选。候选不是主体结论，"
         "只有当前活跃意识实例在读完原文和候选后明确决定，才可能进入主体权威。"
         "任何 target_path=MEMORY.md 的历史通用候选都只可审计、不可在这里决定；"
-        "MEMORY.md 只能回到 nucleus_memory_continuity_review 读取和决定。"
+        "MEMORY.md 只能回到 nucleus_capability_call(life.memory_review, nucleus_memory_continuity_review) 读取和决定。"
     )
     chatter_allow = ["life_engine_internal", "life_chatter"]
 
@@ -1157,7 +1157,7 @@ class LifeReadSubjectCandidateTool(BaseTool):
         ):
             return False, (
                 "MemoryContinuityReviewRequired: 长期记忆连续性候选只能在 "
-                "nucleus_memory_continuity_review 中分页读取；通用读取不形成"
+                "nucleus_capability_call(life.memory_review, nucleus_memory_continuity_review) 中分页读取；通用读取不形成"
                 "可供接受使用的精确投递证明。"
             )
         raw = candidate.candidate_content_bytes
@@ -1222,7 +1222,7 @@ class LifeDecideSubjectCandidateTool(BaseTool):
         "你最终选择的完整目标文档，不会自动合并；系统会验证活跃意识、候选证据和"
         "当前 SOUL+USER+MEMORY revision，冲突时明确拒绝并要求重读。这个通用入口"
         "只处理 SOUL.md/USER.md；任何 MEMORY.md 候选都必须回到"
-        " nucleus_memory_continuity_review。"
+        " nucleus_capability_call(life.memory_review, nucleus_memory_continuity_review)。"
     )
     chatter_allow = ["life_engine_internal", "life_chatter"]
 
@@ -1263,7 +1263,7 @@ class LifeDecideSubjectCandidateTool(BaseTool):
                 return False, (
                     "LegacyMemoryCandidateMigrationRequired: 任何 MEMORY.md 目标候选"
                     "都不能通过通用决定入口处理。历史候选保持可读审计但不会自动转换；"
-                    "新的长期记忆候选只能在 nucleus_memory_continuity_review 中完整"
+                    "新的长期记忆候选只能在 nucleus_capability_call(life.memory_review, nucleus_memory_continuity_review) 中完整"
                     "读取并决定，以保留 exact full-candidate delivery proof。"
                 )
             if candidate.target_path is None:

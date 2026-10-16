@@ -206,9 +206,7 @@ async def _build_router_prompt(
     projection_prompt: str,
     fallback_prompt: str | None,
 ) -> str:
-    template = get_prompt_manager().get_template("default_chatter_router_prompt")
-    if template is None:
-        template = get_prompt_manager().get_template("default_chatter_sub_agent_prompt")
+    template = get_prompt_manager().get_template("life_chatter_router_prompt")
     if template is not None:
         prompt = (
             await template.set("nickname", nickname)
