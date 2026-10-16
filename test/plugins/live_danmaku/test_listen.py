@@ -8,7 +8,31 @@ def test_wbi_query_matches_the_known_vector() -> None:
     )
 
 
-def test_danmaku_keeps_uid_name_and_text() -> None:
+def test_reply_keeps_a_revision_for_the_subtitle() -> None:
+    from plugins.live_danmaku.listen import LiveDanmakuFeed
+
+    feed = LiveDanmakuFeed()
+    feed.note_reply("第一句")
+    feed.note_reply("第二句")
+    replies = [item for item in feed.snapshot()["messages"] if item["kind"] == "reply"]
+    assert [item["revision"] for item in replies] == [1, 2]
+    assert replies[-1]["name"] == "爱莉"
+    assert replies[-1]["text"] == "第二句"
+
+
+def test_live_message_uses_the_existing_text_path() -> None:
+    from plugins.live_danmaku.bridge import PLATFORM, STREAM_ID, build_live_message
+    from plugins.live_danmaku.listen import Danmaku
+
+    message = build_live_message(
+        Danmaku(uid=287347892, name="-风速机-", text="你好", at="17:38:29")
+    )
+    assert message.platform == PLATFORM == "live"
+    assert message.chat_type == "group"
+    assert message.stream_id == STREAM_ID
+    assert message.sender_id == "287347892"
+    assert message.processed_plain_text == "你好"
+    assert message.extra["group_id"] == "31581575"
     item = danmaku_from_command(
         {
             "cmd": "DANMU_MSG",
