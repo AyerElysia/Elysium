@@ -29,14 +29,14 @@ def test_trajectory_basic_turn_flow() -> None:
     # Tool returns result
     traj.record_tool_result(ToolResult(value="西红柿、鸡蛋、牛奶", call_id="call-1", name="nucleus_read_file"))
     assert len(turn1.tool_payloads) == 1
-    assert turn1.tool_payloads[0].role == ROLE.TOOL
+    assert turn1.tool_payloads[0].role == ROLE.TOOL_RESULT
 
     # Export to payloads
     payloads = traj.to_payloads()
     assert len(payloads) == 3
     assert payloads[0].role == ROLE.USER
     assert payloads[1].role == ROLE.ASSISTANT
-    assert payloads[2].role == ROLE.TOOL
+    assert payloads[2].role == ROLE.TOOL_RESULT
 
 
 def test_trajectory_serialization_roundtrip(tmp_path: Path) -> None:
@@ -102,6 +102,24 @@ def test_trajectory_compaction_pruning_and_folding() -> None:
     assert payloads[0].role == ROLE.USER
 
 
+def test_unmatched_historical_tool_calls_are_removed() -> None:
+    from plugins.life_engine.service.heartbeat_rolling import legalize_heartbeat_history
+
+    broken = [
+        LLMPayload(ROLE.USER, [Text("旧事件")]),
+        LLMPayload(ROLE.ASSISTANT, [
+            Text("我去查了"),
+            ToolCall(id="chatcmpl-tool-missing", name="nucleus_read_file", args={}),
+        ]),
+        LLMPayload(ROLE.USER, [Text("下一拍")]),
+    ]
+    legal = legalize_heartbeat_history(broken)
+    assistant = legal[1]
+    assert assistant.role == ROLE.ASSISTANT
+    assert all(not isinstance(part, ToolCall) for part in assistant.content)
+    assert legal[2].role == ROLE.USER
+
+
 def test_trajectory_from_payloads_conversion() -> None:
     raw_payloads = [
         LLMPayload(ROLE.USER, [Text("你好")]),
@@ -120,6 +138,6 @@ def test_trajectory_from_payloads_conversion() -> None:
     assert len(exported) == 5
     assert exported[0].role == ROLE.USER
     assert exported[1].role == ROLE.ASSISTANT
-    assert exported[2].role == ROLE.TOOL
+    assert exported[2].role == ROLE.TOOL_RESULT
     assert exported[3].role == ROLE.USER
     assert exported[4].role == ROLE.ASSISTANT

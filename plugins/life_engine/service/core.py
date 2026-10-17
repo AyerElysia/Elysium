@@ -281,6 +281,7 @@ from .heartbeat_rolling import (
     ensure_heartbeat_user_turn,
     estimate_payload_chars,
     format_sourced_heartbeat_event,
+    legalize_heartbeat_history,
     format_visible_event,
     load_heartbeat_rolling,
     load_heartbeat_trajectory,
@@ -10996,7 +10997,7 @@ class LifeEngineService(BaseService):
                 min_recent_turns=4,
             )
         rolling = ensure_heartbeat_user_turn(
-            copy_rolling_payloads(trajectory.to_payloads())
+            legalize_heartbeat_history(copy_rolling_payloads(trajectory.to_payloads()))
         )
         for payload in rolling:
             request.add_payload(payload)

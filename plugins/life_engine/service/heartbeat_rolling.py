@@ -475,6 +475,56 @@ def iter_selected_events(
     return [event for event in events if str(event.event_id) in wanted]
 
 
+def legalize_heartbeat_history(payloads: Sequence[LLMPayload]) -> list[LLMPayload]:
+    """Drop assistant tool calls whose results were not stored.
+
+    Older heartbeat snapshots kept tool_call parts and discarded tool results.
+    Replaying those calls makes the next request illegal.
+    """
+
+    typed = [payload for payload in payloads if isinstance(payload, LLMPayload)]
+    legal: list[LLMPayload] = []
+    index = 0
+    while index < len(typed):
+        payload = typed[index]
+        calls = [
+            part for part in list(payload.content or [])
+            if isinstance(part, ToolCall)
+        ] if payload.role == ROLE.ASSISTANT else []
+        if not calls:
+            legal.append(payload)
+            index += 1
+            continue
+        expected = {str(part.id) for part in calls if str(part.id or "")}
+        cursor = index + 1
+        seen: set[str] = set()
+        while cursor < len(typed) and typed[cursor].role in {ROLE.TOOL, ROLE.TOOL_RESULT}:
+            for part in list(typed[cursor].content or []):
+                if isinstance(part, ToolResult) and str(part.call_id or ""):
+                    seen.add(str(part.call_id))
+            cursor += 1
+        if expected and expected <= seen:
+            legal.append(LLMPayload(ROLE.ASSISTANT, list(payload.content or [])))
+            for source in typed[index + 1 : cursor]:
+                results = [
+                    part for part in list(source.content or [])
+                    if isinstance(part, ToolResult)
+                ]
+                if results:
+                    legal.append(LLMPayload(ROLE.TOOL_RESULT, results))
+            index = cursor
+            continue
+        prose = [
+            part for part in list(payload.content or [])
+            if not isinstance(part, ToolCall)
+        ]
+        if not prose:
+            prose = [Text("（早期工具调用没有留下回执，已从心跳上下文移除）")]
+        legal.append(LLMPayload(ROLE.ASSISTANT, prose))
+        index = cursor
+    return legal
+
+
 def without_checkpoint_controls(payloads: Sequence[LLMPayload]) -> list[LLMPayload]:
     """Drop retired compression-list frames from a heartbeat history."""
 
@@ -503,7 +553,7 @@ async def load_heartbeat_trajectory(
     """Load subconscious heartbeat rolling history as a structured LifeTrajectory."""
     payloads = await load_heartbeat_rolling(service=service, workspace_path=workspace_path)
     return LifeTrajectory.from_payloads(
-        without_checkpoint_controls(payloads),
+        legalize_heartbeat_history(without_checkpoint_controls(payloads)),
         domain="subconscious",
     )
 

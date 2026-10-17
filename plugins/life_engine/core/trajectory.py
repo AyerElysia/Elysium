@@ -167,9 +167,9 @@ class LifeTrajectory:
                     current_turn = TrajectoryTurn(assistant_payload=payload)
                     traj.turns.append(current_turn)
                     continue
-                if role == ROLE.TOOL and current_turn is None:
+                if role in {ROLE.TOOL, ROLE.TOOL_RESULT} and current_turn is None:
                     current_turn = TrajectoryTurn()
-                    current_turn.tool_payloads.append(payload)
+                    current_turn.tool_payloads.append(_as_tool_result_payload(payload))
                     traj.turns.append(current_turn)
                     continue
                 current_turn = TrajectoryTurn(
@@ -178,16 +178,16 @@ class LifeTrajectory:
                 traj.turns.append(current_turn)
                 if role == ROLE.ASSISTANT:
                     current_turn.assistant_payload = payload
-                elif role == ROLE.TOOL:
-                    current_turn.tool_payloads.append(payload)
+                elif role in {ROLE.TOOL, ROLE.TOOL_RESULT}:
+                    current_turn.tool_payloads.append(_as_tool_result_payload(payload))
             elif role == ROLE.ASSISTANT:
                 if current_turn.assistant_payload is not None:
                     current_turn = TrajectoryTurn(assistant_payload=payload)
                     traj.turns.append(current_turn)
                 else:
                     current_turn.assistant_payload = payload
-            elif role == ROLE.TOOL:
-                current_turn.tool_payloads.append(payload)
+            elif role in {ROLE.TOOL, ROLE.TOOL_RESULT}:
+                current_turn.tool_payloads.append(_as_tool_result_payload(payload))
         return traj
 
     def to_payloads(self) -> list[LLMPayload]:
@@ -257,7 +257,7 @@ class LifeTrajectory:
 
         turn = self.turns[-1]
         results = tool_result if isinstance(tool_result, list) else [tool_result]
-        turn.tool_payloads.append(LLMPayload(ROLE.TOOL, results))
+        turn.tool_payloads.append(LLMPayload(ROLE.TOOL_RESULT, results))
         self._revision += 1
 
     def compact(
@@ -411,6 +411,15 @@ class LifeTrajectory:
             return cls()
         data = json.loads(path.read_text(encoding="utf-8"))
         return cls.from_dict(data)
+
+
+def _as_tool_result_payload(payload: LLMPayload) -> LLMPayload:
+    if payload.role == ROLE.TOOL_RESULT:
+        return payload
+    results = [part for part in payload.content if isinstance(part, ToolResult)]
+    if not results:
+        return payload
+    return LLMPayload(ROLE.TOOL_RESULT, results)
 
 
 def compact_request_payloads(
