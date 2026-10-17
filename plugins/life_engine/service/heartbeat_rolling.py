@@ -7,6 +7,8 @@ text; protocol envelopes stay in the authoritative Life Event ledger.
 
 from __future__ import annotations
 
+from ..core.trajectory import LifeTrajectory
+
 import asyncio
 import json
 from collections.abc import Iterable, Sequence
@@ -432,3 +434,23 @@ def iter_selected_events(
     if not wanted:
         return []
     return [event for event in events if str(event.event_id) in wanted]
+
+
+async def load_heartbeat_trajectory(
+    *,
+    service: Any | None,
+    workspace_path: str,
+) -> LifeTrajectory:
+    """Load subconscious heartbeat rolling history as a structured LifeTrajectory."""
+    payloads = await load_heartbeat_rolling(service=service, workspace_path=workspace_path)
+    return LifeTrajectory.from_payloads(payloads, domain="subconscious")
+
+
+async def save_heartbeat_trajectory(
+    trajectory: LifeTrajectory,
+    *,
+    service: Any | None,
+    workspace_path: str,
+) -> None:
+    """Persist subconscious heartbeat LifeTrajectory."""
+    await save_heartbeat_rolling(trajectory.to_payloads(), service=service, workspace_path=workspace_path)

@@ -9880,7 +9880,8 @@ class LifeEngineService(BaseService):
             return None
 
         user_content = texts.get("USER.md", "").strip()
-        memory_content = texts.get("MEMORY.md", "").strip()
+        # MEMORY 是主体权威文本，与主意识保持完全一致的未修饰引用
+        memory_content = texts.get("MEMORY.md", "")
 
         tool_file = workspace / "TOOL.md"
         tool_content = ""
@@ -9891,21 +9892,16 @@ class LifeEngineService(BaseService):
                 logger.warning(f"无法读取 TOOL.md: {e}")
         tool_content = self._render_heartbeat_tool_prompt(tool_content)
         existence_content = self._load_existence_primer()
-
-        parts = [soul_content]
-        if user_content:
-            parts.extend(["", "---", "", user_content])
-        if memory_content:
-            parts.extend(["", "---", "", memory_content])
-        if existence_content:
-            parts.extend(["", "---", "", existence_content])
-        if tool_content:
-            parts.extend(["", "---", "", tool_content])
         identity_header = "\n".join(self._build_prompt_header()).strip()
-        if identity_header:
-            parts.extend(["", "---", "", identity_header])
 
-        return "\n".join(parts)
+        return LifeChatterContextAssembler.build_prefix_prompt(
+            soul_text=soul_content,
+            user_text=user_content,
+            memory_text=memory_content,
+            existence_text=existence_content,
+            tools_text=tool_content,
+            primary_tool_guide=identity_header,
+        )
 
     def _get_nucleus_tools(self) -> list[type]:
         """Heartbeat resident schemas from HEARTBEAT_TOOL_NAMES."""

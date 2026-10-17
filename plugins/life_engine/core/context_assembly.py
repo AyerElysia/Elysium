@@ -187,3 +187,7 @@ class LifeChatterContextAssembler:
 
         payload_content = new_content[0] if len(new_content) == 1 else new_content
         response.add_payload(LLMPayload(ROLE.USER, payload_content))
+
+
+# Unified context assembler alias
+LifeContextAssembler = LifeChatterContextAssembler

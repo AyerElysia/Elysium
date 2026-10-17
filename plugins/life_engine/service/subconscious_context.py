@@ -1590,9 +1590,9 @@ class SubconsciousContextManager:
         if summary_text:
             sections.append(summary_text)
         if recent_blocks:
-            sections.append("【最近完整因果组】\n" + "\n\n".join(recent_blocks))
+            sections.append("\n\n".join(recent_blocks))
         if delta_blocks:
-            sections.append("【本次新增 delta】\n" + "\n\n".join(delta_blocks))
+            sections.append("\n\n".join(delta_blocks))
         return "\n\n".join(sections)
 
     def _group_priority(self, group: EventGroup) -> int:

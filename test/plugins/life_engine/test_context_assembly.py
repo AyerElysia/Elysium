@@ -167,3 +167,30 @@ def test_prefix_whitespace_only_memory_is_preserved_verbatim() -> None:
 
     assert prompt == "SOUL\n\nUSER\n\n" + memory + "\n\nEXISTENCE\n\nTOOLS\n\nLIVE\n\nGUIDE"
     assert prompt.count(memory) == 1
+
+
+def test_prefix_prompt_cache_prefix_identical_across_chatter_and_heartbeat() -> None:
+    from plugins.life_engine.core.context_assembly import LifeContextAssembler
+
+    shared_persona = {
+        "soul_text": "SOUL IDENTITY",
+        "user_text": "USER PROFILE",
+        "memory_text": "# MEMORY FACTS\n- fact 1",
+        "existence_text": "SELF MODEL",
+    }
+    chatter_prefix = LifeContextAssembler.build_prefix_prompt(
+        **shared_persona,
+        tools_text="TOOLS FOR CHAT",
+        live_guidance="",
+        primary_tool_guide="GUIDE FOR CHAT",
+    )
+    heartbeat_prefix = LifeContextAssembler.build_prefix_prompt(
+        **shared_persona,
+        tools_text="TOOLS FOR HEARTBEAT",
+        live_guidance="",
+        primary_tool_guide="GUIDE FOR HEARTBEAT",
+    )
+
+    shared_prefix_str = "SOUL IDENTITY\n\nUSER PROFILE\n\n# MEMORY FACTS\n- fact 1\n\nSELF MODEL"
+    assert chatter_prefix.startswith(shared_prefix_str)
+    assert heartbeat_prefix.startswith(shared_prefix_str)
