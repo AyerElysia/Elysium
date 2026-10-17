@@ -280,12 +280,16 @@ from .heartbeat_rolling import (
     copy_rolling_payloads,
     ensure_heartbeat_user_turn,
     estimate_payload_chars,
+    format_sourced_heartbeat_event,
     format_visible_event,
     load_heartbeat_rolling,
+    load_heartbeat_trajectory,
     rolling_payloads_only,
     save_heartbeat_rolling,
+    save_heartbeat_trajectory,
     snapshot_dict as heartbeat_snapshot_dict,
 )
+from ..core.trajectory import LifeTrajectory, compact_request_payloads
 from ..core.context_stewardship import (
     DEFAULT_CHECKPOINT_MAX_BYTES,
     DEFAULT_EMERGENCY_REFERENCE_MAX_BYTES,
@@ -8089,7 +8093,7 @@ class LifeEngineService(BaseService):
             snapshot_events,
             cursor=cursor,
             existing_summary=summary,
-            event_renderer=format_visible_event,
+            event_renderer=format_sourced_heartbeat_event,
         )
         prepared.world_perception = None
         try:
@@ -9675,7 +9679,7 @@ class LifeEngineService(BaseService):
             "- `SOUL.md`、`USER.md`、`MEMORY.md`、`EXISTENCE.md` 会固定进入提示词；改它们和改日记一样，由你判断。不要清空 `SOUL.md`，也不要删除或改名身份文件",
             "- 机会页邀请栏只给到期事实。学习操作说明在 learning skill，用 `nucleus_learn action=help` 读取后再决定是否动手；`nucleus_capability_call(operation=nucleus_memory_continuity_review, capability_id=life.memory_review)` 仍可用于结构化整理 MEMORY，但不是唯一写法。后台只提供机会，保持原样、稍后再看和安静结束都有效",
             "- 本窗口可调用的工具以 ROLE.TOOL 为准。未注入本拍的能力仍存在于聊天或其他意识窗口；没出现在本轮 schema 不等于主体不想用",
-            "- 滚动上下文超过容量阈值时会出现一次压缩清单；必须由你调用 `action-author_self_continuity_checkpoint` 亲自写下 continuity_text。系统不会代写摘要，也不会丢掉旧组。`[观察]/[感受]/[意图]/[内在动作]` 不能代替这个工具",
+            "- 上下文变长时，系统会压缩早期轮次并保留最近几轮原文。你不需要计算哈希，也不需要提交连续性检查点",
             "",
             "### `nucleus_rest_heartbeat` — 主动休息一段时间",
             "",
@@ -9693,9 +9697,8 @@ class LifeEngineService(BaseService):
             "```",
             "",
             "然后按需要调用工具。",
-            "若滚动里已经出现 `<context_compression_required>`，本拍必须先调用 "
-            "`action-author_self_continuity_checkpoint`（可先 `tool-read_context_group`）；"
-            "观察/感受正文不能代替该工具。未完成则本拍新经历不会进入滚动、游标也不会前进。",
+            "没有新的外部事件时，可以安静结束，也可以调用 `nucleus_rest_heartbeat` 休息。",
+            "休息时长和理由由你决定。外界新消息会解除休息锁。",
             "",
             "### 原则",
             "",
@@ -10042,51 +10045,61 @@ class LifeEngineService(BaseService):
         payloads = getattr(response, "payloads", None)
         if not isinstance(payloads, list):
             return
-        max_groups, max_bytes = self._heartbeat_compaction_list_limits()
-        response.payloads = ensure_compression_required_appended(
+        response.payloads = compact_request_payloads(
             [payload for payload in payloads if isinstance(payload, LLMPayload)],
-            estimate=estimate_payload_chars,
             trigger_chars=self._heartbeat_compaction_trigger_chars(),
-            max_groups=max_groups,
-            max_bytes=max_bytes,
-            force=True,
+            target_chars=max(8_000, self._heartbeat_compaction_trigger_chars() // 2),
         )
         self._register_heartbeat_live_context(list(response.payloads))
 
+    @staticmethod
+    def _absorb_heartbeat_response_into_trajectory(
+        trajectory: LifeTrajectory,
+        response: Any,
+        *,
+        baseline_count: int,
+    ) -> None:
+        """Append this beat's assistant and tool turns onto the heartbeat trajectory."""
+
+        payloads = list(getattr(response, "payloads", None) or [])
+        for payload in payloads[baseline_count:]:
+            if not isinstance(payload, LLMPayload):
+                continue
+            if payload.role == ROLE.ASSISTANT:
+                trajectory.record_assistant_turn(list(payload.content or []))
+            elif payload.role == ROLE.TOOL:
+                results = [
+                    part for part in list(payload.content or [])
+                    if isinstance(part, ToolResult)
+                ]
+                if results:
+                    trajectory.record_tool_result(results)
+
     async def _heartbeat_unresolved_window_overflow(
         self,
-        baseline_rolling: list[LLMPayload],
+        trajectory: LifeTrajectory,
         *,
         workspace: str,
     ) -> HeartbeatModelResult:
-        """Skip this beat without utility-retrying the same overflowing payloads."""
+        """Compact the heartbeat trajectory and keep the cursor free to advance."""
 
-        max_groups, max_bytes = self._heartbeat_compaction_list_limits()
-        persist_payloads = ensure_compression_required_appended(
-            copy_rolling_payloads(baseline_rolling),
-            estimate=estimate_payload_chars,
-            trigger_chars=self._heartbeat_compaction_trigger_chars(),
-            max_groups=max_groups,
-            max_bytes=max_bytes,
-            force=True,
+        trigger = self._heartbeat_compaction_trigger_chars()
+        trajectory.compact(
+            trigger_chars=1,
+            target_chars=max(8_000, trigger // 2),
+            min_recent_turns=2,
+            tool_result_prune_threshold=200,
         )
-        try:
-            await save_heartbeat_rolling(
-                persist_payloads,
-                service=self,
-                workspace_path=workspace,
-            )
-        except Exception as exc:  # noqa: BLE001 - overflow skip must not raise
-            logger.warning(
-                "心跳窗口溢出后写入压缩清单失败: "
-                f"error_type={type(exc).__name__}"
-            )
         unregister_live_context(HEARTBEAT_RUNTIME_KEY)
+        stored = await load_heartbeat_rolling(
+            service=self,
+            workspace_path=workspace,
+        )
         return HeartbeatModelResult(
             "",
             None,
             compression_unresolved=True,
-            rolling_payloads=tuple(persist_payloads),
+            rolling_payloads=tuple(stored),
         )
 
     def _register_heartbeat_live_context(self, payloads: list[Any]) -> None:
@@ -10177,17 +10190,15 @@ class LifeEngineService(BaseService):
         *,
         budget_payloads: Sequence[LLMPayload] | None = None,
     ) -> None:
+        del budget_payloads
         payloads = getattr(response, "payloads", None)
         if not isinstance(payloads, list):
             return
-        max_groups, max_bytes = self._heartbeat_compaction_list_limits()
-        updated = ensure_compression_required_appended(
+        trigger = self._heartbeat_compaction_trigger_chars()
+        updated = compact_request_payloads(
             [payload for payload in payloads if isinstance(payload, LLMPayload)],
-            estimate=estimate_payload_chars,
-            trigger_chars=self._heartbeat_compaction_trigger_chars(),
-            max_groups=max_groups,
-            max_bytes=max_bytes,
-            budget_payloads=budget_payloads,
+            trigger_chars=trigger,
+            target_chars=max(8_000, trigger // 2),
         )
         response.payloads = updated
         self._register_heartbeat_live_context(updated)
@@ -10210,16 +10221,7 @@ class LifeEngineService(BaseService):
         context-delivery receipts impossible to verify and would also diverge
         from the normal chatter tool path.
         """
-        if compression_turn_required and not is_context_stewardship_tool_name(
-            tool_name
-        ):
-            return (
-                "执行失败: 当前是主体连续性维护回合；"
-                "普通心跳动作均未执行。"
-                "请先用 tool-read_context_group 阅读需要的精确旧组，或调用 "
-                "action-author_self_continuity_checkpoint 亲自写下检查点。",
-                False,
-            )
+        del compression_turn_required
         usable_cls = self._resolve_heartbeat_tool_class(registry, tool_name)
         if not usable_cls:
             return f"未知工具: {tool_name}", False
@@ -10980,32 +10982,25 @@ class LifeEngineService(BaseService):
         request.add_payload(LLMPayload(ROLE.TOOL, tools))
 
         workspace = self._heartbeat_workspace_path()
-        baseline_rolling = await load_heartbeat_rolling(
+        trajectory = await load_heartbeat_trajectory(
             service=self,
             workspace_path=workspace,
         )
-        namespace, subdir = archive_target_for_runtime(HEARTBEAT_RUNTIME_KEY)
-        await verify_subject_checkpoint_archives(
-            baseline_rolling, actor_consciousness_instance_id="chat_global",
-            service=self, workspace_path=workspace, namespace=namespace,
-            local_subdir=subdir,
-        )
-        rolling = copy_rolling_payloads(baseline_rolling)
         wake_text = str(wake_context or "")
         if wake_text.strip():
-            rolling.append(LLMPayload(ROLE.USER, Text(wake_text)))
-        rolling = ensure_heartbeat_user_turn(rolling)
-        max_groups, max_bytes = self._heartbeat_compaction_list_limits()
-        rolling = ensure_compression_required_appended(
-            rolling,
-            estimate=estimate_payload_chars,
-            trigger_chars=self._heartbeat_compaction_trigger_chars(),
-            max_groups=max_groups,
-            max_bytes=max_bytes,
-            budget_payloads=baseline_rolling,
+            trajectory.begin_turn(wake_text, metadata={"kind": "heartbeat_wake"})
+            trigger_chars = self._heartbeat_compaction_trigger_chars()
+            trajectory.compact(
+                trigger_chars=trigger_chars,
+                target_chars=max(8_000, trigger_chars // 2),
+                min_recent_turns=4,
+            )
+        rolling = ensure_heartbeat_user_turn(
+            copy_rolling_payloads(trajectory.to_payloads())
         )
         for payload in rolling:
             request.add_payload(payload)
+        request_prefix_len = len(request.payloads)
         self._register_heartbeat_live_context(list(request.payloads))
         if subconscious_delivery_id:
             request.register_context_delivery(
@@ -11046,7 +11041,7 @@ class LifeEngineService(BaseService):
                     f"不把同一份超窗载荷降级到 utility: {e}"
                 )
                 return await self._heartbeat_unresolved_window_overflow(
-                    baseline_rolling,
+                    trajectory,
                     workspace=workspace,
                 )
             # 主模型失败，尝试轻量模型降级（utils task 通常路由到更快的 provider）
@@ -11087,7 +11082,7 @@ class LifeEngineService(BaseService):
                             f"{fallback_exc}"
                         )
                         return await self._heartbeat_unresolved_window_overflow(
-                            baseline_rolling,
+                            trajectory,
                             workspace=workspace,
                         )
                     logger.error(f"Heartbeat fallback also failed: {fallback_exc}")
@@ -11162,38 +11157,9 @@ class LifeEngineService(BaseService):
             )
 
             if not call_list:
-                # The contract tracks the durable rolling chain.  Request-only
-                # frames (wake context) ride along on response.payloads but are
-                # rebuilt every beat and never persisted, so they must not decide
-                # whether this beat still owes a compression round.
-                pending_compression = payloads_require_compression(
-                    list(baseline_rolling),
-                    estimate=estimate_payload_chars,
-                    trigger_chars=self._heartbeat_compaction_trigger_chars(),
-                ) or has_compression_required_payload(
-                    rolling_payloads_only(list(response.payloads))
-                )
-                if not pending_compression:
-                    last_text = turn_text
-                    final_response_observed = True
-                    break
-                # A narrative-only turn is recorded above as subject activity,
-                # but cannot acknowledge a still-pending maintenance protocol.
-                # Feed back only the technical contract; the subject chooses
-                # both the release boundary and all continuity text.  This
-                # empty tool round shares the existing stall/turn/deadline
-                # limits and the same follow-up path as every other round.
-                response.add_payload(
-                    LLMPayload(
-                        ROLE.USER,
-                        Text(HEARTBEAT_CHECKPOINT_FEEDBACK_TEXT),
-                    )
-                )
-                logger.info(
-                    "life_engine 心跳压缩维护未收到检查点工具调用，"
-                    f"反馈后按剩余预算续轮: #{self._state.heartbeat_count} "
-                    f"model_turn={turn_index + 1}"
-                )
+                last_text = turn_text
+                final_response_observed = True
+                break
 
             # Text attached to a tool-bearing response is non-terminal.  It
             # may describe an intention before the tool actually fails, so it
@@ -11242,15 +11208,7 @@ class LifeEngineService(BaseService):
             self._print_heartbeat_receipt_panel(round_results)
             if await self._apply_heartbeat_subject_checkpoint(response):
                 checkpoint_installed = True
-                # Later overflow/failure may retain the last committed chain,
-                # never the pre-checkpoint baseline from the start of the beat.
-                baseline_rolling = copy_rolling_payloads(
-                    rolling_payloads_only(list(response.payloads))
-                )
-            self._ensure_heartbeat_compression_turn(
-                response,
-                budget_payloads=baseline_rolling,
-            )
+            self._ensure_heartbeat_compression_turn(response)
             last_round_outcomes = _heartbeat_tool_round_outcomes(
                 call_list, round_results
             )
@@ -11487,55 +11445,39 @@ class LifeEngineService(BaseService):
             # in the event ledger; this heartbeat simply has no final text.
             last_text = ""
 
-        final_payloads = rolling_payloads_only(
-            list(getattr(response, "payloads", None) or [])
-        )
-        # Compression is a property of the durable rolling chain, not of the
-        # request-only frames (wake context) that ride along on this beat.
-        still_requires_compression = payloads_require_compression(
-            list(baseline_rolling),
-            estimate=estimate_payload_chars,
-            trigger_chars=self._heartbeat_compaction_trigger_chars(),
-        ) or has_compression_required_payload(final_payloads)
-        # A valid partial release can still leave another maintenance notice.
-        # Installing one checkpoint is not proof that this beat now fits.
-        compression_unresolved = still_requires_compression
-        if stop_reason == "window_overflow":
-            compression_unresolved = True
-        persist_payloads = final_payloads
-        if compression_unresolved:
-            persist_payloads = list(baseline_rolling)
-            if payloads_require_compression(
-                persist_payloads,
-                estimate=estimate_payload_chars,
-                trigger_chars=self._heartbeat_compaction_trigger_chars(),
-            ) or has_compression_required_payload(final_payloads):
-                persist_payloads = ensure_compression_required_appended(
-                    persist_payloads,
-                    estimate=estimate_payload_chars,
-                    trigger_chars=self._heartbeat_compaction_trigger_chars(),
-                    max_groups=max_groups,
-                    max_bytes=max_bytes,
-                )
-            logger.warning(
-                "心跳压缩回合未完成，本拍不把新经历写入滚动链: "
-                f"#{self._state.heartbeat_count}"
+        if wake_text.strip():
+            self._absorb_heartbeat_response_into_trajectory(
+                trajectory,
+                response,
+                baseline_count=request_prefix_len,
             )
-        elif not wake_text.strip() and not checkpoint_installed:
-            persist_payloads = list(baseline_rolling)
+            trigger_chars = self._heartbeat_compaction_trigger_chars()
+            compacted = trajectory.compact(
+                trigger_chars=trigger_chars,
+                target_chars=max(8_000, trigger_chars // 2),
+                min_recent_turns=4,
+            )
+            if compacted.triggered:
+                logger.info(
+                    "心跳轨迹已压缩: "
+                    f"#{self._state.heartbeat_count} "
+                    f"before={compacted.before_chars} after={compacted.after_chars} "
+                    f"folded={compacted.compacted_turns_count}"
+                )
+        compression_unresolved = False
+        persist_payloads = trajectory.to_payloads()
         try:
-            await save_heartbeat_rolling(
-                persist_payloads,
+            await save_heartbeat_trajectory(
+                trajectory,
                 service=self,
                 workspace_path=workspace,
             )
         except Exception as exc:  # noqa: BLE001 - derived snapshot must not crash the beat
             logger.warning(
-                "保存心跳滚动上下文失败: "
+                "保存心跳轨迹失败: "
                 f"error_type={type(exc).__name__}"
             )
-            if not compression_unresolved:
-                raise
+            raise
         unregister_live_context(HEARTBEAT_RUNTIME_KEY)
         return HeartbeatModelResult(
             last_text,

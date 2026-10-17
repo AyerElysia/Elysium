@@ -163,19 +163,41 @@ class LifeTrajectory:
             if role in {ROLE.SYSTEM}:
                 continue
             if role == ROLE.USER or current_turn is None:
-                current_turn = TrajectoryTurn(user_payload=payload)
+                if role == ROLE.ASSISTANT and current_turn is None:
+                    current_turn = TrajectoryTurn(assistant_payload=payload)
+                    traj.turns.append(current_turn)
+                    continue
+                if role == ROLE.TOOL and current_turn is None:
+                    current_turn = TrajectoryTurn()
+                    current_turn.tool_payloads.append(payload)
+                    traj.turns.append(current_turn)
+                    continue
+                current_turn = TrajectoryTurn(
+                    user_payload=payload if role == ROLE.USER else None,
+                )
                 traj.turns.append(current_turn)
+                if role == ROLE.ASSISTANT:
+                    current_turn.assistant_payload = payload
+                elif role == ROLE.TOOL:
+                    current_turn.tool_payloads.append(payload)
             elif role == ROLE.ASSISTANT:
-                current_turn.assistant_payload = payload
+                if current_turn.assistant_payload is not None:
+                    current_turn = TrajectoryTurn(assistant_payload=payload)
+                    traj.turns.append(current_turn)
+                else:
+                    current_turn.assistant_payload = payload
             elif role == ROLE.TOOL:
                 current_turn.tool_payloads.append(payload)
         return traj
 
     def to_payloads(self) -> list[LLMPayload]:
-        """Export valid flattened LLMPayload list for model call."""
+        """Export a detached payload list so request merges cannot mutate history."""
         payloads: list[LLMPayload] = []
         for turn in self.turns:
-            payloads.extend(turn.to_payloads())
+            for payload in turn.to_payloads():
+                payloads.append(
+                    LLMPayload(payload.role, list(payload.content or []))
+                )
         return payloads
 
     def begin_turn(
@@ -212,6 +234,9 @@ class LifeTrajectory:
             self.begin_turn("")
 
         turn = self.turns[-1]
+        if turn.assistant_payload is not None:
+            turn = TrajectoryTurn(metadata={"continuation": True})
+            self.turns.append(turn)
         if isinstance(assistant_content, str):
             content_list: list[Content] = [Text(assistant_content)]
         elif isinstance(assistant_content, list):
@@ -386,6 +411,40 @@ class LifeTrajectory:
             return cls()
         data = json.loads(path.read_text(encoding="utf-8"))
         return cls.from_dict(data)
+
+
+def compact_request_payloads(
+    payloads: Sequence[LLMPayload],
+    *,
+    trigger_chars: int,
+    target_chars: int,
+    min_recent_turns: int = 4,
+) -> list[LLMPayload]:
+    """Compact conversational payloads and leave system and tool schemas in place."""
+
+    prefix: list[LLMPayload] = []
+    body: list[LLMPayload] = []
+    for payload in payloads:
+        if not isinstance(payload, LLMPayload):
+            continue
+        if payload.role == ROLE.SYSTEM:
+            prefix.append(payload)
+            continue
+        if payload.role == ROLE.TOOL and not any(
+            isinstance(part, ToolResult) for part in payload.content
+        ):
+            prefix.append(payload)
+            continue
+        body.append(payload)
+    trajectory = LifeTrajectory.from_payloads(body, domain="request")
+    if trajectory.total_chars() < trigger_chars:
+        return [payload for payload in payloads if isinstance(payload, LLMPayload)]
+    trajectory.compact(
+        trigger_chars=trigger_chars,
+        target_chars=target_chars,
+        min_recent_turns=min_recent_turns,
+    )
+    return [*prefix, *trajectory.to_payloads()]
 
 
 def _serialize_payload(payload: LLMPayload | None) -> dict[str, Any] | None:

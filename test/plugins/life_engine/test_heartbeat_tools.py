@@ -51,9 +51,8 @@ def test_heartbeat_pool_matches_allowlist_exactly() -> None:
     assert names == HEARTBEAT_TOOL_NAMES
     assert "nucleus_learn" in names
     assert "nucleus_write_narrative" in names
-    assert "nucleus_memory_continuity_review" in names
-    assert "author_self_continuity_checkpoint" in names
-    assert "read_context_group" in names
+    assert "author_self_continuity_checkpoint" not in names
+    assert "read_context_group" not in names
     banned = {
         "nucleus_reflect_now",
         "nucleus_review_subject_document",
@@ -74,8 +73,8 @@ def test_heartbeat_pool_matches_allowlist_exactly() -> None:
     assert banned.isdisjoint(names)
     schema_names = [tool.to_schema()["function"]["name"] for tool in tools]
     assert "tool-nucleus_learn" in schema_names
-    assert "action-author_self_continuity_checkpoint" in schema_names
-    assert "tool-read_context_group" in schema_names
+    assert "action-author_self_continuity_checkpoint" not in schema_names
+    assert "tool-read_context_group" not in schema_names
     assert "tool-nucleus_reflect_now" not in schema_names
 
 
@@ -150,10 +149,10 @@ def test_heartbeat_idle_strips_tool_prefix_for_learn_and_todo() -> None:
     )
     assert (
         LifeEngineService._heartbeat_tool_call_counts_as_activity(
-            "action-author_self_continuity_checkpoint",
+            "nucleus_rest_heartbeat",
             {},
         )
-        is True
+        is False
     )
 
 
@@ -172,7 +171,7 @@ async def test_unknown_heartbeat_tool_fails_closed() -> None:
     assert "未知工具" in str(result)
 
 
-async def test_heartbeat_blocks_non_stewardship_tools_during_compression() -> None:
+async def test_heartbeat_does_not_block_tools_for_checkpoint_maintenance() -> None:
     service = LifeEngineService.__new__(LifeEngineService)
     result, ok = await service._run_heartbeat_tool_call_execution(
         "nucleus_search_memory",
@@ -181,8 +180,8 @@ async def test_heartbeat_blocks_non_stewardship_tools_during_compression() -> No
         compression_turn_required=True,
     )
     assert ok is False
-    assert "author_self_continuity_checkpoint" in str(result)
-    assert "read_context_group" in str(result)
+    assert "未知工具" in str(result)
+    assert "检查点" not in str(result)
 
 
 def test_heartbeat_tool_prefix_resolves_resident_schema() -> None:

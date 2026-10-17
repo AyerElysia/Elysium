@@ -44,6 +44,28 @@ def format_visible_event(event: LifeEngineEvent) -> str:
     return format_historical_redelivery(event, _format_visible_event_body(event))
 
 
+def format_sourced_heartbeat_event(event: LifeEngineEvent) -> str:
+    """Render one heartbeat event with the ledger identity the subject can trust.
+
+    Historical redelivery already carries its own label. Fresh events name the
+    time, the platform source, and the ledger id so a bare last line is not an
+    unsourced tail.
+    """
+
+    visible = format_visible_event(event)
+    if not visible.strip():
+        return ""
+    if event.redelivery_operation_id is not None:
+        return visible
+    occurred = str(event.timestamp or "").strip() or "unknown"
+    source = str(event.source_detail or event.source or "life_engine").strip()
+    ledger = str(event.occurrence_id or event.event_id or "").strip() or "none"
+    return (
+        f"[occurred_at={occurred} | source={source} | ledger_source={ledger}]\n"
+        f"{visible}"
+    )
+
+
 def _format_visible_event_body(event: LifeEngineEvent) -> str:
     """Render one life-domain event as first-person-readable text.
 
@@ -160,9 +182,26 @@ def copy_rolling_payloads(payloads: Sequence[LLMPayload]) -> list[LLMPayload]:
     return copied
 
 
+def trajectory_history_payloads(payloads: Sequence[LLMPayload]) -> list[LLMPayload]:
+    """Keep user, assistant, and tool-result turns. Drop system text and tool schemas."""
+
+    kept: list[LLMPayload] = []
+    for payload in payloads:
+        if not isinstance(payload, LLMPayload):
+            continue
+        if payload.role == ROLE.SYSTEM:
+            continue
+        if payload.role == ROLE.TOOL and not any(
+            isinstance(part, ToolResult) for part in list(payload.content or [])
+        ):
+            continue
+        kept.append(payload)
+    return kept
+
+
 def serialize_rolling_payloads(payloads: Sequence[LLMPayload]) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
-    for payload in rolling_payloads_only(payloads):
+    for payload in trajectory_history_payloads(payloads):
         serialized = _serialize_payload(payload)
         if serialized is not None:
             items.append(serialized)
@@ -384,7 +423,7 @@ def _deserialize_payload(data: Any) -> LLMPayload | None:
         role = ROLE(str(data.get("role") or ""))
     except ValueError:
         return None
-    if role in {ROLE.SYSTEM, ROLE.TOOL}:
+    if role == ROLE.SYSTEM:
         return None
     content = [
         item
@@ -436,6 +475,26 @@ def iter_selected_events(
     return [event for event in events if str(event.event_id) in wanted]
 
 
+def without_checkpoint_controls(payloads: Sequence[LLMPayload]) -> list[LLMPayload]:
+    """Drop retired compression-list frames from a heartbeat history."""
+
+    cleaned: list[LLMPayload] = []
+    for payload in payloads:
+        if not isinstance(payload, LLMPayload):
+            continue
+        content = []
+        for part in list(payload.content or []):
+            text = str(getattr(part, "text", "") or "")
+            if text.startswith("<context_compression_required") or text.startswith(
+                "<context_checkpoint_feedback"
+            ):
+                continue
+            content.append(part)
+        if content:
+            cleaned.append(LLMPayload(payload.role, content))
+    return cleaned
+
+
 async def load_heartbeat_trajectory(
     *,
     service: Any | None,
@@ -443,7 +502,10 @@ async def load_heartbeat_trajectory(
 ) -> LifeTrajectory:
     """Load subconscious heartbeat rolling history as a structured LifeTrajectory."""
     payloads = await load_heartbeat_rolling(service=service, workspace_path=workspace_path)
-    return LifeTrajectory.from_payloads(payloads, domain="subconscious")
+    return LifeTrajectory.from_payloads(
+        without_checkpoint_controls(payloads),
+        domain="subconscious",
+    )
 
 
 async def save_heartbeat_trajectory(

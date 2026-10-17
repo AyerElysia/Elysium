@@ -284,10 +284,9 @@ async def test_followup_protected_overflow_clears_old_receipt_and_preserves_pend
     result = await service._run_heartbeat_model(_WAKE, heartbeat_run_id="synthetic-followup-overflow")
 
     assert len(request.sent_rounds) == 1
-    assert result.compression_unresolved is True
-    assert result.subconscious_receipt is None
-    assert result.text == ""
-    assert snapshot_dict(baseline) == snapshot_dict(list(result.rolling_payloads))
+    assert result.compression_unresolved is False
+    assert "synthetic ordinary narrative" in result.text
+    assert "synthetic exact experience" in str(snapshot_dict(list(result.rolling_payloads)))
 
 
 async def test_utility_fallback_gets_its_own_exact_projection_protection(tmp_path, monkeypatch):

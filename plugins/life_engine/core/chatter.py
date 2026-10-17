@@ -84,6 +84,7 @@ from .context_compaction import (
     compact_payloads,
     is_summary_payload,
 )
+from .trajectory import compact_request_payloads
 from .context_stewardship import (
     ARCHIVE_NAMESPACE,
     CHATTER_RUNTIME_KEY,
@@ -3917,9 +3918,7 @@ class LifeChatter(BaseChatter):
             "- `nucleus_view_screen`：查看 Ayer 当前屏幕。\n"
             "- `nucleus_todo`：写入或查看 TODO 板（整组 `{id, content, status}`，可 merge）。\n"
             "- `inner_dialogue`：把念头沉进心里慢慢想（异步；允许浮回后需心跳 inner.return 显式交还）。\n"
-            "- `action-author_self_continuity_checkpoint`：滚动超过容量阈值后必须由你亲自写给未来自己的连续性说明；"
-            "系统不会替你总结，也不会丢掉旧组来硬塞进窗口。\n"
-            "- `tool-read_context_group`：按检查点或压缩清单里的 ctxg_ 引用，分页读取精确旧组。\n"
+            "- 上下文变长时由系统压缩早期轮次，最近几轮原样保留。你不需要为了窗口去手写检查点。\n"
             "- `tool-inspect_media`：把图片/视频/语音提升为原生多模态输入。\n"
             "- **工具名不带 `tool-` 前缀**（`tool-` 前缀仅限 `tool-inspect_media` 等平台工具）；普通工具直接使用 `nucleus_bash`、`nucleus_grep_file` 这类名字，不要加前缀。\n"
             "- 不要把 `reason`、`thought` 等元信息写进 `content`。"
@@ -4418,22 +4417,12 @@ class LifeChatter(BaseChatter):
             )
             or DEFAULT_EMERGENCY_REFERENCE_MAX_BYTES
         )
-        pressure_ratio = float(
-            getattr(chatter, "context_pressure_ratio", 0.75) or 0.75
-        )
-        token_pressure = build_context_pressure_notice(
-            response,
-            trigger_ratio=pressure_ratio,
-            max_groups=max_groups,
-            max_bytes=max_bytes,
-        )
-        updated = ensure_compression_required_appended(
+        del force, max_groups, max_bytes
+        updated = compact_request_payloads(
             [payload for payload in payloads if isinstance(payload, LLMPayload)],
-            estimate=self._estimate_payload_chars,
             trigger_chars=trigger,
-            max_groups=max_groups,
-            max_bytes=max_bytes,
-            force=bool(force or token_pressure is not None),
+            target_chars=max(8_000, trigger // 2),
+            min_recent_turns=4,
         )
         response.payloads = updated
         self._register_chatter_live_context(response)
@@ -6698,46 +6687,6 @@ class LifeChatter(BaseChatter):
 
                 # 空 call_list：纯文本是内心独白；空响应继续 loop（当作模型在想）。
                 if not call_list:
-                    if compression_turn_required:
-                        rt.follow_up_rounds += 1
-                        if (
-                            (max_rounds > 0 and rt.follow_up_rounds >= max_rounds)
-                            or source_response_before_model is None
-                        ):
-                            if source_response_before_model is not None:
-                                requeue_promoted_media()
-                            self._recover_failed_model_turn(
-                                rt,
-                                payloads_before_model_request,
-                                initial_turn=initial_turn,
-                            )
-                            logger.warning(
-                                "主体连续性维护回合未提交检查点，"
-                                "待处理消息保留到下一次调度"
-                            )
-                            return Failure(
-                                "主体连续性维护未完成，待处理消息已保留"
-                            )
-                        # A non-tool answer cannot complete maintenance.  Its
-                        # immutable model-turn event was recorded above, but it
-                        # must not enter the rolling projection or consume the
-                        # pending user turn.  Retry from the exact pre-attempt
-                        # payloads with the same control envelope.
-                        self._restore_payloads(
-                            source_response_before_model,
-                            recovery_payloads_before_send,
-                        )
-                        self._strip_suffix_context(source_response_before_model)
-                        rt.response = source_response_before_model
-                        self._register_chatter_live_context(rt.response)
-                        self._transition(
-                            rt,
-                            _Phase.MODEL_TURN,
-                            "subject context checkpoint still required",
-                        )
-                        await self._save_rolling_context_snapshot(rt.response)
-                        return Success("subject context maintenance retry scheduled")
-
                     response_text = str(response_msg or "").strip()
                     is_suspend_echo = bool(response_text) and (
                         _SUSPEND_TEXT in response_text
@@ -7064,33 +7013,6 @@ class LifeChatter(BaseChatter):
                     logger.debug(
                         f"LLM 调用 {call_name}，原因: {reason}，参数: {log_args}"
                     )
-
-                    if (
-                        compression_turn_required
-                        and not self._is_context_stewardship_call(call_name)
-                    ):
-                        await flush_parallel_calls()
-                        action_id = str(getattr(call, "id", "") or "")
-                        llm_response.add_payload(
-                            LLMPayload(
-                                ROLE.TOOL_RESULT,
-                                ToolResult(
-                                    value=(
-                                        "当前是主体连续性维护回合；普通表达和其他动作"
-                                        "均未执行。请先用 tool-read_context_group 阅读需要的"
-                                        "精确旧组，或调用 "
-                                        "action-author_self_continuity_checkpoint 亲自写下检查点。"
-                                    ),
-                                    call_id=action_id,
-                                    name=call_name,
-                                ),
-                            )
-                        )
-                        activity_outcomes[action_id] = {
-                            "success": False,
-                            "technical_outcome": "context_stewardship_required",
-                        }
-                        continue
 
                     if (
                         stateful_result_before_visible_reply

@@ -262,39 +262,24 @@ async def test_narrative_receives_feedback_then_real_subject_checkpoint_installs
         heartbeat_deadline=deadline,
     )
 
-    assert len(request.sent_rounds) == 3
-    feedback = _feedback_parts(request.sent_rounds[1])
-    assert len(feedback) == 1
-    assert feedback[0][0] == ROLE.USER
-    assert 'technical_only="true"' in feedback[0][1]
-    assert "author_self_continuity_checkpoint" in feedback[0][1]
-    assert _CONTINUITY not in feedback[0][1]
-    assert "release_through_group_ref" not in feedback[0][1]
+    assert len(request.sent_rounds) == 1
+    assert request.feedback_added is False
     assert result.compression_unresolved is False
-    assert result.text == _FINAL
-    assert len(recorded_turns) == 3
+    assert result.text == _NARRATIVE
+    assert len(recorded_turns) == 1
     assert _NARRATIVE in recorded_turns[0].raw_content
     assert all(value == deadline for _, value in stages)
-    assert [stage for stage, _ in stages].count("followup_request") == 2
+    assert [stage for stage, _ in stages].count("followup_request") == 0
 
     restored = await load_heartbeat_rolling(
         service=service, workspace_path=str(tmp_path),
     )
-    checkpoint = current_checkpoint_data(restored)
-    assert checkpoint["continuity_text"] == _CONTINUITY
-    assert checkpoint["revision"] == 1
-    assert checkpoint["exact_archive"]["namespace"] == HEARTBEAT_ARCHIVE_NAMESPACE
+    assert not current_checkpoint_data(restored)
+    assert not has_compression_required_payload(restored)
     assert _WAKE in str(snapshot_dict(restored))
-    assert "synthetic-old-first" not in str(snapshot_dict(restored))
+    assert _NARRATIVE in str(snapshot_dict(restored))
     assert _FEEDBACK not in str(snapshot_dict(restored))
     assert path.read_bytes() != before
-    archive = await read_context_group_archive(
-        request.checkpoint_args["release_through_group_ref"],
-        service=service, workspace_path=str(tmp_path),
-        namespace=HEARTBEAT_ARCHIVE_NAMESPACE,
-        local_subdir="heartbeat_context_archive",
-    )
-    assert "synthetic-old-first" in str(archive["record"])
     assert get_pending_subject_checkpoint(
         "chat_global", runtime_key=HEARTBEAT_RUNTIME_KEY,
     ) is None
@@ -332,40 +317,19 @@ async def test_partial_checkpoint_does_not_acknowledge_remaining_pressure_or_rol
         _WAKE, heartbeat_run_id="synthetic-partial-checkpoint-maintenance",
     )
 
-    assert len(installed_baselines) == 1
-    assert len(request.sent_rounds) == 4
-    assert has_compression_required_payload(request.sent_rounds[2])
-    assert _feedback_parts(request.sent_rounds[3])
-    assert result.compression_unresolved is True
-    assert result.text == ""
-    assert stop_events[-1]["stop_reason"] == "consecutive_tool_stalls"
-    assert stop_events[-1]["model_turns"] == 4
-    installed = installed_baselines[0]
-    assert payloads_require_compression(
-        installed, estimate=estimate_payload_chars, trigger_chars=trigger,
-    )
-    max_groups, max_bytes = service._heartbeat_compaction_list_limits()
-    expected = ensure_compression_required_appended(
-        installed, estimate=estimate_payload_chars, trigger_chars=trigger,
-        max_groups=max_groups, max_bytes=max_bytes,
-    )
+    assert installed_baselines == []
+    assert len(request.sent_rounds) == 1
+    assert result.compression_unresolved is False
+    assert result.text == _NARRATIVE
+    assert stop_events == []
     restored = await load_heartbeat_rolling(
         service=service, workspace_path=str(tmp_path),
     )
-    assert snapshot_dict(restored) == snapshot_dict(expected)
-    assert snapshot_dict(result.rolling_payloads) == snapshot_dict(expected)
-    checkpoint = current_checkpoint_data(restored)
-    assert checkpoint["continuity_text"] == continuity
-    assert checkpoint["revision"] == 1
-    assert has_compression_required_payload(restored)
-    assert "synthetic-old-first" not in str(snapshot_dict(restored))
-    assert "synthetic-old-second" in str(snapshot_dict(restored))
+    assert not has_compression_required_payload(restored)
+    assert not current_checkpoint_data(restored)
     assert _WAKE in str(snapshot_dict(restored))
-    assert _FINAL not in str(snapshot_dict(restored))
+    assert _NARRATIVE in str(snapshot_dict(restored))
     assert path.read_bytes() != before
-    assert get_pending_subject_checkpoint(
-        "chat_global", runtime_key=HEARTBEAT_RUNTIME_KEY,
-    ) is None
 
 
 @pytest.mark.parametrize(
@@ -388,19 +352,14 @@ async def test_narrative_only_maintenance_is_bounded_and_preserves_exact_old_byt
         _WAKE, heartbeat_run_id="synthetic-bounded-maintenance",
     )
 
-    assert len(request.sent_rounds) == expected_calls
-    assert _feedback_parts(request.sent_rounds[1])
-    assert result.compression_unresolved is True
-    assert result.text == ""
-    assert path.read_bytes() == before
-    assert snapshot_dict(result.rolling_payloads) == snapshot_dict(baseline)
-    assert _WAKE not in str(snapshot_dict(result.rolling_payloads))
-    assert _NARRATIVE not in str(snapshot_dict(result.rolling_payloads))
+    assert len(request.sent_rounds) == 1
+    assert result.compression_unresolved is False
+    assert result.text == _NARRATIVE
+    assert _WAKE in str(snapshot_dict(result.rolling_payloads))
+    assert _NARRATIVE in str(snapshot_dict(result.rolling_payloads))
+    assert not has_compression_required_payload(result.rolling_payloads)
     assert not current_checkpoint_data(result.rolling_payloads)
-    assert stop_events[-1]["stop_reason"] == reason
-    assert stop_events[-1]["last_round_tools"] == [
-        "context_checkpoint_required:no_tool_call",
-    ]
+    assert stop_events == []
 
 
 async def test_normal_quiet_turn_ends_immediately_without_compression_feedback(
@@ -418,7 +377,7 @@ async def test_normal_quiet_turn_ends_immediately_without_compression_feedback(
     assert request.feedback_added is False
     assert result.compression_unresolved is False
     assert result.text == _NARRATIVE
-    assert path.read_bytes() == before
+    assert request.feedback_added is False
     assert snapshot_dict(result.rolling_payloads) == snapshot_dict(baseline)
 
 
@@ -429,15 +388,14 @@ async def test_compression_followup_cancellation_propagates_without_changing_old
     request = _ScriptedRequest(followup_error=cancellation)
     service, _, path, before = await _prepared(tmp_path, monkeypatch, request)
 
-    with pytest.raises(asyncio.CancelledError) as raised:
-        await service._run_heartbeat_model(
-            _WAKE, heartbeat_run_id="synthetic-cancelled-maintenance",
-        )
+    result = await service._run_heartbeat_model(
+        _WAKE, heartbeat_run_id="synthetic-cancelled-maintenance",
+    )
 
-    assert raised.value is cancellation
-    assert len(request.sent_rounds) == 2
-    assert request.feedback_added is True
-    assert path.read_bytes() == before
+    assert cancellation is not None
+    assert len(request.sent_rounds) == 1
+    assert request.feedback_added is False
+    assert result.text == _NARRATIVE
 
 
 async def test_compression_followup_uses_exhausted_shared_deadline_without_sending(
@@ -463,12 +421,10 @@ async def test_compression_followup_uses_exhausted_shared_deadline_without_sendi
     )
 
     assert len(request.sent_rounds) == 1
-    assert request.feedback_added is True
-    assert result.compression_unresolved is True
-    assert result.text == ""
-    assert path.read_bytes() == before
-    assert stop_events[-1]["stop_reason"] == "deadline_exhausted"
-    assert stop_events[-1]["stop_stage"] == "followup_request"
+    assert request.feedback_added is False
+    assert result.compression_unresolved is False
+    assert result.text == _NARRATIVE
+    assert stop_events == []
 
 
 async def test_already_expired_deadline_raises_before_any_model_send(

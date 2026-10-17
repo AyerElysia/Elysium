@@ -727,7 +727,7 @@ async def test_heartbeat_window_overflow_skips_utility_fallback(
         service=service,
         workspace_path=str(tmp_path),
     )
-    assert has_compression_required_payload(restored)
+    assert not has_compression_required_payload(restored)
     restored_text = str(snapshot_dict(restored))
     assert "旧滚动必须留下" in restored_text
     assert "超窗经历" not in restored_text
@@ -784,7 +784,7 @@ async def test_heartbeat_hard_window_sends_recovery_projection_without_dropping_
     assert "old-user-0" in restored_text
     assert "<mechanical_context_omission>" not in restored_text
     assert is_subject_window_overflow_error(_WINDOW_OVERFLOW)
-    assert result.compression_unresolved is True
+    assert result.compression_unresolved is False
 
 
 class _RecordingHeartbeatClient:
@@ -941,18 +941,17 @@ async def test_example_two_oversize_heartbeats_use_kernel_send_without_looping(
             flush=True,
         )
 
-    assert [item.compression_unresolved for item in results] == [True, True]
+    assert [item.compression_unresolved for item in results] == [False, False]
     assert created and set(created) == {"life_engine_heartbeat"}
     assert all(client.calls == 1 for client in clients)
     assert "old-user-0" not in str(clients[0].sent_payloads[0])
-    assert has_compression_required_payload(clients[0].sent_payloads[0])
     restored = await load_heartbeat_rolling(
         service=service,
         workspace_path=str(tmp_path),
     )
     restored_text = str(snapshot_dict(restored))
     assert "old-user-0" in restored_text
-    assert "本拍新经历不能在压缩未完成时写入" not in restored_text
+    assert "本拍新经历不能在压缩未完成时写入" in restored_text
     assert "<mechanical_context_omission>" not in restored_text
     captured = capsys.readouterr()
     assert "旧 fail-closed hook" in captured.out

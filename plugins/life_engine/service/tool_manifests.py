@@ -157,27 +157,16 @@ HEARTBEAT_TOOL_NAMES: tuple[str, ...] = (
     "nucleus_skill",
     "nucleus_learn",
     "nucleus_write_narrative",
-    "author_self_continuity_checkpoint",
-    "read_context_group",
 )
 
 LIFE_ENGINE_INTERNAL_MANIFEST: tuple[str, ...] = tuple(
-    (
-        f"action-{name}"
-        if name == "author_self_continuity_checkpoint"
-        else f"tool-{name}"
-    )
-    for name in HEARTBEAT_TOOL_NAMES
+    f"tool-{name}" for name in HEARTBEAT_TOOL_NAMES
 )
 
 
 def heartbeat_tool_classes() -> list[type[Any]]:
     """Resolve HEARTBEAT_TOOL_NAMES to tool classes. Import is lazy."""
 
-    from ..core.context_stewardship import (
-        LifeAuthorSelfContinuityCheckpointAction,
-        LifeReadContextGroupTool,
-    )
     from ..learning.learn_tool import NucleusLearnTool
     from ..opportunity.tools import OPPORTUNITY_TOOLS
     from ..memory.boundary_tools import LifeReadMemoryBoundaryTool
@@ -228,8 +217,6 @@ def heartbeat_tool_classes() -> list[type[Any]]:
         LifeEngineSkillTool,
         NucleusLearnTool,
         LifeEngineWriteNarrativeTool,
-        LifeAuthorSelfContinuityCheckpointAction,
-        LifeReadContextGroupTool,
     )
     by_name: dict[str, type[Any]] = {}
     for cls in classes:

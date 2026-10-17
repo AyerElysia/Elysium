@@ -52,9 +52,8 @@ def managed_heartbeat_header() -> list[str]:
         "attention.* 与已明确选择的外联可靠投递仍走正式主动工具；查询只读事实不等于选择行动。"
         "内心回声通过 life.inner_return 查询原 receipt 并选择是否交还，不猜一个聊天窗口。",
         "周期自唤醒也只是可管理的安排，不是不可删除的后台特权。"
-        "nucleus_rest_heartbeat 可按当前工具协议暂时休息。",
-        "滚动上下文需要连续性检查点时，由你通过 action-author_self_continuity_checkpoint 亲自写下；"
-        "系统不代写身份摘要，也不删除原始活动。",
+        "nucleus_rest_heartbeat 可按当前工具协议暂时休息。睡多久、为什么睡，由你决定。",
+        "上下文变长时由系统压缩早期轮次，最近几轮原样保留。你不需要手写检查点或核对哈希。",
         "遵守本轮实际工具预算。可以分轮查询和决定，不需要为了用工具而制造工作。",
         "",
     ]
