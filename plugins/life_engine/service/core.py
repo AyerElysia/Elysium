@@ -11210,6 +11210,16 @@ class LifeEngineService(BaseService):
             if await self._apply_heartbeat_subject_checkpoint(response):
                 checkpoint_installed = True
             self._ensure_heartbeat_compression_turn(response)
+            if any(
+                str(getattr(call, "name", "") or "").endswith("nucleus_rest_heartbeat")
+                for call in call_list
+            ):
+                logger.info(
+                    "life_engine 本轮已调用主动休息，作为终结动作结束当前心跳: "
+                    f"#{self._state.heartbeat_count}"
+                )
+                stop_reason = "self_pause_terminal"
+                break
             last_round_outcomes = _heartbeat_tool_round_outcomes(
                 call_list, round_results
             )
