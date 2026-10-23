@@ -3,4 +3,4 @@
 	url = https://github.com/TriSeTide/Ayla.git
 [submodule "deepseek-harness"]
 	path = deepseek-harness
-	url = https://github.com/AyerElysia/Elysia.git
+	url = https://github.com/AyerElysia/Elysia-Harness.git
