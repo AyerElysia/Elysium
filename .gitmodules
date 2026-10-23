@@ -1,6 +1,6 @@
 [submodule "Ayla"]
 	path = Ayla
 	url = https://github.com/TriSeTide/Ayla.git
-[submodule "deepseek-harness"]
-	path = deepseek-harness
+[submodule "Elysia-Harness"]
+	path = Elysia-Harness
 	url = https://github.com/AyerElysia/Elysia-Harness.git
