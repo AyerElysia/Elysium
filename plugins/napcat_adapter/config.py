@@ -97,6 +97,30 @@ class NapcatAdapterConfig(BaseConfig):
             order=3
         )
 
+        close_wait_watchdog_enabled: bool = Field(
+            default=False,
+            description=(
+                "是否启用 NapCat CLOSE-WAIT 僵尸连接监控（ss -K 强制断开）。"
+                "仅处理已验证归属且持续处于 CLOSE-WAIT 的连接，"
+                "需同时配置目标进程目录；可能触发风控或掉线，默认关闭。"
+            ),
+            label="CLOSE-WAIT 监控",
+            tag="network",
+            hint="关闭后不再执行 ss -K；仅在确认存在僵尸连接问题时才建议开启",
+            order=4
+        )
+        close_wait_watchdog_process_dir: str = Field(
+            default="",
+            description=(
+                "允许 watchdog 操作的本机 NapCat 进程工作目录（绝对路径）。"
+                "必须与本机已鉴权反向 WebSocket 对端的 cwd 完全一致；"
+                "未配置令牌、目录留空、非本用户或归属不明时不执行清理。"
+            ),
+            label="Watchdog 目标进程目录",
+            tag="network",
+            order=5,
+        )
+
     @config_section("features", title="功能特性", tag="general", order=30)
     class FeaturesSection(SectionBase):
         """功能特性配置"""
