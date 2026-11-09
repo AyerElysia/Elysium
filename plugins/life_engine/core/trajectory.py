@@ -191,13 +191,27 @@ class LifeTrajectory:
         return traj
 
     def to_payloads(self) -> list[LLMPayload]:
-        """Export a detached payload list so request merges cannot mutate history."""
+        """Export a detached payload list so request merges cannot mutate history.
+
+        A follow-up assistant is stored as its own turn. Compaction can place
+        that turn directly after the summary assistant. Merge those two
+        assistants so the request stays user/tool_result → assistant.
+        """
         payloads: list[LLMPayload] = []
         for turn in self.turns:
             for payload in turn.to_payloads():
-                payloads.append(
-                    LLMPayload(payload.role, list(payload.content or []))
-                )
+                detached = LLMPayload(payload.role, list(payload.content or []))
+                if (
+                    payloads
+                    and detached.role == ROLE.ASSISTANT
+                    and payloads[-1].role == ROLE.ASSISTANT
+                ):
+                    payloads[-1] = LLMPayload(
+                        ROLE.ASSISTANT,
+                        [*list(payloads[-1].content or []), *detached.content],
+                    )
+                    continue
+                payloads.append(detached)
         return payloads
 
     def begin_turn(

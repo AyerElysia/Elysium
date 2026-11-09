@@ -1638,6 +1638,57 @@ def test_rolling_context_projection_drops_retired_think_pair() -> None:
     assert [part.name for part in cleaned[1].content] == ["action-life_send_text"]
 
 
+def test_retired_tool_result_between_assistants_merges_into_one() -> None:
+    payloads = [
+        LLMPayload(ROLE.USER, Text("hello")),
+        LLMPayload(ROLE.ASSISTANT, Text("first reply")),
+        LLMPayload(
+            ROLE.TOOL_RESULT,
+            ToolResult(value="legacy ok", call_id="think-1", name="action-think"),
+        ),
+        LLMPayload(ROLE.ASSISTANT, Text("second reply")),
+        LLMPayload(ROLE.USER, Text("again")),
+    ]
+
+    cleaned = LifeChatter._without_retired_think_history(payloads)
+
+    assert [payload.role for payload in cleaned] == [
+        ROLE.USER,
+        ROLE.ASSISTANT,
+        ROLE.USER,
+    ]
+    assert [
+        part.text for part in cleaned[1].content if isinstance(part, Text)
+    ] == ["first reply", "second reply"]
+    LLMContextManager()._validate_payloads(cleaned, allow_incomplete_tail=False)
+
+
+def test_retired_result_cleanup_preserves_live_call_with_remaining_receipt() -> None:
+    call = ToolCall(id="live-call", name="action-life_send_text", args={})
+    receipt = ToolResult(
+        value="synthetic-delivered", call_id=call.id, name=call.name,
+    )
+    payloads = [
+        LLMPayload(ROLE.USER, Text("synthetic-request")),
+        LLMPayload(ROLE.ASSISTANT, [Text("first"), call]),
+        LLMPayload(
+            ROLE.TOOL_RESULT,
+            ToolResult(value="retired", call_id="retired-call", name="action-think"),
+        ),
+        LLMPayload(ROLE.ASSISTANT, Text("second")),
+        LLMPayload(ROLE.TOOL_RESULT, receipt),
+        LLMPayload(ROLE.ASSISTANT, Text("complete")),
+    ]
+
+    cleaned = LifeChatter._without_retired_think_history(payloads)
+
+    assert call in cleaned[1].content
+    assert receipt in cleaned[2].content
+    assert payloads[1].content == [Text("first"), call]
+    assert payloads[3].content == [Text("second")]
+    LLMContextManager()._validate_payloads(cleaned, allow_incomplete_tail=False)
+
+
 def test_rolling_context_projection_drops_whole_retired_think_assistant() -> None:
     payloads = [
         LLMPayload(ROLE.USER, Text("new message")),
