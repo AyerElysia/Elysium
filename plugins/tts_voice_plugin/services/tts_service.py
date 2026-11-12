@@ -57,6 +57,8 @@ _LegacyWeightIdentity = tuple[str, int, int, int, int]
 
 
 _TTS_CLARITY_WARNING_UNITS_PER_SECOND = 4.8
+_BREEZE_MAX_BUSY_RESPONSES = 3
+_BREEZE_CLIENT_ID = "elysium-python"
 
 
 _SEMANTIC_BOUNDARY_RE = re.compile(
@@ -106,18 +108,33 @@ class TTSService(BaseService):
         # A complete outward expression owns one lane so two user-visible voices
         # cannot interleave. vLLM-Omni may still batch bounded internal segments.
         self._synthesis_lock = asyncio.Lock()
+        self._stop_lock = asyncio.Lock()
+        self._stopped = False
+        self._owned_expressions: set[asyncio.Task[Any]] = set()
         self._load_config()
 
     async def stop(self) -> None:
-        """Stop only the TTS server process group started by this service.
+        """Drain only this service's expression children and owned server.
 
-        An already-running external server is never adopted into
-        ``_server_process`` and is therefore left untouched.  Processes created
-        by :meth:`_start_server` own a new session so their two-stage vLLM
-        workers can be reclaimed as one process group.
+        External caller tasks and other service instances are never cancelled.
+        An external shared Breeze server is not adopted and is left untouched.
         """
-        await self._cancel_idle_shutdown_task()
-        await self._stop_owned_server_process(reason="plugin_stop")
+        self._stopped = True
+        async with self._stop_lock:
+            current = asyncio.current_task()
+            children = [
+                task for task in self._owned_expressions if task is not current
+            ]
+            for task in children:
+                if not task.done():
+                    task.cancel()
+            try:
+                if children:
+                    await asyncio.gather(*children, return_exceptions=True)
+            finally:
+                self._owned_expressions.difference_update(children)
+                await self._cancel_idle_shutdown_task()
+                await self._stop_owned_server_process(reason="plugin_stop")
 
     async def _stop_owned_server_process(
         self,
@@ -1266,11 +1283,11 @@ class TTSService(BaseService):
                     self._attest_owned_startup_legacy_weights()
                     return True
         except asyncio.CancelledError:
-            await self.stop()
+            await self._stop_owned_server_process(reason="startup_cancelled")
             raise
 
         logger.error(f"TTS 服务在 {startup_timeout}s 内未就绪，放弃等待。")
-        await self.stop()
+        await self._stop_owned_server_process(reason="startup_timeout")
         return False
 
     # ------------------------------------------------------------------
@@ -1549,6 +1566,9 @@ class TTSService(BaseService):
         content_type = mimetypes.guess_type(filename)[0] or "audio/wav"
         loop = asyncio.get_running_loop()
         deadline = loop.time() + float(self.timeout)
+        expression_deadline = kwargs.get("_breeze_deadline")
+        if expression_deadline is not None:
+            deadline = min(deadline, float(expression_deadline))
         started_at = loop.time()
         busy_retries = 0
 
@@ -1573,11 +1593,21 @@ class TTSService(BaseService):
                 async with session.post(
                     f"{base_url}/v1/audio/speech",
                     data=build_form(),
+                    headers={
+                        "X-Breeze-Client": _BREEZE_CLIENT_ID,
+                        "X-Breeze-Timeout-Ms": str(max(1, math.ceil(remaining * 1000))),
+                    },
                     timeout=aiohttp.ClientTimeout(total=remaining),
                 ) as response:
                     if response.status == 409:
                         await response.read()
                         busy_retries += 1
+                        if busy_retries >= _BREEZE_MAX_BUSY_RESPONSES:
+                            logger.warning(
+                                "Breeze TTS 2 持续繁忙，停止有限兼容重试: "
+                                f"busy_responses={busy_retries}"
+                            )
+                            return None
                     elif response.status != 200:
                         error_body = await response.read()
                         logger.error(
@@ -2084,6 +2114,85 @@ class TTSService(BaseService):
         language_hint: str | None = None,
         expression_instruction: str | None = None,
     ) -> str | None:
+        """Await an owned expression child without adopting the caller task."""
+        if self._stopped:
+            logger.warning("TTS 服务已停止，拒绝新的表达请求")
+            return None
+        work = self._generate_voice_with_budget(
+            text, style_hint, language_hint, expression_instruction
+        )
+        info = get_task_manager().create_task(
+            work,
+            name="tts_voice_expression",
+            daemon=True,
+            metadata={"owner": "tts_voice_plugin"},
+        )
+        child = info.task
+        if child is None:
+            work.close()
+            raise RuntimeError("TTS expression task was not created")
+        self._owned_expressions.add(child)
+        try:
+            result = await asyncio.shield(child)
+            return None if self._stopped else result
+        except asyncio.CancelledError:
+            caller = asyncio.current_task()
+            caller_cancelled = caller is not None and caller.cancelling() > 0
+            if self._stopped and child.cancelled() and not caller_cancelled:
+                logger.info("TTS 服务停止，表达已取消且未交付音频")
+                return None
+            child.cancel()
+            await asyncio.gather(child, return_exceptions=True)
+            raise
+        finally:
+            self._owned_expressions.discard(child)
+
+    async def _generate_voice_with_budget(
+        self,
+        text: str,
+        style_hint: str = "default",
+        language_hint: str | None = None,
+        expression_instruction: str | None = None,
+    ) -> str | None:
+        """Generate one complete expression with a single Breeze time budget.
+
+        The budget includes local lane waiting, reference loading, all transport
+        segments and PCM reads. Caller cancellation propagates unchanged; only
+        this method's own deadline is reported as an ordinary synthesis failure.
+        External shared-service ownership and the selected voice stay unchanged.
+        """
+        self._load_config()
+        if self._backend_name() != "breeze_tts2":
+            return await self._generate_voice(
+                text, style_hint, language_hint, expression_instruction
+            )
+        timeout_seconds = float(self.timeout)
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        try:
+            async with asyncio.timeout_at(deadline):
+                return await self._generate_voice(
+                    text,
+                    style_hint,
+                    language_hint,
+                    expression_instruction,
+                    _breeze_deadline=deadline,
+                )
+        except TimeoutError:
+            logger.error(
+                "Breeze TTS 2 完整表达超过总时间预算，未交付音频: "
+                f"timeout_seconds={timeout_seconds:g}"
+            )
+            return None
+
+    async def _generate_voice(
+        self,
+        text: str,
+        style_hint: str = "default",
+        language_hint: str | None = None,
+        expression_instruction: str | None = None,
+        *,
+        _breeze_deadline: float | None = None,
+    ) -> str | None:
         """生成语音并返回 Base64 编码。
 
         Args:
@@ -2095,8 +2204,6 @@ class TTSService(BaseService):
         Returns:
             Base64 编码的音频数据，失败返回 None
         """
-        self._load_config()
-
         if not self.tts_styles:
             logger.error("TTS风格配置为空，无法生成语音。")
             return None
@@ -2171,6 +2278,8 @@ class TTSService(BaseService):
             "sovits_weights_sha256": server_config.get("sovits_weights_sha256"),
             "breeze_expression_instruction": breeze_expression_instruction,
         }
+        if _breeze_deadline is not None:
+            call_kwargs["_breeze_deadline"] = _breeze_deadline
         final_media_type = self._config.tts_advanced.media_type
         spatial_enabled = self._config.spatial_effects.enabled
 
@@ -2303,9 +2412,12 @@ class TTSService(BaseService):
 
                 results: list[bytes | None] = []
                 for index, segment in enumerate(synthesis_segments, start=1):
-                    results.append(
-                        await synthesize_segment(index, segment, request_kwargs)
-                    )
+                    audio_data = await synthesize_segment(index, segment, request_kwargs)
+                    results.append(audio_data)
+                    if audio_data is None:
+                        # An incomplete expression cannot be delivered. Do not
+                        # spend another full timeout on each remaining segment.
+                        break
                 return results
 
             if backend in {"vllm_omni", "breeze_tts2"}:

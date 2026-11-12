@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from itertools import pairwise
 from pathlib import Path
 import pytest
 
 from plugins.life_engine.core.trajectory import LifeTrajectory, TrajectoryTurn
-from src.kernel.llm import ROLE, LLMPayload, ReasoningText, Text, ToolCall, ToolResult
+from src.kernel.llm import (
+    ROLE, LLMContextManager, LLMPayload, ReasoningText, Text, ToolCall, ToolResult,
+)
 
 
 def test_trajectory_basic_turn_flow() -> None:
@@ -100,6 +103,41 @@ def test_trajectory_compaction_pruning_and_folding() -> None:
     payloads = traj.to_payloads()
     assert len(payloads) >= 3
     assert payloads[0].role == ROLE.USER
+
+
+def test_compaction_keeps_followup_assistant_attached() -> None:
+    raw: list[LLMPayload] = []
+    for i in range(8):
+        raw.append(LLMPayload(ROLE.USER, [Text(f"消息 {i} " + ("字" * 800))]))
+        raw.append(LLMPayload(ROLE.ASSISTANT, [
+            Text("收到"),
+            ToolCall(id=f"c{i}", name="send", args={}),
+        ]))
+        raw.append(LLMPayload(ROLE.TOOL_RESULT, [
+            ToolResult(value="ok" * 400, call_id=f"c{i}", name="send"),
+        ]))
+        raw.append(LLMPayload(ROLE.ASSISTANT, [Text(f"说完了 {i}")]))
+    traj = LifeTrajectory.from_payloads(raw)
+    result = traj.compact(trigger_chars=1_000, target_chars=500, min_recent_turns=3)
+    assert result.triggered is True
+    exported = traj.to_payloads()
+    roles = [payload.role for payload in exported]
+    assert not any(
+        previous == ROLE.ASSISTANT and current == ROLE.ASSISTANT
+        for previous, current in pairwise(roles)
+    )
+    LLMContextManager()._validate_payloads(exported, allow_incomplete_tail=False)
+    retained = [
+        list(payload.content or [])
+        for turn in traj.turns
+        for payload in turn.to_payloads()
+    ]
+    exported[1].content.append(Text("request-local-only"))
+    assert [
+        list(payload.content or [])
+        for turn in traj.turns
+        for payload in turn.to_payloads()
+    ] == retained
 
 
 def test_unmatched_historical_tool_calls_are_removed() -> None:

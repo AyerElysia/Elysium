@@ -2374,7 +2374,48 @@ class LifeChatter(BaseChatter):
                 if len(content) == len(original_content)
                 else LLMPayload(payload.role, content)  # type: ignore[arg-type]
             )
-        return cleaned_payloads
+        return LifeChatter._close_adjacent_assistant_payloads(cleaned_payloads)
+
+    @staticmethod
+    def _close_adjacent_assistant_payloads(
+        payloads: list[LLMPayload],
+    ) -> list[LLMPayload]:
+        """Merge assistants left adjacent after a retired tool result is removed.
+
+        ``assistant -> retired tool_result -> assistant`` becomes
+        ``assistant -> assistant`` once the result is gone. The earlier
+        assistant's calls are preserved if a retained receipt still matches;
+        only orphaned earlier calls are dropped as the frames join.
+        """
+
+        retained_result_ids = {
+            str(part.call_id)
+            for payload in payloads
+            for part in (payload.content or [])
+            if isinstance(part, ToolResult) and part.call_id
+        }
+        closed: list[LLMPayload] = []
+        for payload in payloads:
+            if (
+                not closed
+                or payload.role != ROLE.ASSISTANT
+                or closed[-1].role != ROLE.ASSISTANT
+            ):
+                closed.append(payload)
+                continue
+            previous = closed[-1]
+            kept_previous = [
+                part
+                for part in list(previous.content or [])
+                if not isinstance(part, ToolCall)
+                or str(part.id) in retained_result_ids
+            ]
+            merged = [*kept_previous, *list(payload.content or [])]
+            if not merged:
+                closed.pop()
+                continue
+            closed[-1] = LLMPayload(ROLE.ASSISTANT, merged)
+        return closed
 
     @classmethod
     def _without_retired_reaction_guidance(

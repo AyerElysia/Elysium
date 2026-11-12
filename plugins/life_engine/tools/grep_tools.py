@@ -231,9 +231,9 @@ class LifeEngineGrepFileTool(BaseTool):
         ] = "",
         fixed_string: Annotated[bool, "true 时按字面匹配，不把 pattern 当正则"] = False,
         sort: Annotated[
-            Literal["", "mtime", "name"],
-            "mtime=新→旧；name=路径名。默认 files_with_matches 用 mtime，content 用 name",
-        ] = "",
+            Literal["auto", "mtime", "name"],
+            "auto=按输出模式选择（files_with_matches 用 mtime，content 用 name）；mtime=新→旧；name=路径名",
+        ] = "auto",
         output_mode: Annotated[
             Literal["content", "files_with_matches"],
             "输出模式：'files_with_matches'返回文件列表，'content'返回匹配行内容",
@@ -374,7 +374,7 @@ class LifeEngineGrepFileTool(BaseTool):
 
         limit_unit = "file" if output_mode == "files_with_matches" else "line"
         sort_mode = str(sort or "").strip()
-        if not sort_mode:
+        if sort_mode in {"", "auto"}:
             sort_mode = "mtime" if output_mode == "files_with_matches" else "name"
         if sort_mode not in {"mtime", "name"}:
             return False, f"不支持的 sort: {sort}"

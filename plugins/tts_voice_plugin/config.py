@@ -61,7 +61,14 @@ class TTSSection(SectionBase):
             "可选的 vLLM-Omni Bearer token 环境变量名；为空时不发送 Authorization"
         ),
     )
-    timeout: int = Field(default=180, description="TTS 请求超时秒数")
+    timeout: int = Field(
+        default=180,
+        ge=1,
+        description=(
+            "TTS 请求超时秒数；Breeze 为整条表达的总预算，"
+            "包括本地排队、参考读取、所有片段及 PCM 接收"
+        ),
+    )
     max_text_length: int = Field(
         default=1000,
         ge=1,

@@ -27,6 +27,7 @@ from plugins.life_engine.service.event_builder import (
 )
 from plugins.life_engine.service.heartbeat_rolling import (
     format_new_events_text,
+    format_sourced_heartbeat_event,
     format_visible_event,
 )
 from plugins.life_engine.service.perception_gateway import PerceptionDeliveryUnverified
@@ -414,6 +415,36 @@ def test_ambiguous_snapshot_identity_is_rejected_before_false_ack(
     assert not second.heartbeat_context_consumed
 
 
+@pytest.mark.parametrize("acknowledged_first", [True, False])
+def test_exact_duplicate_identity_collapses_before_visible_projection(
+    acknowledged_first,
+) -> None:
+    original = _event(1, content="synthetic-visible-once")
+    copy = replace(original)
+    acknowledged = replace(original, heartbeat_context_consumed=True)
+
+    prepared = SubconsciousContextManager().prepare(
+        [original, copy],
+        cursor=0,
+        event_renderer=format_visible_event,
+    )
+    copies = [acknowledged, replace(original)]
+    if not acknowledged_first:
+        copies.reverse()
+    consumed_only = SubconsciousContextManager().prepare(
+        copies,
+        cursor=0,
+        event_renderer=format_visible_event,
+    )
+
+    assert prepared.selected_event_ids == [original.event_id]
+    assert prepared.content.count(original.content) == 1
+    assert consumed_only.selected_event_ids == []
+    assert original.content not in consumed_only.content
+    assert not original.heartbeat_context_consumed
+    assert not copy.heartbeat_context_consumed
+
+
 def test_visible_prepare_does_not_fold_crossing_consumed_group_over_pending_gap() -> (
     None
 ):
@@ -453,8 +484,10 @@ def service(tmp_path, monkeypatch):
     service._state_dirty = False
     service._multi_writer_bridge = None
     service._opportunity_runtime = None
+    # The service adds source/time/ledger metadata; budget for that exact
+    # visible group while keeping it smaller than the authoritative raw body.
     service._subconscious_context = SubconsciousContextManager(
-        max_chars=120,
+        max_chars=512,
         recent_group_count=0,
     )
     service._proactive_actor_gate = SimpleNamespace(hold=_isolated_gate)
@@ -496,10 +529,111 @@ async def _commit(service, prepared):
     )
 
 
+@pytest.mark.parametrize("acknowledged_first", [True, False])
+async def test_history_duplicate_keeps_acknowledgement_in_either_order(
+    service, acknowledged_first,
+) -> None:
+    original = _event(10, content="synthetic-repeat")
+    acknowledged = replace(original, heartbeat_context_consumed=True)
+    first, incoming = (
+        (acknowledged, original) if acknowledged_first else (original, acknowledged)
+    )
+    service._event_history = [first]
+
+    await service._append_history([incoming], publish_raw=False, persist=False)
+
+    assert len(service._event_history) == 1
+    assert service._event_history[0].heartbeat_context_consumed
+    assert not original.heartbeat_context_consumed
+    assert acknowledged.heartbeat_context_consumed
+
+
+async def test_history_duplicate_does_not_hide_conflicting_facts(service) -> None:
+    original = _event(10, content="synthetic-original")
+    conflict = replace(original, content="synthetic-conflict")
+    service._event_history = [original]
+
+    await service._append_history(
+        [replace(original), conflict], publish_raw=False, persist=False,
+    )
+
+    assert service._event_history == [original, conflict]
+    with pytest.raises(ValueError, match="unique nonempty event identities"):
+        service._subconscious_context.prepare(
+            service._event_history, cursor=0, event_renderer=format_visible_event,
+        )
+
+
+async def test_commit_acknowledges_run_event_already_copied_to_history(service) -> None:
+    original = _event(10, run="synthetic-visible-run")
+    service._event_history = [original]
+    service._subconscious_context = SubconsciousContextManager(
+        max_chars=512, recent_group_count=1,
+    )
+    # This run output was already appended independently of the pending copy.
+    service._pending_events = [replace(original)]
+    prepared = service._subconscious_context.prepare(
+        [], cursor=0, event_renderer=format_visible_event,
+    )
+
+    await _commit(service, prepared)
+
+    assert len(service._event_history) == 1
+    assert service._event_history[0].heartbeat_context_consumed
+    assert service._pending_events == []
+    following = await service._prepare_heartbeat_context()
+    assert following.selected_event_ids == []
+
+
+async def test_failed_commit_preserves_previously_confirmed_duplicate(service) -> None:
+    confirmed = _event(10, run="synthetic-visible-run", consumed=True)
+    pending = replace(confirmed, heartbeat_context_consumed=False)
+    service._event_history = [confirmed]
+    service._pending_events = [pending]
+    service._subconscious_context = SubconsciousContextManager(
+        max_chars=512, recent_group_count=1,
+    )
+    prepared = await service._prepare_heartbeat_context()
+    service._save_runtime_context.side_effect = OSError("synthetic failed save")
+
+    with pytest.raises(OSError, match="synthetic failed save"):
+        await _commit(service, prepared)
+
+    assert confirmed.heartbeat_context_consumed
+    assert not pending.heartbeat_context_consumed
+    assert service._event_history == [confirmed]
+    assert (await service._prepare_heartbeat_context()).selected_event_ids == []
+
+
+async def test_failed_commit_retains_conflicting_same_id_facts(service) -> None:
+    original = _event(10, content="synthetic-original")
+    service._event_history = [original]
+    prepared = await service._prepare_heartbeat_context()
+    conflict = replace(
+        original, content="synthetic-conflict", heartbeat_run_id="synthetic-visible-run",
+    )
+    service._pending_events = [conflict]
+    service._save_runtime_context.side_effect = OSError("synthetic failed save")
+
+    with pytest.raises(OSError, match="synthetic failed save"):
+        await _commit(service, prepared)
+
+    assert service._event_history == [original, conflict]
+    assert not original.heartbeat_context_consumed
+    assert not conflict.heartbeat_context_consumed
+    with pytest.raises(ValueError, match="unique nonempty event identities"):
+        await service._prepare_heartbeat_context()
+
+
 async def test_real_prepare_and_exact_commit_stop_next_round_replay(service) -> None:
     original_events = list(service._event_history)
     originals = [(event.raw_content, event.content_ref) for event in original_events]
-    expected = format_new_events_text(original_events)
+    expected = "\n".join(
+        format_sourced_heartbeat_event(event) for event in original_events
+    )
+    budget = service._subconscious_context.max_chars
+    assert len(expected) <= budget
+    assert len(original_events[0].raw_content) > budget
     prepared = await service._prepare_heartbeat_context()
 
     assert prepared.acknowledged_event_ids == _raw_ids(original_events)

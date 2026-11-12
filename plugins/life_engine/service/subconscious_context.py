@@ -11,13 +11,66 @@ import hashlib
 import json
 import logging
 import re
-from dataclasses import dataclass, field
+from collections import Counter
+from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Iterable
 
 from .event_builder import EventType, LifeEngineEvent
 from .historical_redelivery import format_historical_redelivery
 
 logger = logging.getLogger(__name__)
+
+
+def _identity_fact(event: LifeEngineEvent) -> str:
+    """Stable comparison key for one event, ignoring acknowledgement state."""
+
+    data = asdict(event)
+    data.pop("heartbeat_context_consumed", None)
+    return json.dumps(data, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def without_exact_identity_copies(
+    events: list[LifeEngineEvent],
+) -> tuple[list[LifeEngineEvent], int]:
+    """Collapse exact copies of an event id without losing acknowledgement.
+
+    Two different events that reuse one id stay in the list. The visible
+    projection still rejects that ambiguity instead of acknowledging whichever
+    copy a dict happened to keep. Acknowledgement state is not part of the
+    fact: an acknowledged copy wins in either input order, at the original
+    position, without mutating either event object.
+    """
+
+    counts: Counter[str] = Counter()
+    for event in events:
+        event_id = event.event_id
+        if isinstance(event_id, str) and event_id.strip():
+            counts[event_id] += 1
+    duplicate_ids = {event_id for event_id, count in counts.items() if count > 1}
+    if not duplicate_ids:
+        return events, 0
+    seen: dict[str, dict[str, int]] = {}
+    kept: list[LifeEngineEvent] = []
+    dropped = 0
+    for event in events:
+        event_id = event.event_id
+        if event_id not in duplicate_ids:
+            kept.append(event)
+            continue
+        fact = _identity_fact(event)
+        facts = seen.setdefault(event_id, {})
+        if fact in facts:
+            previous_index = facts[fact]
+            if (
+                event.heartbeat_context_consumed
+                and not kept[previous_index].heartbeat_context_consumed
+            ):
+                kept[previous_index] = event
+            dropped += 1
+            continue
+        facts[fact] = len(kept)
+        kept.append(event)
+    return kept, dropped
 
 
 SUMMARY_SCHEMA_VERSION = 1
@@ -353,6 +406,13 @@ class SubconsciousContextManager:
             if recent_group_count is None
             else max(0, int(recent_group_count))
         )
+        if event_renderer is not None:
+            events, dropped_copies = without_exact_identity_copies(events)
+            if dropped_copies:
+                logger.warning(
+                    "visible projection collapsed exact duplicate event identities: "
+                    f"dropped={dropped_copies}"
+                )
         sorted_events = self._sort_raw_events(events)
         if event_renderer is not None:
             identities = [event.event_id for event in sorted_events]
@@ -933,6 +993,7 @@ class SubconsciousContextManager:
             if keep_recent_groups is None
             else max(0, int(keep_recent_groups))
         )
+        events, _ = without_exact_identity_copies(list(events))
         summary, retained, _ = self._compact_state(
             events,
             cursor=int(cursor or 0),

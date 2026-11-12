@@ -11,7 +11,7 @@ import wave
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Self
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -129,6 +129,8 @@ def test_long_text_config_defaults_and_bounds() -> None:
     assert config.tts_styles[0].breeze_seed == -1
     assert config.tts_styles[0].breeze_instruction
 
+    with pytest.raises(ValueError):
+        TTSVoiceConfig.model_validate({"tts": {"timeout": 0}})
     with pytest.raises(ValueError):
         TTSVoiceConfig.model_validate({"tts": {"segment_max_units": 15}})
     with pytest.raises(ValueError):
@@ -1707,3 +1709,296 @@ async def test_plugin_unload_stops_and_releases_owned_service() -> None:
 
     owned_service.stop.assert_awaited_once()
     assert plugin.tts_service is None
+
+
+def _shared_breeze_service(tmp_path: Path, *, timeout: int = 300) -> tuple[TTSService, Path]:
+    """Use only a temporary reference and mocked readiness; never a live backend."""
+    reference = tmp_path / "shared-reference.wav"
+    reference.write_bytes(_silent_wav())
+    config = TTSVoiceConfig()
+    config.tts.backend = "breeze_tts2"
+    config.tts.server = "http://127.0.0.1:7862"
+    config.tts.auto_start = False
+    config.tts.timeout = timeout
+    config.tts.segment_max_units = 16
+    config.tts.segment_min_units = 4
+    config.tts_styles[0].refer_wav_path = str(reference)
+    config.tts_styles[0].prompt_text = "公开参考测试。"
+    config.tts_advanced.media_type = "wav"
+    service = TTSService(SimpleNamespace(config=config))  # type: ignore[arg-type]
+    service._ensure_server_alive = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    return service, reference
+
+
+async def test_shared_breeze_busy_compatibility_has_a_fixed_attempt_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, reference = _shared_breeze_service(tmp_path, timeout=1200)
+    calls: list[dict[str, Any]] = []
+
+    class BusySession(_FakeClientSession):
+        def post(self, url: str, **kwargs: Any) -> _FakeHTTPResponse:
+            calls.append({"url": url, **kwargs})
+            return _FakeHTTPResponse(b"busy", status=409)
+
+    sleep = AsyncMock()
+    monkeypatch.setattr(tts_service_module.asyncio, "sleep", sleep)
+    monkeypatch.setattr(tts_service_module.aiohttp, "ClientSession", BusySession)
+    result = await service._call_tts_api(
+        service.tts_styles["default"], "公开重试验证。", "zh",
+        refer_wav_path=str(reference), reference_audio_bytes=reference.read_bytes(),
+    )
+
+    assert result is None
+    assert len(calls) == 3
+    assert sleep.await_count == 2
+    assert all(call["headers"]["X-Breeze-Client"] == "elysium-python" for call in calls)
+    assert all(0 < int(call["headers"]["X-Breeze-Timeout-Ms"]) <= 1_200_000 for call in calls)
+
+
+@pytest.mark.parametrize("status", [503, 504])
+async def test_shared_breeze_queue_rejection_does_not_repeat_the_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: int,
+) -> None:
+    service, reference = _shared_breeze_service(tmp_path)
+    calls: list[str] = []
+
+    class RejectedSession(_FakeClientSession):
+        def post(self, url: str, **_kwargs: Any) -> _FakeHTTPResponse:
+            calls.append(url)
+            return _FakeHTTPResponse(
+                b'{"code":"queue-unavailable"}', status=status,
+                headers={"Retry-After": "1"},
+            )
+
+    sleep = AsyncMock()
+    monkeypatch.setattr(tts_service_module.asyncio, "sleep", sleep)
+    monkeypatch.setattr(tts_service_module.aiohttp, "ClientSession", RejectedSession)
+    result = await service._call_tts_api(
+        service.tts_styles["default"], "公开队列验证。", "zh",
+        refer_wav_path=str(reference), reference_audio_bytes=reference.read_bytes(),
+    )
+
+    assert result is None
+    assert len(calls) == 1
+    sleep.assert_not_awaited()
+
+
+async def test_shared_breeze_request_receives_remaining_expression_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, reference = _shared_breeze_service(tmp_path, timeout=1200)
+    calls: list[dict[str, Any]] = []
+
+    class ReadySession(_FakeClientSession):
+        def post(self, url: str, **kwargs: Any) -> _FakeHTTPResponse:
+            calls.append({"url": url, **kwargs})
+            return _FakeHTTPResponse(b"\x00\x00" * 240, headers={
+                "Content-Type": "audio/pcm", "X-Sample-Rate": "24000", "X-Sample-Format": "s16le",
+            })
+
+    monkeypatch.setattr(tts_service_module.aiohttp, "ClientSession", ReadySession)
+    deadline = asyncio.get_running_loop().time() + 0.25
+    result = await service._call_tts_api(
+        service.tts_styles["default"], "公开预算验证。", "zh",
+        refer_wav_path=str(reference), reference_audio_bytes=reference.read_bytes(),
+        _breeze_deadline=deadline,
+    )
+
+    assert result
+    assert len(calls) == 1
+    assert 0 < int(calls[0]["headers"]["X-Breeze-Timeout-Ms"]) <= 250
+    assert 0 < calls[0]["timeout"].total <= 0.25
+
+
+async def test_shared_breeze_first_failed_segment_stops_the_expression(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, _reference = _shared_breeze_service(tmp_path)
+    text = "第一段公开测试需要完整保留。第二段不应在第一段失败后继续请求。第三段也不能继续请求。"
+    assert len(service._build_synthesis_plan(text)[1]) >= 3
+    backend = AsyncMock(return_value=None)
+    join = Mock(side_effect=AssertionError("must not join incomplete speech"))
+    encode = AsyncMock(side_effect=AssertionError("must not encode incomplete speech"))
+    monkeypatch.setattr(service, "_call_tts_api", backend)
+    monkeypatch.setattr(service, "_join_wav_segments", join)
+    monkeypatch.setattr(service, "_encode_audio", encode)
+
+    assert await service.generate_voice(text) is None
+    backend.assert_awaited_once()
+    join.assert_not_called()
+    encode.assert_not_awaited()
+
+
+async def test_shared_breeze_total_budget_cancels_a_later_segment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, _reference = _shared_breeze_service(tmp_path, timeout=1)
+    text = "第一段公开测试需要完整保留。第二段共用同一个时间预算。第三段不能重置整个时间预算。"
+    assert len(service._build_synthesis_plan(text)[1]) >= 3
+    calls: list[int] = []
+    deadlines: list[float] = []
+    cancelled = asyncio.Event()
+
+    async def delayed_backend(**kwargs: Any) -> bytes:
+        calls.append(int(kwargs["segment_index"]))
+        deadlines.append(float(kwargs["_breeze_deadline"]))
+        try:
+            await asyncio.sleep(0.6)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return _silent_wav()
+
+    monkeypatch.setattr(service, "_call_tts_api", delayed_backend)
+    join = Mock(side_effect=AssertionError("must not deliver a partial expression"))
+    monkeypatch.setattr(service, "_join_wav_segments", join)
+
+    assert await service.generate_voice(text) is None
+    assert calls == [1, 2]
+    assert deadlines[0] == deadlines[1]
+    assert cancelled.is_set()
+    assert not service._synthesis_lock.locked()
+    join.assert_not_called()
+
+
+async def test_shared_breeze_total_budget_includes_local_lane_waiting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, _reference = _shared_breeze_service(tmp_path, timeout=1)
+    backend = AsyncMock(return_value=_silent_wav())
+    monkeypatch.setattr(service, "_call_tts_api", backend)
+    monkeypatch.setattr(service, "_encode_audio", AsyncMock(return_value=_silent_wav()))
+    await service._synthesis_lock.acquire()
+    try:
+        assert await service.generate_voice("公开排队验证。") is None
+        assert service._synthesis_lock.locked()  # The cancelled waiter cannot release another owner.
+        backend.assert_not_awaited()
+    finally:
+        service._synthesis_lock.release()
+
+    assert await service.generate_voice("公开恢复验证。")
+    assert not service._synthesis_lock.locked()
+    backend.assert_awaited_once()
+
+
+@pytest.mark.parametrize("mode", ["cancel", "truncated", "stop"])
+async def test_shared_breeze_closes_interrupted_pcm_without_returning_partial_audio(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    service, _reference = _shared_breeze_service(tmp_path)
+    entered = asyncio.Event()
+    closed = asyncio.Event()
+    calls: list[str] = []
+
+    class InterruptedContent:
+        async def iter_chunked(self, _size: int):
+            yield b"\x00\x00" * 240
+            entered.set()
+            if mode == "truncated":
+                raise tts_service_module.aiohttp.ClientPayloadError("fixture interrupted PCM")
+            await asyncio.Event().wait()
+
+    class InterruptedResponse(_FakeHTTPResponse):
+        async def __aexit__(self, *_args: object) -> None:
+            closed.set()
+
+    class InterruptedSession(_FakeClientSession):
+        def post(self, url: str, **_kwargs: Any) -> InterruptedResponse:
+            calls.append(url)
+            response = InterruptedResponse(b"", headers={
+                "Content-Type": "audio/pcm", "X-Sample-Rate": "24000", "X-Sample-Format": "s16le",
+            })
+            response.content = InterruptedContent()  # type: ignore[assignment]
+            return response
+
+    monkeypatch.setattr(tts_service_module.aiohttp, "ClientSession", InterruptedSession)
+    task = asyncio.create_task(service.generate_voice("公开中断验证。"))
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    if mode == "cancel":
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    elif mode == "stop":
+        await asyncio.wait_for(service.stop(), timeout=1)
+        assert await asyncio.wait_for(task, timeout=1) is None
+        assert not task.cancelled()
+        assert not service._owned_expressions
+    else:
+        assert await task is None
+    assert closed.is_set()
+    assert len(calls) == 1
+    assert not service._synthesis_lock.locked()
+
+
+async def test_shared_breeze_stop_owns_active_and_queued_children_not_callers_or_peers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_dir, second_dir = tmp_path / "first", tmp_path / "second"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    first, _ = _shared_breeze_service(first_dir)
+    second, _ = _shared_breeze_service(second_dir)
+    entered_first, entered_second = asyncio.Event(), asyncio.Event()
+    release_second = asyncio.Event()
+    first_cancelled = asyncio.Event()
+    children: list[asyncio.Task[Any] | None] = []
+    first_calls: list[int] = []
+
+    async def first_backend(**kwargs: Any) -> bytes:
+        first_calls.append(int(kwargs["segment_index"]))
+        children.append(asyncio.current_task())
+        entered_first.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            first_cancelled.set()
+            raise
+        return _silent_wav()
+
+    async def second_backend(**_kwargs: Any) -> bytes:
+        entered_second.set()
+        await release_second.wait()
+        return _silent_wav()
+
+    monkeypatch.setattr(first, "_call_tts_api", first_backend)
+    monkeypatch.setattr(second, "_call_tts_api", second_backend)
+    monkeypatch.setattr(second, "_encode_audio", AsyncMock(return_value=_silent_wav()))
+    caller_progress: list[str] = []
+
+    async def caller(service: TTSService, label: str) -> str | None:
+        result = await service.generate_voice("公开停止验证。")
+        caller_progress.append(label)
+        return result
+
+    active = asyncio.create_task(caller(first, "active"))
+    await asyncio.wait_for(entered_first.wait(), timeout=1)
+    queued = asyncio.create_task(caller(first, "queued"))
+    peer = asyncio.create_task(caller(second, "peer"))
+    await asyncio.wait_for(entered_second.wait(), timeout=1)
+    for _ in range(50):
+        if len(first._owned_expressions) == 2:
+            break
+        await asyncio.sleep(0)
+    assert len(first._owned_expressions) == 2
+    assert children[0] is not active
+
+    with patch.object(tts_service_module.os, "killpg") as killpg:
+        await asyncio.wait_for(asyncio.gather(first.stop(), first.stop()), timeout=1)
+        assert await asyncio.wait_for(active, timeout=1) is None
+        assert await asyncio.wait_for(queued, timeout=1) is None
+        assert not active.cancelled() and not queued.cancelled()
+        assert first_cancelled.is_set()
+        assert not first._owned_expressions and not first._synthesis_lock.locked()
+        assert first_calls == [1]
+        assert set(caller_progress) == {"active", "queued"}
+        assert not peer.done()
+        assert second._owned_expressions and not second._stopped
+        assert await first.generate_voice("停止后拒绝。") is None
+        assert first_calls == [1]
+        release_second.set()
+        assert await asyncio.wait_for(peer, timeout=1)
+        await second.stop()
+        killpg.assert_not_called()
+    assert set(caller_progress) == {"active", "queued", "peer"}
+    assert not second._owned_expressions

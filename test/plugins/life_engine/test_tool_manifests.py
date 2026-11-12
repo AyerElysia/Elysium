@@ -111,3 +111,13 @@ def test_stream_bound_wake_and_followup_are_not_registered() -> None:
     assert "nucleus_browser_fetch" in component_names
     assert "nucleus_web_search" in component_names
     assert "nucleus_web" not in component_names
+
+
+def test_grep_sort_enum_has_no_empty_value() -> None:
+    """Gemini rejects function declarations whose enum starts with ""."""
+    from plugins.life_engine.tools.grep_tools import LifeEngineGrepFileTool
+
+    schema = LifeEngineGrepFileTool.to_schema()
+    enum = schema["function"]["parameters"]["properties"]["sort"]["enum"]
+    assert "" not in enum
+    assert enum[0] == "auto"

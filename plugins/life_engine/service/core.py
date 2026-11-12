@@ -275,6 +275,7 @@ from .subconscious_context import (
     RecentSubconsciousContext,
     SubconsciousContextManager,
     SubconsciousSummary,
+    without_exact_identity_copies,
 )
 from .heartbeat_rolling import (
     copy_rolling_payloads,
@@ -7958,7 +7959,14 @@ class LifeEngineService(BaseService):
             return
 
         async with self._get_lock():
-            self._event_history.extend(events)
+            self._event_history, dropped_copies = without_exact_identity_copies(
+                [*self._event_history, *events]
+            )
+            if dropped_copies:
+                logger.warning(
+                    "life_engine 历史合并相同事件副本: "
+                    f"dropped={dropped_copies}"
+                )
             self._event_history.sort(
                 key=lambda event: (int(event.sequence or 0), str(event.event_id or ""))
             )
@@ -8226,7 +8234,7 @@ class LifeEngineService(BaseService):
             )
 
         rollback_history: list[LifeEngineEvent] | None = None
-        uncommitted_ids: set[str] = set()
+        uncommitted_events: dict[int, LifeEngineEvent] = {}
         committed_ids: list[str] = []
         try:
             async with self._get_lock():
@@ -8245,16 +8253,24 @@ class LifeEngineService(BaseService):
                 if run_events:
                     for event in run_events:
                         if not event.heartbeat_context_consumed:
-                            uncommitted_ids.add(event.event_id)
+                            uncommitted_events[id(event)] = event
                         # Successful output is history, not a new wake-up signal.
                         event.heartbeat_context_consumed = True
                     run_ids = {id(event) for event in run_events}
                     self._pending_events = [
                         event for event in self._pending_events if id(event) not in run_ids
                     ]
-                    self._event_history.extend(run_events)
+                    self._event_history, dropped_copies = without_exact_identity_copies(
+                        [*self._event_history, *run_events]
+                    )
+                    if dropped_copies:
+                        logger.warning(
+                            "life_engine 心跳提交合并相同事件副本: "
+                            f"dropped={dropped_copies}"
+                        )
                 if heartbeat_event is not None:
-                    uncommitted_ids.add(heartbeat_event.event_id)
+                    if not heartbeat_event.heartbeat_context_consumed:
+                        uncommitted_events[id(heartbeat_event)] = heartbeat_event
                     heartbeat_event.heartbeat_context_consumed = True
                     self._event_history.append(heartbeat_event)
                 self._event_history.sort(
@@ -8265,7 +8281,7 @@ class LifeEngineService(BaseService):
                     if event.event_id in acknowledged_ids:
                         if not event.heartbeat_context_consumed:
                             committed_ids.append(event.event_id)
-                            uncommitted_ids.add(event.event_id)
+                            uncommitted_events[id(event)] = event
                         event.heartbeat_context_consumed = True
 
                 self._state.pending_event_count = len(self._pending_events)
@@ -8321,17 +8337,23 @@ class LifeEngineService(BaseService):
         except BaseException:
             if rollback_history is not None:
                 async with self._get_lock():
-                    restored = {event.event_id: event for event in rollback_history}
-                    restored.update(
-                        (event.event_id, event)
-                        for event in self._event_history
-                        if event.event_type != EventType.SUMMARY
+                    # Revert only objects this commit changed. Another copy
+                    # may already carry a durable acknowledgement from before
+                    # the attempt, even when it shares the same event id.
+                    for event in uncommitted_events.values():
+                        event.heartbeat_context_consumed = False
+                    restored, _ = without_exact_identity_copies(
+                        [
+                            *rollback_history,
+                            *(
+                                event
+                                for event in self._event_history
+                                if event.event_type != EventType.SUMMARY
+                            ),
+                        ]
                     )
-                    for event in [*restored.values(), *self._pending_events]:
-                        if event.event_id in uncommitted_ids:
-                            event.heartbeat_context_consumed = False
                     self._event_history = sorted(
-                        restored.values(),
+                        restored,
                         key=lambda event: (int(event.sequence or 0), str(event.event_id or "")),
                     )
                     self._state.heartbeat_context_cursor = cursor_before
